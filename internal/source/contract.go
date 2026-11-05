@@ -138,8 +138,18 @@ type RowHandler func(ctx context.Context, row Row) error
 // Position is an opaque, comparable checkpoint. Concrete types live in each
 // connector package (PGPosition, MySQLPosition) and serialize to one string
 // that is written to the target database inside the same transaction as data.
+//
+// 契约（2026-11-05 裁决，为三轨并行定最小公共面）：
+//   - String() 是**唯一**落到目标库的形态，必须自描述到能独立解析（PG 的 "0/16B6C50"、
+//     MySQL 的 "mysql-bin.000003:1234" 或 GTID 集合），不依赖进程内状态；
+//   - Kind() 与 Endpoint.Kind() 同值（postgres / mysql），引擎用它做对账：位点串与连接
+//     类型不匹配时给 E3001，而不是猜；
+//   - 位点只在**事务边界**上前进（见 sink.Sink.Apply 的不变量），因此两次提交之间的
+//     比较只需要可判等，不需要全序。
 type Position interface {
 	String() string
+	// Kind 返回产生这个位点的连接类型（postgres / mysql）。
+	Kind() string
 }
 
 // EventKind classifies one change event.
@@ -166,6 +176,14 @@ type Event struct {
 	TxID     string    // 用于把同一事务的事件串起来
 	CommitTS time.Time // 源端提交时间；拿不到时为零值（PG track_commit_timestamp=off）
 	DDL      string    // EvDDL 时的原始语句
+	// Relation 是这条事件的行镜像所依据的列定义（2026-11-05 裁决）。
+	//   - 非 nil：New/Old 的 Values 按这份 Table.Columns 的顺序对齐。PG 的 Relation
+	//     消息、MySQL 开了 binlog_row_metadata=FULL 时都能直接给出，两者不需要互相迁就。
+	//   - nil：按 EnsureSchema 时那份 catalog 对齐（连接器没拿到更细的元数据）。
+	// 源端 DDL 之后，连接器必须先发一条**带新 Relation** 的事件（EvDDL 本身或其紧随的事件），
+	// 再发按新列定义的数据事件——否则引擎无从判断"这一行有哪几列"，只能按旧 catalog 猜错。
+	// 实现约定：同一版定义请复用同一个指针（指针相等即同一版），不要每条事件都新建。
+	Relation *Table
 }
 
 // EventHandler consumes the stream; returning an error stops the stream.
@@ -248,6 +266,13 @@ type Source interface {
 	Snapshot(ctx context.Context, opt SnapshotOpt, onRow RowHandler) (Position, error)
 	// Stream emits changes from pos until ctx is cancelled.
 	Stream(ctx context.Context, from Position, onEvent EventHandler) error
+	// ParsePosition 把目标库里存着的位点串还原成连接器自己的类型（2026-11-05 裁决）。
+	//
+	// 为什么放在 Source 上而不是让引擎自己解析：位点串的格式归连接器所有，引擎不该
+	// import 具体连接器包（否则 engine 与 pgsource/mysqlsource 互相依赖）。
+	// 解析失败按「位点与本连接类型不匹配或已损坏」处理，返回错误让上层给 E3001，
+	// 不要静默回落到全量重搬。
+	ParsePosition(raw string) (Position, error)
 	// Advance moves the source-side checkpoint forward (slot advance / purge).
 	Advance(ctx context.Context, to Position) error
 	// Cleanup removes objects this job created (slot, publication, temp snapshot).
