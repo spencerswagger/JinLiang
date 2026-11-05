@@ -725,5 +725,8 @@ func (s *Server) handleCodes(w http.ResponseWriter, r *http.Request) {
 			Why: sp.Why, Next: sp.Next, Risk: sp.Risk,
 		}
 	}
+	// 码表随二进制版本变，不是用户数据：允许浏览器私有缓存 5 分钟，
+	// 免得每打开一个任务页都重新拉一遍（页面里只拉一次，但刷新会重来）。
+	w.Header().Set("Cache-Control", "private, max-age=300")
 	writeJSON(w, http.StatusOK, map[string]any{"codes": out, "count": len(out)})
 }

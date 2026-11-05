@@ -1285,3 +1285,19 @@ func TestStartJobEmitsErrorWhenEngineCannotStart(t *testing.T) {
 		t.Fatal("引擎没能开始，但事件流上什么也没有——用户会看到「点了没反应」")
 	}
 }
+
+// P3：码表允许浏览器私有缓存 5 分钟（随二进制版本变，不是用户数据）。
+func TestCodesEndpointIsCacheable(t *testing.T) {
+	ts, _ := newTestServer(t)
+	token := setupAdmin(t, ts)
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/codes", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if cc := res.Header.Get("Cache-Control"); cc != "private, max-age=300" {
+		t.Fatalf("Cache-Control = %q，期望 private, max-age=300", cc)
+	}
+}
