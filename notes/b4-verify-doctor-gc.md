@@ -101,7 +101,7 @@ DSN 名只用真名：`JINLIANG_TEST_{PG,MYSQL}[_SRC]_DSN`，先 `env | grep JIN
 $ gofmt -l .            # 空
 $ go vet ./...          # 通过
 $ go test ./...         # 全绿
-$ go test -tags=integration ./internal/verify ./internal/gc ./internal/doctor   # 全绿
+$ go test -p 1 -tags=integration ./internal/verify ./internal/gc ./internal/doctor ./internal/remedy   # 全绿
 $ scripts/check_binary_size.sh dist/jinliang
 binary dist/jinliang: 19591328 bytes (18 MB), limit 25 MB → OK
 ```
