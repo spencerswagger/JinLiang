@@ -60,12 +60,14 @@ CREATE TABLE jobs (
 CREATE TABLE runs (
   id         TEXT PRIMARY KEY,
   job_id     TEXT NOT NULL REFERENCES jobs(id),
+  kind       TEXT NOT NULL DEFAULT 'sync',  -- sync | verify | stub，取值见下方
   phase      TEXT NOT NULL,                -- 见 internal/state/phase.go
   started_at TEXT NOT NULL, ended_at TEXT,
   rows_done  INTEGER DEFAULT 0,
   lag_bytes  INTEGER, lag_ms INTEGER,
   last_error TEXT,                         -- 错误码 + 一句话
-  exit_code  INTEGER
+  exit_code  INTEGER,
+  stub       INTEGER NOT NULL DEFAULT 0    -- 已弃用：保留一版兼容，B1 收口后删除（见下方）
 );
 
 CREATE TABLE settings (k TEXT PRIMARY KEY, v TEXT NOT NULL);  -- instance_id / schema_version / 默认值
@@ -76,6 +78,25 @@ CREATE TABLE audit (
 ```
 
 连接与任务的增删改查全部走服务端；UI 只提交字段，不提交 SQL。
+
+**`runs.kind` 的取值**（2026-11-05 裁定）：
+
+| 值 | 含义 | 何时产生 |
+|---|---|---|
+| `sync` | 正常同步运行 | B1 起的真实运行；也是迁移回填的默认值 |
+| `verify` | 校验运行（`GET /api/jobs/{id}/verify` 背后的那一轮） | B1 的校验功能落地后 |
+| `stub` | B0 骨架运行：只推进阶段，不搬运任何数据 | **仅 B0**；B1 起不再产生 |
+
+迁移（照此口径，不许一次删列）：
+
+```sql
+ALTER TABLE runs ADD COLUMN kind TEXT NOT NULL DEFAULT 'sync';
+UPDATE runs SET kind = 'stub' WHERE stub = 1;   -- 回填历史桩运行
+```
+
+- **「最近一次运行」只认 `kind='sync'`**：`verify` 与 `stub` 可以出现在历史列表里，但**不得进入「最近一次同步运行」的判定**——否则一轮校验或一轮桩运行会把真实同步进度盖掉，页面显示"刚跑过"，实际上从没同步。
+- **`runs` 是控制面的运行摘要，不是运行时位点**（§2 红线）：真权威位点在目标端 `_jl_*`，这里只记「这个任务跑到过哪一步」，位点永远不进控制库。
+- **`stub` 列已弃用**：保留一版做兼容，**B1 收口后再删**，不许一次删列。删除时同步做四件事：① 本表删掉该列；② `internal/control/migrate.go` 加一条对应的 `ALTER TABLE runs DROP COLUMN stub`；③ 历史页/详情页去掉读 `stub` 的分支，改读 `kind='stub'`；④ 导出与 API 契约里的 `stub` 字段（`Run` 的 JSON 字段）一并移除。
 
 ## 4. API 面
 
