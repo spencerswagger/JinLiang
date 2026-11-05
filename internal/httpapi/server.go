@@ -106,7 +106,7 @@ func (s *Server) routes() {
 	// ── 认证与首启 ──────────────────────────────────────────
 	s.mux.HandleFunc("GET /api/health", s.handleHealth)
 	s.mux.HandleFunc("GET /api/meta", s.wrap(s.handleMeta, roleAny))
-	s.mux.HandleFunc("POST /api/setup", s.handleSetup)
+	s.mux.HandleFunc("POST /api/setup", s.limiter.wrap(s.handleSetup))
 	s.mux.HandleFunc("POST /api/login", s.limiter.wrap(s.handleLogin))
 	s.mux.HandleFunc("POST /api/logout", s.wrap(s.handleLogout, roleAny))
 	s.mux.HandleFunc("GET /api/session", s.handleSession)
@@ -189,6 +189,9 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 // beyond "已设置/未设置", which the setup page needs anyway.
 func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	// 首启端点要 CSRF，而 CSRF token 只能由 GET 侧种下：/api/session 是所有
+	// 客户端（浏览器、curl、容器脚本）的共同入口，所以在这里发。
+	s.ensureCSRFCookie(w, r)
 	configured, err := s.store.AdminConfigured(ctx)
 	if err != nil {
 		s.writeError(w, r, http.StatusInternalServerError, apiError{Message: err.Error()})

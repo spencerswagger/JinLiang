@@ -89,16 +89,15 @@ func (s *sessionStore) drop(token string) {
 	s.mu.Unlock()
 }
 
-// bearerToken extracts a token from the Authorization header (or the SSE query
-// parameter, because EventSource cannot set headers).
+// bearerToken reads the Authorization header only.
+//
+// 曾经允许 /events?token=… 兜底（EventSource 不能设请求头），但 query 里的凭证
+// 会进访问日志、浏览器历史、Referer，所以删掉了：浏览器用 cookie（EventSource
+// 自动携带），curl 用 Authorization 头。这条由 TestSSERejectsQueryToken 钉住。
 func bearerToken(r *http.Request) string {
-	if h := r.Header.Get("Authorization"); h != "" {
-		if len(h) > 7 && strings.EqualFold(h[:7], "bearer ") {
-			return strings.TrimSpace(h[7:])
-		}
-	}
-	if r.URL.Path != "" && strings.HasSuffix(r.URL.Path, "/events") {
-		return r.URL.Query().Get("token")
+	h := r.Header.Get("Authorization")
+	if len(h) > 7 && strings.EqualFold(h[:7], "bearer ") {
+		return strings.TrimSpace(h[7:])
 	}
 	return ""
 }
@@ -113,12 +112,6 @@ func (s *Server) authenticated(r *http.Request) bool {
 	}
 	if c, err := r.Cookie(sessionCookie); err == nil && s.sessions.valid(c.Value) {
 		return true
-	}
-	// SSE 也可以用 cookie（浏览器 EventSource 会带 cookie）
-	if strings.HasSuffix(r.URL.Path, "/events") {
-		if c, err := r.Cookie(sessionCookie); err == nil && s.sessions.valid(c.Value) {
-			return true
-		}
 	}
 	return false
 }
@@ -278,6 +271,27 @@ func (l *loginLimiter) wrap(h http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// ensureCSRFCookie sets the double-submit token cookie when it is missing, so a
+// visitor who lands on /setup or /api/session gets one before any write.
+//
+// 首启端点也不能裸奔：CSRF 双提交要求的正是「页面给过的 token」，所以 GET 侧
+// 必须先把 cookie 种上，否则 POST 侧永远校验不过。
+func (s *Server) ensureCSRFCookie(w http.ResponseWriter, r *http.Request) string {
+	if c, err := r.Cookie(csrfCookie); err == nil && c.Value != "" {
+		return c.Value
+	}
+	token, err := newCSRFToken()
+	if err != nil {
+		return ""
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name: csrfCookie, Value: token, Path: "/",
+		HttpOnly: false, SameSite: http.SameSiteLaxMode, Secure: r.TLS != nil,
+		Expires: s.now().Add(sessionTTL),
+	})
+	return token
+}
+
 // setSession issues the session + CSRF cookies and returns the token.
 func (s *Server) setSession(w http.ResponseWriter, r *http.Request) (string, error) {
 	token, sess, err := s.sessions.create()
@@ -324,8 +338,21 @@ func (s *Server) clearSession(w http.ResponseWriter, r *http.Request) {
 
 // handleSetup creates the administrator password. Only allowed once, and only
 // while no password exists (otherwise an unauthenticated caller could reset it).
+//
+// 首启端点同样需要 CSRF 与限速：能被跨站 POST 打中的 127.0.0.1 端点，等于把
+// 「谁先设口令谁就是管理员」交给别人。token 由 GET /api/session 或 GET /setup 种下。
 func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	if !s.csrfOK(r) {
+		s.writeError(w, r, http.StatusForbidden, apiError{
+			Class:   "user_action",
+			Message: "缺少 CSRF token",
+			Why:     "首启端点也能被跨站请求打中；设口令这种写操作必须证明来自本页",
+			Next:    []string{"先 GET /api/session（会种下 jl_csrf cookie），再把它的值放进 X-CSRF-Token 头", "或者直接用浏览器打开首页走引导"},
+			Risk:    "无",
+		})
+		return
+	}
 	configured, err := s.store.AdminConfigured(ctx)
 	if err != nil {
 		s.writeError(w, r, http.StatusInternalServerError, plainError("%v", err))

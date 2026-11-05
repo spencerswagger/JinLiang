@@ -2,6 +2,7 @@ package control
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -13,14 +14,15 @@ func TestSealOpenRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	plain := []byte("s3cr3t-密码-🔐")
-	blob, err := c.Seal(plain)
+	aad := []byte("conn-1")
+	blob, err := c.Seal(aad, plain)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if bytes.Contains(blob, plain) {
 		t.Fatal("ciphertext must not contain the plaintext")
 	}
-	got, err := c.Open(blob)
+	got, err := c.Open(aad, blob)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -31,11 +33,12 @@ func TestSealOpenRoundTrip(t *testing.T) {
 
 func TestSealUsesFreshNonce(t *testing.T) {
 	c, _ := newCipher(bytes.Repeat([]byte{1}, KeyLen), KeyFromEnv, "")
-	a, err := c.Seal([]byte("same"))
+	aad := []byte("conn-1")
+	a, err := c.Seal(aad, []byte("same"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := c.Seal([]byte("same"))
+	b, err := c.Seal(aad, []byte("same"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -50,18 +53,19 @@ func TestSealUsesFreshNonce(t *testing.T) {
 func TestOpenRejectsWrongKeyAndTamper(t *testing.T) {
 	a, _ := newCipher(bytes.Repeat([]byte{1}, KeyLen), KeyFromEnv, "")
 	b, _ := newCipher(bytes.Repeat([]byte{2}, KeyLen), KeyFromEnv, "")
-	blob, err := a.Seal([]byte("hello"))
+	aad := []byte("conn-1")
+	blob, err := a.Seal(aad, []byte("hello"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := b.Open(blob); err == nil {
+	if _, err := b.Open(aad, blob); err == nil {
 		t.Fatal("wrong key must fail")
 	}
 	blob[len(blob)-1] ^= 0xff
-	if _, err := a.Open(blob); err == nil {
+	if _, err := a.Open(aad, blob); err == nil {
 		t.Fatal("tampered ciphertext must fail")
 	}
-	if _, err := a.Open([]byte{1, 2, 3}); err == nil {
+	if _, err := a.Open(aad, []byte{1, 2, 3}); err == nil {
 		t.Fatal("short blob must fail")
 	}
 }
@@ -119,8 +123,8 @@ func TestLoadCipherGeneratesDataDirKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	blob, _ := c.Seal([]byte("x"))
-	if _, err := again.Open(blob); err != nil {
+	blob, _ := c.Seal([]byte("conn-1"), []byte("x"))
+	if _, err := again.Open([]byte("conn-1"), blob); err != nil {
 		t.Fatalf("second load must reuse the same key: %v", err)
 	}
 }
@@ -150,5 +154,26 @@ func TestHashVerifyPassword(t *testing.T) {
 	}
 	if _, err := VerifyPassword("not-a-phc-string", "x"); err == nil {
 		t.Fatal("malformed hash must be an error, not a mismatch")
+	}
+}
+
+// P2 回归：把 A 连接的密文搬进 B 行，必须解不开（AAD 绑定生效）。
+func TestCipherBindsCiphertextToRow(t *testing.T) {
+	c, err := newCipher(bytes.Repeat([]byte{3}, KeyLen), KeyFromEnv, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	blob, err := c.Seal([]byte("conn-A"), []byte("alice-password"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Open([]byte("conn-B"), blob); err == nil {
+		t.Fatal("another row's AAD must not open this ciphertext")
+	} else if !errors.Is(err, ErrAADMismatch) {
+		t.Fatalf("error should be ErrAADMismatch, got %v", err)
+	}
+	// 同一行仍然正常
+	if got, err := c.Open([]byte("conn-A"), blob); err != nil || string(got) != "alice-password" {
+		t.Fatalf("same row must still decrypt: %q %v", got, err)
 	}
 }

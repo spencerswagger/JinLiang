@@ -111,7 +111,12 @@ func (s *Store) CreateConnection(ctx context.Context, in ConnectionInput) (Conne
 	if err := in.Validate(); err != nil {
 		return Connection{}, err
 	}
-	secret, err := s.cipher.Seal([]byte(in.Password))
+	id, err := NewID()
+	if err != nil {
+		return Connection{}, err
+	}
+	// AAD = 连接 id：密文与行绑定，搬到别的行解不开（见 crypto.go）
+	secret, err := s.cipher.Seal([]byte(id), []byte(in.Password))
 	if err != nil {
 		return Connection{}, err
 	}
@@ -120,10 +125,6 @@ func (s *Store) CreateConnection(ctx context.Context, in ConnectionInput) (Conne
 		params = map[string]string{}
 	}
 	paramsJSON, err := json.Marshal(params)
-	if err != nil {
-		return Connection{}, err
-	}
-	id, err := NewID()
 	if err != nil {
 		return Connection{}, err
 	}
@@ -158,11 +159,11 @@ func (s *Store) UpdateConnection(ctx context.Context, id string, in ConnectionIn
 	secret := cur.SecretEnc
 	switch {
 	case in.ClearPassword:
-		if secret, err = s.cipher.Seal(nil); err != nil {
+		if secret, err = s.cipher.Seal([]byte(id), nil); err != nil {
 			return Connection{}, err
 		}
 	case in.Password != "":
-		if secret, err = s.cipher.Seal([]byte(in.Password)); err != nil {
+		if secret, err = s.cipher.Seal([]byte(id), []byte(in.Password)); err != nil {
 			return Connection{}, err
 		}
 	}
@@ -248,7 +249,7 @@ func (s *Store) Secret(ctx context.Context, id string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	raw, err := s.cipher.Open(c.SecretEnc)
+	raw, err := s.cipher.Open([]byte(c.ID), c.SecretEnc)
 	if err != nil {
 		return "", err
 	}

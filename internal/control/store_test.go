@@ -3,6 +3,7 @@ package control
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -444,5 +445,41 @@ func TestDataDirPermissionsTightened(t *testing.T) {
 	}
 	if perm := dbInfo.Mode().Perm(); perm != 0o600 {
 		t.Fatalf("db perm = %04o, want 0600", perm)
+	}
+}
+
+// P2 回归：能写控制库文件的人把 A 行的密文搬进 B 行，必须解不开。
+// 这条是 AAD 绑定的存在理由（crypto.go 的 Seal/Open 都带 aad）。
+func TestSwappedCiphertextDoesNotDecrypt(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	a, err := s.CreateConnection(ctx, ConnectionInput{
+		Name: "alice", Kind: "postgres", Host: "h", Port: 5432,
+		Database: "d", Username: "alice", Password: "alice-pw",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := s.CreateConnection(ctx, ConnectionInput{
+		Name: "bob", Kind: "postgres", Host: "h", Port: 5432,
+		Database: "d", Username: "bob", Password: "bob-pw",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 模拟拿到库写权限的攻击者：把 alice 的密文搬到 bob 这一行
+	if _, err := s.DB().ExecContext(ctx,
+		`UPDATE connections SET secret_enc = (SELECT secret_enc FROM connections WHERE id = ?) WHERE id = ?`,
+		a.ID, b.ID); err != nil {
+		t.Fatal(err)
+	}
+	if pw, err := s.Secret(ctx, b.ID); err == nil {
+		t.Fatalf("换行后的密文不该解开，却拿到了 %q", pw)
+	} else if !errors.Is(err, ErrAADMismatch) {
+		t.Fatalf("应该是 ErrAADMismatch，实际 %v", err)
+	}
+	// alice 自己仍然正常
+	if pw, err := s.Secret(ctx, a.ID); err != nil || pw != "alice-pw" {
+		t.Fatalf("alice 的密文应仍然可解：%q %v", pw, err)
 	}
 }

@@ -316,9 +316,9 @@ func (d *JobDoc) Validate() error {
 	// guard
 	if g := d.Guard; g != nil {
 		if g.SlotWarnLag != "" && !reSize.MatchString(g.SlotWarnLag) {
-			add("guard.slot_warn_lag 格式不对：%q（要 5GB 这类）", g.SlotWarnLag)
+			add("guard.slot_warn_lag（同步进度落后多少时告警）格式不对：%q（要 5GB 这类）", g.SlotWarnLag)
 		}
-		checkDuration("guard.slot_warn_seconds", g.SlotWarnSeconds)
+		checkDuration("guard.slot_warn_seconds（落后多久时告警）", g.SlotWarnSeconds)
 		oneOf("guard.on_exceed", g.OnExceed, "pause", "invalidate", "advance")
 	}
 	// observability

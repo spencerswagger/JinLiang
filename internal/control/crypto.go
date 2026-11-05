@@ -38,6 +38,10 @@ var ErrKeyPermTooOpen = errors.New("key file 权限过宽")
 //
 // 每条密文独立 nonce，格式为 nonce || ciphertext+tag。同一明文加密两次结果不同，
 // 所以密文不能用来做相等比较——需要比较时请先解密。
+//
+// AAD 绑定：Seal/Open 都要求传入这条密文所属行的稳定标识（连接 id）。
+// 不这么做的话，能写控制库文件的人可以把 A 行的密文搬进 B 行，再用 B 的身份
+// 解出 A 的密码；绑上 AAD 之后搬过去只会解密失败（GCM 认证不通过）。
 type Cipher struct {
 	aead   cipher.AEAD
 	source KeySource
@@ -51,27 +55,35 @@ func (c *Cipher) KeySource() KeySource { return c.source }
 // environment. Backups: 备份控制库必须同时备份这个文件，否则密文解不开（这是特性）。
 func (c *Cipher) KeyPath() string { return c.path }
 
-// Seal encrypts plaintext into nonce||ciphertext||tag.
-func (c *Cipher) Seal(plaintext []byte) ([]byte, error) {
+// ErrAADMismatch means the ciphertext was produced for a different row.
+var ErrAADMismatch = errors.New("密文与这条记录不匹配")
+
+// Seal encrypts plaintext into nonce||ciphertext||tag, binding it to aad.
+// aad must be stable for the lifetime of the row (we use connections.id).
+func (c *Cipher) Seal(aad, plaintext []byte) ([]byte, error) {
 	nonce := make([]byte, nonceLen)
 	if _, err := rand.Read(nonce); err != nil {
 		return nil, fmt.Errorf("生成 nonce 失败: %w", err)
 	}
 	out := make([]byte, nonceLen, nonceLen+len(plaintext)+c.aead.Overhead())
 	copy(out, nonce)
-	return c.aead.Seal(out, nonce, plaintext, nil), nil
+	return c.aead.Seal(out, nonce, plaintext, aad), nil
 }
 
-// Open decrypts a blob produced by Seal. A wrong key or a tampered blob fails
-// here rather than returning garbage, which is the whole point of GCM.
-func (c *Cipher) Open(blob []byte) ([]byte, error) {
+// Open decrypts a blob produced by Seal for the same aad.
+//
+// 三种失败都落在同一个错误上（GCM 无法区分）：key 不对、密文被改、AAD 不匹配
+// （也就是「这条密文不是这条记录的」）。消息里把三种可能都写出来，避免用户在
+// 只遇到其中一种时被误导。
+func (c *Cipher) Open(aad, blob []byte) ([]byte, error) {
 	if len(blob) < nonceLen+c.aead.Overhead() {
 		return nil, errors.New("密文长度不足，控制库可能损坏")
 	}
 	nonce, ct := blob[:nonceLen], blob[nonceLen:]
-	out, err := c.aead.Open(nil, nonce, ct, nil)
+	out, err := c.aead.Open(nil, nonce, ct, aad)
 	if err != nil {
-		return nil, fmt.Errorf("解密失败（key 文件与密文不匹配，或控制库损坏）: %w", err)
+		return nil, fmt.Errorf("%w：key 文件与密文不匹配、密文被改动，或这条密文属于别的记录: %v",
+			ErrAADMismatch, err)
 	}
 	return out, nil
 }
@@ -211,5 +223,24 @@ func writeFile0600(path string, data []byte) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmpName, path)
+	if err := os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	// fsync 目录：rename 只在内存里改了目录项，断电可能连 key 文件一起丢，
+	// 而 key 一丢，控制库里所有密文就永久解不开了。
+	return syncDir(dir)
+}
+
+// syncDir flushes a directory entry change to disk (best effort on platforms
+// where directories cannot be opened for sync).
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return nil // 目录打不开就算了，不要让「写 key」因为 fsync 失败而报错
+	}
+	defer d.Close()
+	if err := d.Sync(); err != nil {
+		return fmt.Errorf("fsync 目录 %s 失败（key 文件可能未落盘）: %w", dir, err)
+	}
+	return nil
 }

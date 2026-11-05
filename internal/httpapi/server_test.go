@@ -65,9 +65,40 @@ func doJSON(t *testing.T, method, url, token string, body any) (int, map[string]
 	return res.StatusCode, out
 }
 
+// setupRequest 走完整首启流程（先拿 CSRF cookie，再带头发 POST），返回状态码与响应体。
+func setupRequest(t *testing.T, ts *httptest.Server, password string) (int, map[string]any) {
+	t.Helper()
+	jar, _ := cookiejar.New(nil)
+	client := &http.Client{Jar: jar}
+	res, err := client.Get(ts.URL + "/api/session")
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	csrf := cookieValue(jar, mustURL(t, ts.URL), csrfCookie)
+	if csrf == "" {
+		t.Fatal("GET /api/session 没有种下 jl_csrf cookie")
+	}
+	body, _ := json.Marshal(map[string]string{"password": password})
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/setup", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(csrfHeader, csrf)
+	res, err = client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	raw, _ := io.ReadAll(res.Body)
+	out := map[string]any{}
+	if len(raw) > 0 {
+		_ = json.Unmarshal(raw, &out)
+	}
+	return res.StatusCode, out
+}
+
 func setupAdmin(t *testing.T, ts *httptest.Server) string {
 	t.Helper()
-	code, body := doJSON(t, http.MethodPost, ts.URL+"/api/setup", "", map[string]string{"password": testPassword})
+	code, body := setupRequest(t, ts, testPassword)
 	if code != http.StatusCreated {
 		t.Fatalf("setup status = %d body=%v", code, body)
 	}
@@ -76,6 +107,15 @@ func setupAdmin(t *testing.T, ts *httptest.Server) string {
 		t.Fatalf("setup did not return a token: %v", body)
 	}
 	return token
+}
+
+func cookieValue(jar http.CookieJar, u *url.URL, name string) string {
+	for _, c := range jar.Cookies(u) {
+		if c.Name == name {
+			return c.Value
+		}
+	}
+	return ""
 }
 
 func createPGConn(t *testing.T, ts *httptest.Server, token, name string) string {
@@ -136,7 +176,7 @@ func TestHealthAndSessionArePublic(t *testing.T) {
 func TestSetupTwiceIsRefused(t *testing.T) {
 	ts, _ := newTestServer(t)
 	setupAdmin(t, ts)
-	code, body := doJSON(t, http.MethodPost, ts.URL+"/api/setup", "", map[string]string{"password": "another-password"})
+	code, body := setupRequest(t, ts, "another-password")
 	if code != http.StatusConflict {
 		t.Fatalf("second setup = %d body=%v", code, body)
 	}
@@ -144,7 +184,7 @@ func TestSetupTwiceIsRefused(t *testing.T) {
 
 func TestSetupRejectsShortPassword(t *testing.T) {
 	ts, _ := newTestServer(t)
-	code, _ := doJSON(t, http.MethodPost, ts.URL+"/api/setup", "", map[string]string{"password": "short"})
+	code, _ := setupRequest(t, ts, "short")
 	if code != http.StatusBadRequest {
 		t.Fatalf("short password = %d, want 400", code)
 	}
@@ -267,7 +307,7 @@ func TestJobLifecycleAndSSE(t *testing.T) {
 		t.Fatalf("run must report stub=true: %v", runBody)
 	}
 
-	phases := collectSSEPhases(t, ts.URL+"/api/jobs/"+jobID+"/events?token="+token, 15*time.Second)
+	phases := collectSSEPhases(t, ts.URL+"/api/jobs/"+jobID+"/events", token, 15*time.Second)
 	want := []string{"preflight", "prepare", "snapshot", "catchup", "streaming", "draining", "done"}
 	for _, w := range want {
 		if !phases[w] {
@@ -282,13 +322,17 @@ func TestJobLifecycleAndSSE(t *testing.T) {
 }
 
 // collectSSEPhases reads the event stream until a done event or the deadline.
-func collectSSEPhases(t *testing.T, url string, timeout time.Duration) map[string]bool {
+// 凭证走 Authorization 头（query 里的 token 已被移除，见 TestSSEAuthChannels）。
+func collectSSEPhases(t *testing.T, url, token string, timeout time.Duration) map[string]bool {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
 	}
 	res, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -555,4 +599,96 @@ func mustURL(t *testing.T, raw string) *url.URL {
 		t.Fatal(err)
 	}
 	return u
+}
+
+// P3 回归：首启端点也不能裸奔——没有 CSRF 的 setup 必须 403。
+func TestSetupRequiresCSRF(t *testing.T) {
+	ts, _ := newTestServer(t)
+	code, body := doJSON(t, http.MethodPost, ts.URL+"/api/setup", "", map[string]string{"password": testPassword})
+	if code != http.StatusForbidden {
+		t.Fatalf("无 CSRF 的 setup = %d body=%v，期望 403", code, body)
+	}
+	errObj, _ := body["error"].(map[string]any)
+	if errObj == nil || !strings.Contains(errObj["message"].(string), "CSRF") {
+		t.Fatalf("403 应该说明缺 CSRF：%v", body)
+	}
+}
+
+// P2 回归：SSE 不接受 query 里的 token（会进日志/历史/Referer）；
+// 但 curl 的 Authorization 头与浏览器 cookie 都必须能过。
+func TestSSEAuthChannels(t *testing.T) {
+	ts, _ := newTestServer(t)
+	token := setupAdmin(t, ts)
+	conn := createPGConn(t, ts, token, "src")
+	code, created := doJSON(t, http.MethodPost, ts.URL+"/api/jobs", token, map[string]any{
+		"name": "sse-job", "source_id": conn, "target_id": conn,
+		"spec": map[string]any{
+			"source": map[string]any{"scope": map[string]any{"schema": "public"}},
+			"target": map[string]any{"schema": "report"},
+			"mode":   map[string]any{"frequency": "once"},
+		},
+	})
+	if code != http.StatusCreated {
+		t.Fatalf("create job = %d %v", code, created)
+	}
+	jobID, _ := created["id"].(string)
+	eventsURL := ts.URL + "/api/jobs/" + jobID + "/events"
+
+	// 先跑起来，否则流里没有事件可读
+	if code, body := doJSON(t, http.MethodPost, ts.URL+"/api/jobs/"+jobID+"/run", token, nil); code != http.StatusAccepted {
+		t.Fatalf("run = %d %v", code, body)
+	}
+
+	// 1) ?token= 必须被拒
+	req, _ := http.NewRequest(http.MethodGet, eventsURL+"?token="+token, nil)
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	if res.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("?token= = %d，期望 401", res.StatusCode)
+	}
+
+	// 2) Authorization 头能过（curl 路径）：读一条事件即可
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	req, _ = http.NewRequestWithContext(ctx, http.MethodGet, eventsURL, nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	res, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc := bufio.NewScanner(res.Body)
+	got := false
+	for sc.Scan() {
+		if strings.HasPrefix(sc.Text(), "data: ") {
+			got = true
+			break
+		}
+	}
+	res.Body.Close()
+	if !got {
+		t.Fatal("带 Authorization 头的 SSE 应该能读到事件")
+	}
+
+	// 3) 浏览器 cookie 通道
+	jar, _ := cookiejar.New(nil)
+	client := &http.Client{Jar: jar}
+	lres, err := client.PostForm(ts.URL+"/login", map[string][]string{"password": {testPassword}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lres.Body.Close()
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel2()
+	req, _ = http.NewRequestWithContext(ctx2, http.MethodGet, eventsURL, nil)
+	cres, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cres.Body.Close()
+	if cres.StatusCode != http.StatusOK {
+		t.Fatalf("cookie 通道 SSE = %d，期望 200", cres.StatusCode)
+	}
 }

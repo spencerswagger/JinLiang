@@ -129,15 +129,6 @@ func cmdServe(args []string) error {
 	return nil
 }
 
-func isLoopbackListen(listen string) bool {
-	host := listen
-	if i := strings.LastIndex(listen, ":"); i >= 0 {
-		host = listen[:i]
-	}
-	host = strings.Trim(host, "[]")
-	return host == "" || host == "127.0.0.1" || host == "localhost" || host == "::1"
-}
-
 // cmdImport turns job.yaml files into control-database rows.
 func cmdImport(args []string) error {
 	fs := flag.NewFlagSet("import", flag.ExitOnError)

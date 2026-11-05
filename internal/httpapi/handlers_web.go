@@ -87,7 +87,8 @@ func (s *Server) pageLogin(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, nextOr(r, "/"), http.StatusSeeOther)
 		return
 	}
-	s.renderPage(w, r, "login.html", pageData{Title: "登录", Nav: "login"})
+	csrf := s.ensureCSRFCookie(w, r)
+	s.renderPage(w, r, "login.html", pageData{Title: "登录", Nav: "login", CSRF: csrf})
 }
 
 func (s *Server) pageLoginSubmit(w http.ResponseWriter, r *http.Request) {
@@ -127,7 +128,8 @@ func (s *Server) pageSetup(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/login", http.StatusSeeOther)
 		return
 	}
-	s.renderPage(w, r, "setup.html", pageData{Title: "首次启动", Nav: "setup"})
+	csrf := s.ensureCSRFCookie(w, r)
+	s.renderPage(w, r, "setup.html", pageData{Title: "首次启动", Nav: "setup", CSRF: csrf})
 }
 
 func (s *Server) pageSetupSubmit(w http.ResponseWriter, r *http.Request) {
@@ -138,6 +140,17 @@ func (s *Server) pageSetupSubmit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_ = r.ParseForm()
+	if !s.csrfOK(r) {
+		csrf := s.ensureCSRFCookie(w, r)
+		s.renderPage(w, r, "setup.html", pageData{Title: "首次启动", Nav: "setup", CSRF: csrf,
+			Err: ptrErr(apiError{
+				Message: "页面过期了，请重试",
+				Why:     "设置口令需要页面里的防伪 token",
+				Next:    []string{"刷新这一页再提交"},
+				Risk:    "无",
+			})})
+		return
+	}
 	pass := r.FormValue("password")
 	again := r.FormValue("password2")
 	if pass != again {

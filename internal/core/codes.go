@@ -60,7 +60,7 @@ var specs = []Spec{
 			"重启一次数据库实例（连接会中断 10–30 秒）",
 			"回来重新运行：jinliang run job.yaml（会从断点续跑）",
 		},
-		Risk: "WAL 体积会增加约 10–20%；重启期间业务连接需要重连",
+		Risk: "源库里给外部读取的变更流水体积会增加约 10–20%；重启期间业务连接需要重连",
 	},
 	{
 		Code: CodeTargetTableExists, Class: UserAction,
@@ -138,7 +138,7 @@ var specs = []Spec{
 		Message: "目标库把连接断开了",
 		Why:     "常见于连接被防火墙/负载均衡回收，或目标库连接数打满",
 		Next:    []string{"通常会自动重试（5s/20s/60s）", "持续出现请检查目标库连接数上限与空闲超时"},
-		Risk:    "重试期间源端变更会积压，注意 slot 落后告警",
+		Risk:    "重试期间源端变更会积压，注意「同步进度落后」告警",
 	},
 	{
 		Code: CodeSourceTimeout, Class: Retryable,

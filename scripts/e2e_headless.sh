@@ -80,8 +80,31 @@ code=$(curl -s -o "${WORK}/pre.json" -w '%{http_code}' "${BASE}/api/connections"
 [ "${code}" = "428" ] || fail "首启时 /api/connections 应返回 428，实际 ${code}"
 grep -q "管理员口令" "${WORK}/pre.json" || fail "首启提示里应该提到管理员口令"
 
-say "1. 建管理员（口令只存 argon2id 哈希）"
-TOKEN=$(curl -fsS -X POST "${BASE}/api/setup" -H 'Content-Type: application/json' \
+say "1. 建管理员（口令只存 argon2id 哈希；首启端点要 CSRF，不能裸奔）"
+JAR="${WORK}/cookies.txt"
+curl -fsS -c "${JAR}" "${BASE}/api/session" >/dev/null
+CSRF=$(python3 - "${JAR}" <<'PYCOOKIE'
+import sys
+# curl 的 Netscape 格式：domain 	 flag 	 path 	 secure 	 expires 	 name 	 value
+for line in open(sys.argv[1], encoding="utf-8"):
+    if line.startswith("#") and not line.startswith("#HttpOnly_"):
+        continue
+    f = line.rstrip("\n").split("\t")
+    if len(f) >= 7 and f[5] == "jl_csrf":
+        print(f[6])
+        break
+PYCOOKIE
+)
+[ -n "${CSRF}" ] || fail "GET /api/session 没有种下 jl_csrf cookie"
+
+# 先证明「没有 CSRF 的 setup 会被拒」，再证明「带上就能过」
+NOCSRF=$(curl -s -o /dev/null -w '%{http_code}' -X POST "${BASE}/api/setup" \
+  -H 'Content-Type: application/json' --data-binary '{"password":"should-not-work-here"}')
+[ "${NOCSRF}" = "403" ] || fail "无 CSRF 的 /api/setup 应返回 403，实际 ${NOCSRF}"
+echo "  无 CSRF 的 setup 被拒（403），符合预期"
+
+TOKEN=$(curl -fsS -b "${JAR}" -c "${JAR}" -X POST "${BASE}/api/setup" \
+  -H "X-CSRF-Token: ${CSRF}" -H 'Content-Type: application/json' \
   --data-binary '{"password":"e2e-night-shift-password"}' | json '["token"]')
 [ -n "${TOKEN}" ] || fail "setup 没有返回 token"
 
@@ -201,8 +224,14 @@ say "6. run（桩：只推进阶段，不搬数据）"
 api POST "/api/jobs/${JOB_ID}/run" >"${WORK}/run.json"
 json '["stub"]' <"${WORK}/run.json" | grep -qi true || fail "run 必须明确返回 stub=true"
 
-say "7. 读 SSE，看阶段变化（不经浏览器）"
-curl -sN --max-time 15 "${BASE}/api/jobs/${JOB_ID}/events?token=${TOKEN}" >"${WORK}/sse.txt" || true
+say "7. 读 SSE，看阶段变化（不经浏览器；凭证只走请求头）"
+# query 里放 token 会被访问日志/历史/Referer 收走，所以这条路径必须被拒绝
+QTOKEN=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+  "${BASE}/api/jobs/${JOB_ID}/events?token=${TOKEN}")
+[ "${QTOKEN}" = "401" ] || fail "?token= 形式的 SSE 应该被拒绝（401），实际 ${QTOKEN}"
+echo "  ?token= 被拒绝（401）：凭证不再进 URL"
+curl -sN --max-time 15 -H "Authorization: Bearer ${TOKEN}" \
+  "${BASE}/api/jobs/${JOB_ID}/events" >"${WORK}/sse.txt" || true
 DONE=$(grep -c '"type":"done"' "${WORK}/sse.txt" || true)
 [ "${DONE}" -ge 1 ] || { cat "${WORK}/sse.txt"; fail "SSE 里没有看到 done 事件"; }
 for phase in preflight prepare snapshot catchup streaming draining done; do
