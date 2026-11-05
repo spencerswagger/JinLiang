@@ -1063,6 +1063,34 @@ func classifyError(err error) (code core.Code, classified bool) {
 	return "", false
 }
 
+// isUserStop reports「这次失败其实是用户按了停止」。
+func isUserStop(ctx context.Context, err error) bool {
+	if errors.Is(err, context.Canceled) {
+		return true
+	}
+	return ctx != nil && errors.Is(ctx.Err(), context.Canceled)
+}
+
+// stopEarly 在「还没动数据」的阶段按停止收尾：finish_reason=stopped + exit_code=130。
+// FinishRun 对 FinishStopped 允许跳过阶段表（#5 的约定：停止不是失败，阶段落 done），
+// 所以 preflight/prepare 也能直接收成 done。
+func (r *runner) stopEarly(cause error) error {
+	dctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if _, err := r.opt.Store.FinishRun(dctx, r.run.ID, state.Done, "", ExitStopped,
+		control.FinishStopped); err != nil {
+		return fmt.Errorf("按停止收尾失败: %w（原始原因: %v）", err, cause)
+	}
+	r.exitCode = ExitStopped
+	r.phase = state.Done
+	msg := "已手动停止（在动数据之前）：没有写入任何数据，下次 run 从头开始"
+	if r.sink != nil {
+		_ = r.sink.SetPhase(dctx, string(state.Done))
+	}
+	r.emit(dctx, control.Event{Type: "done", Phase: state.Done, Message: msg})
+	return nil
+}
+
 // hint 给「已识别类别、但码表还没有编号」的错误一句可执行的方向。
 // 只写方向，不发明码；等 Ark 的 E1012/E1013 落地后由 classifyError 挂上。
 func hint(err error) (string, []string) {
@@ -1084,6 +1112,13 @@ func hint(err error) (string, []string) {
 }
 
 func (r *runner) fail(ctx context.Context, err error) error {
+	// 用户主动 stop 在 preflight/prepare 阶段也是「取消」。把它记成 failed（更别说 E4002
+	// 「我们的 bug」）是错的——用户做了一件正确的事，不该在历史里显示成故障。
+	// 我们的 run ctx 只由信号/stop 取消，没有内部超时，所以 Canceled 就是用户停止；
+	// 万一将来加了超时，把它记成 stopped 也只是少一条告警，不会误导。
+	if isUserStop(ctx, err) {
+		return r.stopEarly(err)
+	}
 	dctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
