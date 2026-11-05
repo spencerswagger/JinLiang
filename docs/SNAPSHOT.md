@@ -34,7 +34,7 @@
 
 ## 4. 断点
 
-- `_jl_chunk(job_id, table_name, chunk_no, done, rows)` 每完成一块更新。
+- `_jl_chunk(job_key, table_name, chunk_no, done, rows)` 每完成一块更新。
 - 重启：读未完成块继续；快照 id 已失效（源库重启 / 超过 `idle_replication_slot_timeout`）→ 整段重来，并在动作清单里说明原因。
 - MySQL 无主键表：只有表级断点，重来成本要在 `plan` 里标出。
 

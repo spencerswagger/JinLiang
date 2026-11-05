@@ -2,7 +2,7 @@
 # 校验：未知字段直接报错（strict），所有默认值由 `jinliang plan` 打印，无隐藏开关。
 version: 1
 
-job: orders-to-report            # 任务名，也是所有 _jl_* 对象的前缀来源
+job: orders-to-report            # 只是展示名；任务身份 = 「源+目标+范围」指纹（docs/IDENTITY.md）
 
 source:
   kind: postgres                 # postgres | mysql

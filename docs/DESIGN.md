@@ -326,6 +326,7 @@ Go 主干 · **MIT** · 对外开源 · 一期只做 MySQL 与 PostgreSQL（含�
 - [BUILD.md](BUILD.md)：构建产物、部署、升级与状态表迁移。
 - [PLAN.md](PLAN.md)：`plan` 的输出与交互。
 - [ROADMAP.md](ROADMAP.md)：里程碑与验收判据。
+- [IDENTITY.md](IDENTITY.md)：job_key / instance_id / 对象命名的三层身份，多实例共存与孤儿所有权。
 - [OPEN-QUESTIONS.md](OPEN-QUESTIONS.md)：未决清单。
 - 代码契约：[`internal/source/contract.go`](../internal/source/contract.go)、[`internal/sink/contract.go`](../internal/sink/contract.go) —— 已编译通过，CI 校验。
 

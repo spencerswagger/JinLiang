@@ -51,6 +51,7 @@ WAL / binlog / 复制槽 / 位点这些底层概念由工具负责探测、代�
 | [docs/BUILD.md](docs/BUILD.md) | 构建、发布物、systemd、升级与状态表迁移 |
 | [docs/PLAN.md](docs/PLAN.md) | `plan` 的人类模板与 `--json` 输出、确认规则 |
 | [docs/ROADMAP.md](docs/ROADMAP.md) | 里程碑与每阶段的验收判据 |
+| [docs/IDENTITY.md](docs/IDENTITY.md) | 身份与命名：多实例连同一个库如何不冲突、不误删、不双写 |
 | [docs/OPEN-QUESTIONS.md](docs/OPEN-QUESTIONS.md) | 已决与未决清单 |
 | [examples/job.yaml](examples/job.yaml) | 任务定义示例（带全部字段与注释） |
 

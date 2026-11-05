@@ -6,42 +6,69 @@
 
 ### PostgreSQL
 ```sql
+-- 身份：job_key 由「源 + 目标 + 范围」指纹算出，用户起的名字只做展示（见 IDENTITY.md）
+CREATE TABLE IF NOT EXISTS public._jl_instance (
+  instance_id  text        PRIMARY KEY,       -- 26 位随机 base32
+  label        text,                          -- 人可读，如 "prod-a"
+  host         text,
+  first_seen   timestamptz NOT NULL DEFAULT now(),
+  last_seen    timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS public._jl_version (
+  schema_version int NOT NULL,                -- 状态表结构版本，只向前迁移
+  migrated_at    timestamptz NOT NULL DEFAULT now(),
+  migrated_by    text NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS public._jl_lease (
-  job_id     text        PRIMARY KEY,
-  holder     text        NOT NULL,
-  expires_at timestamptz NOT NULL
+  job_key      text        PRIMARY KEY,       -- 同一个 job_key 只允许一个实例跑
+  instance_id  text        NOT NULL,
+  label        text,
+  expires_at   timestamptz NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS public._jl_meta (
-  job_id        text        PRIMARY KEY,
-  schema_version int        NOT NULL DEFAULT 1, -- 状态表结构版本，只向前迁移
-  job_hash      text        NOT NULL,          -- job.yaml 的哈希；变了就要提示
+  job_key       text        PRIMARY KEY,
+  name          text        NOT NULL,          -- 用户起的名字，仅展示，可重复
+  instance_id   text        NOT NULL,          -- 创建者（孤儿判定与审计用）
+  schema_version int        NOT NULL DEFAULT 1,
+  job_hash      text        NOT NULL,          -- job.yaml 语义字段的哈希
   schema_hash   text,                          -- 源端表结构指纹，漂移时报警
-  phase         text        NOT NULL,          -- snapshot / catchup / streaming / paused / done
+  phase         text        NOT NULL,
   position      text,                          -- 各连接器自序列化（PG LSN / MySQL file:pos:gtid）
-  watermark     text,                          -- interval 模式的增量水位（水位列 + 主键复合）
-  snapshot_id   text,                          -- 初始化读数快照标识，结束后清空
+  watermark     text,                          -- interval 模式水位（水位列 + 主键复合）
+  snapshot_id   text,
   started_at    timestamptz NOT NULL DEFAULT now(),
   updated_at    timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE TABLE IF NOT EXISTS public._jl_chunk (   -- 快照断点，块级续跑
-  job_id     text    NOT NULL,
+CREATE TABLE IF NOT EXISTS public._jl_object (   -- 我们建的源端/目标端对象登记表（孤儿判定依据）
+  object_name  text        PRIMARY KEY,        -- jl_<job_key> / jl_<job_key>_<n>
+  object_kind  text        NOT NULL,           -- slot / publication / temp_snapshot
+  job_key      text        NOT NULL,
+  instance_id  text        NOT NULL,
+  created_at   timestamptz NOT NULL DEFAULT now(),
+  dropped_at   timestamptz                      -- 软删，供审计
+);
+
+CREATE TABLE IF NOT EXISTS public._jl_chunk (
+  job_key    text    NOT NULL,
   table_name text    NOT NULL,
   chunk_no   int     NOT NULL,
   range_from text,
   range_to   text,
   done       boolean NOT NULL DEFAULT false,
   rows       bigint  NOT NULL DEFAULT 0,
-  PRIMARY KEY (job_id, table_name, chunk_no)
+  PRIMARY KEY (job_key, table_name, chunk_no)
 );
 
 CREATE TABLE IF NOT EXISTS public._jl_conflict (
   id         bigserial PRIMARY KEY,
-  job_id     text        NOT NULL,
+  job_key    text        NOT NULL,
   table_name text        NOT NULL,
   pk         text        NOT NULL,
-  policy     text        NOT NULL,          -- manual / source_wins / …
+  policy     text        NOT NULL,
   source_row jsonb,
   target_row jsonb,
   resolved   boolean     NOT NULL DEFAULT false,
@@ -50,28 +77,28 @@ CREATE TABLE IF NOT EXISTS public._jl_conflict (
 
 CREATE TABLE IF NOT EXISTS public._jl_dead_letter (
   id         bigserial PRIMARY KEY,
-  job_id     text        NOT NULL,
+  job_key    text        NOT NULL,
   table_name text        NOT NULL,
   reason     text        NOT NULL,
   position   text,
-  raw_row    jsonb       NOT NULL,
+  raw_row    jsonb,
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE TABLE IF NOT EXISTS public._jl_action (   -- 审计：系统为你做了什么（可选，也可只落本地 jsonl）
+CREATE TABLE IF NOT EXISTS public._jl_action (
   id         bigserial PRIMARY KEY,
-  job_id     text        NOT NULL,
+  job_key    text        NOT NULL,
   action_id  text        NOT NULL,
   what       text        NOT NULL,
   sql        text,
   undo       text,
-  actor      text        NOT NULL,          -- jinliang / you / dba
+  actor      text        NOT NULL,              -- instance_id / you / dba
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE TABLE IF NOT EXISTS public._jl_event (   -- 补偿用的载体：源端触发器写 TRUNCATE / DDL 事件
+CREATE TABLE IF NOT EXISTS public._jl_event (
   id         bigserial PRIMARY KEY,
-  job_id     text        NOT NULL,
+  job_key    text        NOT NULL,
   kind       text        NOT NULL,
   table_name text,
   payload    text,
@@ -82,23 +109,43 @@ CREATE TABLE IF NOT EXISTS public._jl_event (   -- 补偿用的载体：源端�
 ### MySQL
 ```sql
 CREATE TABLE IF NOT EXISTS `_jl_lease` (
-  job_id     varchar(128) NOT NULL PRIMARY KEY,
-  holder     varchar(128) NOT NULL,
-  expires_at datetime(6)  NOT NULL
+  job_key      char(10)    NOT NULL PRIMARY KEY,
+  instance_id  varchar(32) NOT NULL,
+  label        varchar(64),
+  expires_at   datetime(6) NOT NULL
 );
 CREATE TABLE IF NOT EXISTS `_jl_meta` (
-  job_id      varchar(128) NOT NULL PRIMARY KEY,
-  job_hash    char(64)     NOT NULL,
-  phase       varchar(16)  NOT NULL,
-  position    text,
-  snapshot_id varchar(128),
-  started_at  datetime(6)  NOT NULL,
-  updated_at  datetime(6)  NOT NULL
+  job_key       char(10)    NOT NULL PRIMARY KEY,
+  name          varchar(128) NOT NULL,
+  instance_id   varchar(32) NOT NULL,
+  schema_version int        NOT NULL DEFAULT 1,
+  job_hash      char(64)    NOT NULL,
+  schema_hash   char(64),
+  phase         varchar(16) NOT NULL,
+  position      text,
+  watermark     text,
+  snapshot_id   varchar(128),
+  started_at    datetime(6) NOT NULL,
+  updated_at    datetime(6) NOT NULL
 );
--- _jl_chunk / _jl_conflict / _jl_dead_letter / _jl_event 同构，略
+CREATE TABLE IF NOT EXISTS `_jl_instance` (
+  instance_id varchar(32) NOT NULL PRIMARY KEY,
+  label       varchar(64),
+  host        varchar(255),
+  first_seen  datetime(6) NOT NULL,
+  last_seen   datetime(6) NOT NULL
+);
+-- _jl_object / _jl_chunk / _jl_conflict / _jl_dead_letter / _jl_action / _jl_event / _jl_version 同构，略
 ```
 
 **命名空间纪律**：所有对象以 `_jl_` 前缀；`gc` 只删这个前缀下的东西，永不 drop 用户表。
+
+**多实例共存（重要）**：
+- 状态表是**按 `job_key` 分区**的，不是按名字；名字相同但源/目标不同 → 两个 `job_key` → 互不干扰。
+- 源端对象（slot / publication）名里带 `job_key`，同一源库被多个实例/多个任务连也不撞。
+- `_jl_object` 记录「谁建的」，`gc` 默认只清**本实例创建**的；跨实例清理必须 `--force` 且先打印对方实例信息。
+- 状态表结构迁移用数据库锁串行化：PG `pg_advisory_lock(hashtext('jinliang:migrate'))`，
+  MySQL `GET_LOCK('jinliang:migrate', 30)`；拿不到锁就等待并重读版本，不乱改。
 
 ## 2. 幂等：位点与数据同事务
 
@@ -108,7 +155,7 @@ BEGIN;
   INSERT INTO report.orders (...) VALUES (...)
     ON DUPLICATE KEY UPDATE ...;
   -- 位点和数据在同一事务里推进
-  UPDATE _jl_meta SET position = ?, updated_at = ? WHERE job_id = ?;
+  UPDATE _jl_meta SET position = ?, updated_at = ? WHERE job_key = ?;
 COMMIT;
 ```
 
@@ -125,7 +172,8 @@ COMMIT;
 ## 3. 崩溃恢复时序
 
 ```
-1. 启动 → 尝试 INSERT _jl_lease(job_id, holder, now()+ttl)
+0. instance_id：--instance / 本地 state 文件 / 新生成并登记 _jl_instance（见 IDENTITY.md）
+1. 启动 → 尝试 INSERT _jl_lease(job_key, instance_id, now()+ttl)
    ├─ 冲突且未过期 → 另一个实例在跑：报 E1005，退出（绝不双写）
    └─ 冲突但已过期 → 接管（记一条 action："接管了超时租约"）
 2. 每 5s 续租（UPDATE expires_at）
