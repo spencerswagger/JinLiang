@@ -1,0 +1,114 @@
+package doctor
+
+import (
+	"context"
+	"testing"
+	"time"
+)
+
+type fakeControl struct {
+	instance  string
+	integrity string
+	schema    int
+	admin     bool
+	runs      []RunInfo
+	err       error
+}
+
+func (f *fakeControl) InstanceID(context.Context) (string, error) { return f.instance, f.err }
+func (f *fakeControl) IntegrityCheck(context.Context) (string, error) {
+	return f.integrity, f.err
+}
+func (f *fakeControl) SchemaVersion(context.Context) (int, error) { return f.schema, f.err }
+func (f *fakeControl) AdminConfigured(context.Context) (bool, error) {
+	return f.admin, f.err
+}
+func (f *fakeControl) OpenRuns(context.Context) ([]RunInfo, error) { return f.runs, f.err }
+
+func fixedNow() time.Time { return time.Date(2026, 11, 6, 1, 30, 0, 0, time.UTC) }
+
+func checkByID(r Report, id string) Check {
+	for _, c := range r.Checks {
+		if c.ID == id {
+			return c
+		}
+	}
+	return Check{}
+}
+
+func TestGhostRunDetected(t *testing.T) {
+	now := fixedNow()
+	ctl := &fakeControl{
+		instance: "inst1", integrity: "ok", schema: 3, admin: true,
+		runs: []RunInfo{
+			{ID: "old-1", JobID: "job1", Phase: "streaming", StartedAt: now.Add(-30 * time.Minute).Format(time.RFC3339)},
+			{ID: "new-1", JobID: "job2", Phase: "snapshot", StartedAt: now.Add(-30 * time.Second).Format(time.RFC3339)},
+		},
+	}
+	rep := Run(context.Background(), Options{
+		Control: ctl, LatestSchemaVersion: 3, Now: func() time.Time { return now },
+	})
+	c := checkByID(rep, "CTL-05")
+	if c.Status != StatusProblem {
+		t.Fatalf("ghost run should be a problem, got %+v", c)
+	}
+	if rep.Healthy {
+		t.Fatal("report must be unhealthy when a ghost run exists")
+	}
+	if rep.Problems != 1 {
+		t.Fatalf("problems=%d, want 1 (%+v)", rep.Problems, rep.Checks)
+	}
+}
+
+func TestRecentOpenRunIsNotGhost(t *testing.T) {
+	now := fixedNow()
+	ctl := &fakeControl{
+		instance: "inst1", integrity: "ok", schema: 3, admin: true,
+		runs: []RunInfo{{ID: "new-1", JobID: "job2", Phase: "streaming", StartedAt: now.Add(-time.Second).Format(time.RFC3339)}},
+	}
+	rep := Run(context.Background(), Options{Control: ctl, LatestSchemaVersion: 3, Now: func() time.Time { return now }})
+	if c := checkByID(rep, "CTL-05"); c.Status != StatusOK {
+		t.Fatalf("recent open run should be ok: %+v", c)
+	}
+	if !rep.Healthy {
+		t.Fatalf("expected healthy: %+v", rep.Checks)
+	}
+}
+
+func TestUnparseableStartedAtCountsAsGhost(t *testing.T) {
+	now := fixedNow()
+	ctl := &fakeControl{
+		instance: "inst1", integrity: "ok", schema: 3, admin: true,
+		runs: []RunInfo{{ID: "bad", JobID: "job", Phase: "streaming", StartedAt: "not-a-time"}},
+	}
+	rep := Run(context.Background(), Options{Control: ctl, LatestSchemaVersion: 3, Now: func() time.Time { return now }})
+	if c := checkByID(rep, "CTL-05"); c.Status != StatusProblem {
+		t.Fatalf("unparseable started_at must not be silently ignored: %+v", c)
+	}
+}
+
+func TestControlProblems(t *testing.T) {
+	now := fixedNow()
+	ctl := &fakeControl{instance: "", integrity: "*** in database main ***", schema: 9, admin: false}
+	rep := Run(context.Background(), Options{Control: ctl, LatestSchemaVersion: 3, Now: func() time.Time { return now }})
+	for _, id := range []string{"CTL-01", "CTL-02", "CTL-03", "CTL-04"} {
+		if c := checkByID(rep, id); c.Status == StatusOK {
+			t.Fatalf("%s should not be ok: %+v", id, c)
+		}
+	}
+	if c := checkByID(rep, "CTL-03"); c.Status != StatusProblem {
+		t.Fatalf("a newer schema must be a problem: %+v", c)
+	}
+}
+
+func TestSkipSourceAndTargetAreVisibleWarnings(t *testing.T) {
+	now := fixedNow()
+	ctl := &fakeControl{instance: "inst1", integrity: "ok", schema: 3, admin: true}
+	rep := Run(context.Background(), Options{Control: ctl, LatestSchemaVersion: 3, Now: func() time.Time { return now }})
+	if c := checkByID(rep, "SRC-00"); c.Status != StatusWarn {
+		t.Fatalf("missing source DSN should warn, not pass: %+v", c)
+	}
+	if c := checkByID(rep, "TGT-00"); c.Status != StatusWarn {
+		t.Fatalf("missing target DSN should warn, not pass: %+v", c)
+	}
+}

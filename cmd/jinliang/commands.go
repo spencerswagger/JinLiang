@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/spencerswagger/jinliang/internal/control"
+	"github.com/spencerswagger/jinliang/internal/doctor"
 	"github.com/spencerswagger/jinliang/internal/httpapi"
 )
 
@@ -280,11 +281,20 @@ func cmdRun(args []string) error {
 
 // cmdDoctor prints a health report. Exit code 1 when something needs attention,
 // so a container healthcheck can just run it.
+//
+// 体检分三块：控制库（完整性/版本/幽灵运行）、源库（变更流水/书签）、
+// 目标库（运行时表/租约/位点/死信/冲突）。控制库之外的检查只有给了 DSN 才做，
+// 没给会明确写「跳过」而不是假装正常。
 func cmdDoctor(args []string) error {
 	fs := flag.NewFlagSet("doctor", flag.ExitOnError)
 	jsonOut := fs.Bool("json", false, "JSON 输出")
 	dir := fs.String("data-dir", "", "数据目录")
 	keyFile := fs.String("key-file", "", "主密钥文件")
+	source := fs.String("source", "", "源端 DSN（可省略：省略则跳过源端体检）")
+	target := fs.String("target", "", "目标端 DSN（可省略）")
+	jobKey := fs.String("job-key", "", "任务指纹（读目标端 _jl_meta / 死信 / 冲突）")
+	slotPrefix := fs.String("slot-prefix", "", "同步书签前缀（默认 jl_<job-key>）")
+	ghostAfter := fs.Duration("ghost-after", 5*time.Minute, "超过这个时间仍未收尾的运行算幽灵")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -295,48 +305,52 @@ func cmdDoctor(args []string) error {
 	defer store.Close()
 	ctx := context.Background()
 
-	instance, _ := store.InstanceID(ctx)
-	integrity, ierr := store.IntegrityCheck(ctx)
+	opts := doctor.Options{
+		Control:             storeControl{s: store},
+		LatestSchemaVersion: control.LatestSchemaVersion(),
+		GhostAfter:          *ghostAfter,
+		JobKey:              strings.TrimSpace(*jobKey),
+		SlotPrefix:          strings.TrimSpace(*slotPrefix),
+	}
+	if opts.JobKey != "" && opts.SlotPrefix == "" {
+		opts.SlotPrefix = "jl_" + opts.JobKey
+	}
+	if strings.TrimSpace(*source) != "" {
+		db, err := openRuntime(*source, "source")
+		if err != nil {
+			return err
+		}
+		defer db.Close()
+		opts.Source = db
+	}
+	if strings.TrimSpace(*target) != "" {
+		db, err := openRuntime(*target, "target")
+		if err != nil {
+			return err
+		}
+		defer db.Close()
+		opts.Target = db
+	}
+	rep := doctor.Run(ctx, opts)
+
 	stats, _ := store.DBStats(ctx)
-	configured, _ := store.AdminConfigured(ctx)
-	schemaV, _ := store.SchemaVersion(ctx)
-	active, _ := store.ActiveRuns(ctx)
-	plan := control.MigrationPlan(schemaV)
-
-	var problems []string
-	if ierr != nil || integrity != "ok" {
-		problems = append(problems, "控制库完整性检查没通过："+integrity)
-	}
-	if !configured {
-		problems = append(problems, "还没有管理员口令：跑一次 jinliang serve 打开页面设置")
-	}
-	if len(plan) > 0 {
-		problems = append(problems, "有未应用的迁移："+strings.Join(plan, ", "))
-	}
-
-	report := map[string]any{
-		"version":          version,
-		"instance_id":      instance,
-		"data_dir":         store.Dir(),
-		"db_path":          store.Path(),
-		"db_bytes":         stats["db_bytes"],
-		"counts":           stats,
-		"schema_version":   store.SchemaVersionText(ctx),
-		"key_source":       string(store.Cipher().KeySource()),
-		"key_path":         store.Cipher().KeyPath(),
-		"admin_configured": configured,
-		"integrity":        integrity,
-		"active_runs":      len(active),
-		"problems":         problems,
-		"healthy":          len(problems) == 0,
-	}
 	if *jsonOut {
-		return printJSON(report)
+		return printJSON(map[string]any{
+			"version":    version,
+			"data_dir":   store.Dir(),
+			"db_path":    store.Path(),
+			"db_bytes":   stats["db_bytes"],
+			"counts":     stats,
+			"key_source": string(store.Cipher().KeySource()),
+			"key_path":   store.Cipher().KeyPath(),
+			"report":     rep,
+		})
 	}
+
 	fmt.Printf("津梁 %s\n", version)
-	fmt.Printf("  实例      %s\n", instance)
+	fmt.Printf("  实例      %s\n", rep.InstanceID)
 	fmt.Printf("  数据目录  %s\n", store.Dir())
-	fmt.Printf("  控制库    %s（schema %s）\n", store.Path(), store.SchemaVersionText(ctx))
+	fmt.Printf("  控制库    %s\n", store.Path())
 	fmt.Printf("  密钥      %s", store.Cipher().KeySource())
 	if p := store.Cipher().KeyPath(); p != "" {
 		fmt.Printf("（%s）", p)
@@ -344,15 +358,27 @@ func cmdDoctor(args []string) error {
 	fmt.Println()
 	fmt.Printf("  行数      连接 %d / 任务 %d / 运行 %d / 审计 %d\n",
 		stats["connections"], stats["jobs"], stats["runs"], stats["audit"])
-	fmt.Printf("  完整性    %s\n", integrity)
-	fmt.Printf("  管理员    %v\n", configured)
-	if len(problems) == 0 {
+	fmt.Println("  体检：")
+	for _, c := range rep.Checks {
+		mark := "OK  "
+		switch c.Status {
+		case doctor.StatusWarn:
+			mark = "注意"
+		case doctor.StatusProblem:
+			mark = "问题"
+		}
+		fmt.Printf("    [%s] %-7s %s\n", mark, c.Area, c.Title)
+		if c.Detail != "" {
+			fmt.Printf("           %s\n", c.Detail)
+		}
+		if c.Hint != "" {
+			fmt.Printf("           能做什么：%s\n", c.Hint)
+		}
+	}
+	if rep.Healthy {
 		fmt.Println("  结论      正常")
 		return nil
 	}
-	fmt.Println("  需要处理：")
-	for _, p := range problems {
-		fmt.Printf("    - %s\n", p)
-	}
+	fmt.Printf("  结论      有 %d 个问题、%d 个提醒\n", rep.Problems, rep.Warnings)
 	return errors.New("体检发现问题")
 }
