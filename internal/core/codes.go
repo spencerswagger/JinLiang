@@ -32,6 +32,8 @@ const (
 	CodeAPINotFound          Code = "E1009" // 这个接口不存在（未实现的 /api 路径）
 	CodePositionKindMismatch Code = "E1010" // 目标库里的位点属于别的数据库类型
 	CodeTxTooLarge           Code = "E1011" // 单个源事务超过整段缓冲的上限
+	CodeNoPrivilege          Code = "E1012" // 账号没有做这件事的权限（SQLSTATE 42501）
+	CodeObjectMissing        Code = "E1013" // 缺这个 schema 或表（SQLSTATE 3F000 / 42P01）
 	CodeTargetReset          Code = "E2001" // 目标连接被重置
 	CodeSourceTimeout        Code = "E2002" // 源库连接超时
 	CodeLockTimeout          Code = "E2003" // 目标库锁等待超时
@@ -61,7 +63,7 @@ var specs = []Spec{
 		Next: []string{
 			"执行：ALTER SYSTEM SET wal_level = 'logical';",
 			"重启一次数据库实例（连接会中断 10–30 秒）",
-			"回来重新运行：jinliang run job.yaml（会从断点续跑）",
+			"回来重新运行：jinliang run --job <id|name>（会从断点续跑）",
 		},
 		Risk: "源库里给外部读取的变更流水体积会增加约 10–20%；重启期间业务连接需要重连",
 	},
@@ -154,6 +156,27 @@ var specs = []Spec{
 			"确实拆不了：调高单事务缓冲上限（MySQL 源用环境变量 JINLIANG_TX_MAX_BYTES / JINLIANG_TX_MAX_EVENTS；PostgreSQL 源暂时没有这个开关）并确认机器内存够",
 		},
 		Risk: "调高上限会推高峰值内存（仍然是整段缓冲，不是流式）；改了上限等于改提交边界，正在跑的任务最好重开一轮",
+	},
+	{
+		Code: CodeNoPrivilege, Class: UserAction,
+		Message: "账号没有做这件事的权限",
+		Why:     "数据库拒绝了这条语句（SQLSTATE 42501）：账号能连上，但没被授予这项操作的权限——源端读表，或目标端建表/写入",
+		Next: []string{
+			"让 DBA 按提示里的对象授权：源端 GRANT SELECT、目标端 GRANT CREATE, INSERT, UPDATE, DELETE",
+			"或换一个已有权限的账号重建连接（连接页可改用户名/口令）",
+		},
+		Risk: "授权是持久变更：建议用专用账号并按 schema 限定，别直接给超级用户",
+	},
+	{
+		Code: CodeObjectMissing, Class: UserAction,
+		Message: "缺这个 schema 或表",
+		Why:     "数据库说这个对象不存在（SQLSTATE 3F000 / 42P01）：可能是目标端 target.schema 还没建，也可能是源端选中的表被删过",
+		Next: []string{
+			"目标端：先建 schema（CREATE SCHEMA <名字>;）或把 target.schema 改成已有的",
+			"源端：选中的表被删过的话，回任务页重选表范围",
+			"改完再跑一次 run：位点不动，不需要重搬历史",
+		},
+		Risk: "换 schema 等于换一套目标表：旧 schema 里的数据不会自动搬过去",
 	},
 	{
 		Code: CodeControlDBBroken, Class: Fatal,
