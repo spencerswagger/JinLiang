@@ -154,8 +154,14 @@ type RowHandler func(ctx context.Context, row Row) error
 //     payload 由连接器自己定义（PG 的 "0/16B6C50"、MySQL 的 "mysql-bin.000003:1234"
 //     或 GTID 集合）。位点是写进目标库、要跨版本存活的，格式一变旧库就读不懂；
 //     **加版本前缀这件事现在零成本，以后是迁移**。解析入口见 SplitPosition。
-//   - Kind() 与 Endpoint.Kind() 同值（postgres / mysql）。引擎用它做对账：
-//     位点串的 kind 与当前源不匹配时给 E1010（user_action：换回对应的源，或重新开始同步），
+//   - Kind() **只表达端点类型**（`postgres` / `mysql`），取值与 Endpoint.Kind() 同值；
+//     **不返回位点变体**。位点变体（例如 MySQL 的 `file_pos` 与 `gtid` 两套坐标）
+//     由连接器自己的坐标表达——MySQL 用 `Coordinate()` 返回 `mysql_file_pos` / `mysql_gtid`
+//     并写进 payload（`;coord=…`），不进 Kind()。
+//     为什么：Kind() 的消费方是引擎做「这个位点属于哪个源」的对账；让它返回细分值，
+//     等于逼引擎知道每种源的内部变体，这层抽象就白做了。
+//   - 前缀里的 kind 也只写 `postgres` / `mysql`，变体永远在 payload 里（见上一条）。
+//     引擎拿它做对账：kind 与当前源不匹配时给 E1010（user_action：换回对应的源，或重新开始同步），
 //     **不要用 E3001**——那是「变更流水接不上，建议 --resync 重搬全量」，
 //     拿它报「这串位点是 MySQL 的、你连的是 PG」会把用户引去重搬一遍全量。
 //   - 位点只在**事务边界**上前进（见 sink.Sink.Apply 的不变量与 ValidateBatch），
