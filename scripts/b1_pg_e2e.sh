@@ -15,16 +15,20 @@ ROWS=${ROWS:-1000000}
 SRC=${JINLIANG_TEST_PG_SRC_DSN:-}
 DST=${JINLIANG_TEST_PG_DSN:-}
 
+# 缺 DSN 一律 exit 78（EX_CONFIG）：CI 里这就是**红的**，不是"跳过即通过"。
+# 变量名以 scripts/e2e_headless.sh 与 docs/BUILD.md 为准：
+#   JINLIANG_TEST_PG_DSN / JINLIANG_TEST_PG_SRC_DSN / JINLIANG_TEST_MYSQL_DSN / JINLIANG_TEST_MYSQL_SRC_DSN
 if [ -z "$SRC" ] || [ -z "$DST" ]; then
-  echo "SKIP: 缺 JINLIANG_TEST_PG_SRC_DSN / JINLIANG_TEST_PG_DSN（B1 验收要两个不同的库）"
+  echo "EX_CONFIG: 缺 JINLIANG_TEST_PG_SRC_DSN / JINLIANG_TEST_PG_DSN（B1 验收要两个不同的库）" >&2
+  echo "           本脚本缺 DSN 时以 78 退出 = 失败，不会静默通过；CI 的 b1-engine job 负责把两个库备齐。" >&2
   exit 78
 fi
 if ! command -v psql >/dev/null 2>&1; then
-  echo "SKIP: 没有 psql"
+  echo "EX_CONFIG: 没有 psql（B1 验收要连两个库核对指纹）" >&2
   exit 78
 fi
 if [ "$SRC" = "$DST" ]; then
-  echo "SKIP: 源库和目标库是同一个（会把表同步到自己身上）"
+  echo "EX_CONFIG: 源库和目标库是同一个（会把表同步到自己身上）" >&2
   exit 78
 fi
 
@@ -59,7 +63,10 @@ psql_src "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots W
 psql_src "SELECT 1 FROM pg_publication WHERE pubname LIKE 'jl_%'" | while read -r _; do :; done
 psql_src "DO \$\$ DECLARE p text; BEGIN FOR p IN SELECT pubname FROM pg_publication WHERE pubname LIKE 'jl_%' LOOP EXECUTE 'DROP PUBLICATION '||quote_ident(p); END LOOP; END \$\$" >/dev/null
 
-cat > "$JOB" <<'YAML'
+# CHUNK_ROWS：块大小。kill 模式要打到"快照第 2 块"，块太多/太少都不稳，
+# 所以 CI 里把它调小（行数少也能有好几块）。
+CHUNK=${CHUNK_ROWS:-100000}
+cat > "$JOB" <<YAML
 version: 1
 job: b1-orders
 source:
@@ -67,6 +74,8 @@ source:
   dsn: env:JINLIANG_TEST_PG_SRC_DSN
   scope:
     schema: public
+  snapshot:
+    chunk_rows: $CHUNK
 target:
   kind: postgres
   dsn: env:JINLIANG_TEST_PG_DSN

@@ -90,6 +90,10 @@ type Source struct {
 	// a 2 GB backlog produces no data events for a long time while it is being
 	// replayed.
 	serverEnd atomic.Uint64
+	// keepEnd / keepPrev are the last two keepalive positions. 两次相同 = 发送端
+	// 真的闲下来了（解码位置 == 发送位置），此时把位点推到那里是安全的。
+	keepEnd  atomic.Uint64
+	keepPrev atomic.Uint64
 
 	tables map[string]*tableInfo
 	order  []string
@@ -647,6 +651,7 @@ func (s *Source) Stream(ctx context.Context, from Position, onEvent source.Event
 				return fmt.Errorf("解析心跳失败: %w", err)
 			}
 			s.serverEnd.Store(uint64(pkm.ServerWALEnd))
+			s.keepPrev.Store(s.keepEnd.Swap(uint64(pkm.ServerWALEnd)))
 			if pkm.ReplyRequested {
 				if err := s.sendStandby(pc); err != nil {
 					return err
@@ -669,6 +674,21 @@ func (s *Source) sendStandby(pc *pgconn.PgConn) error {
 		WALApplyPosition: applied,
 		ReplyRequested:   true,
 	})
+}
+
+// SafeAckPoint returns a position we may advance to without decoding anything
+// further: it is only offered when two consecutive keepalives reported the same
+// end, which means the walsender has sent everything it decoded and is idle.
+//
+// 为什么需要它：源库长时间没有「我们关心的表」的变更时（比如同步 1 张表、源库
+// 在写别的表），一个数据事件都不会发过来，位点就永远不前进 —— 书签占的 WAL
+// 只增不减，磁盘会被慢慢吃光。这是唯一能安全推进的情形。
+func (s *Source) SafeAckPoint() (Position, bool) {
+	end, prev := s.keepEnd.Load(), s.keepPrev.Load()
+	if end == 0 || end != prev {
+		return Position{}, false
+	}
+	return Position{LSN: pglogrepl.LSN(end)}, true
 }
 
 // ServerWALEnd is the source's WAL end as last reported by the stream.
@@ -887,7 +907,21 @@ func (s *Source) Advance(ctx context.Context, to Position) error {
 	if to.IsZero() {
 		return nil
 	}
-	_, err := s.conn.Exec(ctx, `SELECT pg_replication_slot_advance($1, $2::pg_lsn)`, s.opt.Slot, to.String())
+	// 书签通常已经通过正常确认走得更远了（安静期的安全确认点可能领先于最后一批
+	// 数据）。这时 pg_replication_slot_advance 会报「不能后退」，不是错误。
+	cur, exists, err := s.slotPosition(ctx)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return nil
+	}
+	if cur != "" {
+		if c, err := ParsePosition(cur); err == nil && to.Compare(c) <= 0 {
+			return nil
+		}
+	}
+	_, err = s.conn.Exec(ctx, `SELECT pg_replication_slot_advance($1, $2::pg_lsn)`, s.opt.Slot, to.String())
 	if err != nil {
 		return fmt.Errorf("推进同步书签失败: %w", err)
 	}

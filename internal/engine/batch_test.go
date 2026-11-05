@@ -51,7 +51,7 @@ func ev(kind source.EventKind, pos string) source.Event {
 }
 
 func newTestBatcher(sink applier, src acker, rows int) *batcher {
-	return newBatcher(sink, src, rows, time.Millisecond, nil)
+	return newBatcher(sink, src, rows, time.Millisecond, pgsource.Position{}, nil)
 }
 
 // 一个源事务必须整体提交：不足 batch_rows 时也不许拆开。
@@ -260,3 +260,54 @@ func TestApplyAlwaysCarriesPosition(t *testing.T) {
 		t.Fatalf("每批都必须带位点，得到 %v", sink.pos)
 	}
 }
+
+// 安静期推位点：只能在「没有在飞的事务、没有待提交批」时进行，
+// 否则会把一个还没提交完的事务跳过（丢数据）。
+func TestAdvanceToRefusesWhileTransactionInFlight(t *testing.T) {
+	sink := &fakeSink{}
+	src := &fakeSource{}
+	b := newTestBatcher(sink, src, 100)
+	_ = b.Add(context.Background(), ev(source.EvBegin, ""))
+	_ = b.Add(ctx(), ev(source.EvInsert, ""))
+
+	pos, _ := pgsource.ParsePosition("0/700")
+	if err := b.AdvanceTo(ctx(), pos); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.batches) != 0 || len(src.acked) != 0 {
+		t.Fatalf("事务没提交完就推了位点：batches=%d acked=%v", len(sink.batches), src.acked)
+	}
+
+	// 提交之后仍然有「待落库的批」，这时也不许绕过数据去推位点。
+	_ = b.Add(ctx(), ev(source.EvCommit, "0/700"))
+	if err := b.AdvanceTo(ctx(), pos); err != nil {
+		t.Fatal(err)
+	}
+	if len(src.acked) != 0 {
+		t.Fatalf("有待落库的批时不该推位点，得到 %v", src.acked)
+	}
+	// 落库（数据 + 位点同事务）之后才确认。
+	if err := b.Flush(ctx()); err != nil {
+		t.Fatal(err)
+	}
+	if len(src.acked) != 1 || src.acked[0] != "0/700" {
+		t.Fatalf("落库后应该确认位点，得到 %v", src.acked)
+	}
+}
+
+func TestAdvanceToNeverGoesBackwards(t *testing.T) {
+	sink := &fakeSink{}
+	src := &fakeSource{}
+	b := newTestBatcher(sink, src, 100)
+	start, _ := pgsource.ParsePosition("0/900")
+	b.lastPos = start
+	older, _ := pgsource.ParsePosition("0/800")
+	if err := b.AdvanceTo(ctx(), older); err != nil {
+		t.Fatal(err)
+	}
+	if len(src.acked) != 0 {
+		t.Fatalf("位点不该倒退，却确认了 %v", src.acked)
+	}
+}
+
+func ctx() context.Context { return context.Background() }

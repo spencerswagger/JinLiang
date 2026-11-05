@@ -81,3 +81,25 @@ func TestCursorTextKeepsTypesRoundTrippable(t *testing.T) {
 		t.Fatalf("布尔游标: %q", got)
 	}
 }
+
+// 安静期的安全确认点：只有「两次心跳位置相同」才给。
+// 发送端还在前进时给位点，会把还没解码的变更跳过去。
+func TestSafeAckPointNeedsStableKeepalives(t *testing.T) {
+	s := &Source{}
+	if _, ok := s.SafeAckPoint(); ok {
+		t.Fatal("没有任何心跳时不该给安全位点")
+	}
+	s.keepEnd.Store(1000)
+	if _, ok := s.SafeAckPoint(); ok {
+		t.Fatal("只有一次心跳时不该给安全位点（可能还在发）")
+	}
+	s.keepPrev.Store(1000)
+	p, ok := s.SafeAckPoint()
+	if !ok || p.LSN != 1000 {
+		t.Fatalf("两次相同应给出该位点，得到 %v %v", p.LSN, ok)
+	}
+	s.keepPrev.Store(900)
+	if _, ok := s.SafeAckPoint(); ok {
+		t.Fatal("位置在推进时不该给安全位点")
+	}
+}

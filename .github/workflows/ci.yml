@@ -108,3 +108,68 @@ jobs:
             echo "building $target"
             CGO_ENABLED=0 GOOS=${target%/*} GOARCH=${target#*/} go build -trimpath -o /dev/null ./cmd/jinliang
           done
+
+  b1-engine:
+    # B1 引擎：源 → 目标**真链路**（全量 + 增量 + kill -9 重搬 + 指纹比对）。
+    #
+    # 为什么不用 services：逻辑复制要求 wal_level=logical，而 services 只能传环境变量、
+    # 不能给容器加启动参数；所以这里用 docker run 显式带 `-c wal_level=logical` 起两个
+    # 独立的 PostgreSQL（源与目标必须是两个库，否则会把表同步到自己身上）。
+    #
+    # 两个 DSN 由本 job 提供；脚本在缺变量时以 78（EX_CONFIG）退出 = 红，不静默跳过。
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.x"
+      - name: 备好 psql（验收脚本要连两个库核对指纹）
+        run: |
+          set -e
+          command -v psql >/dev/null 2>&1 || { sudo apt-get update -qq; sudo apt-get install -y -qq postgresql-client; }
+          psql --version
+      - name: 起两个 PostgreSQL（wal_level=logical）
+        run: |
+          set -e
+          docker run -d --name pg-src \
+            -e POSTGRES_USER=jinliang -e POSTGRES_PASSWORD=jinliang -e POSTGRES_DB=jinliang_src \
+            -p 55432:5432 postgres:16 -c wal_level=logical
+          docker run -d --name pg-dst \
+            -e POSTGRES_USER=jinliang -e POSTGRES_PASSWORD=jinliang -e POSTGRES_DB=jinliang_test \
+            -p 55433:5432 postgres:16 -c wal_level=logical
+          for c in pg-src pg-dst; do
+            ok=0
+            for _ in $(seq 1 90); do
+              if docker exec "$c" pg_isready -U jinliang >/dev/null 2>&1; then ok=1; break; fi
+              sleep 1
+            done
+            if [ "$ok" != 1 ]; then echo "--- $c 没起来 ---"; docker logs "$c"; exit 1; fi
+            docker exec "$c" psql -U jinliang -tAc "select current_setting('wal_level')"
+          done
+      - name: 引擎单元测试（位点 / 事务组装 / 阶段机 / DDL 生成）
+        run: go test ./internal/engine/ ./internal/pgsink/ ./internal/pgsource/ ./internal/pgwire/
+      - name: B1 端到端（1M 行 + 增量 3 笔 + 指纹一致）
+        env:
+          JINLIANG_TEST_PG_SRC_DSN: postgres://jinliang:jinliang@127.0.0.1:55432/jinliang_src?sslmode=disable
+          JINLIANG_TEST_PG_DSN: postgres://jinliang:jinliang@127.0.0.1:55433/jinliang_test?sslmode=disable
+          ROWS: "300000"
+          CHUNK_ROWS: "20000"
+        run: |
+          set -e
+          mkdir -p dist
+          CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o dist/jinliang ./cmd/jinliang
+          scripts/b1_pg_e2e.sh ./dist/jinliang
+      - name: B1 端到端（快照中途 kill -9 后重搬，不重不丢）
+        env:
+          JINLIANG_TEST_PG_SRC_DSN: postgres://jinliang:jinliang@127.0.0.1:55432/jinliang_src?sslmode=disable
+          JINLIANG_TEST_PG_DSN: postgres://jinliang:jinliang@127.0.0.1:55433/jinliang_test?sslmode=disable
+          ROWS: "300000"
+          CHUNK_ROWS: "20000"
+        run: |
+          set -e
+          scripts/b1_pg_e2e.sh ./dist/jinliang kill
+      - name: 失败时把两个库的日志打出来
+        if: failure()
+        run: |
+          echo "=== pg-src ==="; docker logs pg-src 2>&1 | tail -50
+          echo "=== pg-dst ==="; docker logs pg-dst 2>&1 | tail -50

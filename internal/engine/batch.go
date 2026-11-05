@@ -54,7 +54,7 @@ type batcher struct {
 }
 
 func newBatcher(sink applier, src acker, batchRows int, delay time.Duration,
-	onApplied func(rows int64, pos pgsource.Position)) *batcher {
+	start pgsource.Position, onApplied func(rows int64, pos pgsource.Position)) *batcher {
 	if batchRows < 1 {
 		batchRows = 1
 	}
@@ -62,7 +62,30 @@ func newBatcher(sink applier, src acker, batchRows int, delay time.Duration,
 		delay = time.Millisecond
 	}
 	return &batcher{sink: sink, src: src, batchRows: batchRows, delay: delay,
-		onApplied: onApplied, lastFlush: time.Now()}
+		lastPos: start, pendPos: start, onApplied: onApplied, lastFlush: time.Now()}
+}
+
+// AdvanceTo pushes the checkpoint forward without any data, for the case where
+// the source is quiet: the stream saw nothing to apply, but the bookmark must
+// still move or it holds WAL forever. It refuses while a transaction is in
+// flight — the position inside an unfinished transaction is not a checkpoint.
+func (b *batcher) AdvanceTo(ctx context.Context, pos pgsource.Position) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.inTx || len(b.cur) > 0 || len(b.pending) > 0 {
+		return nil
+	}
+	if pos.Compare(b.lastPos) <= 0 {
+		return nil
+	}
+	if err := b.sink.Apply(ctx, nil, pos); err != nil {
+		return err
+	}
+	b.src.Ack(pos)
+	b.lastPos = pos
+	b.pendPos = pos
+	b.lastFlush = time.Now()
+	return nil
 }
 
 // Add takes one source event. It never blocks on the sink for long: it only

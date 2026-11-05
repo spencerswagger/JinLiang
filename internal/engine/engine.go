@@ -635,7 +635,7 @@ func (r *runner) stream(ctx context.Context, res *Result) error {
 	r.lastPos = from
 	r.mu.Unlock()
 
-	b := newBatcher(r.sink, r.src, r.batchRows(), r.batchDelay(), func(rows int64, pos pgsource.Position) {
+	b := newBatcher(r.sink, r.src, r.batchRows(), r.batchDelay(), from, func(rows int64, pos pgsource.Position) {
 		r.rowsStream += rows
 		r.mu.Lock()
 		r.lastPos = pos
@@ -669,6 +669,7 @@ func (r *runner) stream(ctx context.Context, res *Result) error {
 	lastEvent.Store(time.Now().UnixNano())
 	lagEvery := 3 * time.Second
 	lastLag := time.Now()
+	lastAdvance := time.Now()
 	// 没有变更时 pgoutput 只发心跳：靠「一段时间没有数据事件且没有待提交批」
 	// 判定已追平，而不是等一条永远不来的 Commit。
 	go func() {
@@ -689,6 +690,17 @@ func (r *runner) stream(ctx context.Context, res *Result) error {
 						r.note(context.Background(), "已追平初始化期间的变更，转入常态增量")
 					}
 				}
+				// 源库安静时把位点推到「两次心跳都没动」的那个位置：不推的话书签
+				// 会把 WAL 一直攒着（同步一张表、源库在写别的表时尤其明显）。
+				if quiet {
+					if p, ok := r.src.SafeAckPoint(); ok && time.Since(lastAdvance) > time.Second {
+						if err := b.AdvanceTo(context.Background(), p); err == nil {
+							lastAdvance = time.Now()
+							_, pos = b.Applied()
+						}
+					}
+				}
+
 				var lag int64 = -1
 				if quiet && time.Since(lastLag) > lagEvery {
 					lastLag = time.Now()
