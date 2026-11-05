@@ -16,6 +16,24 @@ CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=$(git describe 
 - 控制库用纯 Go SQLite（`modernc.org/sqlite`），保持 `CGO_ENABLED=0` 与交叉编译。
 - 体积预算：UI 资源 <1 MB，SQLite 驱动约 +3 MB ⇒ 仍守 <25 MB 目标。
 
+## 1B. headless 验收（M0.5 判据：不经浏览器跑完整个流程）
+
+```bash
+CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o dist/jinliang ./cmd/jinliang
+. ./.keys/env.sh            # 或自己 export 四个 DSN
+scripts/e2e_headless.sh ./dist/jinliang
+```
+
+- 脚本自举：先 `go run ./test/fixture` 在测试库里建 `e2e_*` 两张表，空库也能跑。
+- 四个 DSN 全从环境读（`JINLIANG_TEST_{PG,MYSQL}[_SRC]_DSN`），脚本里没有字面量连接串；
+  **缺哪个就打印 SKIP 并列出覆盖清单**，不静默通过。
+- 链路：建连接（真测连拿版本）→ catalog 枚举 → 建任务 → 预检（含 blocked 时给出可执行下一步）→
+  `run` 桩 → SSE 看到全部阶段 → 运行历史落库 → export yaml（断言不含口令）→
+  **重启进程验数据仍在** → `doctor`/`export`/`import` 往返 → yaml 过 `schema/job.schema.json`。
+- 只有一种引擎时目标端回落同一实例（换 schema），单库也能验完整链。
+- 离线沙盒装不上 `jsonschema`/`pyyaml` 时，`validate_schema.py` 会显式 SKIP，
+  由 `scripts/validate_schema_lite.py`（stdlib、同一份 schema 文件）做硬断言；CI 用真 jsonschema。
+
 ## 2. 发布物
 
 | 文件 | 说明 |

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/spencerswagger/jinliang/internal/control"
+	"github.com/spencerswagger/jinliang/internal/core"
 )
 
 const testPassword = "test-admin-password"
@@ -690,5 +691,152 @@ func TestSSEAuthChannels(t *testing.T) {
 	defer cres.Body.Close()
 	if cres.StatusCode != http.StatusOK {
 		t.Fatalf("cookie 通道 SSE = %d，期望 200", cres.StatusCode)
+	}
+}
+
+// P0-1 回归：未注册的 /api/* 必须回 404 + JSON 信封，不能被 WebUI 的
+// "GET /" 兜底吞成 200 HTML——否则「这个接口有没有实现」就无法自证。
+func TestUnknownAPIPathReturnsJSON404(t *testing.T) {
+	ts, _ := newTestServer(t)
+	token := setupAdmin(t, ts)
+
+	cases := []struct{ method, path string }{
+		{http.MethodGet, "/api/nope"},
+		{http.MethodGet, "/api/gc"},
+		{http.MethodPost, "/api/gc"},
+		{http.MethodGet, "/api/jobs/x/verify"},
+		{http.MethodDelete, "/api/nope"},
+	}
+	for _, c := range cases {
+		req, err := http.NewRequest(c.method, ts.URL+c.path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(res.Body)
+		res.Body.Close()
+
+		if res.StatusCode != http.StatusNotFound {
+			t.Errorf("%s %s = %d，期望 404（body 前 80 字节：%q）", c.method, c.path, res.StatusCode, clip(string(body), 80))
+		}
+		if ct := res.Header.Get("Content-Type"); !strings.Contains(ct, "application/json") {
+			t.Errorf("%s %s 的 Content-Type = %q，期望 application/json", c.method, c.path, ct)
+		}
+		var env struct {
+			Error struct {
+				Code    string   `json:"code"`
+				Message string   `json:"message"`
+				Next    []string `json:"next"`
+				Risk    string   `json:"risk"`
+			} `json:"error"`
+		}
+		if err := json.Unmarshal(body, &env); err != nil {
+			t.Fatalf("%s %s 返回的不是 JSON 信封: %v（%q）", c.method, c.path, err, clip(string(body), 120))
+		}
+		if env.Error.Code != string(core.CodeAPINotFound) {
+			t.Errorf("%s %s 的 code = %q，期望 %s", c.method, c.path, env.Error.Code, core.CodeAPINotFound)
+		}
+		if env.Error.Message == "" || len(env.Error.Next) == 0 {
+			t.Errorf("%s %s 的信封缺 message/next（四段式不完整）", c.method, c.path)
+		}
+	}
+
+	// 真接口不受兜底影响
+	if code, _ := doJSON(t, http.MethodGet, ts.URL+"/api/connections", token, nil); code != http.StatusOK {
+		t.Fatalf("已注册的接口被兜底吞掉了：/api/connections = %d", code)
+	}
+}
+
+// P0-2 回归（硬要求）：被任务引用的连接不许改坐标——「连接就是身份」，拒绝而不是
+// 静默重算 job_key。断言三件事：409、原任务 job_key 一个字没变、四段式说明「连接就是身份」。
+func TestReferencedConnectionCoordinatesAreLocked(t *testing.T) {
+	ts, _ := newTestServer(t)
+	token := setupAdmin(t, ts)
+	src := createPGConn(t, ts, token, "src")
+
+	body := map[string]any{
+		"name": "coords-job", "source_id": src, "target_id": src,
+		"spec": map[string]any{
+			"source": map[string]any{"scope": map[string]any{"schema": "public"}},
+			"target": map[string]any{"schema": "report"},
+			"mode":   map[string]any{"frequency": "once"},
+		},
+	}
+	code, created := doJSON(t, http.MethodPost, ts.URL+"/api/jobs", token, body)
+	if code != http.StatusCreated {
+		t.Fatalf("create job = %d %v", code, created)
+	}
+	jobID, _ := created["id"].(string)
+	keyBefore, _ := created["job_key"].(string)
+	if jobID == "" || keyBefore == "" {
+		t.Fatalf("建任务没拿到 id/job_key: %v", created)
+	}
+
+	// 改 host（坐标变了）→ 必须 409
+	code, resp := doJSON(t, http.MethodPut, ts.URL+"/api/connections/"+src, token, map[string]any{
+		"name": "src", "kind": "postgres", "host": "10.0.0.9", "port": 5432,
+		"database": "nope", "username": "u", "params": map[string]string{"sslmode": "disable"},
+	})
+	if code != http.StatusConflict {
+		t.Fatalf("改被引用连接的坐标 = %d %v，期望 409", code, resp)
+	}
+	errObj, _ := resp["error"].(map[string]any)
+	if errObj == nil {
+		t.Fatalf("409 必须带四段式信封：%v", resp)
+	}
+	if msg, _ := errObj["message"].(string); !strings.Contains(msg, "身份") {
+		t.Errorf("409 文案必须说明「连接就是身份」，实际 %q", msg)
+	}
+	if nxt, _ := errObj["next"].([]any); len(nxt) == 0 {
+		t.Error("409 必须给下一步（新建连接 / 只改名字口令）")
+	}
+
+	// 原任务的身份必须一个字都没变（拒绝，而不是静默重算）
+	code, after := doJSON(t, http.MethodGet, ts.URL+"/api/jobs/"+jobID, token, nil)
+	if code != http.StatusOK {
+		t.Fatalf("读回任务 = %d", code)
+	}
+	jobObj, _ := after["job"].(map[string]any)
+	if got, _ := jobObj["job_key"].(string); got != keyBefore {
+		t.Errorf("被拒之后 job_key 变了：%q → %q（必须是拒绝，不能静默重算）", keyBefore, got)
+	}
+	if code, jobs := doJSON(t, http.MethodGet, ts.URL+"/api/jobs", token, nil); code != http.StatusOK ||
+		jobs["count"].(float64) != 1 {
+		t.Errorf("任务数应仍为 1，实际 %v", jobs)
+	}
+
+	// 只改名字/口令不属于坐标变化 → 允许
+	if code, resp := doJSON(t, http.MethodPut, ts.URL+"/api/connections/"+src, token, map[string]any{
+		"name": "src-renamed", "kind": "postgres", "host": "127.0.0.1", "port": 1,
+		"database": "nope", "username": "u", "password": "new-secret",
+		"params": map[string]string{"sslmode": "disable"},
+	}); code != http.StatusOK {
+		t.Errorf("只改名字/口令应允许，实际 %d %v", code, resp)
+	}
+}
+
+// P0-2 回归（硬要求）：没被任何任务引用的连接，改坐标仍然允许。
+func TestUnreferencedConnectionCoordinatesCanChange(t *testing.T) {
+	ts, _ := newTestServer(t)
+	token := setupAdmin(t, ts)
+	conn := createPGConn(t, ts, token, "free")
+
+	code, resp := doJSON(t, http.MethodPut, ts.URL+"/api/connections/"+conn, token, map[string]any{
+		"name": "free", "kind": "postgres", "host": "10.0.0.9", "port": 5432,
+		"database": "nope", "username": "u", "params": map[string]string{"sslmode": "disable"},
+	})
+	if code != http.StatusOK {
+		t.Fatalf("改未被引用连接的坐标应允许，实际 %d %v", code, resp)
+	}
+	if host, _ := resp["host"].(string); host != "10.0.0.9" {
+		t.Errorf("host 没改成功：%v", resp["host"])
+	}
+	if code, jobs := doJSON(t, http.MethodGet, ts.URL+"/api/jobs", token, nil); code != http.StatusOK ||
+		jobs["count"].(float64) != 0 {
+		t.Errorf("这个测试不该产生任务，实际 %v", jobs)
 	}
 }

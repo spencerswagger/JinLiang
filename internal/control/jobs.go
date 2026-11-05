@@ -431,11 +431,7 @@ func (s *Store) ImportYAML(ctx context.Context, data []byte, opts ImportOptions)
 		return Job{Name: doc.Job}, nil
 	}
 	// 指纹相同的任务已存在 → 更新它，而不是报冲突（幂等导入）。
-	key := state.JobKey(
-		identityDSNHint(doc.Source.Kind, doc.Source.DSN),
-		identityDSNHint(doc.Target.Kind, doc.Target.DSN),
-		doc.ScopeFingerprint())
-	_ = key // 真实指纹在 CreateJob 里按连接坐标重算
+	// 指纹只在 CreateJob/UpdateJob 里按连接坐标算一次，这里不重复计算。
 	if existing, err := s.findByEndpointsAndScope(ctx, srcID, tgtID, doc.ScopeFingerprint()); err == nil {
 		return s.UpdateJob(ctx, existing.ID, in)
 	}
@@ -513,8 +509,6 @@ func splitEnvDSN(dsn string) (string, bool) {
 	}
 	return "", false
 }
-
-func identityDSNHint(kind, dsn string) string { return kind + "://" + dsn }
 
 func isUniqueViolation(err error) bool {
 	if err == nil {

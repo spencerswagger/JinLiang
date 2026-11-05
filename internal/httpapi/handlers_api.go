@@ -578,6 +578,18 @@ func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {
 			Next: []string{"改表范围或换连接，让指纹不同", "或者直接编辑已有任务"},
 			Risk: "两个任务跑同一份数据会互相覆盖",
 		})
+	case errors.Is(err, control.ErrIdentityLocked):
+		s.writeError(w, r, http.StatusConflict, apiError{
+			Class:   "user_action",
+			Message: "这个连接的坐标不能改：它已经是任务身份的一部分",
+			Why: "任务的指纹＝源＋目标＋表范围（docs/IDENTITY.md §2），改坐标会让已有任务和指纹脱节，" +
+				"同一份同步就变成两个任务、两条写入流打同一张目标表",
+			Next: []string{
+				"要换地址/库：新建一个连接，再把任务切过去（任务页可以改源与目标）",
+				"只是换名字、换口令、加参数：这些不属于身份，随便改",
+			},
+			Risk: "无：这条只是拒绝改坐标，不会动现有连接与任务",
+		})
 	case errors.Is(err, control.ErrInvalid):
 		s.writeError(w, r, http.StatusBadRequest, plainError("%s", strings.TrimPrefix(err.Error(), control.ErrInvalid.Error()+": ")))
 	case errors.As(err, new(apiError)):
