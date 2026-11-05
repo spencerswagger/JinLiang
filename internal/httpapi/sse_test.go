@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/spencerswagger/jinliang/internal/control"
+	"github.com/spencerswagger/jinliang/internal/state"
 )
 
 // sseFrame 是流里的一帧（id/event/data）。
@@ -70,14 +71,12 @@ func readSSEFrames(t *testing.T, url, token, lastEventID string, timeout time.Du
 // P1-c 回归：SSE 每帧必须有 event: <type>，否则浏览器只能靠猜 payload 里的 type，
 // 也没法用 addEventListener('phase')。
 func TestSSEFramesCarryEventNames(t *testing.T) {
-	ts, _ := newTestServer(t)
+	ts, store := newTestServer(t)
 	token := setupAdmin(t, ts)
 	connID := createPGConn(t, ts, token, "src")
 	jobID := createOnceJob(t, ts, token, connID)
 
-	if code, _ := doJSON(t, http.MethodPost, ts.URL+"/api/jobs/"+jobID+"/run", token, nil); code != http.StatusAccepted {
-		t.Fatalf("run = %d", code)
-	}
+	publishRunLikeEvents(t, store, jobID, 3)
 	frames := readSSEFrames(t, ts.URL+"/api/jobs/"+jobID+"/events", token, "", 15*time.Second, true)
 	if len(frames) == 0 {
 		t.Fatal("SSE 没收到任何帧")
@@ -145,9 +144,7 @@ func TestSSEReplayDedupesAndKeepsOrder(t *testing.T) {
 	token := setupAdmin(t, ts)
 	connID := createPGConn(t, ts, token, "src")
 	jobID := createOnceJob(t, ts, token, connID)
-	if code, _ := doJSON(t, http.MethodPost, ts.URL+"/api/jobs/"+jobID+"/run", token, nil); code != http.StatusAccepted {
-		t.Fatalf("run = %d", code)
-	}
+	publishRunLikeEvents(t, store, jobID, 5)
 	all := readSSEFrames(t, ts.URL+"/api/jobs/"+jobID+"/events", token, "", 15*time.Second, true)
 	if len(all) < 4 {
 		t.Fatalf("事件太少，没法验证回放：%d", len(all))
@@ -179,6 +176,27 @@ func TestSSEReplayDedupesAndKeepsOrder(t *testing.T) {
 }
 
 // createOnceJob 建一个「一次性」任务（run 桩会走完全部阶段）。
+
+// publishRunLikeEvents 往 bus 里发一串「像一次真 run」的事件。
+//
+// 为什么要这样：B0 的桩 runner 已从生产路径移除，UI 与 CLI 现在都走 engine.Run，
+// 而 engine 需要真的数据库。但这些用例测的是 **SSE 的帧格式/回放/去重**，
+// 与谁产生事件无关，所以直接往 bus 里发。
+func publishRunLikeEvents(t *testing.T, store *control.Store, jobID string, n int) {
+	t.Helper()
+	for i := 0; i < n; i++ {
+		ev := control.Event{
+			JobID: jobID, RunID: "run-test", Type: "phase",
+			Phase: state.Snapshot, Message: "第 " + strconv.Itoa(i) + " 块",
+		}
+		if i == n-1 {
+			ev.Type, ev.Phase = "done", state.Done
+			ev.Message = "结束"
+		}
+		store.Bus().Publish(ev)
+	}
+}
+
 func createOnceJob(t *testing.T, ts *httptest.Server, token, connID string) string {
 	t.Helper()
 	body := map[string]any{

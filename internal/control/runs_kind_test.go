@@ -111,8 +111,8 @@ func TestMigrateRunsKindBackfillsOldStubRows(t *testing.T) {
 	}
 }
 
-// ② B0 的桩运行必须落 kind='stub'（并且为了兼容旧读者，stub 列同时是 1）。
-func TestStubRunHasKindStub(t *testing.T) {
+// ② kind='stub' 的历史行必须能写、能读（B0 桩已从生产路径移除，但读侧兼容一版）。
+func TestStubRunKindStillReadable(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
 	src, tgt := seedConnections(t, s)
@@ -120,7 +120,8 @@ func TestStubRunHasKindStub(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	run, err := s.Runner().Start(ctx, job.ID, ActorCLI)
+	// 直接按桩的语义写一行：kind=stub，兼容列 stub=1
+	run, err := s.StartRun(ctx, job.ID, state.Preflight, RunKindStub)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,15 +130,12 @@ func TestStubRunHasKindStub(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got.Kind != RunKindStub {
-		t.Fatalf("桩运行的 kind = %q，期望 %q", got.Kind, RunKindStub)
+		t.Fatalf("桩行的 kind = %q，期望 %q", got.Kind, RunKindStub)
 	}
 	if !got.Stub {
 		t.Fatal("兼容列 stub 也应仍为 1")
 	}
-	if err := s.Runner().Stop(ctx, job.ID); err != nil && err != ErrNoActiveRun {
-		t.Fatal(err)
-	}
-	if err := s.Runner().Wait(ctx, job.ID); err != nil {
+	if _, err := s.FinishRun(ctx, run.ID, state.Failed, "桩路径已下线", 1, FinishInterrupted); err != nil {
 		t.Fatal(err)
 	}
 }

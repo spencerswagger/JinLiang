@@ -126,7 +126,12 @@ jobs:
             GRANT REPLICATION CLIENT, REPLICATION SLAVE ON *.* TO 'jinliang'@'%';
             FLUSH PRIVILEGES;"
       - name: 全量集成（含 engine / mysqlsource）
-        run: go test -tags=integration ./internal/...
+        # mysqlsource 的 Snapshot 会枚举整个源库，和 verify 在同一个 MySQL 库里
+        # 建/删表会互相干扰，所以单独一组；其余包各自用独立 schema，可并行。
+        run: |
+          set -e
+          go test -tags=integration ./internal/mysqlsource
+          go test -tags=integration ./internal/engine ./internal/verify ./internal/gc ./internal/doctor ./internal/remedy
 
   bench:
     runs-on: ubuntu-latest

@@ -108,6 +108,19 @@ def _split_inline(s: str) -> list[str]:
     return parts
 
 
+def split_documents(text: str) -> list[str]:
+    """按行首 `---` 切分多文档（`jinliang export --all` 的产物）。"""
+    docs, cur = [], []
+    for line in text.splitlines():
+        if line.strip() == "---":
+            docs.append("\n".join(cur))
+            cur = []
+            continue
+        cur.append(line)
+    docs.append("\n".join(cur))
+    return [d for d in docs if d.strip()]
+
+
 def parse_yaml(text: str) -> dict:
     lines = []
     for raw in text.splitlines():
@@ -279,19 +292,29 @@ def main(paths: list[str]) -> int:
     rc = 0
     for p in paths:
         try:
-            doc = parse_yaml(pathlib.Path(p).read_text(encoding="utf-8"))
+            raw = pathlib.Path(p).read_text(encoding="utf-8")
+            docs = [parse_yaml(d) for d in split_documents(raw)]
         except (YamlError, OSError) as e:
             print("%s: YAML 解析失败 -> %s" % (p, e), file=sys.stderr)
             rc = 1
             continue
-        errs = validate(doc, SCHEMA, SCHEMA)
-        if errs:
-            print("%s: INVALID" % p, file=sys.stderr)
-            for e in errs:
-                print("  - %s" % e, file=sys.stderr)
+        if not docs:
+            print("%s: INVALID -> 空文档" % p, file=sys.stderr)
             rc = 1
-        else:
-            print("%s: ok" % p)
+            continue
+        bad = False
+        for i, doc in enumerate(docs):
+            where = "%s#doc%d" % (p, i + 1) if len(docs) > 1 else p
+            errs = validate(doc, SCHEMA, SCHEMA)
+            if errs:
+                print("%s: INVALID" % where, file=sys.stderr)
+                for e in errs:
+                    print("  - %s" % e, file=sys.stderr)
+                rc = 1
+                bad = True
+                break
+        if not bad:
+            print("%s: ok%s" % (p, "（%d 份）" % len(docs) if len(docs) > 1 else ""))
     return rc
 
 
