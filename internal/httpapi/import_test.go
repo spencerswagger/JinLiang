@@ -119,7 +119,7 @@ func TestHistoryShowsStopReasonInsteadOfDone(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	run, err := store.StartRun(ctx, job.ID, "preflight")
+	run, err := store.StartRun(ctx, job.ID, "preflight", control.RunKindSync)
 	if err != nil {
 		t.Fatal(err)
 	}

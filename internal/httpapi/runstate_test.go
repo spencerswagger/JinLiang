@@ -72,7 +72,7 @@ func seedStoppedJob(t *testing.T, store *control.Store) control.Job {
 	if err != nil {
 		t.Fatal(err)
 	}
-	run, err := store.StartRun(ctx, job.ID, "preflight")
+	run, err := store.StartRun(ctx, job.ID, "preflight", control.RunKindSync)
 	if err != nil {
 		t.Fatal(err)
 	}

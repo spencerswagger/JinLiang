@@ -381,7 +381,7 @@ func TestRunsPersistAndPhaseTransitionsAreChecked(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	run, err := s.StartRun(ctx, job.ID, "preflight")
+	run, err := s.StartRun(ctx, job.ID, "preflight", RunKindSync)
 	if err != nil {
 		t.Fatal(err)
 	}

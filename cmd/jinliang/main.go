@@ -28,9 +28,14 @@ func main() {
   jinliang serve    [--listen 127.0.0.1:8080] [--data-dir DIR] [--key-file FILE] [--api-token TOKEN]
   jinliang import   --file job.yaml [--dry-run] [--data-dir DIR]
   jinliang export   [--job ID|NAME] [--out FILE] [--all] [--data-dir DIR]
-  jinliang run      --job ID|NAME [--json] [--snapshot-only] [--verify] [--data-dir DIR]
+  jinliang run      --job ID|NAME [--json] [--snapshot-only] [--stop-when-idle DUR] [--verify] [--data-dir DIR]
   jinliang status   [--job ID|NAME] [--json] [--verify] [--data-dir DIR]
-  jinliang doctor   [--json] [--data-dir DIR]
+  jinliang doctor   [--source DSN] [--target DSN] [--job-key KEY] [--json] [--data-dir DIR]
+  jinliang verify   --source DSN --target DSN --tables a,b [--level all] [--job-key KEY] [--json]
+  jinliang gc       --target DSN [--source DSN] [--apply] [--force-cross-instance] [--json]
+  jinliang conflicts list --target DSN [--job-key KEY]
+  jinliang dead-letter list|retry --target DSN [--id N] [--dry-run]
+  jinliang undo     （未实现，命令只给说明）
   jinliang version
 
 环境变量:
@@ -63,6 +68,16 @@ func main() {
 		err = cmdStatus(args)
 	case "doctor":
 		err = cmdDoctor(args)
+	case "verify":
+		err = cmdVerify(args)
+	case "gc":
+		err = cmdGC(args)
+	case "conflicts":
+		err = cmdConflicts(args)
+	case "dead-letter":
+		err = cmdDeadLetter(args)
+	case "undo":
+		err = cmdUndo(args)
 	case "help", "-h", "--help":
 		usage()
 		return

@@ -119,7 +119,7 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 	srcEP := endpointOf(srcConn, srcSecret)
 	tgtEP := endpointOf(tgtConn, tgtSecret)
 
-	run, err := opt.Store.StartRun(ctx, job.ID, state.Preflight)
+	run, err := opt.Store.StartRun(ctx, job.ID, state.Preflight, control.RunKindSync)
 	if err != nil && errors.Is(err, control.ErrConflict) {
 		// 控制面有「一个任务只允许一条活跃 run」的约束（#5）。进程被 kill -9 之后
 		// 那条 run 会永久占位，直接报错等于「崩过一次就再也跑不了」。
@@ -127,7 +127,7 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 		if reclaimed, rerr := reclaimAbandonedRun(ctx, opt.Store, job, tgtEP, schemaOf(doc, tgtConn)); rerr != nil {
 			return res, rerr
 		} else if reclaimed {
-			run, err = opt.Store.StartRun(ctx, job.ID, state.Preflight)
+			run, err = opt.Store.StartRun(ctx, job.ID, state.Preflight, control.RunKindSync)
 		}
 	}
 	if err != nil {
