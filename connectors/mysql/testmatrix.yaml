@@ -1,0 +1,39 @@
+# MySQL 连接器可测性清单 —— 没有这个文件，CI 直接红。
+# 见 docs/DESIGN.md 「测试与验证架构」
+name: mysql
+dialect: mysql
+image: mysql
+versions:
+  - "5.7.44"   # EOL 2023-10，尽力支持
+  - "8.0.43"   # EOL 2026-04，全支持
+  - "8.4.7"    # LTS
+  - "9.4.0"    # 创新版，跟随最新
+tier: A               # A=上游 CI 可跑；B=需授权/自托管；C=仅人工
+privileged: false
+resources: { cpu: 2, mem_gb: 2, disk_gb: 4 }
+startup:
+  args:
+    - "--log-bin=mysql-bin"
+    - "--binlog-format=ROW"
+    - "--binlog-row-image=FULL"
+    - "--server-id=1001"
+  env:
+    MYSQL_ROOT_PASSWORD: root
+capabilities:
+  - snapshot
+  - cdc
+  - ddl_whitelist
+  - partial_columns
+  - no_pk_detect
+scenarios:            # S1..S8
+  - snapshot
+  - incremental_crud
+  - large_transaction
+  - ddl_whitelist
+  - crash_recovery
+  - orphan_cleanup
+  - type_boundary
+notes: |
+  MySQL 5.7 无 LOCK INSTANCE FOR BACKUP、无原子 DDL；
+  8.4 起 SHOW MASTER STATUS 移除（用 SHOW BINARY LOG STATUS）、mysql_native_password 默认关闭；
+  9.x 移除该插件。连接器一律运行时能力探测，不按版本号分支。

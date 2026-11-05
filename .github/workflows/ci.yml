@@ -1,0 +1,37 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.x"
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+      - name: vet
+        run: go vet ./...
+      - name: build
+        run: go build ./...
+      - name: test
+        run: go test ./...
+
+  testmatrix:
+    # 每个连接器必须带可测性清单，否则视为未完成
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: every connector must ship testmatrix.yaml
+        run: |
+          set -e
+          fail=0
+          for d in connectors/*/; do
+            [ -f "$d/testmatrix.yaml" ] || { echo "missing $d/testmatrix.yaml"; fail=1; }
+          done
+          exit $fail

@@ -1,0 +1,6 @@
+/jinliang
+/dist/
+*.test
+*.out
+.jinliang/
+.DS_Store

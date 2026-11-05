@@ -1,0 +1,46 @@
+# PostgreSQL 连接器可测性清单 —— 没有这个文件，CI 直接红。
+name: postgres
+dialect: postgres
+image: postgres
+versions:
+  - "10.23"    # EOL 2022-11，尽力支持
+  - "11.22"    # EOL 2023-11
+  - "12.22"    # EOL 2024-11
+  - "13.21"    # EOL 2025-11
+  - "14.19"
+  - "15.14"
+  - "16.10"
+  - "17.6"
+  - "18.1"
+tier: A
+privileged: false
+resources: { cpu: 2, mem_gb: 2, disk_gb: 4 }
+startup:
+  args:
+    - "-c"
+    - "wal_level=logical"
+    - "-c"
+    - "max_replication_slots=10"
+    - "-c"
+    - "max_wal_senders=10"
+  env:
+    POSTGRES_PASSWORD: root
+capabilities:
+  - snapshot
+  - snapshot_export      # PG 10+ EXPORT_SNAPSHOT
+  - cdc
+  - ddl_whitelist
+  - partial_columns
+  - no_pk_detect
+scenarios:
+  - snapshot
+  - incremental_crud
+  - large_transaction
+  - ddl_whitelist
+  - crash_recovery
+  - orphan_cleanup
+  - type_boundary
+notes: |
+  PG 10 有原生 pgoutput，但无 TRUNCATE 复制、无 slot 磁盘阀、无 pg_replication_slot_advance()；
+  13+ 才有 max_slot_wal_keep_size；14+ 流式大事务；15+ 行过滤/列清单；17+ slot 随主备切换存活；
+  18 冲突检测视图 + idle_replication_slot_timeout。
