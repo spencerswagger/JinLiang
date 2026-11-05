@@ -2,9 +2,12 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/spencerswagger/jinliang/internal/control"
 	"github.com/spencerswagger/jinliang/internal/state"
@@ -114,4 +117,56 @@ func newControlStore(t *testing.T) (*control.Store, string) {
 		t.Fatalf("建任务失败: %v", err)
 	}
 	return store, job.ID
+}
+
+// P3-2（升为必修）：排查方向必须落进 runs.last_error。
+// 事件是易失的（进程重启就没了），用户回头找原因看的是历史页；
+// 诊断信息只在事件流里活一次，等于没做。
+func TestUnclassifiedErrorHintPersistsToLastError(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want []string
+	}{
+		{
+			name: "权限不够",
+			err:  &pgconn.PgError{Code: "42501", Message: "permission denied for schema public"},
+			want: []string{"权限", "GRANT", "原始错误"},
+		},
+		{
+			name: "对象不存在",
+			err:  &pgconn.PgError{Code: "3F000", Message: `schema "report" does not exist`},
+			want: []string{"对象不存在", "target.schema", "原始错误"},
+		},
+		{
+			name: "完全未识别",
+			err:  errors.New("something we have never seen"),
+			want: []string{"还没分类", "维护者", "原始错误"},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			store, jobID := newControlStore(t)
+			run, err := store.StartRun(context.Background(), jobID, state.Prepare, control.RunKindSync)
+			if err != nil {
+				t.Fatal(err)
+			}
+			r := &runner{opt: Options{Store: store}, job: control.Job{ID: jobID}, run: run, phase: state.Prepare}
+			if err := r.fail(context.Background(), c.err); err == nil {
+				t.Fatal("这条错误应返回错误")
+			}
+			got, err := store.GetRun(context.Background(), run.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.FinishReason != control.FinishFailed {
+				t.Fatalf("应记 failed，得到 %q", got.FinishReason)
+			}
+			for _, w := range c.want {
+				if !strings.Contains(got.LastError, w) {
+					t.Fatalf("last_error 缺 %q（历史页看不到排查方向）：%s", w, got.LastError)
+				}
+			}
+		})
+	}
 }

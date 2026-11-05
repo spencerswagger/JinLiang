@@ -1124,6 +1124,7 @@ func (r *runner) fail(ctx context.Context, err error) error {
 
 	code, classified := classifyError(err)
 	var ev control.Event
+	lastError := err.Error()
 	var np *notImplementedError
 	switch {
 	case errors.As(err, &np):
@@ -1140,6 +1141,9 @@ func (r *runner) fail(ctx context.Context, err error) error {
 			Message: why + " 原始错误：" + err.Error(),
 			Next:    next,
 		}
+		// 排查方向必须落进 runs.last_error：事件是易失的（进程一重启就没了），
+		// 而用户回头找原因看的是历史页。诊断信息只在事件流里活一次，等于没做。
+		lastError = why + " 原始错误：" + err.Error() + " 下一步：" + strings.Join(next, "；")
 	}
 	r.opt.Store.Bus().Publish(ev)
 
@@ -1149,7 +1153,7 @@ func (r *runner) fail(ctx context.Context, err error) error {
 		reason = control.FinishInterrupted // 租约被接管 = 被中断，不是「这条同步本身错了」
 	}
 	if r.phase != state.Failed {
-		if _, ferr := r.opt.Store.FinishRun(dctx, r.run.ID, state.Failed, err.Error(), ExitFailed, reason); ferr != nil {
+		if _, ferr := r.opt.Store.FinishRun(dctx, r.run.ID, state.Failed, lastError, ExitFailed, reason); ferr != nil {
 			return fmt.Errorf("%w（收尾也失败：%v）", err, ferr)
 		}
 		r.phase = state.Failed
