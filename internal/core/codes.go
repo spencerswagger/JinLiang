@@ -31,6 +31,7 @@ const (
 	CodeConnUnreachable      Code = "E1008" // 连不上对端数据库（控制面测连/枚举用）
 	CodeAPINotFound          Code = "E1009" // 这个接口不存在（未实现的 /api 路径）
 	CodePositionKindMismatch Code = "E1010" // 目标库里的位点属于别的数据库类型
+	CodeTxTooLarge           Code = "E1011" // 单个源事务超过整段缓冲的上限
 	CodeTargetReset          Code = "E2001" // 目标连接被重置
 	CodeSourceTimeout        Code = "E2002" // 源库连接超时
 	CodeLockTimeout          Code = "E2003" // 目标库锁等待超时
@@ -143,6 +144,16 @@ var specs = []Spec{
 			"确实要换源：删掉目标端的同步元数据后重跑，会重搬一次全量",
 		},
 		Risk: "重搬全量期间目标端数据会短暂不一致，耗时随数据量增长",
+	},
+	{
+		Code: CodeTxTooLarge, Class: UserAction,
+		Message: "一个事务太大，整段缓冲撑不住了",
+		Why:     "我们按事务整段缓冲（这样位点才能落在事务边界上），占用内存约等于行数×行宽；这个事务超过了上限（默认 128 MB / 100 万事件）",
+		Next: []string{
+			"把大事务拆小：分批 DELETE / INSERT（每批几千行），或先建新表再切换",
+			"确实拆不了：调高单事务缓冲上限并确认机器内存够（默认 128 MB / 100 万事件）",
+		},
+		Risk: "调高上限会推高峰值内存（仍然是整段缓冲，不是流式）；改了上限等于改提交边界，正在跑的任务最好重开一轮",
 	},
 	{
 		Code: CodeControlDBBroken, Class: Fatal,
