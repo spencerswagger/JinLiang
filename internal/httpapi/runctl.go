@@ -100,6 +100,14 @@ func (s *Server) activeSyncRun(ctx context.Context, jobID string) (*control.Run,
 //
 // 失败不是「弹一句运行失败」：引擎会把四段式写进 run 行的 last_error，并通过
 // SSE 发一条 error 事件（带 code / next），前端照它渲染。
+// 两种「这个任务起不来」的原因必须分开说：它们的下一步完全不同。
+var (
+	// errThisProcessBusy：本进程里就有一条在跑（内存登记）。
+	errThisProcessBusy = fmt.Errorf("%w：这台机器上已有另一个 jinliang 进程在跑这个任务", control.ErrRunInProgress)
+	// errStaleRunInControlDB：控制库里有一条上次没结束的 run（进程被强杀留下的）。
+	errStaleRunInControlDB = fmt.Errorf("%w：控制库里还有一条上次没结束的运行", control.ErrRunInProgress)
+)
+
 // errEngineUnsupported 是「引擎只做了 PG→PG」这条能力边界的四段式。
 // 放在 HTTP 入口同步判，是为了不在返回 202 之后什么也不发生——那正是我们一直
 // 在打的静默失败。（引擎里也有同样一条检查，见 internal/engine/engine.go:114。）
@@ -124,14 +132,15 @@ func (s *Server) startJob(ctx context.Context, job control.Job, actor string) er
 		return err
 	}
 	if s.runs.active(job.ID) {
-		return control.ErrRunInProgress
+		// 本进程里就有一条在跑：这是最常见的情况，文案不能说「控制库里有一条」——
+		// 那里可能什么都没有，按那句话去查会白忙。
+		return errThisProcessBusy
 	}
 	if run, err := s.activeSyncRun(ctx, job.ID); err != nil {
 		return err
 	} else if run != nil {
-		// 控制库里还有一条没结束的 run：可能是上一个进程被 kill 留下的。
-		return fmt.Errorf("%w：控制库里还有一条没结束的运行（%s），serve 启动时会按心跳过期替它收尾；也可以先删除控制库里的那条 run",
-			control.ErrRunInProgress, run.ID)
+		// 控制库里确实有一条没结束的 run（上一个进程被 kill 留下的）。
+		return fmt.Errorf("%w（run %s，owner_instance=%s）", errStaleRunInControlDB, run.ID, run.OwnerInstance)
 	}
 
 	// 故意用 context.Background：run 的生命周期比 HTTP 请求长，请求返回后还要继续跑。

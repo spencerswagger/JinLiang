@@ -1301,3 +1301,57 @@ func TestCodesEndpointIsCacheable(t *testing.T) {
 		t.Fatalf("Cache-Control = %q，期望 private, max-age=300", cc)
 	}
 }
+
+// 两种 409 必须分开说：本进程在跑（不要去控制库找 run 行），vs 控制库里确有
+// 一条上次没结束的 run（这才是能去查 run 的情形）。
+func TestRunConflictCopyDistinguishesCause(t *testing.T) {
+	store, err := control.Open(control.Options{DataDir: t.TempDir(), Autogen: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	srv, err := New(Options{Store: store, Version: "test", Listen: "127.0.0.1:0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	block := make(chan struct{})
+	srv.runFn = func(ctx context.Context, _ *control.Store, _ control.Job, _ jobrun.Options) (engine.Result, error) {
+		<-block
+		return engine.Result{}, nil
+	}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	token := setupAdmin(t, ts)
+	conn := createPGConn(t, ts, token, "src")
+	code, created := doJSON(t, http.MethodPost, ts.URL+"/api/jobs", token, map[string]any{
+		"name": "conflict-copy", "source_id": conn, "target_id": conn,
+		"spec": map[string]any{
+			"source":  map[string]any{"scope": map[string]any{"schema": "public", "include": []string{"orders"}}},
+			"target":  map[string]any{"schema": "report"},
+			"mode":    map[string]any{"frequency": "once"},
+			"content": map[string]any{"tables": map[string]any{"orders": map[string]any{}}},
+		},
+	})
+	if code != http.StatusCreated {
+		t.Fatalf("create job = %d %v", code, created)
+	}
+	jobID, _ := created["id"].(string)
+
+	if code, _ := doJSON(t, http.MethodPost, ts.URL+"/api/jobs/"+jobID+"/run", token, nil); code != http.StatusAccepted {
+		t.Fatalf("第一次 run 应为 202")
+	}
+	// 本进程在跑：文案要说「已经开始了」，且**不许**指向控制库里的 run
+	code, body := doJSON(t, http.MethodPost, ts.URL+"/api/jobs/"+jobID+"/run", token, nil)
+	if code != http.StatusConflict {
+		t.Fatalf("并发第二次 run = %d，期望 409", code)
+	}
+	errObj, _ := body["error"].(map[string]any)
+	msg, _ := errObj["message"].(string)
+	if !strings.Contains(msg, "已经开始在跑了") {
+		t.Fatalf("本进程在跑时文案应说「已经开始在跑了」，实际 %q", msg)
+	}
+	if strings.Contains(msg, "控制库里") {
+		t.Fatalf("本进程在跑时不该把人指向控制库的 run 行（那里可能是空的），实际 %q", msg)
+	}
+	close(block)
+}

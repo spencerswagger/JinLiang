@@ -343,19 +343,32 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.startJob(ctx, job, actorOf(r)); err != nil {
-		if errors.Is(err, control.ErrRunInProgress) {
+		if errors.Is(err, errStaleRunInControlDB) {
+			// 控制库里确实有一条没结束的 run：这是唯一该去查 run 行的情形。
 			s.writeError(w, r, http.StatusConflict, apiError{
 				Class:   "user_action",
-				Message: "这个任务暂时起不来：控制库里还有一条未结束的运行",
-				Why: "一个任务同时只允许一条活跃运行（库里有唯一索引挡着）。" +
-					"如果上一次是进程被强杀（没有心跳），引擎会在下一次启动时把它收尾成「已中断」再接管——" +
-					"所以这里拒绝的通常是「真的还有另一个进程在写」",
+				Message: "这个任务起不来：控制库里还有一条上次没结束的运行",
+				Why: "上一次的进程被强杀（没有心跳）留下的占位。" +
+					"serve 启动时会按心跳过期（默认 90 秒）替它收尾成「已中断」，然后就能起来了",
 				Next: []string{
-					"打开任务页看实时事件：GET /api/jobs/{id}/events",
-					"确认没有别的进程在跑（多实例部署时尤其要看）：看那条 run 的 owner_instance",
-					"确实卡住了：等心跳过期（默认 90 秒）后重试，或 POST /api/jobs/{id}/stop",
+					"等一会儿再点「开始」（超过心跳阈值后 serve 会收尾）",
+					"或者重启用一次 serve：启动时的收尾会把这条标成「已中断」",
 				},
-				Risk: "无：位点与数据同事务提交，重跑从断点继续",
+				Risk: "无：那条运行已经不会写数据了；重跑会从目标端已提交的位点继续",
+			})
+			return
+		}
+		if errors.Is(err, control.ErrRunInProgress) {
+			// 本进程里就有一条在跑——**不要**让人去控制库找 run 行，那里可能是空的。
+			s.writeError(w, r, http.StatusConflict, apiError{
+				Class:   "user_action",
+				Message: "这个任务已经开始在跑了",
+				Why:     "同一个任务同时只允许一条运行（本机靠这层登记，多实例靠目标端租约），否则两条写入流会互相覆盖",
+				Next: []string{
+					"看实时事件确认它在做什么：GET /api/jobs/{id}/events",
+					"想停下：POST /api/jobs/{id}/stop（位点已提交，重跑从断点继续）",
+				},
+				Risk: "无",
 			})
 			return
 		}

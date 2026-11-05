@@ -463,11 +463,21 @@ func (s *Server) pageJobRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.startJob(r.Context(), job, control.ActorUI); err != nil {
+		if errors.Is(err, errStaleRunInControlDB) {
+			s.renderPartial(w, "error_card", apiError{
+				Class:   "user_action",
+				Message: "这个任务起不来：控制库里还有一条上次没结束的运行",
+				Why:     "上一次的进程被强杀留下的占位；serve 启动时会按心跳过期替它收尾成「已中断」",
+				Next:    []string{"等一会儿再点「开始」", "或者重启用一次 serve"},
+				Risk:    "无：重跑会从目标端已提交的位点继续",
+			})
+			return
+		}
 		if errors.Is(err, control.ErrRunInProgress) {
 			s.renderPartial(w, "error_card", apiError{
 				Class:   "user_action",
-				Message: "这个任务已经在跑了",
-				Why:     "同一任务同时跑两份会互相覆盖",
+				Message: "这个任务已经开始在跑了",
+				Why:     "同一任务同时只允许一条运行，否则两条写入流会互相覆盖",
 				Next:    []string{"先看下面的实时事件；要停下按「停止」"},
 				Risk:    "无",
 			})
