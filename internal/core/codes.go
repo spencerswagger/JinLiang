@@ -29,6 +29,7 @@ const (
 	CodeViewNoStream        Code = "E1006" // 视图没有变更流
 	CodeSecretPerm          Code = "E1007" // 私钥文件权限不对（安全底线）
 	CodeConnUnreachable     Code = "E1008" // 连不上对端数据库（控制面测连/枚举用）
+	CodeAPINotFound         Code = "E1009" // 这个接口不存在（未实现的 /api 路径）
 	CodeTargetReset         Code = "E2001" // 目标连接被重置
 	CodeSourceTimeout       Code = "E2002" // 源库连接超时
 	CodeLockTimeout         Code = "E2003" // 目标库锁等待超时
@@ -121,6 +122,16 @@ var specs = []Spec{
 			"口令或证书改过的话，重新填一次口令再测",
 		},
 		Risk: "没有风险：测连只做只读查询（读版本号与权限），不写数据、不建对象",
+	},
+	{
+		Code: CodeAPINotFound, Class: UserAction,
+		Message: "没有这个接口",
+		Why:     "控制面的接口清单在 docs/CONTROL-PLANE.md §4；不在这张表里的路径不会假装成功，也不会被网页兜底吞掉",
+		Next: []string{
+			"对一下 §4 的路径（注意 /api/jobs/{id}/yaml 是导出，/api/jobs/{id}/verify 还没做）",
+			"B1 才会补 verify / gc：在那之前它们会明确告诉你「没有这个接口」",
+		},
+		Risk: "无：这条只影响调用方判断，不会改动任何数据",
 	},
 	{
 		Code: CodeControlDBBroken, Class: Fatal,

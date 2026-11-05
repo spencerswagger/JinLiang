@@ -143,6 +143,19 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("PUT /api/settings", s.wrap(s.handlePutSettings, roleUser))
 	s.mux.HandleFunc("GET /api/doctor", s.wrap(s.handleDoctor, roleUser))
 
+	// ── /api 兜底：不存在的接口必须说「不存在」，不能落到 WebUI 的 GET / 上 ──
+	//
+	// Go 1.22 的 ServeMux 里更具体的模式优先，所以这条只接住没人注册的 /api/*。
+	// 少了它的话，GET /api/jobs/{id}/verify、/api/gc 会拿到 200 + 总览页 HTML，
+	// 按 §4 写的自动化会以为成功——「接口有没有实现」就再也自证不了了。
+	// 必须按方法逐条注册：无方法的 "/api/" 会与 "GET /" 冲突（Go 1.22 的
+	// ServeMux 要求两者之一更具体，而 "GET /" 只是方法更窄、路径更宽）。
+	for _, m := range []string{
+		http.MethodGet, http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete,
+	} {
+		s.mux.HandleFunc(m+" /api/", s.handleAPINotFound)
+	}
+
 	// ── WebUI ───────────────────────────────────────────────
 	s.mux.HandleFunc("GET /static/", s.handleStatic)
 	s.mux.HandleFunc("GET /login", s.pageLogin)
@@ -172,6 +185,12 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /diagnostics", s.guard(s.pageDiagnostics))
 	s.mux.HandleFunc("GET /settings", s.guard(s.pageSettings))
 	s.mux.HandleFunc("POST /settings/admin", s.guard(s.pageSettingsAdmin))
+}
+
+// handleAPINotFound answers every unregistered /api/* path with the same JSON
+// error envelope the rest of the API uses (docs/ERRORS.md four-part shape).
+func (s *Server) handleAPINotFound(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusNotFound, errorEnvelope{Error: codeError(core.CodeAPINotFound, "")})
 }
 
 // handleHealth is unauthenticated: it answers "is the process up" and nothing

@@ -156,6 +156,20 @@ func (s *Store) UpdateConnection(ctx context.Context, id string, in ConnectionIn
 	if err := in.Validate(); err != nil {
 		return Connection{}, err
 	}
+	// P0-2：坐标（kind/host/port/database/username）是 job_key 的输入，
+	// 而 job_key 是「同一份同步只能有一个任务」的唯一防线（docs/IDENTITY.md §2）。
+	// 被任务引用时改坐标，会让已有任务与指纹脱节：重新 import 同一份 yaml 就
+	// 会算出另一个指纹、变出第二个任务，B1 里就是两条写入流打同一张目标表。
+	// 所以这里守卫（与 DeleteConnection 的 ErrInUse 同构），要换地址请新建连接。
+	if coordsChanged(cur, in) {
+		n, err := s.CountJobsUsingConnection(ctx, id)
+		if err != nil {
+			return Connection{}, err
+		}
+		if n > 0 {
+			return Connection{}, fmt.Errorf("%w：有 %d 个任务把它当身份的一部分（改地址请新建一个连接，再把任务切过去）", ErrIdentityLocked, n)
+		}
+	}
 	secret := cur.SecretEnc
 	switch {
 	case in.ClearPassword:
@@ -295,6 +309,16 @@ func (s *Store) CountJobsUsingConnection(ctx context.Context, id string) (int, e
 	err := s.db.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM jobs WHERE source_id = ? OR target_id = ?`, id, id).Scan(&n)
 	return n, err
+}
+
+// coordsChanged reports whether the identity-bearing fields changed. 名字、
+// 口令、额外参数不属于身份，改它们不影响任务指纹。
+func coordsChanged(cur Connection, in ConnectionInput) bool {
+	return cur.Kind != in.Kind ||
+		cur.Host != in.Host ||
+		cur.Port != in.Port ||
+		cur.Database != in.Database ||
+		cur.Username != in.Username
 }
 
 func clip(s string, max int) string {
