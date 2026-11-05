@@ -1089,3 +1089,41 @@ func TestJobExportCanonicalAndAlias(t *testing.T) {
 		t.Fatalf("/exports 的 Content-Type = %q，期望 application/json", ct)
 	}
 }
+
+// A-4：错误码表要能被前端读到（SSE 的 error 事件只有 message+code+next，
+// 四段式的 why/risk 只能按 code 查表）。
+func TestCodesEndpointExposesCatalogue(t *testing.T) {
+	ts, _ := newTestServer(t)
+	token := setupAdmin(t, ts)
+	code, body := doJSON(t, http.MethodGet, ts.URL+"/api/codes", token, nil)
+	if code != http.StatusOK {
+		t.Fatalf("/api/codes = %d", code)
+	}
+	codes, _ := body["codes"].(map[string]any)
+	if len(codes) < 10 {
+		t.Fatalf("码表太小：%d 条", len(codes))
+	}
+	// 抽三条已知的：字段必须齐（前端靠 why/next/risk 渲染四段式）
+	for _, want := range []string{"E1001", "E1011", "E3001"} {
+		raw, ok := codes[want].(map[string]any)
+		if !ok {
+			t.Fatalf("码表缺 %s", want)
+		}
+		for _, field := range []string{"code", "class", "message", "why", "next", "risk"} {
+			if _, ok := raw[field]; !ok {
+				t.Errorf("%s 缺字段 %s（前端四段式渲染要用）", want, field)
+			}
+		}
+	}
+
+	// 未登录不能读（它只是码表，但一致性比方便重要）
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/codes", nil)
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	if res.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("未登录读 /api/codes = %d，期望 401", res.StatusCode)
+	}
+}

@@ -148,6 +148,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/settings", s.wrap(s.handleGetSettings, roleUser))
 	s.mux.HandleFunc("PUT /api/settings", s.wrap(s.handlePutSettings, roleUser))
 	s.mux.HandleFunc("GET /api/doctor", s.wrap(s.handleDoctor, roleUser))
+	s.mux.HandleFunc("GET /api/codes", s.wrap(s.handleCodes, roleUser))
 
 	// ── /api 兜底：不存在的接口必须说「不存在」，不能落到 WebUI 的 GET / 上 ──
 	//

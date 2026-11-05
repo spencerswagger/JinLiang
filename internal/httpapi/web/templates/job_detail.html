@@ -37,7 +37,8 @@
       <input type="hidden" name="csrf_token" value="{{$.CSRF}}">
       <button type="submit">停止</button>
     </form>
-    <span class="meta">B1 引擎只有「停止」：会提交位点、按中断收尾；再点「开始」从断点继续。暂停/恢复要等引擎支持（见下）</span>
+    <button type="button" disabled title="引擎还没有暂停能力（B5 之前不可用）；要停下请用「停止」">暂停</button>
+    <button type="button" disabled title="没有暂停就没有恢复；再点「开始」会从位点续跑">恢复</button>
   </div>
 
   <h3>事件流</h3>

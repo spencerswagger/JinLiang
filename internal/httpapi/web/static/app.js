@@ -25,6 +25,19 @@
   });
 
   // ── SSE：任务详情页的实时阶段 ───────────────────────────────
+  // 错误码表：error 事件只有 message + code + next，why/risk 要按 code 查表才有。
+  // 一次拉全量（几十条），失败就退回「只显示 message + next」。
+  var codeTable = {};
+  var codesLoading = null;
+  function loadCodes() {
+    if (codesLoading) return codesLoading;
+    codesLoading = fetch("/api/codes", { credentials: "same-origin" })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (d) { if (d && d.codes) codeTable = d.codes; })
+      .catch(function () { /* 查不到就少两段，不影响主流程 */ });
+    return codesLoading;
+  }
+
   var log = document.getElementById("eventlog");
   var live = document.getElementById("live-phase");
   var hint = document.getElementById("live-hint");
@@ -42,16 +55,24 @@
     var row = document.createElement("div");
 
     if (ev.type === "error") {
-      // 错误必须是四段式：发生了什么 / 代码 / 你现在能做什么（按钮化的文字清单）。
-      // 引擎发的 error 事件带 code 与 next[]，照它渲染，不要自己编原因。
-      row.className = "err";
-      var next = (ev.next || []).map(function (n) {
+      // 完整的四段式：发生了什么 / 为什么 / 你能做什么 / 风险。
+      // 事件只有 message + code + next；why 与 risk 按 code 查码表（core.Catalogue），
+      // 查不到就只渲染前两段——不编造原因，也不假装没有风险。
+      var spec = (ev.code && codeTable[ev.code]) || null;
+      var why = spec && spec.why ? spec.why : "";
+      var risk = spec && spec.risk ? spec.risk : "";
+      var next = (ev.next || (spec && spec.next) || []).map(function (n) {
         return "<li>" + esc(n) + "</li>";
       }).join("");
+      row.className = "err";
       row.innerHTML =
-        '<h3>' + esc(ev.message || "出错了") +
+        '<h3>' + esc(ev.message || (spec && spec.message) || "出错了") +
         (ev.code ? ' <span class="badge bad">' + esc(ev.code) + "</span>" : "") + "</h3>" +
-        (next ? "<ol>" + next + "</ol>" : "") +
+        "<dl>" +
+        (why ? "<dt>为什么</dt><dd>" + esc(why) + "</dd>" : "") +
+        (next ? "<dt>你现在能做什么</dt><dd><ol>" + next + "</ol></dd>" : "") +
+        (risk ? "<dt>风险</dt><dd>" + esc(risk) + "</dd>" : "") +
+        "</dl>" +
         '<p class="hint">' + esc(time) + "</p>";
       log.appendChild(row);
       log.scrollTop = log.scrollHeight;
@@ -68,6 +89,30 @@
     while (log.childElementCount > 200) {
       log.removeChild(log.firstChild);
     }
+  }
+
+  // rows 刷新：progress 事件没有结构化字段（B5 才有），只能读控制库的 run 行；
+  // 但 snapshot 每块一条 progress，10M 会上百条 —— 必须节流，最多 1 秒一次。
+  var rowsEl = document.getElementById("live-rows");
+  var lastRowsAt = 0;
+  var rowsInflight = false;
+  function refreshRows(jobID) {
+    if (!rowsEl || !jobID || rowsInflight) return;
+    var now = Date.now();
+    if (now - lastRowsAt < 1000) return; // 1 秒内只拉一次
+    lastRowsAt = now;
+    rowsInflight = true;
+    fetch("/api/jobs/" + encodeURIComponent(jobID), { credentials: "same-origin" })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (d) {
+        var run = d && d.job && d.job.last_run;
+        if (run) {
+          rowsEl.textContent =
+            "已处理 " + (run.rows_done || 0) + " 行（每 1 秒刷新一次；数字来自控制库的 run 行）";
+        }
+      })
+      .catch(function () { /* 拉不到就保留上一次的数字 */ })
+      .then(function () { rowsInflight = false; });
   }
 
   function startStream(url) {
@@ -90,6 +135,7 @@
       appendLine(ev);
       if (ev.phase_label && live) live.textContent = ev.phase_label;
       if (ev.phase_hint && hint) hint.textContent = ev.phase_hint;
+      if (ev.type === "progress" || ev.type === "phase") refreshRows(ev.job_id);
       if (ev.type === "done" && dot) dot.classList.remove("on");
     }
     // 服务端给每条事件都带 event: <type>，所以必须按名字订阅；
@@ -116,6 +162,7 @@
   }
 
   if (stream) {
+    loadCodes();
     startStream(stream.dataset.url);
   }
 

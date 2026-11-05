@@ -488,8 +488,8 @@ func (s *Server) pageJobResume(w http.ResponseWriter, r *http.Request) {
 	e := apiError{
 		Class:   "user_action",
 		Message: "引擎没有「恢复」这个动作",
-		Why:     "暂停没实现，所以没有「恢复」；直接再点「开始」会从断点续跑",
-		Next:    []string{"点「开始」——已提交的数据不会重搬"},
+		Why:     "暂停没实现，所以没有「恢复」；直接再点「开始」会从目标端已提交的位点续跑",
+		Next:    []string{"点「开始」——已同步的数据不会重搬"},
 		Risk:    "无",
 	}
 	s.renderPartial(w, "error_card", e)

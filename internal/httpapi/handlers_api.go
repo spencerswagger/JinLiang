@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/spencerswagger/jinliang/internal/control"
+	"github.com/spencerswagger/jinliang/internal/core"
 	"github.com/spencerswagger/jinliang/internal/dsn"
 	"github.com/spencerswagger/jinliang/internal/netcheck"
 )
@@ -345,10 +346,16 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(err, control.ErrRunInProgress) {
 			s.writeError(w, r, http.StatusConflict, apiError{
 				Class:   "user_action",
-				Message: "这个任务已经在跑了",
-				Why:     "同一个任务同时跑两份会互相覆盖（多实例靠目标端租约，本进程靠这一层）",
-				Next:    []string{"打开任务页看实时事件：GET /api/jobs/{id}/events", "要停下就 POST /api/jobs/{id}/stop（位点已提交，重跑会从断点继续）"},
-				Risk:    "无",
+				Message: "这个任务暂时起不来：控制库里还有一条未结束的运行",
+				Why: "一个任务同时只允许一条活跃运行（库里有唯一索引挡着）。" +
+					"如果上一次是进程被强杀（没有心跳），引擎会在下一次启动时把它收尾成「已中断」再接管——" +
+					"所以这里拒绝的通常是「真的还有另一个进程在写」",
+				Next: []string{
+					"打开任务页看实时事件：GET /api/jobs/{id}/events",
+					"确认没有别的进程在跑（多实例部署时尤其要看）：看那条 run 的 owner_instance",
+					"确实卡住了：等心跳过期（默认 90 秒）后重试，或 POST /api/jobs/{id}/stop",
+				},
+				Risk: "无：位点与数据同事务提交，重跑从断点继续",
 			})
 			return
 		}
@@ -383,10 +390,10 @@ func notImplementedPause() apiError {
 		Why: "B1 的引擎只有「取消」一种停下方式：它会提交位点、按中断收尾。" +
 			"做真的「暂停/恢复」需要在阶段之间设安全停点，属于下一步的工作",
 		Next: []string{
-			"想现在停下：POST /api/jobs/{id}/stop（位点会提交，重跑从断点继续）",
-			"或者等这个任务自己跑完，再在任务页改配置",
+			"想现在停下：POST /api/jobs/{id}/stop（当前事务提交完就停，不会丢数据）",
+			"停下来的那一轮，下次 run 会从目标端已提交的位点接着跑，不会重搬已经同步过的数据",
 		},
-		Risk: "停止会让这一轮标记为「已中断」，但不会丢数据——位点与数据同事务提交",
+		Risk: "停止会让这一轮标记为「已停止」（不是失败）：位点与数据同事务提交，重跑从断点继续",
 	}
 }
 
@@ -703,3 +710,20 @@ func safeFilename(s string) string {
 // 暴露警告自相矛盾。统一用 internal/netcheck（与首启守卫同一份实现）。
 
 func isLoopback(listen string) bool { return netcheck.IsLoopbackListen(listen) }
+
+// handleCodes 把错误码表交给前端。
+//
+// 为什么需要它：SSE 的 error 事件只有 message + code + next，**没有 why/risk**，
+// 而「为什么会这样」与「这么做的风险」正是四段式的后两段。让前端按 code 来查表，
+// 比在每条事件里重复塞字段更省（也让码表只有一处权威：core.Catalogue）。
+func (s *Server) handleCodes(w http.ResponseWriter, r *http.Request) {
+	specs := core.Catalogue()
+	out := make(map[string]apiError, len(specs))
+	for _, sp := range specs {
+		out[string(sp.Code)] = apiError{
+			Code: string(sp.Code), Class: string(sp.Class), Message: sp.Message,
+			Why: sp.Why, Next: sp.Next, Risk: sp.Risk,
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"codes": out, "count": len(out)})
+}
