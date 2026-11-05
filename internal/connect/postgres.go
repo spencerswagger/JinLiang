@@ -195,12 +195,18 @@ func (p *Postgres) Catalog(ctx context.Context, scope source.Scope) (source.Cata
 		return source.Catalog{}, err
 	}
 
+	// 排序规则单独取：attcollation 与类型自带的不同 = 这一列显式 COLLATE 过。
+	// 不取的话，跨库搬过去会悄悄落到目标库的默认排序规则上——upsert 的判重
+	// 和 ORDER BY 的结果都会变，而且是「看起来跑通了」的那种变。
 	const qCols = `
 		SELECT c.relname, a.attname, format_type(a.atttypid, a.atttypmod),
-		       NOT a.attnotnull, pg_get_expr(d.adbin, d.adrelid), col_description(c.oid, a.attnum)
+		       NOT a.attnotnull, pg_get_expr(d.adbin, d.adrelid), col_description(c.oid, a.attnum),
+		       CASE WHEN a.attcollation <> t.typcollation THEN co.collname END
 		FROM pg_attribute a
 		JOIN pg_class c ON c.oid = a.attrelid
 		JOIN pg_namespace n ON n.oid = c.relnamespace
+		JOIN pg_type t ON t.oid = a.atttypid
+		LEFT JOIN pg_collation co ON co.oid = a.attcollation
 		LEFT JOIN pg_attrdef d ON d.adrelid = c.oid AND d.adnum = a.attnum
 		WHERE n.nspname = $1 AND c.relkind IN ('r','p','v','m','f')
 		  AND a.attnum > 0 AND NOT a.attisdropped
@@ -212,8 +218,8 @@ func (p *Postgres) Catalog(ctx context.Context, scope source.Scope) (source.Cata
 	for crows.Next() {
 		var table, col, typ string
 		var nullable bool
-		var def, comment sql.NullString
-		if err := crows.Scan(&table, &col, &typ, &nullable, &def, &comment); err != nil {
+		var def, comment, collation sql.NullString
+		if err := crows.Scan(&table, &col, &typ, &nullable, &def, &comment, &collation); err != nil {
 			crows.Close()
 			return source.Catalog{}, err
 		}
@@ -221,7 +227,8 @@ func (p *Postgres) Catalog(ctx context.Context, scope source.Scope) (source.Cata
 		if !ok {
 			continue
 		}
-		c := source.Column{Name: col, Type: typ, Nullable: nullable, Comment: comment.String}
+		c := source.Column{Name: col, Type: typ, Nullable: nullable, Comment: comment.String,
+			Collation: collation.String}
 		if def.Valid {
 			s := def.String
 			c.Default = &s

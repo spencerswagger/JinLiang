@@ -16,6 +16,7 @@ import (
 
 	"github.com/spencerswagger/jinliang/internal/control"
 	"github.com/spencerswagger/jinliang/internal/doctor"
+	"github.com/spencerswagger/jinliang/internal/engine"
 	"github.com/spencerswagger/jinliang/internal/httpapi"
 )
 
@@ -293,13 +294,20 @@ func cmdExport(args []string) error {
 	return os.WriteFile(*out, []byte(buf.String()), 0o600)
 }
 
-// cmdRun is the headless execution path: no browser, no server.
+// cmdRun is the headless execution path: no browser, no server. It runs the
+// real engine (B1) and prints the same events the UI would show.
 func cmdRun(args []string) error {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
 	jobRef := fs.String("job", "", "任务 id 或名字（必填）")
 	jsonOut := fs.Bool("json", false, "事件以 JSON Lines 输出（给自动化用）")
 	dir := fs.String("data-dir", "", "数据目录")
 	keyFile := fs.String("key-file", "", "主密钥文件")
+	snapshotOnly := fs.Bool("snapshot-only", false, "只搬存量数据，不进增量")
+	stopAfter := fs.Duration("stop-after", 0, "跑这么久之后收尾（冒烟测试用；0 = 一直跑）")
+	idleAfter := fs.Duration("stop-when-idle", 0, "追平后安静这么久就收尾（一次性增量同步用；0 = 一直跑）")
+	maxLag := fs.Int64("max-lag", 0, "配 --stop-when-idle：源端积压小于这么多字节才算追平（默认 8MB）")
+	verify := fs.Bool("verify", false, "跑完对比源端与目标端的行数与指纹")
+	batchRows := fs.Int("batch-rows", 0, "每批行数（默认取任务的 reliability.batch_rows）")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -318,32 +326,191 @@ func cmdRun(args []string) error {
 	if err != nil {
 		return fmt.Errorf("找不到任务 %q: %w", *jobRef, err)
 	}
-	if _, err := store.Runner().Start(ctx, job.ID, control.ActorCLI); err != nil {
-		return err
-	}
-
-	ch, cancel := store.Bus().Subscribe(job.ID)
-	defer cancel()
 
 	enc := newEventPrinter(*jsonOut, os.Stdout)
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		case ev, ok := <-ch:
-			if !ok {
-				return nil
-			}
-			enc.print(ev)
-			if ev.Type == "done" || ev.Type == "error" {
-				if ev.Type == "error" {
-					return errors.New(ev.Message)
+	ch, cancel := store.Bus().Subscribe(job.ID)
+	defer cancel()
+	printDone := make(chan struct{})
+	go func() {
+		defer close(printDone)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case ev, ok := <-ch:
+				if !ok {
+					return
 				}
-				return nil
+				enc.print(ev)
 			}
 		}
+	}()
+
+	res, runErr := engine.Run(ctx, engine.Options{
+		Store:        store,
+		JobID:        job.ID,
+		Actor:        control.ActorCLI,
+		SnapshotOnly: *snapshotOnly,
+		StopAfter:    *stopAfter,
+		IdleAfter:    *idleAfter,
+		LagThreshold: *maxLag,
+		Verify:       *verify,
+		BatchRows:    *batchRows,
+	})
+	time.Sleep(30 * time.Millisecond) // 让最后几条事件先打印出来
+	cancel()
+	<-printDone
+
+	if !*jsonOut {
+		fmt.Printf("\n结果：阶段 %s，复制 %d 行，增量 %d 行，用时 %s，退出码 %d\n",
+			res.Phase, res.RowsCopied, res.RowsStream, res.Elapsed.Truncate(time.Millisecond), res.ExitCode)
+		if res.Position != "" {
+			fmt.Printf("位点：%s（目标端已确认\n", res.Position)
+		}
+		for _, d := range res.Mismatches {
+			fmt.Println("差异：" + d)
+		}
+		if res.Note != "" {
+			fmt.Println("说明：" + res.Note)
+		}
+		if res.ExitCode == engine.ExitStopped {
+			fmt.Println("（手动停止用 Ctrl-C 也可以：会在提交完手上这个事务后收尾）")
+		}
 	}
+	if res.ExitCode == engine.ExitStopped {
+		return &exitError{code: engine.ExitStopped, msg: "已手动停止"}
+	}
+	if runErr != nil {
+		return runErr
+	}
+	return nil
 }
+
+// cmdStatus prints where a job is now, without touching anything.
+func cmdStatus(args []string) error {
+	fs := flag.NewFlagSet("status", flag.ExitOnError)
+	jobRef := fs.String("job", "", "任务 id 或名字（空 = 列出全部任务）")
+	jsonOut := fs.Bool("json", false, "JSON 输出")
+	dir := fs.String("data-dir", "", "数据目录")
+	keyFile := fs.String("key-file", "", "主密钥文件")
+	verify := fs.Bool("verify", false, "顺便比对源端与目标端（只读，会扫表）")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	store, err := openStore(dataDir(*dir), *keyFile, false)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	ctx := context.Background()
+
+	if strings.TrimSpace(*jobRef) == "" {
+		jobs, err := store.ListJobs(ctx)
+		if err != nil {
+			return err
+		}
+		if len(jobs) == 0 {
+			return errors.New("控制库里还没有任务：先 jinliang import --file job.yaml 或打开 jinliang serve")
+		}
+		for _, j := range jobs {
+			line := fmt.Sprintf("%s  %s", j.ID, j.Name)
+			if j.LastRun != nil {
+				line += fmt.Sprintf("  [%s", j.LastRun.Phase)
+				if j.LastRun.RowsDone > 0 {
+					line += fmt.Sprintf(" %d 行", j.LastRun.RowsDone)
+				}
+				line += "]"
+			} else {
+				line += "  [还没跑过]"
+			}
+			fmt.Println(line)
+		}
+		return nil
+	}
+
+	st, err := engine.StatusFor(ctx, engine.Options{Store: store, JobID: *jobRef})
+	if err != nil {
+		return err
+	}
+	if *jsonOut {
+		return printJSON(st)
+	}
+	fmt.Printf("任务      %s（%s）\n", st.Name, st.JobID)
+	fmt.Printf("指纹      %s\n", st.JobKey)
+	fmt.Printf("源 → 目标 %s → %s\n", st.Source, st.Target)
+	fmt.Printf("模式      %s，%d 张表\n", st.Mode, len(st.Tables))
+	fmt.Printf("阶段      %s\n", orDash(st.Phase))
+	fmt.Printf("位点      %s（更新于 %s）\n", orDash(st.Position), orDash(st.UpdatedAt))
+	fmt.Printf("落后      %s（书签占用 %s）\n", humanBytes(st.LagBytes), humanBytes(st.SlotBytes))
+	if st.LastRun != nil {
+		fmt.Printf("最近一次  %s 开始，阶段 %s，%d 行", st.LastRun.StartedAt, st.LastRun.Phase, st.LastRun.RowsDone)
+		if st.LastRun.EndedAt != "" {
+			fmt.Printf("，结束于 %s", st.LastRun.EndedAt)
+		}
+		if st.LastRun.ExitCode != nil {
+			fmt.Printf("，退出码 %d", *st.LastRun.ExitCode)
+		}
+		fmt.Println()
+		if st.LastRun.LastError != "" {
+			fmt.Printf("上次错误  %s\n", st.LastRun.LastError)
+		}
+	}
+	if st.Note != "" {
+		fmt.Printf("说明      %s\n", st.Note)
+	}
+	if *verify {
+		// 校验是两次独立查询（源一次、目标一次）：任务还在写的时候两次查询不是同一时点，
+		// 差异可能只是「中间又搬了几行」。先把话说清楚，别让人白惊慌。
+		if st.LastRun != nil && st.LastRun.EndedAt == "" {
+			fmt.Println("注意      这个任务还有一次运行没结束（进行中）：此刻的比对是两个不同时点的快照，")
+			fmt.Println("          差异可能只是中间又搬了几行。校验只在停写之后才有意义。")
+		}
+		diffs, err := engine.VerifyJob(ctx, engine.Options{Store: store, JobID: st.JobID})
+		if err != nil {
+			return err
+		}
+		if len(diffs) == 0 {
+			fmt.Println("校验      一致")
+		} else {
+			fmt.Println("校验      有差异：")
+			for _, d := range diffs {
+				fmt.Println("  - " + d)
+			}
+			return &exitError{code: 5, msg: "校验发现不一致"}
+		}
+	}
+	return nil
+}
+
+func orDash(s string) string {
+	if strings.TrimSpace(s) == "" {
+		return "—"
+	}
+	return s
+}
+
+func humanBytes(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	units := []string{"KB", "MB", "GB", "TB"}
+	v := float64(n)
+	i := -1
+	for v >= unit && i < len(units)-1 {
+		v /= unit
+		i++
+	}
+	return fmt.Sprintf("%.1f %s", v, units[i])
+}
+
+// exitError carries a specific exit code up to main (0 完成 / 1 失败 / 130 手动停止).
+type exitError struct {
+	code int
+	msg  string
+}
+
+func (e *exitError) Error() string { return e.msg }
 
 // cmdDoctor prints a health report. Exit code 1 when something needs attention,
 // so a container healthcheck can just run it.
