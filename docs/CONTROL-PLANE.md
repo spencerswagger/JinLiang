@@ -60,13 +60,22 @@ CREATE TABLE jobs (
 CREATE TABLE runs (
   id         TEXT PRIMARY KEY,
   job_id     TEXT NOT NULL REFERENCES jobs(id),
+  kind       TEXT NOT NULL DEFAULT 'sync',  -- sync | verify | stub，取值见下方
   phase      TEXT NOT NULL,                -- 见 internal/state/phase.go
   started_at TEXT NOT NULL, ended_at TEXT,
   rows_done  INTEGER DEFAULT 0,
   lag_bytes  INTEGER, lag_ms INTEGER,
   last_error TEXT,                         -- 错误码 + 一句话
-  exit_code  INTEGER
+  exit_code  INTEGER,
+  finish_reason  TEXT,                     -- completed | failed | stopped | interrupted（见下方）
+  heartbeat_at   TEXT,                     -- 运行中每 30s 刷新一次，用于判活
+  owner_instance TEXT,                     -- 起这一轮运行的实例（settings.instance_id）
+  stub       INTEGER NOT NULL DEFAULT 0    -- 已弃用：保留一版兼容，B1 收口后删除（见下方）
 );
+
+-- 一个任务同时只能有一条未结束的运行（partial unique index，迁移 v2 已建）。
+-- 没有它：进程被杀后那行永远 ended_at IS NULL，历史页永久显示在跑、还能再开第二个。
+CREATE UNIQUE INDEX idx_runs_one_active ON runs(job_id) WHERE ended_at IS NULL;
 
 CREATE TABLE settings (k TEXT PRIMARY KEY, v TEXT NOT NULL);  -- instance_id / schema_version / 默认值
 CREATE TABLE audit (
@@ -77,22 +86,109 @@ CREATE TABLE audit (
 
 连接与任务的增删改查全部走服务端；UI 只提交字段，不提交 SQL。
 
+**`runs.kind` 的取值**（2026-11-05 裁定）：
+
+| 值 | 含义 | 何时产生 |
+|---|---|---|
+| `sync` | 正常同步运行 | B1 起的真实运行；也是迁移回填的默认值 |
+| `verify` | 校验运行（`GET /api/jobs/{id}/verify` 背后的那一轮） | B1 的校验功能落地后 |
+| `stub` | B0 骨架运行：只推进阶段，不搬运任何数据 | **仅 B0**；B1 起不再产生 |
+
+迁移（照此口径，不许一次删列）：
+
+```sql
+ALTER TABLE runs ADD COLUMN kind TEXT NOT NULL DEFAULT 'sync';
+UPDATE runs SET kind = 'stub' WHERE stub = 1;   -- 回填历史桩运行
+```
+
+**`runs.finish_reason` 的取值**：
+
+| 值 | 含义 |
+|---|---|
+| `completed` | 正常跑完 |
+| `failed` | 失败结束（`last_error` 里有错误码） |
+| `stopped` | 用户手动停止：phase 落 `done`，**但 `finish_reason='stopped'`**，绝不伪装成正常完成 |
+| `interrupted` | 进程被 kill / 断电 / 升级时发现的心跳过期遗留运行（phase 落 `failed`） |
+
+**存活与收尾口径**（`heartbeat_at` / `owner_instance`）：
+
+- 运行中每 **30s** 刷新一次 `heartbeat_at`；`owner_instance` 记起这一轮运行的实例身份（`settings.instance_id`）。
+- **`serve` 启动时只收「心跳过期 3 轮」的 open run**（3×30s＝90s；用 `COALESCE(heartbeat_at, started_at)` 早于阈值判定）：补 `ended_at`、`finish_reason='interrupted'`、非终态 phase 落 `failed`，`last_error` 写「进程在运行中被终止」。
+- **只收过期的，不无条件收所有 open run**：同一个控制库也会被 `export` / `import` / `run` 这类短命令打开，它们不该把 serve 手里正跑的那行标成中断——那会白放开活跃槽，还能再起第二个 run。所以这个收尾**只在 `serve` 启动时做，CLI 不做**。
+- 判据用「心跳过期」而不是「owner 不是我」：同机重启后 `instance_id` 不变，用 owner 判活会误杀正在跑的那一行。
+- 配一条 partial unique index `idx_runs_one_active`：同一任务同时只能有一行 open run（`ended_at IS NULL`）。
+- 这三列与索引由独立一条迁移加（同样是 `ADD COLUMN`，顺序：加列 → 收尾过期 run → 建唯一索引）。**迁移版本号必须唯一且严格递增**：同版本号的两条会被静默跳过（`migrate()` 只按读到的 `schema_version` 判断，不报错），后果是列永远不存在、`runs` 查询全线炸。
+
+- **「最近一次运行」只认 `kind='sync'`**：`verify` 与 `stub` 可以出现在历史列表里，但**不得进入「最近一次同步运行」的判定**——否则一轮校验或一轮桩运行会把真实同步进度盖掉，页面显示"刚跑过"，实际上从没同步。
+- **`runs` 是控制面的运行摘要，不是运行时位点**（§2 红线）：真权威位点在目标端 `_jl_*`，这里只记「这个任务跑到过哪一步」，位点永远不进控制库。
+- **`stub` 列已弃用**：保留一版做兼容，**B1 收口后再删**，不许一次删列。删除时同步做四件事：① 本表删掉该列；② `internal/control/migrate.go` 加一条对应的 `ALTER TABLE runs DROP COLUMN stub`；③ 历史页/详情页去掉读 `stub` 的分支，改读 `kind='stub'`；④ 导出与 API 契约里的 `stub` 字段（`Run` 的 JSON 字段）一并移除。
+
 ## 4. API 面
 
-| 方法 | 路径 | 说明 |
-|---|---|---|
-| GET | `/api/connections` | 列表（密码永远不回传，只回 `has_secret: true`） |
-| POST/PUT | `/api/connections[/{id}]` | 新建/修改；保存前自动跑一次连通性与能力探测 |
-| POST | `/api/connections/{id}/test` | 单测连接（返回版本、能力、耗时） |
-| GET | `/api/catalog?connection_id=…&schema=…` | 枚举库表给 UI 勾选（带行数估算/主键/类型） |
-| GET/POST/PUT | `/api/jobs[/{id}]` | 任务 CRUD（`spec_json` 与 yaml schema 同构） |
-| POST | `/api/jobs/{id}/preflight` | 预检报告（四态） |
-| POST | `/api/jobs/{id}/run` `\|/pause` `\|/resume` `\|/stop` | 控制 |
-| GET | `/api/jobs/{id}/events` | **SSE**：阶段迁移、批次提交、延迟、错误（UI 实时刷新） |
-| GET | `/api/jobs/{id}/verify` | 校验（流式进度） |
-| GET | `/api/jobs/{id}/export` | 导出 yaml（与 `job.schema.json` 一致） |
-| POST | `/api/jobs/import` | 导入 yaml（先校验、再预览 diff、再确认） |
-| GET | `/api/doctor` `/api/gc` | 体检与孤儿清理（默认 dry-run） |
+**鉴权三档**：`公开`（不需要登录，只用于首启与存活探测；个别端点另有「仅本机」限定，见对应行）· `已配置`（只要求管理员口令已设置，未设置时回 428 并引导 `/api/setup`）· `需登录`（会话 cookie 或 `Authorization: Bearer`）。
+
+**CSRF**：只有「cookie 会话 + 写方法」需要 `X-CSRF-Token`（双提交）；带 `Authorization: Bearer` 的请求不需要——Bearer 不会被浏览器自动带上，不存在跨站伪造。
+
+### 4.1 认证与首启
+
+| 方法 | 路径 | 说明 | 鉴权 | CSRF | 幂等 | 成功 |
+|---|---|---|---|---|---|---|
+| GET | `/api/health` | 存活探测，只回版本与 uptime | 公开 | 不需要 | 是（只读） | 200 |
+| GET | `/api/session` | 是否已设口令、调用方是否已登录；**顺带种下 `jl_csrf` cookie**（首启端点要 CSRF，token 只能由 GET 侧发） | 公开 | 不需要 | 是（只读） | 200 |
+| POST | `/api/setup` | 设置管理员口令（argon2id），只允许一次；成功后发会话。反代场景请先在控制台本机完成首启 | **仅本机**（未设口令时：非本机 → 403；已配置 → 409；限速 5 次/分钟）。「本机」= `RemoteAddr` 是 loopback **且** 请求不带 `Forwarded` / `X-Forwarded-For` / `X-Real-IP` 任一转发头——带了就按非本机 fail-closed | **需要** | 否（第二次 409） | 201 |
+| POST | `/api/login` | 口令换会话 token | 公开（限速 5 次/分钟） | 不需要（此时还没有会话） | 否（每次发新会话） | 200 |
+| POST | `/api/logout` | 丢掉当前会话并清 cookie | 已配置 | 需要 | 是 | 200 |
+| GET | `/api/meta` | 版本、`instance_id`、`schema_version`、`data_dir`、鉴权模式 | 已配置 | 不需要 | 是（只读） | 200 |
+
+### 4.2 连接
+
+| 方法 | 路径 | 说明 | 鉴权 | CSRF | 幂等 | 成功 |
+|---|---|---|---|---|---|---|
+| GET | `/api/connections` | 列表（密码永远不回传，只回 `has_secret: true`） | 需登录 | 不需要 | 是（只读） | 200 |
+| POST | `/api/connections` | 新建；可只传 `dsn` 一条串；保存后自动跑一次测连（测连失败不阻断保存） | 需登录 | 需要 | **否**（同坐标重复 POST 会得到两条连接） | 201 |
+| GET | `/api/connections/{id}` | 单条（含 `used_by_jobs`） | 需登录 | 不需要 | 是（只读） | 200 |
+| PUT | `/api/connections/{id}` | 修改；**被任务引用时坐标（`kind/host/port/database/username`）不可改**，改则 409 `ErrIdentityLocked`（见 `docs/IDENTITY.md` §2.1）；改名称/口令/`params` 允许 | 需登录 | 需要 | 是（同 body 重复提交结果一致） | 200 |
+| DELETE | `/api/connections/{id}` | 删除；仍被任务引用时 409 | 需登录 | 需要 | 是（第二次 404） | 200 |
+| POST | `/api/connections/{id}/test` | 单测连接（版本、能力、耗时）；**连通失败也回 200**，看 `ok` 字段 | 需登录 | 需要 | 是（会刷新 `last_test_*`） | 200 |
+| GET | `/api/catalog?connection_id=…&schema=…` | 枚举库表给 UI 勾选（带行数估算/主键/类型） | 需登录 | 不需要 | 是（只读） | 200 |
+
+### 4.3 任务
+
+| 方法 | 路径 | 说明 | 鉴权 | CSRF | 幂等 | 成功 |
+|---|---|---|---|---|---|---|
+| GET | `/api/jobs` | 列表（带两端连接名与最近一次运行） | 需登录 | 不需要 | 是（只读） | 200 |
+| POST | `/api/jobs` | 新建（`spec_json` 与 yaml schema 同构）；同指纹 409 并指向已有任务 | 需登录 | 需要 | 否（同指纹 409） | 201 |
+| GET | `/api/jobs/{id}` | 单条 = 任务 + `spec` + 最近 20 次运行 | 需登录 | 不需要 | 是（只读） | 200 |
+| PUT | `/api/jobs/{id}` | 修改（保留 `id` 与 `created_at`） | 需登录 | 需要 | 是（同 body 一致；改完指纹撞别的任务 409） | 200 |
+| DELETE | `/api/jobs/{id}` | 删除任务，**连同它的运行历史**（审计记录保留） | 需登录 | 需要 | 是（第二次 404） | 200 |
+| POST | `/api/jobs/{id}/preflight` | 预检报告（四态：`ok`/`autofixable`/`warn`/`blocked`），只读 | 需登录 | 需要 | 是（只读） | 200 |
+| POST | `/api/jobs/{id}/run` | 开始一轮运行；已经是运行中则 409 | 需登录 | 需要 | 否（同任务不并行） | 202 |
+| POST | `/api/jobs/{id}/pause` | 在安全点暂停；没在跑则 409 | 需登录 | 需要 | 是（重复暂停无副作用） | 202 |
+| POST | `/api/jobs/{id}/resume` | 从暂停恢复；没暂停则 400 | 需登录 | 需要 | 否 | 202 |
+| POST | `/api/jobs/{id}/stop` | 收尾后结束；没在跑则 409 | 需登录 | 需要 | 是（重复停止无副作用） | 202 |
+| GET | `/api/jobs/{id}/events` | **SSE**：阶段迁移、批次提交、延迟、错误（UI 实时刷新）；只认会话 cookie 或 `Authorization` 头，**不接受 query 里的 token** | 需登录 | 不需要（只读） | 是 | 200 |
+| GET | `/api/jobs/{id}/export` | **导出 yaml（规范路径）**：与 `job.schema.json` 一致的完整 JobDoc；会记一条审计 | 需登录 | 不需要 | 是（只读） | 200 |
+| GET | `/api/jobs/{id}/yaml` | **已弃用别名（deprecated，将在后续版本移除）**：与上一条完全等价，只为现有 e2e / UI / CLI 保留一个周期；新代码一律用 `/export` | 需登录 | 不需要 | 是（只读） | 200 |
+| POST | `/api/jobs/import` | 导入 yaml（逐份导入，先校验再落库）；同指纹是**更新**既有任务，不是报冲突 | 需登录 | 需要 | **是**（同坐标复用连接、同指纹更新任务） | 201 全成功 / 207 部分成功 / 422 零成功（body 带 `{total, imported[], skipped[]}`） |
+| GET | `/api/export` | 导出全部任务，每份之间用 `---` 分隔 | 需登录 | 不需要 | 是（只读） | 200 |
+
+> 导出路径以 `/api/jobs/{id}/export` 为规范；`/yaml` 是实现早期自行引入的名字，现降为别名，保留一个周期后移除（移除时同步改 `E1009` 的提示文案）。
+
+### 4.4 运维
+
+| 方法 | 路径 | 说明 | 鉴权 | CSRF | 幂等 | 成功 |
+|---|---|---|---|---|---|---|
+| GET | `/api/runs` | 运行历史（`?job_id=` 过滤、`?limit=` 上限 500）；按 `started_at` 倒序 | 需登录 | 不需要 | 是（只读） | 200 |
+| GET | `/api/audit` | 控制面操作审计（`?limit=`）；按 `at` 倒序 | 需登录 | 不需要 | 是（只读） | 200 |
+| GET | `/api/settings` | 设置项 + `instance_id` / `schema_version` / 密钥来源 / 监听地址 | 需登录 | 不需要 | 是（只读） | 200 |
+| PUT | `/api/settings` | 改设置（当前只允许 `default_batch_rows`），白名单外 400 | 需登录 | 需要 | 是 | 200 |
+| GET | `/api/doctor` | 体检：控制库完整性、数据量、活跃运行、监听地址风险 | 需登录 | 不需要 | 是（只读） | 200 |
+
+### 4.5 未实现与未注册的路径
+
+- `GET /api/jobs/{id}/verify`、`GET /api/gc`：**B1 才做**。在那之前它们返回 404 + `E1009`，不做假装成功的空实现。
+- 其他任何未注册的 `/api/*`：一律返回 **404 + JSON 错误信封（`E1009`）**，绝不落到 WebUI 的 `GET /` 上被 HTML 兜底——否则「这个接口到底有没有实现」就再也自证不了了。
+- **注册路由必须带方法**（`GET /api/x` 这种），前缀与精确路径都不例外。不带方法的前缀注册（`/api/`）会与 `GET /` 的路径宽度冲突并在注册期 panic；不带方法的**精确**路径（`/api/gc`）同样会与 `GET /api/` 的兜底冲突 panic。带方法之后更具体的模式优先，兜底不会挡住将来新增的路由。这是实测结论，不是风格偏好。
 
 错误一律走 `internal/core/codes.go` 的结构：`{code, class, message, why, next[], risk}`，UI 直接渲染四段式卡片，不需要翻译。
 
