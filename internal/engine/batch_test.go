@@ -51,7 +51,7 @@ func (f *fakeSource) LastCommit() pgsource.Position { return f.last }
 
 // commitEvent 模拟「源端提交了某个事务」，返回对应的 Commit 事件。
 func commitEvent(src *fakeSource, pos string) source.Event {
-	p, _ := pgsource.ParsePosition(pos)
+	p, _ := pgsource.ParsePayload(pos)
 	src.last = p
 	return source.Event{Kind: source.EvCommit}
 }
@@ -78,10 +78,14 @@ func TestBatcherKeepsSourceTransactionAtomic(t *testing.T) {
 	if err := b.Flush(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if len(sink.batches) != 1 || len(sink.batches[0]) != 2 {
-		t.Fatalf("期望 1 批 2 个事件，得到 %d 批 %v", len(sink.batches), sink.batches)
+	// 批里带事务边界（Begin + 2 条数据 + Commit）：sink 靠 EvCommit 判定「事务已提交」。
+	if len(sink.batches) != 1 || len(sink.batches[0]) != 4 {
+		t.Fatalf("期望 1 批 4 个事件（Begin+2 数据+Commit），得到 %d 批 %d 个事件", len(sink.batches), len(sink.batches[0]))
 	}
-	if sink.pos[0] != "0/100" {
+	if sink.batches[0][0].Kind != source.EvBegin || sink.batches[0][3].Kind != source.EvCommit {
+		t.Fatal("批次必须保留事务边界：首个是 EvBegin、末尾是 EvCommit")
+	}
+	if sink.pos[0] != "postgres:v1:0/100" {
 		t.Fatalf("位点应该是这个事务的提交位点，得到 %s", sink.pos[0])
 	}
 }
@@ -105,13 +109,14 @@ func TestBatcherGroupCommitUsesLastPosition(t *testing.T) {
 	if err := b.Flush(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if len(sink.batches) != 1 || len(sink.batches[0]) != 4 {
-		t.Fatalf("两个源事务应合并成 1 批 4 行，得到 %d 批", len(sink.batches))
+	if len(sink.batches) != 1 || len(sink.batches[0]) != 8 {
+		t.Fatalf("两个源事务应合并成 1 批 8 个事件（2×(Begin+2 数据+Commit)），得到 %d 批 %d 个事件",
+			len(sink.batches), len(sink.batches[0]))
 	}
-	if sink.pos[0] != "0/200" {
+	if sink.pos[0] != "postgres:v1:0/200" {
 		t.Fatalf("合并批的位点必须是最后提交的那个，得到 %s", sink.pos[0])
 	}
-	if got := src.acked[len(src.acked)-1]; got != "0/200" {
+	if got := src.acked[len(src.acked)-1]; got != "postgres:v1:0/200" {
 		t.Fatalf("源端确认的位点应为 0/200，得到 %s", got)
 	}
 }
@@ -131,8 +136,8 @@ func TestBatcherFlushesOversizedTransactionImmediately(t *testing.T) {
 	if len(sink.batches) != 1 {
 		t.Fatalf("大事务应在 COMMIT 时立刻提交，得到 %d 批", len(sink.batches))
 	}
-	if len(sink.batches[0]) != 5 {
-		t.Fatalf("事务被拆开了：批里只有 %d 个事件", len(sink.batches[0]))
+	if len(sink.batches[0]) != 7 {
+		t.Fatalf("事务被拆开了：批里只有 %d 个事件（应为 Begin+5 数据+Commit）", len(sink.batches[0]))
 	}
 }
 
@@ -155,7 +160,7 @@ func TestBatcherDoesNotAckWhenApplyFails(t *testing.T) {
 	if err := b.Flush(context.Background()); err != nil {
 		t.Fatalf("重试应该成功: %v", err)
 	}
-	if len(src.acked) != 1 || src.acked[0] != "0/400" {
+	if len(src.acked) != 1 || src.acked[0] != "postgres:v1:0/400" {
 		t.Fatalf("重试成功后应确认 0/400，得到 %v", src.acked)
 	}
 }
@@ -177,10 +182,11 @@ func TestBatcherEmptyTransactionKeepsPosition(t *testing.T) {
 	if err := b.Flush(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if len(sink.batches) != 1 || len(sink.batches[0]) != 0 {
-		t.Fatalf("空事务也要推进位点：得到 %d 批", len(sink.batches))
+	if len(sink.batches) != 1 || len(sink.batches[0]) != 2 {
+		t.Fatalf("空事务也要推进位点（Begin+Commit 两个事件）：得到 %d 批，%d 个事件",
+			len(sink.batches), len(sink.batches[0]))
 	}
-	if sink.pos[0] != "0/500" {
+	if sink.pos[0] != "postgres:v1:0/500" {
 		t.Fatalf("空事务提交后位点应为 0/500，得到 %s", sink.pos[0])
 	}
 }
@@ -266,7 +272,7 @@ func TestApplyAlwaysCarriesPosition(t *testing.T) {
 	if err := b.Flush(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(sink.pos, []string{"0/900"}) {
+	if !reflect.DeepEqual(sink.pos, []string{"postgres:v1:0/900"}) {
 		t.Fatalf("每批都必须带位点，得到 %v", sink.pos)
 	}
 }
@@ -280,7 +286,7 @@ func TestAdvanceToRefusesWhileTransactionInFlight(t *testing.T) {
 	_ = b.Add(context.Background(), ev(source.EvBegin, ""))
 	_ = b.Add(ctx(), ev(source.EvInsert, ""))
 
-	pos, _ := pgsource.ParsePosition("0/700")
+	pos, _ := pgsource.ParsePayload("0/700")
 	if err := b.AdvanceTo(ctx(), pos); err != nil {
 		t.Fatal(err)
 	}
@@ -300,7 +306,7 @@ func TestAdvanceToRefusesWhileTransactionInFlight(t *testing.T) {
 	if err := b.Flush(ctx()); err != nil {
 		t.Fatal(err)
 	}
-	if len(src.acked) != 1 || src.acked[0] != "0/700" {
+	if len(src.acked) != 1 || src.acked[0] != "postgres:v1:0/700" {
 		t.Fatalf("落库后应该确认位点，得到 %v", src.acked)
 	}
 }
@@ -309,9 +315,9 @@ func TestAdvanceToNeverGoesBackwards(t *testing.T) {
 	sink := &fakeSink{}
 	src := &fakeSource{}
 	b := newTestBatcher(sink, src, 100)
-	start, _ := pgsource.ParsePosition("0/900")
+	start, _ := pgsource.ParsePayload("0/900")
 	b.lastPos = start
-	older, _ := pgsource.ParsePosition("0/800")
+	older, _ := pgsource.ParsePayload("0/800")
 	if err := b.AdvanceTo(ctx(), older); err != nil {
 		t.Fatal(err)
 	}

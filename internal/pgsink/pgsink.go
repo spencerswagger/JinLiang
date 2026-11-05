@@ -608,6 +608,13 @@ func (s *Sink) BulkApply(ctx context.Context, ti *tableInfo, chunkNo int, rows [
 // Apply implements the sink contract. One call = one target transaction, and
 // the position advances inside it.
 func (s *Sink) Apply(ctx context.Context, evs []source.Event, pos source.Position) error {
+	// 契约不变量（sink.Sink.Apply 注释，2026-11-05）：事务边界由 Begin/Commit 表达，
+	// 没有 rollback 事件；半个事务的批次不许推进位点。
+	if err := source.ValidateBatch(evs); err != nil {
+		return fmt.Errorf("这一批事件不满足事务边界不变量: %w", err)
+	}
+	advance := pos != nil && (len(evs) == 0 || endsWithCommit(evs))
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -635,12 +642,18 @@ func (s *Sink) Apply(ctx context.Context, evs []source.Event, pos source.Positio
 			// Begin/Commit/Heartbeat/DDL 由引擎处理，不落 SQL
 		}
 	}
-	if pos != nil {
+	if advance {
 		if err := s.setPositionTx(ctx, tx, pos.String()); err != nil {
 			return err
 		}
 	}
 	return tx.Commit(ctx)
+}
+
+// endsWithCommit reports whether this batch closes on a committed transaction.
+// 半个事务的批次（续段没有收尾）不许推进位点。
+func endsWithCommit(evs []source.Event) bool {
+	return len(evs) > 0 && evs[len(evs)-1].Kind == source.EvCommit
 }
 
 func (s *Sink) upsertTx(ctx context.Context, tx pgx.Tx, ev source.Event) error {

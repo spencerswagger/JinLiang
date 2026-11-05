@@ -36,8 +36,16 @@ type Position struct {
 	LSN pglogrepl.LSN
 }
 
-// String renders the position the way PostgreSQL does (0/16B3748).
-func (p Position) String() string { return p.LSN.String() }
+// String is the only form that reaches the target database: "<kind>:v1:<payload>"
+// (docs 契约 2026-11-05). 位点要跨版本存活，所以版本号写在串里。
+func (p Position) String() string {
+	return source.FormatPosition(dsn.KindPostgres, p.LSN.String())
+}
+
+// Kind reports which kind of source produced this position. It is the endpoint
+// kind, never a position variant — the engine uses it to check "this checkpoint
+// belongs to this source".
+func (p Position) Kind() string { return dsn.KindPostgres }
 
 // IsZero reports whether the position was never set.
 func (p Position) IsZero() bool { return p.LSN == 0 }
@@ -53,20 +61,47 @@ func (p Position) Compare(o Position) int {
 	return 0
 }
 
-// ParsePosition parses "0/16B3748" (also accepts a bare decimal, for tests).
-func ParsePosition(s string) (Position, error) {
-	s = strings.TrimSpace(s)
-	if s == "" {
+// ErrPositionForeignSource means the stored checkpoint was written by another
+// kind of source (a MySQL position on a PostgreSQL job). It is NOT E3001:
+// 换回正确的源，而不是重搬一遍全量（E1010）。
+type ErrPositionForeignSource struct {
+	Want string
+	Got  string
+}
+
+func (e *ErrPositionForeignSource) Error() string {
+	return fmt.Sprintf("目标库里的同步进度是 %s 写的，而这次连的是 %s：换回对应的源，或重新开始同步", e.Got, e.Want)
+}
+
+// ParsePayload parses the PG-specific part of a position ("0/16B3748").
+func ParsePayload(payload string) (Position, error) {
+	payload = strings.TrimSpace(payload)
+	if payload == "" {
 		return Position{}, nil
 	}
-	if lsn, err := pglogrepl.ParseLSN(s); err == nil {
-		return Position{LSN: lsn}, nil
-	}
-	n, err := strconv.ParseUint(s, 10, 64)
+	lsn, err := pglogrepl.ParseLSN(payload)
 	if err != nil {
-		return Position{}, fmt.Errorf("同步进度 %q 不是合法的位点（形如 0/16B3748）", s)
+		return Position{}, fmt.Errorf("%w：载荷 %q 不是 PostgreSQL 的 WAL 位置（形如 0/16B3748）",
+			source.ErrPositionMalformed, payload)
 	}
-	return Position{LSN: pglogrepl.LSN(n)}, nil
+	return Position{LSN: lsn}, nil
+}
+
+// ParsePosition parses the versioned wire form "postgres:v1:0/16B3748".
+// 空串表示「还没有位点」。格式不对与「这是别人的位点」分开报（上层给不同错误码）。
+func ParsePosition(raw string) (Position, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return Position{}, nil
+	}
+	kind, payload, err := source.SplitPosition(raw)
+	if err != nil {
+		return Position{}, err
+	}
+	if kind != dsn.KindPostgres {
+		return Position{}, &ErrPositionForeignSource{Want: dsn.KindPostgres, Got: kind}
+	}
+	return ParsePayload(payload)
 }
 
 // Options configures the source half of one job.
@@ -155,6 +190,16 @@ func (s *Source) Close() {
 // Kind implements the endpoint contract.
 func (s *Source) Kind() string { return dsn.KindPostgres }
 
+// ParsePosition implements source.Source: the engine hands a stored position
+// string back and gets a typed position, without knowing what an LSN is.
+func (s *Source) ParsePosition(raw string) (source.Position, error) {
+	p, err := ParsePosition(raw)
+	if err != nil {
+		return nil, err
+	}
+	return p, nil
+}
+
 // CurrentLSN reads the server's current write position, used to measure lag and
 // to know when catchup is done.
 func (s *Source) CurrentLSN(ctx context.Context) (Position, error) {
@@ -162,7 +207,7 @@ func (s *Source) CurrentLSN(ctx context.Context) (Position, error) {
 	if err := s.conn.QueryRow(ctx, `SELECT pg_current_wal_lsn()::text`).Scan(&v); err != nil {
 		return Position{}, err
 	}
-	return ParsePosition(v)
+	return ParsePayload(v)
 }
 
 // ServerTime returns the source clock (lag is measured against it).
@@ -246,7 +291,7 @@ func (s *Source) Prepare(ctx context.Context, popt PrepareOptions) (PrepareResul
 	if slotExists {
 		res.ReusedSlot = true
 		if slotLSN != "" {
-			pos, err := ParsePosition(slotLSN)
+			pos, err := ParsePayload(slotLSN)
 			if err != nil {
 				return res, err
 			}
@@ -285,7 +330,7 @@ func (s *Source) Prepare(ctx context.Context, popt PrepareOptions) (PrepareResul
 	if err != nil {
 		return res, fmt.Errorf("建同步书签 %s 失败（账号需要 REPLICATION 权限，或书签数已满）: %w", s.opt.Slot, err)
 	}
-	pos, err := ParsePosition(created.ConsistentPoint)
+	pos, err := ParsePayload(created.ConsistentPoint)
 	if err != nil {
 		return res, err
 	}
@@ -582,6 +627,9 @@ type relation struct {
 	columns []string
 	// mapTo is, per relation column, the index in the catalog column order.
 	mapTo []int
+	// table is this version of the column definition, handed to the engine on
+	// every event (Event.Relation). 同一版定义复用同一个指针：指针相等即同一版。
+	table *source.Table
 }
 
 // Stream consumes the change stream from pos until ctx is cancelled.
@@ -759,7 +807,7 @@ func (s *Source) handleWAL(ctx context.Context, data []byte, walStart pglogrepl.
 		if err != nil {
 			return err
 		}
-		return onEvent(ctx, source.Event{Kind: source.EvInsert, Table: rel.ref, New: row})
+		return onEvent(ctx, source.Event{Kind: source.EvInsert, Table: rel.ref, Relation: rel.table, New: row})
 	case *pglogrepl.UpdateMessage:
 		rel := rels[m.RelationID]
 		if rel == nil {
@@ -773,7 +821,7 @@ func (s *Source) handleWAL(ctx context.Context, data []byte, walStart pglogrepl.
 		if err != nil {
 			return err
 		}
-		return onEvent(ctx, source.Event{Kind: source.EvUpdate, Table: rel.ref, New: row, Old: old})
+		return onEvent(ctx, source.Event{Kind: source.EvUpdate, Table: rel.ref, Relation: rel.table, New: row, Old: old})
 	case *pglogrepl.DeleteMessage:
 		rel := rels[m.RelationID]
 		if rel == nil {
@@ -783,11 +831,11 @@ func (s *Source) handleWAL(ctx context.Context, data []byte, walStart pglogrepl.
 		if err != nil {
 			return err
 		}
-		return onEvent(ctx, source.Event{Kind: source.EvDelete, Table: rel.ref, Old: old})
+		return onEvent(ctx, source.Event{Kind: source.EvDelete, Table: rel.ref, Relation: rel.table, Old: old})
 	case *pglogrepl.TruncateMessage:
 		for _, r := range m.RelationIDs {
 			if rel := rels[r]; rel != nil {
-				if err := onEvent(ctx, source.Event{Kind: source.EvTruncate, Table: rel.ref}); err != nil {
+				if err := onEvent(ctx, source.Event{Kind: source.EvTruncate, Table: rel.ref, Relation: rel.table}); err != nil {
 					return err
 				}
 			}
@@ -806,6 +854,11 @@ func (s *Source) buildRelation(m *pglogrepl.RelationMessage) (*relation, error) 
 		return nil, fmt.Errorf("发布里出现了任务范围外的表 %s（发布和任务不同步，请重新跑一次）", key)
 	}
 	rel := &relation{ref: ti.ref}
+	tbl := &source.Table{
+		TableRef:    ti.ref,
+		PrimaryKey:  append([]string(nil), ti.pk...),
+		HasStablePK: len(ti.pk) > 0,
+	}
 	for _, col := range m.Columns {
 		idx, ok := ti.colIndex[col.Name]
 		if !ok {
@@ -813,7 +866,13 @@ func (s *Source) buildRelation(m *pglogrepl.RelationMessage) (*relation, error) 
 		}
 		rel.columns = append(rel.columns, col.Name)
 		rel.mapTo = append(rel.mapTo, idx)
+		typ := ""
+		if idx < len(ti.types) {
+			typ = ti.types[idx]
+		}
+		tbl.Columns = append(tbl.Columns, source.Column{Name: col.Name, Type: typ})
 	}
+	rel.table = tbl
 	return rel, nil
 }
 
@@ -926,7 +985,7 @@ func (s *Source) Advance(ctx context.Context, to Position) error {
 		return nil
 	}
 	if cur != "" {
-		if c, err := ParsePosition(cur); err == nil && to.Compare(c) <= 0 {
+		if c, err := ParsePayload(cur); err == nil && to.Compare(c) <= 0 {
 			return nil
 		}
 	}

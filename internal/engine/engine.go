@@ -626,10 +626,17 @@ func (r *runner) stream(ctx context.Context, res *Result) error {
 	}
 	from := r.consistentPoint
 	if r.reusedSlot {
-		if pos, err := r.sink.Position(ctx); err == nil && pos != "" {
-			if p, err := pgsource.ParsePosition(pos); err == nil {
-				from = p
+		if raw, err := r.sink.Position(ctx); err == nil && raw != "" {
+			// 位点串的格式归连接器所有：引擎不自己解析（契约 2026-11-05）。
+			parsed, err := r.src.ParsePosition(raw)
+			if err != nil {
+				return err
 			}
+			p, ok := parsed.(pgsource.Position)
+			if !ok {
+				return fmt.Errorf("%w：这个源给出的位点类型是 %T，引擎不认识", source.ErrPositionMalformed, parsed)
+			}
+			from = p
 		}
 	}
 	target, err := r.src.CurrentLSN(ctx)
@@ -813,6 +820,14 @@ func (r *runner) fail(ctx context.Context, err error) error {
 		code = core.CodeTargetTableExists
 	case pgsource.IsPositionGap(err):
 		code = core.CodePositionGap
+	}
+	var foreign *pgsource.ErrPositionForeignSource
+	var tooBig *txTooLargeError
+	switch {
+	case errors.As(err, &foreign):
+		code = core.CodePositionKindMismatch
+	case errors.As(err, &tooBig):
+		code = core.CodeTxTooLarge
 	}
 	var ev control.Event
 	var np *notImplementedError

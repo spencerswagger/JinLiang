@@ -20,6 +20,18 @@ import (
 //
 // 提交时机：攒够 batch_rows，或距上次提交超过 batch_delay（先到者触发）。
 // 目标端慢的时候批会自然变大，快的时候批会变小 —— 这就是 group commit。
+// 单事务缓冲上限：与 docs/STREAMING.md §1 一致（128 MB / 100 万事件），
+// 超了报 E1011 而不是硬撑（spill 未实现）。
+const (
+	defaultMaxTxBytes  = int64(128 << 20)
+	defaultMaxTxEvents = 1_000_000
+)
+
+// endsWithCommit reports whether the batch closes on a committed transaction.
+func endsWithCommit(evs []source.Event) bool {
+	return len(evs) > 0 && evs[len(evs)-1].Kind == source.EvCommit
+}
+
 // applier / acker are the two things the batcher needs. They are interfaces so
 // the transaction-assembly rules can be unit tested without a database.
 type applier interface {
@@ -41,7 +53,9 @@ type batcher struct {
 	delay     time.Duration
 
 	mu       sync.Mutex
-	cur      []source.Event // 当前源事务（还没 COMMIT）
+	cur      []source.Event // 当前源事务（还没 COMMIT），首元素是 EvBegin
+	txRows   int
+	txBytes  int64
 	inTx     bool
 	pending  []source.Event // 已提交、还没落库的源事务
 	pendRows int
@@ -50,6 +64,10 @@ type batcher struct {
 	applied   int64
 	lastPos   pgsource.Position
 	lastFlush time.Time
+
+	// 单事务缓冲上限（docs/STREAMING.md §1：128 MB / 100 万事件）。
+	maxTxBytes  int64
+	maxTxEvents int
 
 	// onFlush fires after a successful commit (used for phase switching).
 	onFlush func(applied int64, pos pgsource.Position)
@@ -66,7 +84,8 @@ func newBatcher(sink applier, src acker, batchRows int, delay time.Duration,
 		delay = time.Millisecond
 	}
 	return &batcher{sink: sink, src: src, batchRows: batchRows, delay: delay,
-		lastPos: start, pendPos: start, onApplied: onApplied, lastFlush: time.Now()}
+		lastPos: start, pendPos: start, onApplied: onApplied, lastFlush: time.Now(),
+		maxTxBytes: defaultMaxTxBytes, maxTxEvents: defaultMaxTxEvents}
 }
 
 // AdvanceTo pushes the checkpoint forward without any data, for the case where
@@ -102,13 +121,16 @@ func (b *batcher) Add(ctx context.Context, ev source.Event) error {
 	case source.EvBegin:
 		b.inTx = true
 		b.cur = b.cur[:0]
+		b.cur = append(b.cur, ev) // 事务边界要传给 sink：EvCommit 是唯一提交信号
 		return nil
 	case source.EvCommit:
 		if b.inTx && len(b.cur) > 0 {
+			b.cur = append(b.cur, ev)
 			b.pending = append(b.pending, b.cur...)
-			b.pendRows += len(b.cur)
+			b.pendRows += b.txRows
 		}
 		b.cur = b.cur[:0]
+		b.txRows = 0
 		b.inTx = false
 		if b.src != nil {
 			if p := b.src.LastCommit(); p.Compare(b.pendPos) > 0 {
@@ -126,9 +148,41 @@ func (b *batcher) Add(ctx context.Context, ev source.Event) error {
 			return fmt.Errorf("收到事务外的事件（kind=%d）：这是解码器的问题", ev.Kind)
 		}
 		b.cur = append(b.cur, ev)
+		b.txRows++
+		b.txBytes += estimateSize(ev)
+		// 单事务过大：报 E1011 停下，不硬撑（撑下去是 OOM，进程直接没了看不出原因）。
+		if b.txBytes > b.maxTxBytes || b.txRows > b.maxTxEvents {
+			return &txTooLargeError{rows: int64(b.txRows), bytes: b.txBytes}
+		}
 		return nil
 	}
 	return nil
+}
+
+// estimateSize 粗估一个事件占多少内存：够用来在「一个 DELETE 5000 万行」这种场景
+// 下及时刹车，不需要精确到字节。
+func estimateSize(ev source.Event) int64 {
+	const perCell = 48 // interface header + 时间/整数的近似
+	n := int64(0)
+	for _, v := range ev.New.Values {
+		n += perCell + int64(len(v.S)+len(v.B))
+	}
+	for _, v := range ev.Old.Values {
+		n += perCell + int64(len(v.S)+len(v.B))
+	}
+	return n
+}
+
+// txTooLargeError is E1011: the source transaction does not fit in the buffer.
+type txTooLargeError struct {
+	rows  int64
+	bytes int64
+}
+
+func (e *txTooLargeError) Error() string {
+	return fmt.Sprintf("源端有一个事务太大：约 %d 行 / %s，超过整段缓冲的上限（%d 行 / %s）。"+
+		"要么把它拆成几个小事务，要么等 spill-to-disk 实现后再跑",
+		e.rows, humanLag(e.bytes), defaultMaxTxEvents, humanLag(defaultMaxTxBytes))
 }
 
 // Flush commits whatever is pending. Safe to call concurrently (the ticker and
@@ -147,6 +201,10 @@ func (b *batcher) flushLocked(ctx context.Context) error {
 	}
 	pos := b.pendPos
 	rows := int64(b.pendRows)
+	if !endsWithCommit(b.pending) {
+		// 契约：半个事务的批次必须复用上一个已提交位点，不能推进。
+		pos = b.lastPos
+	}
 	// 数据与位点同事务提交（pgsink.Apply 内部保证）。
 	if err := b.sink.Apply(ctx, b.pending, pos); err != nil {
 		return err

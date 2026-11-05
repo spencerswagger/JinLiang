@@ -92,11 +92,18 @@ func StatusFor(ctx context.Context, opt Options) (Status, error) {
 		return st, nil
 	}
 	defer src.Close()
-	if pos, err := pgsource.ParsePosition(st.Position); err == nil && !pos.IsZero() {
-		if cur, err := src.CurrentLSN(ctx); err == nil {
-			st.LagBytes = int64(cur.LSN) - int64(pos.LSN)
-			if st.LagBytes < 0 {
-				st.LagBytes = 0
+	if parsed, err := src.ParsePosition(st.Position); err == nil {
+		pos, ok := parsed.(pgsource.Position)
+		if !ok {
+			st.Note = "目标库里的位点本工具不认识，可能被别的程序写过"
+			return st, nil
+		}
+		if !pos.IsZero() {
+			if cur, err := src.CurrentLSN(ctx); err == nil {
+				st.LagBytes = int64(cur.LSN) - int64(pos.LSN)
+				if st.LagBytes < 0 {
+					st.LagBytes = 0
+				}
 			}
 		}
 	}
