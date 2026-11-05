@@ -9,11 +9,14 @@ package pgsink
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -72,6 +75,10 @@ type Sink struct {
 	tables map[string]*tableInfo
 	order  []string
 
+	// ownerToken 让「同一个进程里的两个 Sink」也彼此可分（否则它们同 pid、
+	// 同 instance_id，第二个会把第一个的租约抢走）。
+	ownerToken string
+
 	// CountSource / FingerprintSource are injected by the engine so Verify can
 	// compare both sides without this package importing the source.
 	CountSource       func(ctx context.Context, ref source.TableRef) (int64, error)
@@ -98,7 +105,7 @@ func Open(ctx context.Context, opt Options) (*Sink, error) {
 		opt.OnExists = "error"
 	}
 	tables, order := buildTables(opt.Catalog)
-	s := &Sink{opt: opt, tables: tables, order: order}
+	s := &Sink{opt: opt, tables: tables, order: order, ownerToken: newOwnerToken()}
 	conn, err := pgwire.Connect(ctx, opt.Target)
 	if err != nil {
 		return nil, err
@@ -305,21 +312,27 @@ func (s *Sink) Position(ctx context.Context) (string, error) {
 
 // AcquireLease takes the job's lease, or reports who else holds it.
 //
-// 判断顺序在 leaseTakeover 里（纯函数，有单测）：过期可接管；别的实例不可；
-// 同一台机器上「pid 还活着」不可、「pid 已死」立刻接管（kill -9 后的重启
-// 不用等 30 秒）。抢租约用一条带条件的 UPDATE，命中 0 行说明被抢先了。
+// 判定在 leaseTakeover 里（纯函数、有单测）。读-判-写放在**一个事务**里，并且
+// `SELECT ... FOR UPDATE` 锁住那一行：否则两个进程可能同时读到「没人持有」，
+// 然后都写成功——那正是 Owl 指出的「同 instance_id 无条件抢租约」的后果。
 func (s *Sink) AcquireLease(ctx context.Context, ttl time.Duration) (bool, string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	label := leaseOwnerLabel(s.opt.JobName, os.Getpid())
+	label := leaseOwnerLabel(s.opt.JobName, os.Getpid(), s.ownerToken)
 	now := time.Now()
 
-	cur, exists, err := s.readLeaseLocked(ctx)
+	tx, err := s.conn.Begin(ctx)
 	if err != nil {
 		return false, "", err
 	}
-	ok, why := leaseTakeover(cur, exists, now, s.opt.InstanceID, os.Getpid(), processAlive)
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	cur, exists, err := s.readLeaseForUpdate(ctx, tx)
+	if err != nil {
+		return false, "", err
+	}
+	ok, why := leaseTakeover(cur, exists, now, s.opt.InstanceID, os.Getpid(), s.ownerToken, processAlive)
 	if !ok {
 		return false, why, nil
 	}
@@ -327,27 +340,47 @@ func (s *Sink) AcquireLease(ctx context.Context, ttl time.Duration) (bool, strin
 	if !exists {
 		q := fmt.Sprintf(`INSERT INTO %s (job_key, instance_id, label, expires_at)
 			VALUES ($1,$2,$3, now() + $4::interval)`, s.stateTable("_jl_lease"))
-		if _, err := s.conn.Exec(ctx, q, s.opt.JobKey, s.opt.InstanceID, label, ttl); err != nil {
-			if pgwire.SQLState(err) == "23505" { // unique_violation：被抢先
-				return false, "另一个进程刚刚抢先拿到了租约", nil
-			}
+		if _, err := tx.Exec(ctx, q, s.opt.JobKey, s.opt.InstanceID, label, ttl); err != nil {
 			return false, "", err
 		}
-		return true, why, nil
+	} else {
+		q := fmt.Sprintf(`UPDATE %s SET instance_id=$1, label=$2, expires_at=now() + $3::interval
+			WHERE job_key=$4`, s.stateTable("_jl_lease"))
+		if _, err := tx.Exec(ctx, q, s.opt.InstanceID, label, ttl, s.opt.JobKey); err != nil {
+			return false, "", err
+		}
 	}
-
-	q := fmt.Sprintf(`UPDATE %s SET instance_id=$1, label=$2, expires_at=now() + $3::interval
-		WHERE job_key=$4 AND (expires_at < now() OR instance_id=$1)`,
-		s.stateTable("_jl_lease"))
-	tag, err := s.conn.Exec(ctx, q, s.opt.InstanceID, label, ttl, s.opt.JobKey)
-	if err != nil {
+	if err := tx.Commit(ctx); err != nil {
 		return false, "", err
-	}
-	if tag.RowsAffected() == 0 {
-		return false, "另一个实例刚刚抢先拿到了租约", nil
 	}
 	return true, why, nil
 }
+
+// readLeaseForUpdate locks the lease row for the duration of the decision.
+func (s *Sink) readLeaseForUpdate(ctx context.Context, tx pgx.Tx) (leaseRow, bool, error) {
+	q := fmt.Sprintf(`SELECT instance_id, COALESCE(label,''), expires_at FROM %s WHERE job_key=$1 FOR UPDATE`,
+		s.stateTable("_jl_lease"))
+	var row leaseRow
+	err := tx.QueryRow(ctx, q, s.opt.JobKey).Scan(&row.InstanceID, &row.Label, &row.Expires)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return leaseRow{}, false, nil
+	}
+	if err != nil {
+		return leaseRow{}, false, err
+	}
+	return row, true, nil
+}
+
+// newOwnerToken 给每个 Sink 一个进程内唯一、跨进程也不冲突的标识。
+func newOwnerToken() string {
+	var b [6]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("%d", ownerSeq.Add(1))
+	}
+	return hex.EncodeToString(b[:])
+}
+
+var ownerSeq atomic.Uint32
 
 // readLeaseLocked loads the current lease row (caller holds mu).
 func (s *Sink) readLeaseLocked(ctx context.Context) (leaseRow, bool, error) {
@@ -370,8 +403,9 @@ func (s *Sink) RenewLease(ctx context.Context, ttl time.Duration) (bool, error) 
 	defer s.mu.Unlock()
 
 	q := fmt.Sprintf(`UPDATE %s SET expires_at = now() + $1::interval
-		WHERE job_key=$2 AND instance_id=$3`, s.stateTable("_jl_lease"))
-	tag, err := s.conn.Exec(ctx, q, ttl, s.opt.JobKey, s.opt.InstanceID)
+		WHERE job_key=$2 AND instance_id=$3 AND label=$4`, s.stateTable("_jl_lease"))
+	tag, err := s.conn.Exec(ctx, q, ttl, s.opt.JobKey, s.opt.InstanceID,
+		leaseOwnerLabel(s.opt.JobName, os.Getpid(), s.ownerToken))
 	if err != nil {
 		return false, err
 	}
@@ -383,8 +417,10 @@ func (s *Sink) ReleaseLease(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	q := fmt.Sprintf(`DELETE FROM %s WHERE job_key=$1 AND instance_id=$2`, s.stateTable("_jl_lease"))
-	_, err := s.conn.Exec(ctx, q, s.opt.JobKey, s.opt.InstanceID)
+	q := fmt.Sprintf(`DELETE FROM %s WHERE job_key=$1 AND instance_id=$2 AND label=$3`,
+		s.stateTable("_jl_lease"))
+	_, err := s.conn.Exec(ctx, q, s.opt.JobKey, s.opt.InstanceID,
+		leaseOwnerLabel(s.opt.JobName, os.Getpid(), s.ownerToken))
 	return err
 }
 

@@ -260,3 +260,53 @@ func dump(t *testing.T, conn *pgx.Conn, table string) []string {
 	}
 	return out
 }
+
+// Owl 要的那条：两个持有**同一个 instance_id** 的句柄，第二个在租约未过期时抢不到。
+// 没有这条，同一台机器上两次 `run --job X` 会同时写同一张目标表。
+func TestLeaseNotStolenBySameInstance(t *testing.T) {
+	_, dstDSN := dsns(t)
+	dst := mustConn(t, dstDSN)
+	exec(t, dst, "DROP TABLE IF EXISTS _jl_meta, _jl_chunk, _jl_lease, _jl_object, _jl_instance")
+
+	cfg := cfgOf(t, dstDSN)
+	ep := dsn.Endpoint{Kind: "postgres", Host: cfg.Host, Port: int(cfg.Port),
+		Database: cfg.Database, Username: cfg.User, Password: cfg.Password,
+		Params: map[string]string{"sslmode": "disable"}}
+	opts := pgsink.Options{Target: ep, JobKey: "leasejob01", JobName: "lease-job",
+		InstanceID: "same-instance", Schema: "public"}
+
+	ctx := context.Background()
+	first, err := pgsink.Open(ctx, opts)
+	if err != nil {
+		t.Fatalf("打开第一个句柄失败: %v", err)
+	}
+	defer first.Close()
+	ok, why, err := first.AcquireLease(ctx, time.Minute)
+	if err != nil || !ok {
+		t.Fatalf("第一个句柄应拿到租约: ok=%v err=%v why=%s", ok, err, why)
+	}
+
+	second, err := pgsink.Open(ctx, opts)
+	if err != nil {
+		t.Fatalf("打开第二个句柄失败: %v", err)
+	}
+	defer second.Close()
+	ok, why, err = second.AcquireLease(ctx, time.Minute)
+	if err != nil {
+		t.Fatalf("第二个句柄取租约报错: %v", err)
+	}
+	if ok {
+		t.Fatal("同一个 instance_id 的第二个句柄不该抢到未过期的租约（会双写）")
+	}
+	if !strings.Contains(why, "还有一个进程") {
+		t.Fatalf("拒绝时要说清是谁在跑，得到: %s", why)
+	}
+
+	// 第一个仍然有效：续租成功，第二个续租失败（它没有租约）
+	if ok, err := first.RenewLease(ctx, time.Minute); err != nil || !ok {
+		t.Fatalf("第一个句柄应能续租: ok=%v err=%v", ok, err)
+	}
+	if ok, _ := second.RenewLease(ctx, time.Minute); ok {
+		t.Fatal("没拿到租约的句柄不该续租成功")
+	}
+}
