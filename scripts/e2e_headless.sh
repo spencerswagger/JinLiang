@@ -2,7 +2,7 @@
 # 验收 ④：不经浏览器，纯 curl 走完整条链。
 #
 #   serve → 建连接（测连返回版本）→ 枚举库表 → 建任务 → 预检 → run（桩）
-#         → 读 SSE 看到阶段变化 → export 出 yaml → 重启进程 → 数据还在
+#         → 真引擎全量（PG→PG）→ 读 SSE 看到阶段与进度 → export 出 yaml → 重启进程 → 数据还在
 #
 # 需要：一个能连的 PostgreSQL（JINLIANG_TEST_PG_DSN）与 MySQL（JINLIANG_TEST_MYSQL_DSN）。
 # 依赖：curl、python3（只用标准库，不装任何包）。
@@ -192,8 +192,13 @@ else
 fi
 
 say "3. 枚举库表（catalog）"
-# 不传 schema：让服务端列出它自己认的第一个 schema，脚本才对 PG/MySQL 都成立。
-api GET "/api/catalog?connection_id=${CONN_ID}" >"${WORK}/cat.json"
+# PostgreSQL 显式点 public：库里有多个 schema 时（比如引擎自己建的 _jl_* 目标 schema），
+# 依赖「默认 schema」会让脚本挑到空 schema 或引擎元数据表，e2e 就不稳定。
+if [ "${SRC_LABEL}" = "postgres" ]; then
+  api GET "/api/catalog?connection_id=${CONN_ID}&schema=public" >"${WORK}/cat.json"
+else
+  api GET "/api/catalog?connection_id=${CONN_ID}" >"${WORK}/cat.json"
+fi
 SRC_SCHEMA=$(json '["schema"]' <"${WORK}/cat.json")
 TABLE=$(python3 - "${WORK}/cat.json" <<'PY'
 import json,sys
@@ -201,7 +206,11 @@ d=json.load(open(sys.argv[1]))
 tables=d.get("tables") or []
 if not tables:
     print(""); raise SystemExit
-# 选一张有主键的表，预检更干净
+names=[t["table"] for t in tables]
+# fixture 建的 e2e_customers 是这条链路的固定样本；它不在才退回「第一张有主键的表」。
+# 不能直接取第一张有主键的表：引擎自己的 _jl_* 元数据表也有主键，会把 e2e 带偏。
+if "e2e_customers" in names:
+    print("e2e_customers"); raise SystemExit
 for t in tables:
     if t.get("primary_key"):
         print(t["table"]); raise SystemExit

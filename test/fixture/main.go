@@ -60,7 +60,10 @@ func fixturePG(ctx context.Context, raw string) error {
 			message text
 		)`,
 		// B1 引擎是 PG→PG：e2e 用这条 schema 当目标端，避免与源端 public 撞表。
-		`CREATE SCHEMA IF NOT EXISTS jl_e2e_out`,
+		// 每次都重建：目标端留着上一轮的 `_jl_meta` 与表时，引擎会认为「已经同步过」
+		// 而不再搬数据，e2e 就看不到 snapshot/progress（本地复跑会假绿）。
+		`DROP SCHEMA IF EXISTS jl_e2e_out CASCADE`,
+		`CREATE SCHEMA jl_e2e_out`,
 		`INSERT INTO e2e_customers (name, city)
 		 SELECT 'demo-'||g, 'city-'||(g%5)
 		 FROM generate_series(1,3) g
