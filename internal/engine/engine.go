@@ -186,6 +186,12 @@ type runner struct {
 
 	phase   state.Phase
 	leaseOK bool
+	// 丢掉租约必须让整个 run 停下来：光 emit 一句「本进程停止写入」而写路径照跑，
+	// 等于两个进程同时写同一张目标表。
+	leaseLost atomic.Bool
+	leaseWhy  atomic.Value // string
+	cancelRun context.CancelFunc
+	leaseTick time.Duration
 
 	snapshotName    string
 	consistentPoint pgsource.Position
@@ -202,7 +208,11 @@ type runner struct {
 	lastLagB int64
 }
 
-func (r *runner) execute(ctx context.Context, res *Result) error {
+func (r *runner) execute(parent context.Context, res *Result) error {
+	ctx, cancel := context.WithCancel(parent)
+	r.cancelRun = cancel
+	defer cancel()
+
 	defer func() {
 		res.Phase = r.phase
 		res.RowsCopied = r.rowsCopied
@@ -227,6 +237,9 @@ func (r *runner) execute(ctx context.Context, res *Result) error {
 
 	if r.needSnapshot {
 		if err := r.snapshot(ctx); err != nil {
+			if r.leaseLost.Load() {
+				return r.fail(ctx, r.leaseLostError())
+			}
 			if errors.Is(err, context.Canceled) {
 				return r.drain(ctx, ExitStopped, "收到停止信号：全量阶段已停在块边界")
 			}
@@ -257,6 +270,9 @@ func (r *runner) execute(ctx context.Context, res *Result) error {
 	}
 
 	if err := r.stream(ctx, res); err != nil {
+		if r.leaseLost.Load() {
+			return r.fail(ctx, r.leaseLostError())
+		}
 		var stopped *stoppedError
 		if errors.As(err, &stopped) {
 			code := ExitStopped
@@ -269,6 +285,9 @@ func (r *runner) execute(ctx context.Context, res *Result) error {
 			return r.drain(ctx, ExitStopped, "收到停止信号：已把手上这个事务提交完")
 		}
 		return r.fail(ctx, err)
+	}
+	if r.leaseLost.Load() {
+		return r.fail(ctx, r.leaseLostError())
 	}
 	if err := r.drain(ctx, ExitOK, "增量追平"); err != nil {
 		return err
@@ -557,23 +576,72 @@ func (r *runner) prepare(ctx context.Context) error {
 }
 
 func (r *runner) renewLease(ctx context.Context) {
-	t := time.NewTicker(r.leaseTTL / 3)
+	interval := r.leaseTTL / 3
+	if r.leaseTick > 0 {
+		interval = r.leaseTick
+	}
+	r.watchLease(ctx, interval, func(c context.Context) (bool, error) {
+		return r.sink.RenewLease(c, r.leaseTTL)
+	})
+}
+
+// watchLease keeps the lease alive; the moment it is lost it cancels the whole
+// run. 只有「真的停下来」才算数：emit 一句话然后继续写是最坏的结果。
+func (r *runner) watchLease(ctx context.Context, interval time.Duration, renew func(context.Context) (bool, error)) {
+	if interval <= 0 {
+		interval = 10 * time.Second
+	}
+	t := time.NewTicker(interval)
 	defer t.Stop()
+	failures := 0
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			ok, err := r.sink.RenewLease(context.Background(), r.leaseTTL)
-			if err == nil && !ok {
-				r.emit(context.Background(), control.Event{
-					Type: "error", Code: string(core.CodeJobRunningElsewhere),
-					Message: "租约被别的实例接管了，本进程停止写入",
-				})
+			ok, err := renew(context.Background())
+			if err != nil {
+				// 一次网络抖动不算丢；连续两次续不上就当丢了（TTL 还有余量）。
+				failures++
+				if failures < 2 {
+					continue
+				}
+				r.loseLease(fmt.Sprintf("续租连续失败：%v", err))
+				return
+			}
+			failures = 0
+			if !ok {
+				r.loseLease("租约被别的实例接管了")
 				return
 			}
 		}
 	}
+}
+
+// loseLease marks the run as lost and stops every writer.
+func (r *runner) loseLease(why string) {
+	r.leaseWhy.Store(why)
+	r.leaseLost.Store(true)
+	r.emit(context.Background(), control.Event{
+		Type: "error", Code: string(core.CodeJobRunningElsewhere),
+		Message: "租约丢了（" + why + "）：本进程立刻停止写入，这一轮按失败收尾",
+	})
+	if r.cancelRun != nil {
+		r.cancelRun()
+	}
+}
+
+// leaseLostError is what the run ends with after losing the lease.
+type leaseLostError struct{ why string }
+
+func (e *leaseLostError) Error() string {
+	return "租约丢了（" + e.why + "）：另一个实例接管了这个任务，本进程已停止写入。" +
+		"这一轮记成失败，重启会从目标端 _jl_meta 的位点接着跑"
+}
+
+func (r *runner) leaseLostError() error {
+	why, _ := r.leaseWhy.Load().(string)
+	return &leaseLostError{why: why}
 }
 
 func (r *runner) teardown() {
@@ -880,6 +948,8 @@ func (r *runner) fail(ctx context.Context, err error) error {
 		code = core.CodeJobRunningElsewhere
 	case errors.Is(err, pgsink.ErrTargetTableExists):
 		code = core.CodeTargetTableExists
+	case errors.As(err, new(*leaseLostError)):
+		code = core.CodeJobRunningElsewhere
 	case errors.As(err, new(*reusedTableRecopyError)):
 		code = core.CodeTargetTableExists // 目标表不是我们的：按「撞表」行为停下，不覆盖
 	case pgsource.IsPositionGap(err):
@@ -971,6 +1041,9 @@ func (r *runner) note(ctx context.Context, msg string) {
 }
 
 func (r *runner) emit(ctx context.Context, ev control.Event) {
+	if r.opt.Store == nil { // 单测里没有控制库：事件流不是被测对象
+		return
+	}
 	ev.JobID = r.job.ID
 	ev.RunID = r.run.ID
 	if ev.Phase == "" {
