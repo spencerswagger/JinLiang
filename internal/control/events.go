@@ -114,6 +114,11 @@ func (b *Bus) Epoch() string {
 // 「取快照 → cancel 关闭 → 发送」这个交错就是 panic: send on closed channel，
 // 而调用方是 go r.loop(...) 这个没有 recover 的 goroutine —— 用户关一次任务页
 // 就可能把整个进程带走。发送本身是非阻塞的（default 丢弃），持锁不会拖慢发布。
+//
+// 不变量（TestPublishNeverBlocks 锁着）：对订阅者的发送必须是**非阻塞**的。
+// 一旦有人把 `select { case ch <- ev: default: }` 改成裸 `ch <- ev`，一个不读的
+// 客户端（慢手机、断线但 TCP 还没断）就会把持锁的 Publish 卡死，所有 job 的事件
+// 一起停摆，最后 HTTP 超时。环缓冲才是补档的真相，丢弃是设计而不是 bug。
 func (b *Bus) Publish(ev Event) Event {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -189,6 +194,21 @@ func (b *Bus) Replay(jobID, epoch string, afterSeq int64) (events []Event, epoch
 		}
 	}
 	return events, true
+}
+
+// EventTypes is the closed set of event names the SSE stream may emit and the
+// browser subscribes to (web/static/app.js hardcodes the same list — 加新类型要
+// 同时改两处，否则浏览器会静默丢掉带 event: 的消息)。
+var EventTypes = []string{"phase", "progress", "note", "error", "done"}
+
+// IsEventType reports whether t is one of EventTypes.
+func IsEventType(t string) bool {
+	for _, ev := range EventTypes {
+		if t == ev {
+			return true
+		}
+	}
+	return false
 }
 
 // ErrorEvent builds a four-part error event from the shared catalogue.

@@ -36,6 +36,10 @@ type Run struct {
 	FinishReason string `json:"finish_reason,omitempty"`
 }
 
+// DefaultHeartbeatInterval is how often a running job refreshes heartbeat_at.
+// 进程被杀时没有心跳，`serve` 启动时按 StaleAfter(3×) 判死并收尾。
+const DefaultHeartbeatInterval = 30 * time.Second
+
 // Finish reasons. "stopped" must never look like a successful completion.
 const (
 	FinishCompleted   = "completed"
@@ -58,7 +62,7 @@ func (s *Store) StartRun(ctx context.Context, jobID string, phase state.Phase) (
 		r.ID, r.JobID, string(r.Phase), r.StartedAt, r.HeartbeatAt, r.OwnerInstance); err != nil {
 		// 唯一索引 idx_runs_one_active 把「一个任务两个活跃 run」关死在库层面。
 		if strings.Contains(err.Error(), "UNIQUE") {
-			return Run{}, fmt.Errorf("%w: 这个任务已经有一条未结束的运行（可能是上次进程被杀的残留，稍后会自动标记为 interrupted）", ErrConflict)
+			return Run{}, fmt.Errorf("%w: 这个任务已经有一条未结束的运行（多半是上次进程被杀的残留）。跑一次 `jinliang serve` 会替它收尾（心跳过期后标成 interrupted）", ErrConflict)
 		}
 		return Run{}, fmt.Errorf("写入运行记录失败: %w", err)
 	}
@@ -93,8 +97,10 @@ func (s *Store) UpdateRunPhase(ctx context.Context, runID string, to state.Phase
 }
 
 // TouchRun refreshes the liveness heartbeat for a running run.
+// 只更新未结束的行：收尾与心跳是并发的，别让一个迟到的 tick 把 ended_at 的行改活。
 func (s *Store) TouchRun(ctx context.Context, runID string) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE runs SET heartbeat_at = ? WHERE id = ?`, s.nowText(), runID)
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE runs SET heartbeat_at = ? WHERE id = ? AND ended_at IS NULL`, s.nowText(), runID)
 	return err
 }
 
@@ -106,12 +112,15 @@ func (s *Store) TouchRun(ctx context.Context, runID string) error {
 // 会拿到新的 boot epoch，但 run 的 owner_instance 是部署身份，重启后不变。
 func (s *Store) RecoverStaleRuns(ctx context.Context, staleAfter time.Duration) (int, error) {
 	if staleAfter <= 0 {
-		staleAfter = 2 * time.Minute
+		staleAfter = StaleAfter(s.heartbeat)
 	}
 	cutoff := s.now().Add(-staleAfter).UTC().Format(time.RFC3339)
+	// phase 也要落到可表达的终态：否则历史页会永久显示「增量中」「已暂停」。
+	// interrupted 记成 failed（它确实没跑完），靠 finish_reason 区分「失败」和「被中断」。
 	res, err := s.db.ExecContext(ctx,
 		`UPDATE runs
 		    SET ended_at = ?, finish_reason = ?,
+		        phase = CASE WHEN phase IN ('done','failed') THEN phase ELSE 'failed' END,
 		        last_error = COALESCE(last_error, '进程在运行中被终止，心跳已过期；这一轮没有正常收尾')
 		  WHERE ended_at IS NULL
 		    AND COALESCE(heartbeat_at, started_at) < ?`,
@@ -129,7 +138,11 @@ func (s *Store) FinishRun(ctx context.Context, runID string, to state.Phase, las
 	if err != nil {
 		return Run{}, err
 	}
-	if !state.CanTransition(cur.Phase, to) {
+	// 手动停止是唯一允许「不走阶段表」的收尾：用户可以在 preflight（还没动过数据）
+	// 就按停止，而阶段表里 preflight 只能去 prepare/idle/failed。把它记成 failed
+	// 会在历史页显示「失败」，那是撒谎。停止的语义由 finish_reason=stopped 表达，
+	// 阶段统一落 done。
+	if !state.CanTransition(cur.Phase, to) && finishReason != FinishStopped {
 		return Run{}, fmt.Errorf("非法的阶段迁移 %s → %s（这是程序错误）", cur.Phase, to)
 	}
 	if _, err := s.db.ExecContext(ctx,

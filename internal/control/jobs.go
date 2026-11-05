@@ -212,6 +212,21 @@ func (s *Store) UpdateJob(ctx context.Context, id string, in JobInput) (Job, err
 		return Job{}, fmt.Errorf("%w: %v", ErrInvalid, err)
 	}
 	key := state.JobKey(identityDSN(src), identityDSN(tgt), doc.ScopeFingerprint())
+	if key != cur.JobKey {
+		// 改连接或改表范围 = 换身份。B1 起目标端的同步元数据（_jl_meta）是按
+		// job_key 存的，静默重算会让旧身份下的状态变成孤儿：新 run 从头再来，
+		// 旧书签没人回收，用户看到的是「数据重复」而不是「你改了配置」。
+		// 有运行历史就硬挡；没有历史（刚建还没跑过）允许改，那是正常的编辑。
+		var runs int
+		if err := s.db.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM runs WHERE job_id = ?`, id).Scan(&runs); err != nil {
+			return Job{}, err
+		}
+		if runs > 0 {
+			return Job{}, fmt.Errorf("%w：这个任务已经有 %d 条运行历史，换连接或改表范围会换掉它的身份（指纹 %s → %s），目标库里的同步状态会变成孤儿。要换就新建一个任务，再停用这个",
+				ErrIdentityLocked, runs, cur.JobKey, key)
+		}
+	}
 	specJSON, err := json.Marshal(doc)
 	if err != nil {
 		return Job{}, err

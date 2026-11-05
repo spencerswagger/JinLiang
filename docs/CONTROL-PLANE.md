@@ -84,6 +84,21 @@ CREATE TABLE audit (
 
 连接与任务的增删改查全部走服务端；UI 只提交字段，不提交 SQL。
 
+**运行存活语义**（B0 起生效）：
+
+- `heartbeat_at` 由运行中的独立 ticker 每 30s 刷新（`--heartbeat` / `JINLIANG_HEARTBEAT_SECONDS`
+  可调，5–600s）。**与阶段推进无关**：暂停、长事务、卡在一次大 batch 里都照打，
+  否则「活着但没动」的 run 会被下一次启动误判为死掉。
+- 过期阈值 = **3× 心跳**（默认 90s），`serve` 启动时打印，并按它执行 `RecoverStaleRuns`：
+  心跳过期的 open run 标 `finish_reason=interrupted`、`phase=failed`、写一条审计。
+- 迁移 v2 只收尾**心跳过期**的遗留行；心跳新鲜的 open run 留给它自己的进程收尾——
+  只跑 200ms 的 `doctor`/`export` 也会打开同一个控制库，它无权替别人判死。
+- 收尾一律落到可表达终态（done/failed），历史页用 `finish_reason` 覆盖显示
+  「已完成 / 已停止 / 已中断 / 失败」：`phase=done` 既可能是跑完也可能是手动停止，
+  只看 phase 会撒谎。手动停止是唯一允许不走阶段表的收尾（在 preflight 也能停）。
+- 有运行历史的任务**不许换连接/改表范围**（会换 job_key，目标端同步状态变孤儿），
+  返回 `ErrIdentityLocked`；要换就新建任务。
+
 ## 4. API 面
 
 | 方法 | 路径 | 说明 |
@@ -119,12 +134,17 @@ data: {"epoch":"…","reason":"控制面进程重启过，之前的事件序号�
   最多重复一次；反过来写会永久丢事件。
 - 浏览器必须 `addEventListener('<type>')`，不能只挂 `onmessage`（带 `event:` 的帧不会进 onmessage）。
 - 心跳是注释行 `: ping`（15s），不影响事件解析。
+- `event:` 名是**闭集** `phase|progress|note|error|done`：服务端遇到未知 type 会退回「无名事件」
+  （只发 `id`+`data`，落 `onmessage`），否则浏览器按名字订阅会静默丢掉它。加新 type 要同时改
+  `control.EventTypes` 与 `web/static/app.js`。
+- `Last-Event-ID` 只带序号（没有 epoch）一律当作未知 epoch：发 `reset`，不从环形缓冲里按数字补。
 
 ### 4B. 导入/导出的多文档语义
 
 - `export --all` 与 `GET /api/export` 写出 `---` 分隔的**多文档**流，一份一个任务。
 - 导入逐份解析：`import` 回报「导入 N 份 / 跳过 M 份」并逐条列出跳过原因；
-  **有跳过时 CLI 退出码非 0、HTTP 返回 207**——备份没有完整恢复不能看起来像成功。
+  **有跳过时 CLI 退出码非 0**；HTTP 分档：部分成功 `207`、**一份都没进 `422`**
+  （207 属于 2xx，`curl -f` 会当成功，那和「不能看起来像成功」矛盾）。
 - 空文档（只有注释/空白）跳过；单文档入口（`ParseJobYAML`）收到多份会明确报错，不静默取第一份。
 
 错误一律走 `internal/core/codes.go` 的结构：`{code, class, message, why, next[], risk}`，UI 直接渲染四段式卡片，不需要翻译。

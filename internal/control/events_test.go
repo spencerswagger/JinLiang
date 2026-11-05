@@ -3,6 +3,7 @@ package control
 import (
 	"sync"
 	"testing"
+	"time"
 )
 
 // P0-1 回归：Publish 在过去是「锁外往快照 channel 发」，cancel() 会在摘除后
@@ -93,5 +94,31 @@ func TestReplayRefusesForeignEpoch(t *testing.T) {
 	events, ok := bus.Replay("j", "first", 0)
 	if !ok || len(events) != 1 {
 		t.Fatalf("同 epoch 回放 = %d 条, ok=%v", len(events), ok)
+	}
+}
+
+// C-5：不变量——对订阅者的发送必须非阻塞。
+//
+// 取消掉的、断线但 TCP 还没断的、只是不读的客户端，都不能让 Publish 停下来。
+// 这个测试订阅之后**一个事件都不读**，然后连发 200 条：缓冲满了以后旧实现里的
+// 裸 `ch <- ev` 会永久卡住（<-ch 没人收），而正确实现靠 default 丢弃、立刻返回。
+// 环缓冲才是补档的真相。
+func TestPublishNeverBlocksOnSlowSubscriber(t *testing.T) {
+	bus := NewBus(nil)
+	_, cancel := bus.Subscribe("job-1") // 故意不读，也不取消
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		for i := 0; i < 200; i++ {
+			bus.Publish(Event{JobID: "job-1", Type: "progress"})
+		}
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Publish 被不读事件的订阅者卡住了：发送必须是非阻塞的（select/default）")
 	}
 }

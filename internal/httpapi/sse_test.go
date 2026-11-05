@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/spencerswagger/jinliang/internal/control"
 )
 
 // sseFrame 是流里的一帧（id/event/data）。
@@ -197,6 +199,56 @@ func createOnceJob(t *testing.T, ts *httptest.Server, token, connID string) stri
 		t.Fatalf("no job id: %v", created)
 	}
 	return id
+}
+
+// A1 回归：升级前的老页面只会带裸数字 seq（没有 epoch）。它属于「上一辈子的
+// 计数器」，拿去跟当前 seq 比就是静默丢事件；必须当未知 epoch → 发 reset。
+func TestSSEBareNumericLastEventIDTriggersReset(t *testing.T) {
+	ts, _ := newTestServer(t)
+	token := setupAdmin(t, ts)
+	connID := createPGConn(t, ts, token, "src")
+	jobID := createOnceJob(t, ts, token, connID)
+	doJSON(t, http.MethodPost, ts.URL+"/api/jobs/"+jobID+"/run", token, nil)
+
+	// 先等出几个事件，确保环形缓冲里确实有东西（否则「补回 0 条」没有意义）。
+	readSSEFrames(t, ts.URL+"/api/jobs/"+jobID+"/events", token, "", 15*time.Second, true)
+
+	frames := readSSEFrames(t, ts.URL+"/api/jobs/"+jobID+"/events", token, "3", 10*time.Second, true)
+	if len(frames) == 0 {
+		t.Fatal("裸数字 id 重连后什么都没收到")
+	}
+	if frames[0].Event != "reset" {
+		t.Fatalf("裸数字 Last-Event-ID 必须先发 reset，实际第一帧 event=%q", frames[0].Event)
+	}
+	if !strings.Contains(frames[0].Data, "epoch") {
+		t.Fatalf("reset 要说清楚为什么重置: %s", frames[0].Data)
+	}
+}
+
+// C6 回归：SSE 的 type 是闭集（app.js 逐类型 addEventListener）。
+// 未知 type 若带 event: 行，浏览器会静默丢掉；服务端要退回无名事件。
+func TestSSEUnknownTypeFallsBackToUnnamedEvent(t *testing.T) {
+	ts, store := newTestServer(t)
+	token := setupAdmin(t, ts)
+	connID := createPGConn(t, ts, token, "src")
+	jobID := createOnceJob(t, ts, token, connID)
+
+	store.Bus().Publish(control.Event{JobID: jobID, Type: "brand-new-type", Message: "未来才有的类型"})
+	store.Bus().Publish(control.Event{JobID: jobID, Type: "done", Message: "结束"})
+
+	frames := readSSEFrames(t, ts.URL+"/api/jobs/"+jobID+"/events", token, "", 5*time.Second, true)
+	var found bool
+	for _, f := range frames {
+		if strings.Contains(f.Data, "brand-new-type") {
+			found = true
+			if f.Event != "" {
+				t.Fatalf("未知 type 不应带 event: 行（浏览器会丢），实际 %q", f.Event)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("未知 type 的事件没有出现在流里")
+	}
 }
 
 func parseIDForTest(id string) (epoch string, seq int64, ok bool) {

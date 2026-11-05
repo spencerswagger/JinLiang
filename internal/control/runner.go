@@ -160,6 +160,12 @@ func (r *Runner) loop(job Job, run Run, ctl *runControl) {
 		delete(r.active, ctl.jobID)
 		r.mu.Unlock()
 	}()
+	// 独立心跳：阶段推进可能几分钟不发生（长 streaming、暂停），只有阶段推进时打心跳
+	// 会让「活着但没动」的 run 被下一次 serve 判死（Ark P0-3）。暂停期间也照打。
+	hbCtx, hbCancel := context.WithCancel(context.Background())
+	defer hbCancel()
+	go r.heartbeat(hbCtx, ctl, run.ID)
+
 	// 这个 goroutine 是 go r.loop(...) 起的，没人接它的 panic：一次 panic 就是整个
 	// 控制台进程退出，用户正在看的页面直接断。兜住它，把这一轮标失败，进程继续活。
 	defer func() {
@@ -212,6 +218,23 @@ func (r *Runner) loop(job Job, run Run, ctl *runControl) {
 		Stub:    true,
 	})
 	_ = r.store.Audit(ctx, ActorStub, ActionRunStub, map[string]any{"job_id": job.ID, "run_id": run.ID})
+}
+
+// heartbeat refreshes runs.heartbeat_at on its own ticker until the run ends.
+// 与阶段无关：暂停、长事务、卡在一次大 batch 里都不影响它。
+func (r *Runner) heartbeat(ctx context.Context, ctl *runControl, runID string) {
+	t := time.NewTicker(r.store.HeartbeatInterval())
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ctl.done:
+			return
+		case <-t.C:
+			_ = r.store.TouchRun(context.Background(), runID)
+		}
+	}
 }
 
 // gate blocks while the run is paused. It returns false when the run must stop.

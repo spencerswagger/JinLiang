@@ -57,13 +57,18 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 
 	fmt.Fprint(w, "retry: 3000\n\n")
 
+	// lastEpoch == "" 有两种来源：老页面只会带裸数字 seq（升级前的服务端不发 epoch），
+	// 或者客户端自己拼了个数字。两种都属于「未知 epoch」——裸数字是上一辈子的进程
+	// 计数器，拿去跟当前 seq 比就是静默丢事件。所以一律先 reset 再从当前缓冲重发。
+	unknownEpoch := haveLast && lastEpoch == ""
+
 	if haveLast {
-		if events, epochOK := s.store.Bus().Replay(jobID, lastEpoch, lastSeq); epochOK {
+		if events, epochOK := s.store.Bus().Replay(jobID, lastEpoch, lastSeq); epochOK && !unknownEpoch {
 			lastSeq = writeSSEList(w, events, lastSeq)
 		} else {
-			// 另一个进程生命周期的事件流：旧 seq 与新的没有可比性。
+			// 另一个进程生命周期（或无法识别）的事件流：旧 seq 与新的没有可比性。
 			// 明确告诉客户端「重置」，而不是让它拿着错位的序号继续。
-			writeSSEReset(w, s.store.Bus().Epoch())
+			writeSSEReset(w, s.store.Bus().Epoch(), unknownEpoch)
 			events, _ := s.store.Bus().Replay(jobID, "", 0)
 			lastSeq = writeSSEList(w, events, 0)
 		}
@@ -115,12 +120,17 @@ func writeSSEList(w http.ResponseWriter, events []control.Event, since int64) in
 	return since
 }
 
-// writeSSEReset tells a reconnecting client that the process restarted: the ids
-// it remembers belong to a stream that no longer exists.
-func writeSSEReset(w http.ResponseWriter, epoch string) {
+// writeSSEReset tells a reconnecting client that the ids it remembers belong to
+// a stream we cannot match: the process restarted, or the id carried no epoch at
+// all (an old page from before epochs existed).
+func writeSSEReset(w http.ResponseWriter, epoch string, noEpoch bool) {
+	reason := "控制面进程重启过，之前的事件序号已经失效；下面从这一轮的开头重新发送"
+	if noEpoch {
+		reason = "这个 Last-Event-ID 没有 epoch（升级前的客户端只会发序号），无法判断断档位置；下面从这一轮的开头重新发送"
+	}
 	payload, err := json.Marshal(map[string]string{
 		"epoch":  epoch,
-		"reason": "控制面进程重启过，之前的事件序号已经失效；下面从这一轮的开头重新发送",
+		"reason": reason,
 	})
 	if err != nil {
 		return
@@ -134,6 +144,13 @@ func writeSSE(w http.ResponseWriter, ev control.Event) bool {
 	payload, err := json.Marshal(ev)
 	if err != nil {
 		return true // 跳过坏事件，别把流打断
+	}
+	// type 必须是浏览器订阅过的那几种（app.js 逐类型 addEventListener）。
+	// 将来的新 type 如果直接带 event: 行，浏览器会静默丢弃这条消息；
+	// 所以未知 type 退回「无名事件」，至少还能落到 onmessage 上被看见。
+	if !control.IsEventType(ev.Type) {
+		_, err = fmt.Fprintf(w, "id: %s\ndata: %s\n\n", ev.SSEID(), payload)
+		return err == nil
 	}
 	_, err = fmt.Fprintf(w, "id: %s\nevent: %s\ndata: %s\n\n", ev.SSEID(), ev.Type, payload)
 	return err == nil

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -31,12 +32,40 @@ func dataDir(flagValue string) string {
 // openStore opens the control database with the key resolution rules from
 // docs/CONTROL-PLANE.md §5.
 func openStore(dir, keyFile string, autogen bool) (*control.Store, error) {
+	return openStoreWithHeartbeat(dir, keyFile, autogen, 0)
+}
+
+// openStoreWithHeartbeat lets `serve` pin the heartbeat interval (everything else
+// uses the 30s default; only serve actually runs jobs).
+func openStoreWithHeartbeat(dir, keyFile string, autogen bool, heartbeat time.Duration) (*control.Store, error) {
 	return control.Open(control.Options{
-		DataDir: dir,
-		KeyFile: keyFile,
-		EnvKey:  os.Getenv("JINLIANG_KEY"),
-		Autogen: autogen,
+		DataDir:   dir,
+		KeyFile:   keyFile,
+		EnvKey:    os.Getenv("JINLIANG_KEY"),
+		Autogen:   autogen,
+		Heartbeat: heartbeat,
 	})
+}
+
+// heartbeatInterval resolves --heartbeat seconds / JINLIANG_HEARTBEAT_SECONDS.
+// 30s 默认、上限 10 分钟：再长就不是心跳了（B1 的长事务靠它续命，不能太懒）。
+func heartbeatInterval(flagSeconds int) (time.Duration, error) {
+	if flagSeconds <= 0 {
+		if v := strings.TrimSpace(os.Getenv("JINLIANG_HEARTBEAT_SECONDS")); v != "" {
+			n, err := strconv.Atoi(v)
+			if err != nil {
+				return 0, fmt.Errorf("JINLIANG_HEARTBEAT_SECONDS=%q 不是整数", v)
+			}
+			flagSeconds = n
+		}
+	}
+	if flagSeconds == 0 {
+		return control.DefaultHeartbeatInterval, nil
+	}
+	if flagSeconds < 5 || flagSeconds > 600 {
+		return 0, fmt.Errorf("心跳间隔要在 5–600 秒之间（收到 %d）", flagSeconds)
+	}
+	return time.Duration(flagSeconds) * time.Second, nil
 }
 
 func cmdServe(args []string) error {
@@ -45,19 +74,30 @@ func cmdServe(args []string) error {
 	dir := fs.String("data-dir", "", "数据目录（默认 ~/.config/jinliang）")
 	keyFile := fs.String("key-file", "", "主密钥文件（必须 0600）")
 	apiToken := fs.String("api-token", os.Getenv("JINLIANG_API_TOKEN"), "固定 bearer token（自动化用）")
+	hbSeconds := fs.Int("heartbeat", 0, "运行心跳间隔（秒，默认 30；也可用 JINLIANG_HEARTBEAT_SECONDS）")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 
-	store, err := openStore(dataDir(*dir), *keyFile, true)
+	hb, err := heartbeatInterval(*hbSeconds)
+	if err != nil {
+		return err
+	}
+	stale := control.StaleAfter(hb)
+
+	store, err := openStoreWithHeartbeat(dataDir(*dir), *keyFile, true, hb)
 	if err != nil {
 		return err
 	}
 	defer store.Close()
 
+	// SSE 的 id 是 <boot_epoch>-<seq>：只有 serve 写 epoch（doctor/export 不写，
+	// 否则设置页的 boot_epoch 会一直跳）。
+	store.StartBootEpoch(context.Background())
+
 	// 上一次进程可能被 kill -9：心跳过期的 run 永远 ended_at IS NULL，
 	// 历史页会永久显示「在跑」并且挡住下一次运行。启动时替它们收尾。
-	if n, err := store.RecoverStaleRuns(context.Background(), 2*time.Minute); err != nil {
+	if n, err := store.RecoverStaleRuns(context.Background(), stale); err != nil {
 		return fmt.Errorf("清点上次遗留的运行失败: %w", err)
 	} else if n > 0 {
 		fmt.Printf("  上次有 %d 条运行没有正常收尾（进程被终止），已标记为 interrupted\n", n)
@@ -93,6 +133,7 @@ func cmdServe(args []string) error {
 	fmt.Printf("  地址      %s\n", url)
 	fmt.Printf("  数据目录  %s\n", store.Dir())
 	fmt.Printf("  控制库    %s\n", store.Path())
+	fmt.Printf("  运行心跳  每 %s 一次；超过 %s 没有心跳视为进程已死（可 --heartbeat 调）\n", hb, stale)
 	fmt.Printf("  密钥来源  %s", store.Cipher().KeySource())
 	if p := store.Cipher().KeyPath(); p != "" {
 		fmt.Printf("（%s）", p)

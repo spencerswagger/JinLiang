@@ -414,8 +414,13 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 		"job_ids": ids, "imported": report.ImportedCount(), "skipped": len(report.Skipped),
 	})
 	status := http.StatusCreated
-	if len(report.Skipped) > 0 {
-		status = http.StatusMultiStatus // 207：部分成功
+	switch {
+	case report.ImportedCount() == 0 && len(report.Skipped) > 0:
+		// 一份都没进：这不是「部分成功」，是失败。207 属于 2xx，`curl -f` 会当成功，
+		// 与 §4B「不能看起来像成功」直接冲突 → 422 + 完整 report。
+		status = http.StatusUnprocessableEntity
+	case len(report.Skipped) > 0:
+		status = http.StatusMultiStatus // 207：部分成功（至少一份真的写进去了）
 	}
 	writeJSON(w, status, report)
 }

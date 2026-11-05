@@ -125,8 +125,9 @@ func TestRecoverStaleRuns(t *testing.T) {
 	if got.EndedAt == "" || got.FinishReason != FinishInterrupted {
 		t.Fatalf("残留 run 必须是 interrupted 且已结束: %+v", got)
 	}
-	if got.Phase.Terminal() {
-		t.Fatalf("phase 保持原样（不伪造阶段），实际 %s", got.Phase)
+	if !got.Phase.Terminal() {
+		// 收尾必须落到可表达的终态，否则历史页会永久显示「增量中/已暂停」。
+		t.Fatalf("被判定中断的 run 的 phase 应该是终态，实际 %s", got.Phase)
 	}
 
 	// 恢复之后同一个任务能重新开跑：不会再被唯一索引挡住。
@@ -142,5 +143,106 @@ func TestRecoverStaleRuns(t *testing.T) {
 	}
 	if n != 0 {
 		t.Fatalf("心跳还在的 run 被误标了 %d 条", n)
+	}
+}
+
+// A2 回归：心跳必须独立于阶段推进——暂停 10 分钟的活 run 不能在下一次
+// RecoverStaleRuns 里被判死（那会静默放开活跃槽，还能起第二个 run）。
+func TestHeartbeatContinuesWhilePaused(t *testing.T) {
+	s, err := Open(Options{DataDir: t.TempDir(), Autogen: true, Heartbeat: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	ctx := context.Background()
+	src, tgt := seedConnections(t, s)
+	job, err := s.CreateJob(ctx, sampleJobInput(src, tgt))
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := s.Runner().Start(ctx, job.ID, ActorAPI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Runner().Pause(ctx, job.ID); err != nil {
+		t.Fatalf("pause: %v", err)
+	}
+	// 等两个心跳周期：暂停期间也必须有心跳。
+	time.Sleep(2500 * time.Millisecond)
+
+	got, err := s.GetRun(ctx, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.EndedAt != "" {
+		t.Fatalf("暂停中的 run 不该结束: %+v", got)
+	}
+	if got.HeartbeatAt == run.HeartbeatAt {
+		t.Fatalf("暂停期间心跳没有更新（Started=%s HeartbeatAt=%s）", run.HeartbeatAt, got.HeartbeatAt)
+	}
+
+	// 阈值 3×1s：刚心跳过，绝不能被判死。
+	n, err := s.RecoverStaleRuns(ctx, StaleAfter(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("暂停中的活 run 被误判为中断（%d 条），活跃槽会被错误放开", n)
+	}
+
+	if err := s.Runner().Stop(ctx, job.ID); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+	if err := s.Runner().Wait(ctx, job.ID); err != nil {
+		t.Fatal(err)
+	}
+	final, err := s.GetRun(ctx, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if final.FinishReason != FinishStopped {
+		t.Fatalf("手动停止的 finish_reason = %q，期望 stopped", final.FinishReason)
+	}
+}
+
+// B4 回归：有运行历史的任务不许静默换身份（换连接/改表范围会换掉 job_key，
+// 目标端按 job_key 存的同步状态会变成孤儿）。
+func TestUpdateJobCannotChangeIdentityWithHistory(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	src, tgt := seedConnections(t, s)
+	job, err := s.CreateJob(ctx, sampleJobInput(src, tgt))
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := s.StartRun(ctx, job.ID, "preflight")
+	if err != nil {
+		t.Fatal(err)
+	}
+	walkToDraining(t, s, run.ID)
+	if _, err := s.FinishRun(ctx, run.ID, "done", "", 0, FinishCompleted); err != nil {
+		t.Fatal(err)
+	}
+
+	// 换一个源连接（坐标不同 → job_key 不同）
+	other, err := s.CreateConnection(ctx, ConnectionInput{
+		Name: "另一个源", Kind: "postgres", Host: "10.0.0.9", Port: 5432,
+		Database: "other", Username: "u", Password: "pw",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := sampleJobInput(other, tgt)
+	in.Name = job.Name
+	_, err = s.UpdateJob(ctx, job.ID, in)
+	if !errors.Is(err, ErrIdentityLocked) {
+		t.Fatalf("有运行历史时换连接必须被拒（ErrIdentityLocked），实际 %v", err)
+	}
+
+	// 只改名字 / 只改内容不算换身份，必须放行。
+	rename := sampleJobInput(src, tgt)
+	rename.Name = "改个名字"
+	if _, err := s.UpdateJob(ctx, job.ID, rename); err != nil {
+		t.Fatalf("只改名不该被拦：%v", err)
 	}
 }

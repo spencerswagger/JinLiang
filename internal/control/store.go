@@ -35,6 +35,10 @@ type Options struct {
 	Autogen bool
 	// Now is a test seam; nil means time.Now.
 	Now func() time.Time
+	// Heartbeat is how often a running job refreshes runs.heartbeat_at.
+	// Zero means DefaultHeartbeatInterval (30s). 过期阈值固定取 3×它
+	// （StaleAfter），B1 的长事务靠这个独立 ticker 而不是阶段推进来续命。
+	Heartbeat time.Duration
 }
 
 // Store is the control database plus the cipher that protects connection
@@ -48,6 +52,7 @@ type Store struct {
 	bus        *Bus
 	runner     *Runner
 	instanceID string // settings.instance_id：审计、租约、run 的 owner 都用它
+	heartbeat  time.Duration
 }
 
 // DefaultDataDir returns ~/.config/jinliang (or $XDG_CONFIG_HOME/jinliang).
@@ -109,9 +114,12 @@ func Open(opts Options) (*Store, error) {
 		return nil, fmt.Errorf("连接控制库失败: %w", err)
 	}
 
-	s := &Store{db: db, dir: abs, path: path, cipher: cipher, now: opts.Now}
+	s := &Store{db: db, dir: abs, path: path, cipher: cipher, now: opts.Now, heartbeat: opts.Heartbeat}
 	if s.now == nil {
 		s.now = time.Now
+	}
+	if s.heartbeat <= 0 {
+		s.heartbeat = DefaultHeartbeatInterval
 	}
 	s.bus = NewBus(s.now)
 	if err := s.migrate(ctx); err != nil {
@@ -119,10 +127,6 @@ func Open(opts Options) (*Store, error) {
 		return nil, err
 	}
 	if err := s.ensureInstance(ctx); err != nil {
-		db.Close()
-		return nil, err
-	}
-	if err := s.ensureBootEpoch(ctx); err != nil {
 		db.Close()
 		return nil, err
 	}
