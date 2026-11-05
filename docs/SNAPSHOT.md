@@ -10,7 +10,7 @@
 | 复合主键 | 以首列切分区间，块内用 keyset 游标推进（`ORDER BY k1,k2` + 复合 `>` 条件） |
 | 单列文本 / UUID | 不切区间，用 **keyset 游标**：`WHERE pk > $last ORDER BY pk LIMIT n` |
 | 无主键（PG） | 按 `ctid` 区间切分（`WHERE ctid >= '(a,0)' AND ctid < '(b,0)'`） |
-| 无主键（MySQL） | **只能单连接顺序扫**（InnoDB 隐藏 rowid 不可用）→ 不支持块级断点，失败整表重来；预检里明确告知 |
+| 无主键（MySQL） | **只能单连接顺序扫**（InnoDB 隐藏 rowid 不可用）→ 只有表级断点，失败整表重来；预检里提示，**不因表大而拒绝** |
 
 分块大小默认 10 万行；块太大内存与锁压力大，太小则往返过多。
 
@@ -34,7 +34,7 @@
 
 ## 4. 断点
 
-- `_ds_chunk(job_id, table_name, chunk_no, done, rows)` 每完成一块更新。
+- `_jl_chunk(job_id, table_name, chunk_no, done, rows)` 每完成一块更新。
 - 重启：读未完成块继续；快照 id 已失效（源库重启 / 超过 `idle_replication_slot_timeout`）→ 整段重来，并在动作清单里说明原因。
 - MySQL 无主键表：只有表级断点，重来成本要在 `plan` 里标出。
 

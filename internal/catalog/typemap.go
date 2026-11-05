@@ -23,7 +23,7 @@ const (
 	Lossless     Loss = iota // 完全等价
 	Lossy                    // 精度/范围/时区可能变，但不报错
 	NeedsConfirm             // 语义不同，必须用户确认
-	Unsupported              // 无法映射，拒绝该列并给替代
+	Unsupported              // 字典未覆盖；上层按 text 兜底并提示，不拒绝
 )
 
 // String renders the loss level for reports.
@@ -187,7 +187,7 @@ func Map(from, to Engine, sourceType string) (Mapping, bool) {
 		return Mapping{Target: "bit(1)", Loss: NeedsConfirm, Note: "未指定位数"}, true
 	}
 
-	return Mapping{Target: "", Loss: Unsupported, Note: "字典未覆盖，需试探建表或人工指定"}, false
+	return Mapping{Target: "text", Loss: Unsupported, Note: "字典未覆盖：默认按 text 落地，可人工指定类型"}, false
 }
 
 // atoiSafe parses a positive int prefix without importing strconv for one call.

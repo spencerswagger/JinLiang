@@ -6,13 +6,13 @@
 
 ### PostgreSQL
 ```sql
-CREATE TABLE IF NOT EXISTS public._ds_lease (
+CREATE TABLE IF NOT EXISTS public._jl_lease (
   job_id     text        PRIMARY KEY,
   holder     text        NOT NULL,
   expires_at timestamptz NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS public._ds_meta (
+CREATE TABLE IF NOT EXISTS public._jl_meta (
   job_id        text        PRIMARY KEY,
   schema_version int        NOT NULL DEFAULT 1, -- 状态表结构版本，只向前迁移
   job_hash      text        NOT NULL,          -- job.yaml 的哈希；变了就要提示
@@ -25,7 +25,7 @@ CREATE TABLE IF NOT EXISTS public._ds_meta (
   updated_at    timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE TABLE IF NOT EXISTS public._ds_chunk (   -- 快照断点，块级续跑
+CREATE TABLE IF NOT EXISTS public._jl_chunk (   -- 快照断点，块级续跑
   job_id     text    NOT NULL,
   table_name text    NOT NULL,
   chunk_no   int     NOT NULL,
@@ -36,7 +36,7 @@ CREATE TABLE IF NOT EXISTS public._ds_chunk (   -- 快照断点，块级续跑
   PRIMARY KEY (job_id, table_name, chunk_no)
 );
 
-CREATE TABLE IF NOT EXISTS public._ds_conflict (
+CREATE TABLE IF NOT EXISTS public._jl_conflict (
   id         bigserial PRIMARY KEY,
   job_id     text        NOT NULL,
   table_name text        NOT NULL,
@@ -48,7 +48,7 @@ CREATE TABLE IF NOT EXISTS public._ds_conflict (
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE TABLE IF NOT EXISTS public._ds_dead_letter (
+CREATE TABLE IF NOT EXISTS public._jl_dead_letter (
   id         bigserial PRIMARY KEY,
   job_id     text        NOT NULL,
   table_name text        NOT NULL,
@@ -58,7 +58,7 @@ CREATE TABLE IF NOT EXISTS public._ds_dead_letter (
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE TABLE IF NOT EXISTS public._ds_action (   -- 审计：系统为你做了什么（可选，也可只落本地 jsonl）
+CREATE TABLE IF NOT EXISTS public._jl_action (   -- 审计：系统为你做了什么（可选，也可只落本地 jsonl）
   id         bigserial PRIMARY KEY,
   job_id     text        NOT NULL,
   action_id  text        NOT NULL,
@@ -69,7 +69,7 @@ CREATE TABLE IF NOT EXISTS public._ds_action (   -- 审计：系统为你做了�
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE TABLE IF NOT EXISTS public._ds_event (   -- 补偿用的载体：源端触发器写 TRUNCATE / DDL 事件
+CREATE TABLE IF NOT EXISTS public._jl_event (   -- 补偿用的载体：源端触发器写 TRUNCATE / DDL 事件
   id         bigserial PRIMARY KEY,
   job_id     text        NOT NULL,
   kind       text        NOT NULL,
@@ -81,12 +81,12 @@ CREATE TABLE IF NOT EXISTS public._ds_event (   -- 补偿用的载体：源端�
 
 ### MySQL
 ```sql
-CREATE TABLE IF NOT EXISTS `_ds_lease` (
+CREATE TABLE IF NOT EXISTS `_jl_lease` (
   job_id     varchar(128) NOT NULL PRIMARY KEY,
   holder     varchar(128) NOT NULL,
   expires_at datetime(6)  NOT NULL
 );
-CREATE TABLE IF NOT EXISTS `_ds_meta` (
+CREATE TABLE IF NOT EXISTS `_jl_meta` (
   job_id      varchar(128) NOT NULL PRIMARY KEY,
   job_hash    char(64)     NOT NULL,
   phase       varchar(16)  NOT NULL,
@@ -95,10 +95,10 @@ CREATE TABLE IF NOT EXISTS `_ds_meta` (
   started_at  datetime(6)  NOT NULL,
   updated_at  datetime(6)  NOT NULL
 );
--- _ds_chunk / _ds_conflict / _ds_dead_letter / _ds_event 同构，略
+-- _jl_chunk / _jl_conflict / _jl_dead_letter / _jl_event 同构，略
 ```
 
-**命名空间纪律**：所有对象以 `_ds_` 前缀；`gc` 只删这个前缀下的东西，永不 drop 用户表。
+**命名空间纪律**：所有对象以 `_jl_` 前缀；`gc` 只删这个前缀下的东西，永不 drop 用户表。
 
 ## 2. 幂等：位点与数据同事务
 
@@ -108,7 +108,7 @@ BEGIN;
   INSERT INTO report.orders (...) VALUES (...)
     ON DUPLICATE KEY UPDATE ...;
   -- 位点和数据在同一事务里推进
-  UPDATE _ds_meta SET position = ?, updated_at = ? WHERE job_id = ?;
+  UPDATE _jl_meta SET position = ?, updated_at = ? WHERE job_id = ?;
 COMMIT;
 ```
 
@@ -120,29 +120,29 @@ COMMIT;
 | 提交后、`Advance` 源端位点前 | 目标位点已前进；重启后**以目标位点为权威**，源端 slot 由 `Advance` 追平，不重复应用 |
 | 提交后、`Advance` 中途失败 | 同上；下次 `Advance` 幂等对齐 |
 
-**权威规则**：目标库的 `_ds_meta.position` 是唯一权威；源端 slot 只是「别让变更流水被清掉」的护栏。
+**权威规则**：目标库的 `_jl_meta.position` 是唯一权威；源端 slot 只是「别让变更流水被清掉」的护栏。
 
 ## 3. 崩溃恢复时序
 
 ```
-1. 启动 → 尝试 INSERT _ds_lease(job_id, holder, now()+ttl)
+1. 启动 → 尝试 INSERT _jl_lease(job_id, holder, now()+ttl)
    ├─ 冲突且未过期 → 另一个实例在跑：报 E1005，退出（绝不双写）
    └─ 冲突但已过期 → 接管（记一条 action："接管了超时租约"）
 2. 每 5s 续租（UPDATE expires_at）
-3. 读 _ds_meta：phase / position / snapshot_id
-   ├─ phase=snapshot → 读 _ds_chunk 找未完成块，继续；快照 id 过期则整段重来
+3. 读 _jl_meta：phase / position / snapshot_id
+   ├─ phase=snapshot → 读 _jl_chunk 找未完成块，继续；快照 id 过期则整段重来
    ├─ phase=catchup/streaming → 从目标位点继续流
    └─ 无记录 → 新任务
-4. 若源端 slot 不存在但 _ds_meta 有 position → 判定「变更流水已被清理」，E3001 要求 --resync
+4. 若源端 slot 不存在但 _jl_meta 有 position → 判定「变更流水已被清理」，E3001 要求 --resync
 5. 正常结束 → phase=done，Cleanup 清 slot / publication / 临时快照；保留 meta 供查历史
 ```
 
 ## 4. 孤儿清理（`gc`）
 
 判定四条，全部满足才进「可清理」清单：
-1. 对象名属于本工具命名空间（`ds_<job>_*`）；
+1. 对象名属于本工具命名空间（`jl_<job>_*`）；
 2. `active = false`（有人在读绝不删）；
-3. 没有活动任务认领（`_ds_lease` 无有效记录，或该 job 已 `done`）；
+3. 没有活动任务认领（`_jl_lease` 无有效记录，或该 job 已 `done`）；
 4. 落后量已超 guard 阈值（或 `--force`）。
 
 默认 `dry-run` 只列不删，输出每条的前置判定结果。

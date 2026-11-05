@@ -45,7 +45,7 @@ WantedBy=multi-user.target
 ## 4. 版本与状态表迁移
 
 - 二进制版本语义：`MAJOR.MINOR.PATCH`；`0.x` 期间允许破坏性变更，但必须写迁移说明。
-- `_ds_meta.schema_version` 记录状态表结构版本；启动时只做**向前迁移**（加列、加表）。
+- `_jl_meta.schema_version` 记录状态表结构版本；启动时只做**向前迁移**（加列、加表）。
 - 不支持状态表降级：回滚二进制前需 `jinliang run --resync` 或在旧版本上不能跑（文档写清）。
 - `job_hash` 与 `schema_version` 不匹配时，启动只提示不自动改。
 

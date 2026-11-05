@@ -24,7 +24,9 @@ WAL / binlog / 复制槽 / 位点这些底层概念由工具负责探测、代�
 ## 设计要点
 
 - **预检三级**：已满足 / 我可代做（可逆、不动数据、不重启）/ 必须你或 DBA（给定制 SQL + 影响 + 回滚）。
-- **降级先补偿**：自动补偿 → 有代价替代 → 才拒绝；降级不降正确性。
+- **降级先补偿、不拒绝**：自动补偿 → 有代价替代 → 最后只给提示（含风险与改善路径），决定权在你；降级不降正确性。
+- **不拒绝，只提示**：无主键表照跑（insert-only）、超大表照跑、MyISAM 照跑、不认识的类型按 text 落地 —— 全部只提示风险。只有「物理做不到」与「私钥文件权限不对」会停。
+- **提示即文档**：不做文档站；每条提示自带「发生了什么 / 为什么 / 你能做什么 / 风险」。
 - **垃圾清理**：孤儿复制槽四条判定，默认只列不删；崩溃恢复靠租约 + 位点与数据同事务。
 - **能力运行时探测**，不按版本号分支（8.4 移除了 `SHOW MASTER STATUS`，PG 10 没有 slot 磁盘阀）。
 - **测试矩阵驱动**：每个连接器必须带 `testmatrix.yaml`，缺失即 CI 红；影子模型对拍一致性。
@@ -42,14 +44,14 @@ WAL / binlog / 复制槽 / 位点这些底层概念由工具负责探测、代�
 | [docs/STREAMING.md](docs/STREAMING.md) | 增量流：事务组装、批提交、位点、背压与限速 |
 | [docs/CONFLICT.md](docs/CONFLICT.md) | 冲突策略、死信、人工介入 |
 | [docs/VERIFY.md](docs/VERIFY.md) | 三级一致性校验与订正 |
-| [docs/STATE-SCHEMA.md](docs/STATE-SCHEMA.md) | `_ds_*` 状态表、位点同事务的幂等证明、崩溃恢复时序 |
+| [docs/STATE-SCHEMA.md](docs/STATE-SCHEMA.md) | `_jl_*` 状态表、位点同事务的幂等证明、崩溃恢复时序 |
 | [docs/RUNTIME.md](docs/RUNTIME.md) | 生命周期状态机、暂停恢复、热更新、时钟 |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 分层与依赖方向、数据流、背压、扩展点 |
 | [docs/SECURITY.md](docs/SECURITY.md) | 凭证、最小权限账号、TLS、日志、审计、供应链 |
 | [docs/BUILD.md](docs/BUILD.md) | 构建、发布物、systemd、升级与状态表迁移 |
 | [docs/PLAN.md](docs/PLAN.md) | `plan` 的人类模板与 `--json` 输出、确认规则 |
 | [docs/ROADMAP.md](docs/ROADMAP.md) | 里程碑与每阶段的验收判据 |
-| [docs/OPEN-QUESTIONS.md](docs/OPEN-QUESTIONS.md) | 待拍板/待实测的未决问题 |
+| [docs/OPEN-QUESTIONS.md](docs/OPEN-QUESTIONS.md) | 已决与未决清单 |
 | [examples/job.yaml](examples/job.yaml) | 任务定义示例（带全部字段与注释） |
 
 代码层契约已可编译、可测试：`internal/source/contract.go`、`internal/sink/contract.go`、

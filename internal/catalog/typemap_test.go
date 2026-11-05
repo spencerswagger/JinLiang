@@ -24,7 +24,7 @@ func TestMap(t *testing.T) {
 		{"mysql datetime lossy", MySQL, Postgres, "datetime", "timestamp", Lossy, true},
 		{"mysql json -> jsonb", MySQL, Postgres, "json", "jsonb", Lossy, true},
 		{"same engine passthrough", Postgres, Postgres, "numeric(12,2)", "numeric(12,2)", Lossless, true},
-		{"unknown type", Postgres, MySQL, "tsrange", "", Unsupported, false},
+		{"unknown type falls back to text", Postgres, MySQL, "tsrange", "text", Unsupported, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

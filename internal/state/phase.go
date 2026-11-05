@@ -3,7 +3,7 @@
 // naturally idempotent.
 package state
 
-// Phase is the lifecycle state of one job, persisted in _ds_meta.phase.
+// Phase is the lifecycle state of one job, persisted in _jl_meta.phase.
 type Phase string
 
 // Job lifecycle phases. The order matters: only the transitions in the

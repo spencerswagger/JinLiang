@@ -21,13 +21,13 @@ idle -> preflight -> prepare -> snapshot -> catchup -> streaming -> draining -> 
 
 ```
 1. 解析 yaml（strict）-> 算 job_hash
-2. 连源/目标（只读探测）-> 预检 -> 有 blocked 就退出码 3
-3. 抢租约（目标库 _ds_lease，TTL 30s）
+2. 连源/目标（只读探测）-> 预检 -> 只有 blocked（物理做不到）退出码 3；warn 需确认后继续
+3. 抢租约（目标库 _jl_lease，TTL 30s）
    |- 未过期 -> E1005 退出（绝不双写）
    |- 已过期 -> 接管，记一条 action
-4. 读 _ds_meta
+4. 读 _jl_meta
    |- job_hash 变了 -> 打印差异，要求 run --accept-change（不自动改）
-   |- phase=snapshot -> 读 _ds_chunk 续跑未完成块
+   |- phase=snapshot -> 读 _jl_chunk 续跑未完成块
    |- phase=streaming -> 从目标库位点继续
 5. 执行 prepare 动作（需确认的部分已确认）
 6. 进入 snapshot / catchup / streaming
@@ -65,5 +65,5 @@ idle -> preflight -> prepare -> snapshot -> catchup -> streaming -> draining -> 
 
 ## 6. 崩溃恢复
 
-见 [STATE-SCHEMA.md](STATE-SCHEMA.md)：目标库 `_ds_meta.position` 是唯一权威，源端书签只是护栏；
+见 [STATE-SCHEMA.md](STATE-SCHEMA.md)：目标库 `_jl_meta.position` 是唯一权威，源端书签只是护栏；
 三种崩溃点都推过（提交前 / 提交后未 advance / advance 中途失败），结论是不重不丢。

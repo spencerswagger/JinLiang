@@ -36,7 +36,9 @@
 | `jinliang conflicts list\|resolve` | 人工冲突处理（`manual` 策略下） | `resolve` 会 |
 | `jinliang undo <action-id>` | 撤销某个代做动作 | 会 |
 
-**退出码**：`0` 成功 · `3` 需要你处理（预检未过 / 冲突待决）· `4` 可重试失败已用尽 · `5` 冲突未决 · `1` 一般失败 · `2` 参数错误。
+**退出码**：`0` 成功 · `3` 需要你做一个动作或确认一个风险 · `4` 可重试失败已用尽 · `5` 冲突未决 · `1` 一般失败 · `2` 参数错误。
+
+**`3` 的含义分两种，提示里会说清**：物理前置没满足（例如没开变更流，跑不了）、或者你确认风险即可继续（例如无主键大表）。**后者允许 `--accept-risk` 直接继续。**
 
 ## 3. 预检清单（固定 ID，报告里可引用）
 
@@ -51,7 +53,7 @@
 | PG-03 | `max_wal_senders` 余量 ≥1 | autofixable |
 | PG-04 | 账号有 `REPLICATION`（或 superuser） | blocked 或 autofixable（我们建账号并授权） |
 | PG-05 | `pg_hba.conf` 允许 replication 连接（用真连验证） | blocked（给具体行 + 需 reload） |
-| PG-06 | 目标表有主键 / `REPLICA IDENTITY` 足够 | blocked（无主键的表不能增量 upsert，给出改法） |
+| PG-06 | 目标表有主键 / `REPLICA IDENTITY` | **warn**：无主键只能 insert-only、不可块级续跑；照跑，附改善建议（加主键） |
 | PG-07 | `max_slot_wal_keep_size` 是否存在 | PG≤12：记一条「无磁盘保护阀」补偿说明 |
 | PG-08 | 是否 primary（`pg_is_in_recovery()`） | blocked（指向正确节点） |
 | PG-09 | `track_commit_timestamp` | 关：记「时间戳新者胜」精度受限 |
@@ -64,10 +66,10 @@
 | MY-02 | `binlog_format = ROW` | blocked（需重启） |
 | MY-03 | `binlog_row_image = FULL` | autofixable（`SET GLOBAL`，需 SYSTEM_VARIABLES_ADMIN） |
 | MY-04 | 账号有 `REPLICATION SLAVE` / `REPLICATION CLIENT` / `SELECT` | blocked 或 autofixable（我们建账号） |
-| MY-05 | `server_id` 唯一且未与源冲突 | blocked（给建议值） |
+| MY-05 | `server_id` 唯一且未与源冲突 | blocked（撞号会把真正的从库踢下线，给建议值） |
 | MY-06 | `binlog_expire_logs_seconds` ≥ 预期最长断线 | 提示风险（可 autofix） |
-| MY-07 | `binlog_transaction_compression` | 开了则必须支持 zstd 解压（我们实现），否则 blocked |
-| MY-08 | 表的存储引擎 | MyISAM → blocked（无事务，语义不成立） |
+| MY-07 | `binlog_transaction_compression` | 默认自身解压；解不了才 blocked，并提示「关闭源端压缩」 |
+| MY-08 | 表的存储引擎 | MyISAM → **warn**（无事务，崩溃时可能不一致），照跑并标注 |
 | MY-09 | 认证插件可用（8.4/9.x 移除 native） | autofixable（建 caching_sha2 独立账号） |
 | MY-10 | 主从角色（`SHOW REPLICA STATUS` / `SHOW BINARY LOG STATUS`） | 指向主库，或说明只读副本的限制 |
 
@@ -117,5 +119,5 @@ DocURL    对应文档锚点
 1. **分块**：按主键区间切块（每块 10 万行），源与目标各自算 `count(*)` 与 `sum(hash)`。
 2. **哈希函数**：对每行所有列做规范化（NULL 哨兵、时间统一 UTC、浮点用十进制字符串、二进制按 hex）后取 `xxhash64`，再求和 —— 服务端算，不拉数据。
 3. **抽样**：不一致的块拉全行逐列比对，输出字段级差异。
-4. **订正**：生成 `INSERT ... ON CONFLICT/DUPLICATE KEY UPDATE` 语句，`--fix` 才执行并记录到 `_ds_conflict`。
+4. **订正**：生成 `INSERT ... ON CONFLICT/DUPLICATE KEY UPDATE` 语句，`--fix` 才执行并记录到 `_jl_conflict`。
 5. **自测**：测试里故意破坏目标库（改一行、删一行、改精度），`verify` 必须报出。

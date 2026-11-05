@@ -39,7 +39,7 @@ type Level string
 const (
 	LevelAuto    Level = "auto"    // 我们自动补偿，用户无感
 	LevelCostly  Level = "costly"  // 有代价的替代，需用户确认
-	LevelBlocked Level = "blocked" // 只能拒绝，并解释 + 给替代路径
+	LevelBlocked Level = "blocked" // 物理上做不到（缺权限/缺变更流）；不是"因风险拒绝"，并给替代
 )
 
 // Compensation describes the fallback for one missing capability.
@@ -178,7 +178,8 @@ type CheckStatus string
 const (
 	StatusOK          CheckStatus = "ok"          // 已满足
 	StatusAutofixable CheckStatus = "autofixable" // 我可代做（可逆、不动数据、不重启）
-	StatusBlocked     CheckStatus = "blocked"     // 必须你或 DBA 做
+	StatusWarn        CheckStatus = "warn"        // 有风险但能跑：只提示，用户确认即可继续
+	StatusBlocked     CheckStatus = "blocked"     // 物理上做不到（缺变更流/缺权限/副本），不是"不让你做"
 )
 
 // Check is one preflight item, written so a non-DBA can act on it.
@@ -197,7 +198,7 @@ type Check struct {
 // Report is the whole preflight result.
 type Report struct {
 	Checks   []Check `json:"checks"`
-	CanStart bool    `json:"can_start"` // 只要有一个 blocked 就是 false
+	CanStart bool    `json:"can_start"` // blocked=物理做不到时 false；warn 不影响启动，只需确认
 }
 
 // Requirements declares which capabilities a job needs, so preflight can look

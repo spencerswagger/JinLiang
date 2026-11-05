@@ -3,7 +3,7 @@
 ## 1. 凭证
 
 - 只接受 `env:NAME` 与 `file:/path`；**禁止**在 yaml 或命令行里写明文 DSN。
-- `file:` 读取时检查权限（要求 0600，否则拒绝并提示 `chmod`）。
+- `file:` 读取时检查权限：不是 0600 就**不读这个文件**并提示 `chmod`。这是全产品唯一的硬停：安全底线。
 - 内存中只保留必要字符串；日志与 `plan` 输出统一脱敏（密码、token、连接串）。
 - 可选系统 keyring（linux secret-service / macOS keychain）二期做；一期用文件 + 环境变量。
 
@@ -37,7 +37,7 @@ GRANT REPLICATION SLAVE, REPLICATION CLIENT, SELECT ON <db>.* TO 'jinliang_ro'@'
 ## 5. 审计
 
 每次代做动作（建账号、建表、建书签、清理）都记一条 action：谁（工具/你/DBA）、何时、SQL、undo。
-落地：本地 `audit/*.jsonl`（默认）+ 可选 `_ds_action` 表（目标库）。
+落地：本地 `audit/*.jsonl`（默认）+ 可选 `_jl_action` 表（目标库）。
 `jinliang undo <action-id>` 可撤销，撤销本身也记一条。
 
 ## 6. 供应链
