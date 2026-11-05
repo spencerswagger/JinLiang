@@ -1,0 +1,70 @@
+name: mysql-matrix
+
+# MySQL 源（轨 B）的真库矩阵：5.7 / 8.0 / 8.4 各跑一遍
+# 全量（快照）/ 增量（binlog 取流）/ 崩溃恢复（按位点重放）。
+# 沙盒里没有 docker，所以这一层只能在 Actions 上跑。
+
+on:
+  pull_request:
+    paths:
+      - "internal/mysqlsource/**"
+      - ".github/workflows/mysql-matrix.yml"
+  workflow_dispatch:
+
+jobs:
+  connector:
+    name: mysql ${{ matrix.mysql }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - mysql: "5.7"
+            note: "无 GTID 默认、无事务压缩、SHOW MASTER STATUS"
+          - mysql: "8.0"
+            note: "SHOW MASTER STATUS、8.0.20+ 事务压缩"
+          - mysql: "8.4"
+            note: "SHOW MASTER STATUS 已移除、mysql_native_password 默认关闭"
+    services:
+      mysql:
+        image: mysql:${{ matrix.mysql }}
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: jinliang_src
+          MYSQL_USER: jinliang
+          MYSQL_PASSWORD: jinliang
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -ujinliang -pjinliang"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 40
+    env:
+      JINLIANG_TEST_MYSQL_SRC_DSN: mysql://jinliang:jinliang@127.0.0.1:3306/jinliang_src
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.x"
+
+      - name: 等 MySQL 就绪并补齐复制权限
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 60); do
+            if mysqladmin ping -h 127.0.0.1 -uroot -proot --silent; then break; fi
+            sleep 2
+          done
+          mysql -h 127.0.0.1 -uroot -proot -e "
+            GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'jinliang'@'%';
+            FLUSH PRIVILEGES;
+            SHOW VARIABLES LIKE 'log_bin';
+            SHOW VARIABLES LIKE 'binlog_format';
+            SHOW VARIABLES LIKE 'binlog_row_image';
+            SELECT VERSION();"
+
+      - name: 连接器契约测试（全量 / 增量 / 崩溃恢复）
+        run: go test -tags=integration ./internal/mysqlsource/ -v -timeout 10m
+
+      - name: 单元测试（不依赖数据库）
+        run: go test ./internal/mysqlsource/
