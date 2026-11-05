@@ -396,6 +396,12 @@ func cmdStatus(args []string) error {
 		fmt.Printf("说明      %s\n", st.Note)
 	}
 	if *verify {
+		// 校验是两次独立查询（源一次、目标一次）：任务还在写的时候两次查询不是同一时点，
+		// 差异可能只是「中间又搬了几行」。先把话说清楚，别让人白惊慌。
+		if st.LastRun != nil && st.LastRun.EndedAt == "" {
+			fmt.Println("注意      这个任务还有一次运行没结束（进行中）：此刻的比对是两个不同时点的快照，")
+			fmt.Println("          差异可能只是中间又搬了几行。校验只在停写之后才有意义。")
+		}
 		diffs, err := engine.VerifyJob(ctx, engine.Options{Store: store, JobID: st.JobID})
 		if err != nil {
 			return err
