@@ -387,7 +387,7 @@ func notImplementedPause() apiError {
 	return apiError{
 		Class:   "user_action",
 		Message: "引擎还不支持暂停",
-		Why: "B1 的引擎只有「取消」一种停下方式：它会提交位点、按中断收尾。" +
+		Why: "B1 的引擎只有「取消」一种停下方式：它会提交位点、按「已停止」收尾（不是失败）。" +
 			"做真的「暂停/恢复」需要在阶段之间设安全停点，属于下一步的工作",
 		Next: []string{
 			"想现在停下：POST /api/jobs/{id}/stop（当前事务提交完就停，不会丢数据）",
