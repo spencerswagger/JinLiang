@@ -27,6 +27,9 @@ type migration struct {
 	// 放在事务里是故意的：迁移版本号与它带来的数据形态必须一起提交，
 	// 否则版本号已经前进、索引却没建上，下次启动再也不会补。
 	After func(ctx context.Context, tx *sql.Tx, s *Store) error
+	// Fn 用于需要先看当前结构再决定的迁移（例如「列不存在才加」）。
+	// 与 Stmts 二选一；一起给时先跑 Stmts 再跑 Fn。
+	Fn func(ctx context.Context, tx *sql.Tx) error
 }
 
 // migrations 是控制库的全部结构历史。字段名严格对齐 CONTROL-PLANE §3。
@@ -95,6 +98,14 @@ var migrations = []migration{
 		},
 		After: closeOnlyStaleRunsThenIndex,
 	},
+	{
+		Version: 3,
+		Name:    "runs-kind",
+		// hugo 裁决：runs 用 kind 表达「这一轮是什么运行」（sync | verify | stub），
+		// 布尔 stub 的反面是「默认真跑」——任何漏标记的新写入方都会被历史页当成真同步。
+		// 兼容：stub 列保留一版（B1 收口后再删），历史行照旧可读。
+		Fn: migrateRunsKind,
+	},
 }
 
 // closeOnlyStaleRunsThenIndex 是 v2 的收尾。
@@ -145,6 +156,60 @@ func closeOnlyStaleRunsThenIndex(ctx context.Context, tx *sql.Tx, s *Store) erro
 		fmt.Fprintf(os.Stderr, "迁移 2(runs-liveness)：%d 条心跳过期的运行已标记 interrupted\n", closed)
 	}
 	return nil
+}
+
+// migrateRunsKind 给 runs 加 kind 并回填旧行的 stub=1 → 'stub'。
+//
+// 幂等：先看 sqlite_master/pragma 里有没有这一列，有就跳过 ALTER；
+// 回填也只在加列成功后做一次，所以重跑不会重复写、不会报错。
+func migrateRunsKind(ctx context.Context, tx *sql.Tx) error {
+	has, err := columnExists(ctx, tx, "runs", "kind")
+	if err != nil {
+		return err
+	}
+	if !has {
+		if _, err := tx.ExecContext(ctx,
+			`ALTER TABLE runs ADD COLUMN kind TEXT NOT NULL DEFAULT 'sync'`); err != nil {
+			return fmt.Errorf("给 runs 加 kind 列失败: %w", err)
+		}
+	}
+	// 旧库里的桩运行：stub=1 的行必须是 'stub'，否则历史页会把它们当真同步。
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE runs SET kind = 'stub' WHERE stub = 1 AND kind <> 'stub'`); err != nil {
+		return fmt.Errorf("回填 runs.kind 失败: %w", err)
+	}
+	return nil
+}
+
+// columnExists 查 sqlite 的列清单（PRAGMA 不能用参数绑定，所以只接受我们自己的表名）。
+func columnExists(ctx context.Context, tx *sql.Tx, table, column string) (bool, error) {
+	switch table {
+	case "runs", "jobs", "connections", "settings", "audit":
+	default:
+		return false, fmt.Errorf("columnExists: 不接受表名 %q", table)
+	}
+	rows, err := tx.QueryContext(ctx, `PRAGMA table_info(`+table+`)`)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			cid     int
+			name    string
+			ctype   string
+			notnull int
+			dflt    sql.NullString
+			pk      int
+		)
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			return false, err
+		}
+		if strings.EqualFold(name, column) {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }
 
 // migrate applies every migration newer than the recorded schema_version.
@@ -198,6 +263,11 @@ func (s *Store) applyMigration(ctx context.Context, m migration) error {
 	if m.After != nil {
 		if err := m.After(ctx, tx, s); err != nil {
 			return err
+		}
+	}
+	if m.Fn != nil {
+		if err := m.Fn(ctx, tx); err != nil {
+			return fmt.Errorf("迁移 %d 的自定义步骤失败: %w", m.Version, err)
 		}
 	}
 	if _, err := tx.ExecContext(ctx,

@@ -21,7 +21,7 @@ func TestOneActiveRunPerJob(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	first, err := s.StartRun(ctx, job.ID, "preflight")
+	first, err := s.StartRun(ctx, job.ID, "preflight", RunKindSync)
 	if err != nil {
 		t.Fatalf("第一条 run 应该能建: %v", err)
 	}
@@ -32,7 +32,7 @@ func TestOneActiveRunPerJob(t *testing.T) {
 		t.Fatal("run 必须有初始心跳")
 	}
 
-	if _, err := s.StartRun(ctx, job.ID, "preflight"); !errors.Is(err, ErrConflict) {
+	if _, err := s.StartRun(ctx, job.ID, "preflight", RunKindSync); !errors.Is(err, ErrConflict) {
 		t.Fatalf("同一任务第二条活跃 run 必须被拒（ErrConflict），实际 %v", err)
 	}
 
@@ -41,7 +41,7 @@ func TestOneActiveRunPerJob(t *testing.T) {
 	if _, err := s.FinishRun(ctx, first.ID, "done", "", 0, FinishCompleted); err != nil {
 		t.Fatalf("finish: %v", err)
 	}
-	if _, err := s.StartRun(ctx, job.ID, "preflight"); err != nil {
+	if _, err := s.StartRun(ctx, job.ID, "preflight", RunKindSync); err != nil {
 		t.Fatalf("上一轮结束后应该能再开: %v", err)
 	}
 }
@@ -66,7 +66,7 @@ func TestFinishRunRecordsWhyItEnded(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	run, err := s.StartRun(ctx, job.ID, "preflight")
+	run, err := s.StartRun(ctx, job.ID, "preflight", RunKindSync)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -103,7 +103,7 @@ func TestRecoverStaleRuns(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	stale, err := s.StartRun(ctx, job.ID, "preflight")
+	stale, err := s.StartRun(ctx, job.ID, "preflight", RunKindSync)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -131,7 +131,7 @@ func TestRecoverStaleRuns(t *testing.T) {
 	}
 
 	// 恢复之后同一个任务能重新开跑：不会再被唯一索引挡住。
-	if _, err := s.StartRun(ctx, job.ID, "preflight"); err != nil {
+	if _, err := s.StartRun(ctx, job.ID, "preflight", RunKindSync); err != nil {
 		t.Fatalf("恢复后应该能重新开跑: %v", err)
 	}
 
@@ -215,7 +215,7 @@ func TestUpdateJobCannotChangeIdentityWithHistory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	run, err := s.StartRun(ctx, job.ID, "preflight")
+	run, err := s.StartRun(ctx, job.ID, "preflight", RunKindSync)
 	if err != nil {
 		t.Fatal(err)
 	}

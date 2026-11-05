@@ -106,7 +106,8 @@ func (r *Runner) Start(ctx context.Context, jobID, actor string) (Run, error) {
 		r.mu.Unlock()
 		return Run{}, fmt.Errorf("%w：先暂停，或者等它跑完", ErrRunInProgress)
 	}
-	run, err := r.store.StartRun(ctx, jobID, state.Preflight)
+	// B0 的桩路径显式写 kind=stub：不靠列默认值，免得以后有人以为这是真同步。
+	run, err := r.store.StartRun(ctx, jobID, state.Preflight, RunKindStub)
 	if err != nil {
 		r.mu.Unlock()
 		return Run{}, err

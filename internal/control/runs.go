@@ -12,6 +12,18 @@ import (
 
 // Run is one execution of a job: the summary the UI shows, not the source of
 // truth for positions (those live in the target database, CONTROL-PLANE §2).
+// Run 的种类：这一轮是什么运行。布尔 stub 的反面是「默认真跑」，所以用枚举。
+const (
+	RunKindSync   = "sync"   // 正常同步（列表页的「最近一次运行」只认这个）
+	RunKindVerify = "verify" // 校验运行（B1 的 verify，不是同步，别混进历史主视图）
+	RunKindStub   = "stub"   // B0 骨架运行：只推进阶段、不搬数据；B1 起不再产生
+)
+
+// ValidRunKind reports whether k is one of the three known kinds.
+func ValidRunKind(k string) bool {
+	return k == RunKindSync || k == RunKindVerify || k == RunKindStub
+}
+
 type Run struct {
 	ID        string      `json:"id"`
 	JobID     string      `json:"job_id"`
@@ -23,8 +35,10 @@ type Run struct {
 	LagMs     *int64      `json:"lag_ms,omitempty"`
 	LastError string      `json:"last_error,omitempty"`
 	ExitCode  *int        `json:"exit_code,omitempty"`
-	// Stub marks a B0 skeleton run: no data was moved. The UI must say so
-	// instead of pretending a real sync happened.
+	// Kind 是这一轮的种类（sync | verify | stub）。B0 之后新代码必须显式传，
+	// 不靠列默认值。
+	Kind string `json:"kind"`
+	// Stub 是 B0 的旧列，保留一版做兼容；新代码以 Kind 为准，两者应一致。
 	Stub bool `json:"stub"`
 	// HeartbeatAt is the last liveness ping from the process that owns this run.
 	// A crashed process leaves ended_at NULL forever unless someone notices —
@@ -48,24 +62,36 @@ const (
 	FinishInterrupted = "interrupted"
 )
 
-// StartRun inserts a run row in the given phase.
-func (s *Store) StartRun(ctx context.Context, jobID string, phase state.Phase) (Run, error) {
+// StartRun inserts a run row in the given phase and kind.
+//
+// kind 必须显式传（sync / verify / stub）：列的 DEFAULT 'sync' 只服务历史行兼容，
+// 不是给新代码偷懒用的——漏写会让一次 verify 被当成真同步展示。
+func (s *Store) StartRun(ctx context.Context, jobID string, phase state.Phase, kind string) (Run, error) {
+	if !ValidRunKind(kind) {
+		return Run{}, fmt.Errorf("未知的运行种类 %q（只接受 sync / verify / stub）", kind)
+	}
 	id, err := NewID()
 	if err != nil {
 		return Run{}, err
 	}
 	now := s.nowText()
-	r := Run{ID: id, JobID: jobID, Phase: phase, StartedAt: now, HeartbeatAt: now, OwnerInstance: s.instanceID}
+	legacyStub := 0
+	if kind == RunKindStub {
+		legacyStub = 1 // 兼容旧列：老读者仍看 stub=1
+	}
+	r := Run{ID: id, JobID: jobID, Phase: phase, StartedAt: now, HeartbeatAt: now,
+		OwnerInstance: s.instanceID, Kind: kind}
 	if _, err := s.db.ExecContext(ctx,
-		`INSERT INTO runs (id, job_id, phase, started_at, heartbeat_at, owner_instance, rows_done, stub)
-		 VALUES (?, ?, ?, ?, ?, ?, 0, 0)`,
-		r.ID, r.JobID, string(r.Phase), r.StartedAt, r.HeartbeatAt, r.OwnerInstance); err != nil {
+		`INSERT INTO runs (id, job_id, phase, started_at, heartbeat_at, owner_instance, rows_done, stub, kind)
+		 VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)`,
+		r.ID, r.JobID, string(r.Phase), r.StartedAt, r.HeartbeatAt, r.OwnerInstance, legacyStub, r.Kind); err != nil {
 		// 唯一索引 idx_runs_one_active 把「一个任务两个活跃 run」关死在库层面。
 		if strings.Contains(err.Error(), "UNIQUE") {
 			return Run{}, fmt.Errorf("%w: 这个任务已经有一条未结束的运行（多半是上次进程被杀的残留）。跑一次 `jinliang serve` 会替它收尾（心跳过期后标成 interrupted）", ErrConflict)
 		}
 		return Run{}, fmt.Errorf("写入运行记录失败: %w", err)
 	}
+	r.Stub = legacyStub == 1
 	return r, nil
 }
 
@@ -169,7 +195,7 @@ func (s *Store) SetRunError(ctx context.Context, runID, msg string) error {
 
 const runCols = `id, job_id, phase, started_at, COALESCE(ended_at,''), rows_done,
 	lag_bytes, lag_ms, COALESCE(last_error,''), exit_code, stub,
-	COALESCE(heartbeat_at,''), COALESCE(owner_instance,''), COALESCE(finish_reason,'')`
+	COALESCE(heartbeat_at,''), COALESCE(owner_instance,''), COALESCE(finish_reason,''), kind`
 
 func scanRun(sc interface{ Scan(...any) error }) (Run, error) {
 	var r Run
@@ -179,7 +205,7 @@ func scanRun(sc interface{ Scan(...any) error }) (Run, error) {
 	var stub int
 	if err := sc.Scan(&r.ID, &r.JobID, &phase, &r.StartedAt, &r.EndedAt, &r.RowsDone,
 		&lagBytes, &lagMs, &r.LastError, &exit, &stub,
-		&r.HeartbeatAt, &r.OwnerInstance, &r.FinishReason); err != nil {
+		&r.HeartbeatAt, &r.OwnerInstance, &r.FinishReason, &r.Kind); err != nil {
 		return Run{}, err
 	}
 	r.Phase = state.Phase(phase)
@@ -208,7 +234,7 @@ func (s *Store) GetRun(ctx context.Context, id string) (Run, error) {
 	return r, err
 }
 
-// LatestRun returns the most recent run for a job.
+// LatestRun returns the most recent run of any kind.
 func (s *Store) LatestRun(ctx context.Context, jobID string) (Run, error) {
 	r, err := scanRun(s.db.QueryRowContext(ctx,
 		`SELECT `+runCols+` FROM runs WHERE job_id = ? ORDER BY started_at DESC, id DESC LIMIT 1`, jobID))
@@ -216,6 +242,25 @@ func (s *Store) LatestRun(ctx context.Context, jobID string) (Run, error) {
 		return Run{}, ErrNotFound
 	}
 	return r, err
+}
+
+// LatestRunOfKind returns the most recent run of one kind.
+//
+// 「最近一次运行」在任务列表/详情页必须用 kind='sync' 取：verify 运行会被
+// 写成一行 run，但它不是同步，混进主视图会让人以为同步跑过。
+func (s *Store) LatestRunOfKind(ctx context.Context, jobID, kind string) (Run, error) {
+	r, err := scanRun(s.db.QueryRowContext(ctx,
+		`SELECT `+runCols+` FROM runs WHERE job_id = ? AND kind = ?
+		 ORDER BY started_at DESC, id DESC LIMIT 1`, jobID, kind))
+	if isNoRows(err) {
+		return Run{}, ErrNotFound
+	}
+	return r, err
+}
+
+// LatestSyncRun 是「最近一次同步运行」，列表页与任务摘要都用它。
+func (s *Store) LatestSyncRun(ctx context.Context, jobID string) (Run, error) {
+	return s.LatestRunOfKind(ctx, jobID, RunKindSync)
 }
 
 // ListRuns returns recent runs, newest first. jobID "" means all jobs.
