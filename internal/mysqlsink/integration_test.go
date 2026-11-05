@@ -251,8 +251,18 @@ func TestIntegrationDDLOutsideWhitelistStops(t *testing.T) {
 	if !strings.Contains(err.Error(), "白名单") {
 		t.Fatalf("错误要说清白名单: %v", err)
 	}
-	if n := countRows(t, s, "jl_b3_orders"); n != 0 {
-		t.Fatalf("整批应回滚，实际写了 %d 行", n)
+	// 语义（Docs + Owl 裁决）：DDL 会隐式提交，所以「数据先落、位点后落」——
+	// 数据可以已经写进去（重放靠 upsert 幂等），但位点绝不能前进，且 DDL 不能执行。
+	var tableStillThere int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM information_schema.TABLES
+		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME='jl_b3_orders'`).Scan(&tableStillThere); err != nil {
+		t.Fatal(err)
+	}
+	if tableStillThere != 1 {
+		t.Fatal("被拒绝的 DROP TABLE 绝不能执行")
+	}
+	if p, _ := s.MetaPosition(ctx); strings.Contains(p, "pos=500") {
+		t.Fatalf("DDL 被拒时位点不能前进: %q", p)
 	}
 }
 
@@ -397,3 +407,90 @@ func (p testPosition) String() string { return p.raw }
 func (p testPosition) Kind() string   { return "mysql" }
 
 var _ = time.Now
+
+// 同一批 DDL 应用两次必须幂等（这是「DDL 隐式提交」那条必改的验收标准）。
+// 旧实现里 DDL 塞在数据事务中：崩在「DDL 之后、位点写入之前」后重放 → 1061 Duplicate key name → 永久卡死。
+func TestIntegrationDDLReplayIsIdempotent(t *testing.T) {
+	ctx := context.Background()
+	s := openSink(t, nil)
+	dropTable(t, s, "jl_b3_orders")
+	defer dropTable(t, s, "jl_b3_orders")
+	if _, err := s.EnsureSchema(ctx, ordersCatalog()); err != nil {
+		t.Fatalf("建表: %v", err)
+	}
+
+	batch := []source.Event{
+		{Kind: source.EvBegin, TxID: "t1"},
+		{Kind: source.EvInsert, TxID: "t1", Table: source.TableRef{Table: "jl_b3_orders"},
+			New:      source.Row{Table: source.TableRef{Table: "jl_b3_orders"}, Values: []source.Value{{Kind: source.KindInt, I: 1}, {Kind: source.KindString, S: "x"}}},
+			Relation: relationPtr("jl_b3_orders")},
+		{Kind: source.EvDDL, TxID: "t2", DDL: "CREATE INDEX jl_b3_idx ON `jl_b3_orders` (`note`)"},
+		{Kind: source.EvCommit, TxID: "t2"},
+	}
+	for round := 1; round <= 2; round++ {
+		if err := s.Apply(ctx, batch, posOf(t, "mysql:v1:file=binlog.000001;pos=700;coord=mysql_file_pos")); err != nil {
+			t.Fatalf("第 %d 次应用失败（应幂等跳过已存在的索引）: %v", round, err)
+		}
+	}
+	if n := countRows(t, s, "jl_b3_orders"); n != 1 {
+		t.Fatalf("重放两次后仍应 1 行，实际 %d", n)
+	}
+	var idx int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(DISTINCT INDEX_NAME) FROM information_schema.STATISTICS
+		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME='jl_b3_orders' AND INDEX_NAME='jl_b3_idx'`).Scan(&idx); err != nil {
+		t.Fatal(err)
+	}
+	if idx != 1 {
+		t.Fatalf("索引应只有一份，实际 %d", idx)
+	}
+
+	// ADD COLUMN 同理（重复执行会 1060 Duplicate column name）。
+	add := []source.Event{
+		{Kind: source.EvBegin, TxID: "t3"},
+		{Kind: source.EvDDL, TxID: "t3", DDL: "ALTER TABLE `jl_b3_orders` ADD COLUMN extra2 VARCHAR(8) NULL"},
+		{Kind: source.EvCommit, TxID: "t3"},
+	}
+	for round := 1; round <= 2; round++ {
+		if err := s.Apply(ctx, add, posOf(t, "mysql:v1:file=binlog.000001;pos=800;coord=mysql_file_pos")); err != nil {
+			t.Fatalf("第 %d 次加列失败（应幂等跳过）: %v", round, err)
+		}
+	}
+	var cols int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM information_schema.COLUMNS
+		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME='jl_b3_orders' AND COLUMN_NAME='extra2'`).Scan(&cols); err != nil {
+		t.Fatal(err)
+	}
+	if cols != 1 {
+		t.Fatalf("列应只有一份，实际 %d", cols)
+	}
+}
+
+// 数据先落、位点后落：DDL 被白名单拒绝时，数据已提交但位点不动（重放靠 upsert 幂等）。
+func TestIntegrationDataCommitsBeforeRejectedDDL(t *testing.T) {
+	ctx := context.Background()
+	s := openSink(t, nil)
+	dropTable(t, s, "jl_b3_orders")
+	defer dropTable(t, s, "jl_b3_orders")
+	if _, err := s.EnsureSchema(ctx, ordersCatalog()); err != nil {
+		t.Fatalf("建表: %v", err)
+	}
+	batch := []source.Event{
+		{Kind: source.EvBegin, TxID: "t1"},
+		{Kind: source.EvInsert, TxID: "t1", Table: source.TableRef{Table: "jl_b3_orders"},
+			New:      source.Row{Table: source.TableRef{Table: "jl_b3_orders"}, Values: []source.Value{{Kind: source.KindInt, I: 3}, {Kind: source.KindString, S: "keep"}}},
+			Relation: relationPtr("jl_b3_orders")},
+		{Kind: source.EvCommit, TxID: "t1"},
+		{Kind: source.EvDDL, TxID: "t2", DDL: "DROP TABLE `jl_b3_orders`"},
+		{Kind: source.EvCommit, TxID: "t2"},
+	}
+	err := s.Apply(ctx, batch, posOf(t, "mysql:v1:file=binlog.000001;pos=900;coord=mysql_file_pos"))
+	if err == nil {
+		t.Fatal("DROP TABLE 不在白名单，必须停")
+	}
+	if n := countRows(t, s, "jl_b3_orders"); n != 1 {
+		t.Fatalf("数据应先落库（1 行），实际 %d 行", n)
+	}
+	if p, _ := s.MetaPosition(ctx); strings.Contains(p, "pos=900") {
+		t.Fatalf("DDL 失败时位点不能前进（否则重放会跳过这笔数据）: %q", p)
+	}
+}

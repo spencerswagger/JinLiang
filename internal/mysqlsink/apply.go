@@ -10,28 +10,141 @@ import (
 	"github.com/spencerswagger/jinliang/internal/source"
 )
 
-// Apply 实现 sink.Sink：一个批次 = 一个目标端事务 = 数据 + 位点，原子提交。
+// Apply 实现 sink.Sink。
 //
-// 批次里的行按 `(表, 插入/更新)` 分组做多行 upsert；删除按主键逐行（多行 DELETE 的
-// 参数顺序更难保证正确，收益也小）；DDL 过白名单后立即执行。
+// 一个批次通常是「一个目标端事务 = 数据 + 位点」。但 **MySQL 的 DDL 与 TRUNCATE 会隐式
+// 提交**：把它们塞进同一个 tx，已累积的 INSERT 会被顺手提交掉、`tx.Commit()` 退化成空操作，
+// 「数据 + 位点同事务」在有 DDL 的批次里就不成立了；更糟的是重放会再执行一次 CREATE INDEX /
+// ADD COLUMN，直接 `Error 1061/1060` 永久卡死在该批次。
+//
+// 所以分两种走法：
+//   - 批次里没有 DDL/TRUNCATE：单事务，数据 + 位点一起提交（最强保证）；
+//   - 有：先提交数据（带**上一个已提交位点**）、再单独执行 DDL（执行前先判是否已存在，
+//     幂等跳过）、最后单独写新位点。顺序是「数据先落、位点后落」——中间崩最多重放数据
+//     （upsert 幂等）或重跑一次幂等的 DDL，绝不重复建索引。
 func (s *Sink) Apply(ctx context.Context, evs []source.Event, pos source.Position) error {
 	// 契约不变量先机械校验一遍：事务不配对、以半截事务结尾的批次一律不收。
-	// 引擎也会校验；这里再挡一次是因为「位点与数据同事务」的代价太大，宁可多一道。
 	if err := source.ValidateBatch(evs); err != nil {
 		return fmt.Errorf("拒绝写入：批次不满足事务边界不变量: %w", err)
 	}
 
+	advance := pos != nil && (len(evs) == 0 || endsWithCommit(evs))
+
+	if !batchHasImplicitCommit(evs) {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("开目标端事务失败: %w", err)
+		}
+		fail := true
+		defer func() {
+			if fail {
+				_ = tx.Rollback()
+			}
+		}()
+		if err := s.applyData(ctx, tx, evs); err != nil {
+			return err
+		}
+		if advance {
+			if err := s.writePosition(ctx, tx, pos.String()); err != nil {
+				return err
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("提交目标端事务失败: %w", err)
+		}
+		fail = false
+		return nil
+	}
+
+	// —— 含隐式提交语句：拆成三个独立事务 ——
+	if err := s.commitDataWithPreviousPosition(ctx, evs); err != nil {
+		return err
+	}
+	if err := s.applyImplicitCommitStatements(ctx, evs); err != nil {
+		return err
+	}
+	if advance {
+		return s.commitPosition(ctx, pos.String())
+	}
+	return nil
+}
+
+// batchHasImplicitCommit 报告批次里是否含 DDL / TRUNCATE（它们会隐式提交）。
+func batchHasImplicitCommit(evs []source.Event) bool {
+	for _, ev := range evs {
+		if ev.Kind == source.EvDDL || ev.Kind == source.EvTruncate {
+			return true
+		}
+	}
+	return false
+}
+
+// commitDataWithPreviousPosition 把数据落库，位点写**上一个已提交位点**（不变）。
+func (s *Sink) commitDataWithPreviousPosition(ctx context.Context, evs []source.Event) error {
+	prev, err := s.MetaPosition(ctx)
+	if err != nil {
+		return err
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("开目标端事务失败: %w", err)
 	}
+	fail := true
 	defer func() {
-		if err != nil {
+		if fail {
 			_ = tx.Rollback()
 		}
 	}()
+	if err := s.applyData(ctx, tx, evs); err != nil {
+		return err
+	}
+	if prev != "" {
+		if err := s.writePosition(ctx, tx, prev); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("提交数据失败: %w", err)
+	}
+	fail = false
+	return nil
+}
 
-	// 同一张表连续的插入/更新合并成一条多行 upsert；顺序按源顺序保留。
+// applyImplicitCommitStatements 单独执行 DDL/TRUNCATE；已生效的直接跳过（幂等）。
+func (s *Sink) applyImplicitCommitStatements(ctx context.Context, evs []source.Event) error {
+	for _, ev := range evs {
+		switch ev.Kind {
+		case source.EvTruncate:
+			if _, err := s.db.ExecContext(ctx, "TRUNCATE TABLE "+qualified(ev.Table)); err != nil {
+				return fmt.Errorf("清空 %s 失败: %w", qualified(ev.Table), err)
+			}
+		case source.EvDDL:
+			if err := s.applyDDL(ctx, ev.DDL); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// commitPosition 把位点单独落库（DDL 之后的最后一步）。
+func (s *Sink) commitPosition(ctx context.Context, position string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("开位点事务失败: %w", err)
+	}
+	if err := s.writePosition(ctx, tx, position); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("提交位点失败: %w", err)
+	}
+	return nil
+}
+
+// applyData 写行（插入/更新/删除），不含任何会隐式提交的语句。
+func (s *Sink) applyData(ctx context.Context, tx *sql.Tx, evs []source.Event) error {
 	i := 0
 	for i < len(evs) {
 		ev := evs[i]
@@ -42,36 +155,17 @@ func (s *Sink) Apply(ctx context.Context, evs []source.Event, pos source.Positio
 				evs[j].Table == ev.Table {
 				j++
 			}
-			if err = s.applyUpserts(ctx, tx, evs[i:j]); err != nil {
+			if err := s.applyUpserts(ctx, tx, evs[i:j]); err != nil {
 				return err
 			}
 			i = j
 			continue
 		case source.EvDelete:
-			if err = s.applyDelete(ctx, tx, ev); err != nil {
-				return err
-			}
-		case source.EvTruncate:
-			if _, err = tx.ExecContext(ctx, "TRUNCATE TABLE "+qualified(ev.Table)); err != nil {
-				return fmt.Errorf("清空 %s 失败: %w", qualified(ev.Table), err)
-			}
-		case source.EvDDL:
-			if err = s.applyDDL(ctx, tx, ev); err != nil {
+			if err := s.applyDelete(ctx, tx, ev); err != nil {
 				return err
 			}
 		}
 		i++
-	}
-
-	// 位点与数据同事务（docs/STATE-SCHEMA.md §1）。半个事务的批次由引擎给「上一个
-	// 已提交位点」；这里只在批次以 EvCommit 收尾时推进，否则原样保留。
-	if pos != nil && (len(evs) == 0 || endsWithCommit(evs)) {
-		if err = s.writePosition(ctx, tx, pos.String()); err != nil {
-			return err
-		}
-	}
-	if err = tx.Commit(); err != nil {
-		return fmt.Errorf("提交目标端事务失败: %w", err)
 	}
 	return nil
 }
@@ -161,37 +255,123 @@ func (s *Sink) classify(ctx context.Context, stmt string) DDLDecision {
 	return decided
 }
 
-// applyDDL 走白名单：allow 执行、skip 跳过、confirm/reject 停下。
-func (s *Sink) applyDDL(ctx context.Context, tx *sql.Tx, ev source.Event) error {
-	d := s.classify(ctx, ev.DDL)
+// applyDDL 走白名单并**独立执行**（DDL 隐式提交，不能塞进数据事务）。
+//
+// 幂等：执行前先查目标端是否已经生效（列/索引/类型），已生效就跳过——
+// 这样「DDL 之后、位点写入之前崩溃 → 重放」不会再撞 1061/1060。
+func (s *Sink) applyDDL(ctx context.Context, stmt string) error {
+	d := s.classify(ctx, stmt)
 	switch d.Class {
 	case DDLAllow:
-		if _, err := tx.ExecContext(ctx, d.SQL); err != nil {
+		done, err := s.ddlAlreadyApplied(ctx, d)
+		if err != nil {
+			return err
+		}
+		if done {
+			return nil
+		}
+		if _, err := s.db.ExecContext(ctx, d.SQL); err != nil {
 			return fmt.Errorf("跟随 DDL 失败（%s）：%w", d.Reason, err)
+		}
+		// 结构变了：唯一键缓存必须失效，否则加完唯一索引仍按「没有唯一键」报错。
+		if d.Table.Table != "" {
+			delete(s.uniqueCache, s.schemaOf(d.Table)+"."+d.Table.Table)
 		}
 		return nil
 	case DDLSkip:
 		return nil
 	case DDLConfirm:
-		if s.opt.AutoConfirmDDL {
-			if _, err := tx.ExecContext(ctx, d.SQL); err != nil {
-				return fmt.Errorf("执行需确认的 DDL 失败（%s）：%w", d.Reason, err)
-			}
-			return nil
+		if !s.opt.AutoConfirmDDL {
+			return fmt.Errorf("DDL 需要确认后才跟随：%s。原语句：%s。"+
+				"你能做的：① 在源端暂缓这类变更；② 确认后手工在目标端执行同样的语句，再重跑本任务；"+
+				"③ 确实要我们自动跟随，把 content.schema_follow.auto_confirm 打开（会失去人工把关）。"+
+				"风险：删列/加唯一索引会改变目标端数据或 upsert 判据，自动执行后无法回滚",
+				d.Reason, stmt)
 		}
-		return fmt.Errorf("DDL 需要确认后才跟随：%s。原语句：%s。"+
-			"你能做的：① 在源端暂缓这类变更；② 确认后手工在目标端执行同样的语句，再重跑本任务；"+
-			"③ 确实要我们自动跟随，把 content.schema_follow.auto_confirm 打开（会失去人工把关）。"+
-			"风险：删列/加唯一索引会改变目标端数据或 upsert 判据，自动执行后无法回滚",
-			d.Reason, ev.DDL)
+		if _, err := s.db.ExecContext(ctx, d.SQL); err != nil {
+			return fmt.Errorf("执行需确认的 DDL 失败（%s）：%w", d.Reason, err)
+		}
+		if d.Table.Table != "" {
+			delete(s.uniqueCache, s.schemaOf(d.Table)+"."+d.Table.Table)
+		}
+		return nil
 	default:
 		return fmt.Errorf("DDL 不在白名单，已停在目标端写入之前：%s。原语句：%s。"+
 			"你能做的：① 把这条变更拆成白名单内的形态（加列/放宽长度/加索引）；"+
 			"② 或者先在源端与目标端各自手工完成结构变更，再重跑；"+
 			"③ 该表不再同步就把 content.tables.<表> 关掉。"+
 			"风险：我们不会照搬这类 DDL，也不会静默跳过——继续跑会让后续行按错误结构写入",
-			d.Reason, ev.DDL)
+			d.Reason, stmt)
 	}
+}
+
+// ddlAlreadyApplied 判断一条 allow 类 DDL 是否已经在目标端生效。
+func (s *Sink) ddlAlreadyApplied(ctx context.Context, d DDLDecision) (bool, error) {
+	if d.Table.Table == "" {
+		return false, nil
+	}
+	schema := s.schemaOf(d.Table)
+	switch {
+	case d.Column != "" && d.NewType != "":
+		// MODIFY/CHANGE：目标端类型已经等于目标类型 → 已生效。
+		var cur string
+		err := s.db.QueryRowContext(ctx, `
+			SELECT COLUMN_TYPE FROM information_schema.COLUMNS
+			WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND COLUMN_NAME = ?`,
+			schema, d.Table.Table, d.Column).Scan(&cur)
+		if err == sql.ErrNoRows {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		return strings.EqualFold(normalizeTypeText(cur), normalizeTypeText(d.NewType)), nil
+	case d.Column != "":
+		// ADD COLUMN：列已存在 → 跳过。
+		var n int
+		if err := s.db.QueryRowContext(ctx, `
+			SELECT COUNT(*) FROM information_schema.COLUMNS
+			WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND COLUMN_NAME = ?`,
+			schema, d.Table.Table, d.Column).Scan(&n); err != nil {
+			return false, err
+		}
+		return n > 0, nil
+	}
+	// 索引：按索引名判存在。
+	if name := indexNameOf(d.SQL); name != "" {
+		var n int
+		if err := s.db.QueryRowContext(ctx, `
+			SELECT COUNT(*) FROM information_schema.STATISTICS
+			WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND INDEX_NAME = ?`,
+			schema, d.Table.Table, name).Scan(&n); err != nil {
+			return false, err
+		}
+		return n > 0, nil
+	}
+	return false, nil
+}
+
+// indexNameOf 从 ADD INDEX / CREATE INDEX 语句里取索引名。
+func indexNameOf(stmt string) string {
+	fields := strings.Fields(stmt)
+	for i, f := range fields {
+		switch strings.ToUpper(f) {
+		case "INDEX", "KEY":
+			// ALTER TABLE … ADD INDEX name (…)  /  CREATE INDEX name ON …
+			if i+1 < len(fields) {
+				n := trimBackticks(strings.TrimSuffix(fields[i+1], "("))
+				if strings.EqualFold(n, "ON") || n == "" {
+					return ""
+				}
+				return n
+			}
+		}
+	}
+	return ""
+}
+
+func normalizeTypeText(t string) string {
+	return strings.Join(strings.Fields(strings.ToLower(t)), " ")
 }
 
 // columnsFor 取目标表的列清单与「要更新的列」（排除主键）。

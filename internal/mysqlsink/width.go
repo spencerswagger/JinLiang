@@ -223,19 +223,44 @@ func splitType(t string) (string, string) {
 	return t, ""
 }
 
+// tableWidthOptions 用目标表**实际的默认字符集**决定每字符几字节。
+//
+// 口径必须和 CheckIndexWidths 一致：那边按列的真实字符集算，这边要是统一按 4 字节，
+// latin1 的表会被多报一堆假警告（假警告多了用户就不看了，等于没有警告）。
+func (s *Sink) tableWidthOptions(ctx context.Context, t source.TableRef) WidthOptions {
+	opt := s.width
+	if s.db == nil {
+		return opt
+	}
+	var charset sql.NullString
+	err := s.db.QueryRowContext(ctx, `
+		SELECT co.CHARACTER_SET_NAME FROM information_schema.TABLES t
+		LEFT JOIN information_schema.COLLATIONS co ON co.COLLATION_NAME = t.TABLE_COLLATION
+		WHERE t.TABLE_SCHEMA = ? AND t.TABLE_NAME = ?`, s.schemaOf(t), t.Table).Scan(&charset)
+	if err != nil || !charset.Valid || charset.String == "" {
+		return opt
+	}
+	opt.CharsetBytes = charsetMaxBytes(charset.String)
+	return opt
+}
+
 // widthChecks 把警告变成预检项（StatusWarn：只提示，不阻断）。
 func (s *Sink) widthChecks(ctx context.Context, cat source.Catalog) []source.Check {
 	var checks []source.Check
-	for _, w := range CheckRowWidth(cat, s.width) {
-		checks = append(checks, source.Check{
-			ID:     "MY-W01",
-			Title:  "utf8mb4 下列宽可能超过索引/列上限",
-			Status: source.StatusWarn,
-			Detail: w.String(),
-			SQL:    fmt.Sprintf("ALTER TABLE `%s`.`%s` MODIFY `%s` VARCHAR(%d);", w.Schema, w.Table, w.Column, w.Limit/s.width.perChar()),
-			Who:    "you",
-			Code:   "E4001",
-		})
+	for _, t := range cat.Tables {
+		opt := s.tableWidthOptions(ctx, t.TableRef)
+		single := source.Catalog{Tables: []source.Table{t}}
+		for _, w := range CheckRowWidth(single, opt) {
+			checks = append(checks, source.Check{
+				ID:     "MY-W01",
+				Title:  "utf8mb4 下列宽可能超过索引/列上限",
+				Status: source.StatusWarn,
+				Detail: w.String(),
+				SQL:    fmt.Sprintf("ALTER TABLE `%s`.`%s` MODIFY `%s` VARCHAR(%d);", w.Schema, w.Table, w.Column, w.Limit/opt.perChar()),
+				Who:    "you",
+				Code:   "E4001",
+			})
+		}
 	}
 	if s.db != nil {
 		for _, schema := range catalogSchemas(cat) {

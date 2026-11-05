@@ -87,13 +87,16 @@ func ClassifyDDL(stmt string) DDLDecision {
 				case "CONSTRAINT", "FOREIGN":
 					return DDLDecision{Class: DDLReject, Table: tbl,
 						Reason: "外键约束不在白名单：跨表约束在同步过程中必然短暂不成立"}
-				case "INDEX", "KEY", "FULLTEXT", "SPATIAL", "COLUMN", "PARTITION":
+				case "COLUMN":
+					return DDLDecision{Class: DDLAllow, Table: tbl, Column: addColumnName(fields), SQL: raw,
+						Reason: "加列属于白名单四类，跟随（已存在则跳过）"}
+				case "INDEX", "KEY", "FULLTEXT", "SPATIAL":
 					return DDLDecision{Class: DDLAllow, Table: tbl, SQL: raw,
-						Reason: "加列/加索引属于白名单四类，跟随"}
+						Reason: "加索引属于白名单四类，跟随（已存在则跳过）"}
 				}
 			}
-			return DDLDecision{Class: DDLAllow, Table: tbl, SQL: raw,
-				Reason: "加列属于白名单四类，跟随"}
+			return DDLDecision{Class: DDLAllow, Table: tbl, Column: addColumnName(fields), SQL: raw,
+				Reason: "加列属于白名单四类，跟随（已存在则跳过）"}
 		case "MODIFY", "CHANGE":
 			col, newType, renamed, ok := parseModify(rest)
 			if !ok {
@@ -132,6 +135,22 @@ func ClassifyDDL(stmt string) DDLDecision {
 	_ = up
 	return DDLDecision{Class: DDLReject,
 		Reason: fmt.Sprintf("语句类型 %q 不在白名单（只跟随加列/放宽长度/加索引/删列）", fields[0])}
+}
+
+// addColumnName 从 "ALTER TABLE t ADD [COLUMN] c type…" 里取列名。
+func addColumnName(fields []string) string {
+	for i, f := range fields {
+		if strings.EqualFold(f, "ADD") && i+1 < len(fields) {
+			j := i + 1
+			if strings.EqualFold(trimBackticks(fields[j]), "COLUMN") {
+				j++
+			}
+			if j < len(fields) {
+				return trimBackticks(fields[j])
+			}
+		}
+	}
+	return ""
 }
 
 func firstWord(fields []string) string {
