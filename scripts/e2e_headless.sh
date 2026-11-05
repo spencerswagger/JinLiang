@@ -104,8 +104,10 @@ MY_DSN="$(pick_my)"
 if [ -n "${PG_DSN}" ]; then SRC_DSN="${PG_DSN}"; SRC_LABEL=postgres
 elif [ -n "${MY_DSN}" ]; then SRC_DSN="${MY_DSN}"; SRC_LABEL=mysql
 else
-  echo "  SKIP：四个 DSN 全空，完整链无法运行（这不是通过）"
-  exit 0
+  # 退出码 78 = EX_CONFIG（sysexits.h）：一个 DSN 都没给，说明环境没准备好。
+  # 这里绝不能 exit 0——CI 会把「什么都没验」当成「全部通过」，那是假绿。
+  echo "  SKIP：四个 DSN 全空，完整链无法运行（这不是通过，退出码 78 = EX_CONFIG）" >&2
+  exit 78
 fi
 if [ "${SRC_LABEL}" = "postgres" ] && [ -n "${MY_DSN}" ]; then TGT_DSN="${MY_DSN}"; TGT_LABEL=mysql
 elif [ "${SRC_LABEL}" = "mysql" ] && [ -n "${PG_DSN}" ]; then TGT_DSN="${PG_DSN}"; TGT_LABEL=postgres
