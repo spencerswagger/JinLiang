@@ -3,6 +3,9 @@ package engine
 import (
 	"context"
 	"fmt"
+	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -26,6 +29,23 @@ const (
 	defaultMaxTxBytes  = int64(128 << 20)
 	defaultMaxTxEvents = 1_000_000
 )
+
+// txLimits reads the two knobs Data 的 #11 也认的同一组环境变量，
+// 保证两个连接器的口径一致（`reliability.tx_oversize` 的数值形状还没定）。
+func txLimits() (bytes int64, events int) {
+	bytes, events = defaultMaxTxBytes, defaultMaxTxEvents
+	if v := strings.TrimSpace(os.Getenv("JINLIANG_TX_MAX_BYTES")); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			bytes = n
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("JINLIANG_TX_MAX_EVENTS")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			events = n
+		}
+	}
+	return bytes, events
+}
 
 // endsWithCommit reports whether the batch closes on a committed transaction.
 func endsWithCommit(evs []source.Event) bool {
@@ -83,9 +103,10 @@ func newBatcher(sink applier, src acker, batchRows int, delay time.Duration,
 	if delay <= 0 {
 		delay = time.Millisecond
 	}
+	txBytes, txEvents := txLimits()
 	return &batcher{sink: sink, src: src, batchRows: batchRows, delay: delay,
 		lastPos: start, pendPos: start, onApplied: onApplied, lastFlush: time.Now(),
-		maxTxBytes: defaultMaxTxBytes, maxTxEvents: defaultMaxTxEvents}
+		maxTxBytes: txBytes, maxTxEvents: txEvents}
 }
 
 // AdvanceTo pushes the checkpoint forward without any data, for the case where
@@ -180,9 +201,12 @@ type txTooLargeError struct {
 }
 
 func (e *txTooLargeError) Error() string {
-	return fmt.Sprintf("源端有一个事务太大：约 %d 行 / %s，超过整段缓冲的上限（%d 行 / %s）。"+
-		"要么把它拆成几个小事务，要么等 spill-to-disk 实现后再跑",
-		e.rows, humanLag(e.bytes), defaultMaxTxEvents, humanLag(defaultMaxTxBytes))
+	return fmt.Sprintf("源端有个事务太大：已经缓冲约 %d 行 / %s，超过单事务上限。"+
+		"你现在能做什么：1) 把它拆成几个小事务（批量 UPDATE/DELETE 改成分页做）；"+
+		"2) 调大上限 JINLIANG_TX_MAX_BYTES / JINLIANG_TX_MAX_EVENTS 后重跑。"+
+		"风险：调高会让峰值内存跟着涨，调得比机器内存还大就是 OOM（进程直接消失，看不出原因）；"+
+		"spill-to-disk 还没实现，所以现在只能报错停下，不会硬撑",
+		e.rows, humanLag(e.bytes))
 }
 
 // Flush commits whatever is pending. Safe to call concurrently (the ticker and
