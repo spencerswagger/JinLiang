@@ -55,6 +55,14 @@ func cmdServe(args []string) error {
 	}
 	defer store.Close()
 
+	// 上一次进程可能被 kill -9：心跳过期的 run 永远 ended_at IS NULL，
+	// 历史页会永久显示「在跑」并且挡住下一次运行。启动时替它们收尾。
+	if n, err := store.RecoverStaleRuns(context.Background(), 2*time.Minute); err != nil {
+		return fmt.Errorf("清点上次遗留的运行失败: %w", err)
+	} else if n > 0 {
+		fmt.Printf("  上次有 %d 条运行没有正常收尾（进程被终止），已标记为 interrupted\n", n)
+	}
+
 	if !isLoopbackListen(*listen) {
 		fmt.Fprintf(os.Stderr, `jinliang serve: 注意 —— 你把控制台暴露在 %s 上了。
 
@@ -162,15 +170,28 @@ func cmdImport(args []string) error {
 	}
 	defer store.Close()
 
-	job, err := store.ImportYAML(context.Background(), raw, control.ImportOptions{Actor: control.ActorCLI, DryRun: *dry})
-	if err != nil {
+	report, err := store.ImportYAMLDocs(context.Background(), raw, control.ImportOptions{Actor: control.ActorCLI, DryRun: *dry})
+	if err != nil && report.Total == 0 {
 		return err
 	}
 	if *dry {
-		fmt.Printf("校验通过：%s（dry-run，没有写入）\n", job.Name)
+		fmt.Printf("校验：%s\n", report.Summary())
+	} else {
+		for _, job := range report.Imported {
+			fmt.Printf("已导入任务 %s（id=%s，指纹=%s）\n", job.Name, job.ID, job.JobKey)
+		}
+		fmt.Printf("%s\n", report.Summary())
+	}
+	for _, skip := range report.Skipped {
+		fmt.Fprintf(os.Stderr, "跳过第 %d 份（%s）：%s\n", skip.Index, skip.Name, skip.Reason)
+	}
+	if len(report.Skipped) > 0 {
+		// 有跳过的导入绝不能返回 0：脚本/CI 会把它当成「全部恢复成功」。
+		return fmt.Errorf("%s —— 备份没有完整恢复，见上面每份的原因", report.Summary())
+	}
+	if *dry {
 		return nil
 	}
-	fmt.Printf("已导入任务 %s（id=%s，指纹=%s）\n", job.Name, job.ID, job.JobKey)
 	fmt.Println("下一步：jinliang serve → 打开任务页跑一次预检")
 	return nil
 }

@@ -18,6 +18,9 @@ const (
 	SettingAdminSetAt    = "admin_password_set_at"
 	SettingDefaultBatch  = "default_batch_rows" // 新建向导的默认批次
 	SettingDefaultListen = "listen"             // 上次使用的监听地址（仅展示）
+	// SettingBootEpoch 每次进程启动重写一次：SSE 的 id 是 "<boot_epoch>-<seq>"，
+	// 客户端带着旧 epoch 重连时我们发 reset，而不是假装能补齐（events.go）。
+	SettingBootEpoch = "boot_epoch"
 )
 
 // Setting reads one settings row. The bool is false when the key is absent.
@@ -72,6 +75,23 @@ func (s *Store) InstanceID(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("控制库缺少 instance_id（%s 可能被手工改过）", s.path)
 	}
 	return v, nil
+}
+
+// instanceIDValue is the cached id from Open (no DB round-trip on every run).
+func (s *Store) instanceIDValue() string { return s.instanceID }
+
+// ensureBootEpoch writes a fresh epoch on every start and pins the event bus to
+// it. 进程内 seq 从 1 开始本来没问题，但跨重启就必须让客户端分得清「这是另一条流」。
+func (s *Store) ensureBootEpoch(ctx context.Context) error {
+	id, err := newInstanceID()
+	if err != nil {
+		return err
+	}
+	if err := s.SetSetting(ctx, SettingBootEpoch, id); err != nil {
+		return err
+	}
+	s.bus.SetEpoch(id)
+	return nil
 }
 
 // newInstanceID delegates to internal/state so CLI runs and the control plane

@@ -58,7 +58,7 @@
       if (dot) dot.classList.remove("on");
       // EventSource 会自己重连；这里只把灯灭掉，别吓人
     };
-    es.onmessage = function (msg) {
+    function onEvent(msg) {
       var ev;
       try {
         ev = JSON.parse(msg.data);
@@ -69,7 +69,23 @@
       if (ev.phase_label && live) live.textContent = ev.phase_label;
       if (ev.phase_hint && hint) hint.textContent = ev.phase_hint;
       if (ev.type === "done" && dot) dot.classList.remove("on");
-    };
+    }
+    // 服务端给每条事件都带 event: <type>，所以必须按名字订阅；
+    // onmessage 只收「没有 event 字段」的消息（保留它是为了兼容旧服务端）。
+    ["phase", "progress", "note", "error", "done"].forEach(function (name) {
+      es.addEventListener(name, onEvent);
+    });
+    es.addEventListener("reset", function () {
+      // 控制面进程重启过：之前的序号失效，日志里明说一句，然后从新流继续。
+      if (log) {
+        var row = document.createElement("div");
+        row.className = "ev";
+        row.innerHTML = '<span class="t">' + new Date().toLocaleTimeString() + "</span> " +
+          "控制面重启过，事件流已重置（下面从这一轮开头继续）";
+        log.appendChild(row);
+      }
+    });
+    es.onmessage = onEvent;
   }
 
   if (stream) {

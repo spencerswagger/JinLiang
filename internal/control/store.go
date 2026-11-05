@@ -40,13 +40,14 @@ type Options struct {
 // Store is the control database plus the cipher that protects connection
 // secrets. All writes go through it; nothing else opens the SQLite file.
 type Store struct {
-	db     *sql.DB
-	dir    string
-	path   string
-	cipher *Cipher
-	now    func() time.Time
-	bus    *Bus
-	runner *Runner
+	db         *sql.DB
+	dir        string
+	path       string
+	cipher     *Cipher
+	now        func() time.Time
+	bus        *Bus
+	runner     *Runner
+	instanceID string // settings.instance_id：审计、租约、run 的 owner 都用它
 }
 
 // DefaultDataDir returns ~/.config/jinliang (or $XDG_CONFIG_HOME/jinliang).
@@ -121,6 +122,10 @@ func Open(opts Options) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
+	if err := s.ensureBootEpoch(ctx); err != nil {
+		db.Close()
+		return nil, err
+	}
 	if err := os.Chmod(path, filePerm); err != nil {
 		db.Close()
 		return nil, err
@@ -174,15 +179,17 @@ func ensurePrivateDir(dir string) error {
 // ensureInstance makes sure settings.instance_id exists. The instance id is the
 // third identity layer (docs/IDENTITY.md §4): audit, lease owner, object owner.
 func (s *Store) ensureInstance(ctx context.Context) error {
-	if _, ok, err := s.Setting(ctx, SettingInstanceID); err != nil {
+	if v, ok, err := s.Setting(ctx, SettingInstanceID); err != nil {
 		return err
 	} else if ok {
+		s.instanceID = v
 		return nil
 	}
 	id, err := newInstanceID()
 	if err != nil {
 		return err
 	}
+	s.instanceID = id
 	return s.SetSetting(ctx, SettingInstanceID, id)
 }
 

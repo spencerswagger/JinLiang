@@ -160,6 +160,16 @@ func (r *Runner) loop(job Job, run Run, ctl *runControl) {
 		delete(r.active, ctl.jobID)
 		r.mu.Unlock()
 	}()
+	// 这个 goroutine 是 go r.loop(...) 起的，没人接它的 panic：一次 panic 就是整个
+	// 控制台进程退出，用户正在看的页面直接断。兜住它，把这一轮标失败，进程继续活。
+	defer func() {
+		if rec := recover(); rec != nil {
+			msg := fmt.Sprintf("运行时内部错误（本轮已标记失败，进程继续运行）：%v", rec)
+			r.bus.Publish(Event{JobID: job.ID, RunID: run.ID, Type: "error",
+				Code: "E4002", Message: msg, Stub: true})
+			_, _ = r.store.FinishRun(context.Background(), run.ID, state.Failed, msg, 1, FinishFailed)
+		}
+	}()
 
 	ctx := context.Background()
 	cur := state.Preflight
@@ -176,6 +186,7 @@ func (r *Runner) loop(job Job, run Run, ctl *runControl) {
 			r.fail(job, run, "阶段推进失败："+err.Error())
 			return
 		}
+		_ = r.store.TouchRun(ctx, run.ID) // 心跳：让重启后的 serve 能区分「在跑」和「进程已死」
 		cur = step.phase
 		r.bus.Publish(Event{
 			JobID: job.ID, RunID: run.ID, Type: "phase", Phase: step.phase,
@@ -190,7 +201,7 @@ func (r *Runner) loop(job Job, run Run, ctl *runControl) {
 		r.finishStopped(job, run, cur)
 		return
 	}
-	final, err := r.store.FinishRun(ctx, run.ID, state.Done, "", 0)
+	final, err := r.store.FinishRun(ctx, run.ID, state.Done, "", 0, FinishCompleted)
 	if err != nil {
 		r.fail(job, run, "收尾失败："+err.Error())
 		return
@@ -270,7 +281,7 @@ func (r *Runner) fail(job Job, run Run, msg string) {
 	ev := ErrorEvent(job.ID, run.ID, "E4002", msg)
 	ev.Stub = true
 	r.bus.Publish(ev)
-	_, _ = r.store.FinishRun(context.Background(), run.ID, state.Failed, msg, 1)
+	_, _ = r.store.FinishRun(context.Background(), run.ID, state.Failed, msg, 1, FinishFailed)
 }
 
 func (r *Runner) finishStopped(job Job, run Run, cur state.Phase) {
@@ -281,7 +292,9 @@ func (r *Runner) finishStopped(job Job, run Run, cur state.Phase) {
 			return
 		}
 	}
-	final, err := r.store.FinishRun(ctx, run.ID, state.Done, "", 0)
+	// 手动停止是「停止」，不是「顺利完成」：B0 原来写 phase=done + exit_code=0，
+	// 历史页就会把它当成一次正常结束。finish_reason 让两者分得开。
+	final, err := r.store.FinishRun(ctx, run.ID, state.Done, "", 0, FinishStopped)
 	if err != nil {
 		r.fail(job, run, "停止时收尾失败："+err.Error())
 		return

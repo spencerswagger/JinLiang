@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
+	"time"
 
 	"github.com/spencerswagger/jinliang/internal/state"
 )
@@ -24,7 +26,23 @@ type Run struct {
 	// Stub marks a B0 skeleton run: no data was moved. The UI must say so
 	// instead of pretending a real sync happened.
 	Stub bool `json:"stub"`
+	// HeartbeatAt is the last liveness ping from the process that owns this run.
+	// A crashed process leaves ended_at NULL forever unless someone notices —
+	// that is exactly what this column and RecoverStaleRuns are for.
+	HeartbeatAt string `json:"heartbeat_at,omitempty"`
+	// OwnerInstance is the control-plane instance that started the run.
+	OwnerInstance string `json:"owner_instance,omitempty"`
+	// FinishReason explains how it ended: completed | failed | stopped | interrupted.
+	FinishReason string `json:"finish_reason,omitempty"`
 }
+
+// Finish reasons. "stopped" must never look like a successful completion.
+const (
+	FinishCompleted   = "completed"
+	FinishFailed      = "failed"
+	FinishStopped     = "stopped"
+	FinishInterrupted = "interrupted"
+)
 
 // StartRun inserts a run row in the given phase.
 func (s *Store) StartRun(ctx context.Context, jobID string, phase state.Phase) (Run, error) {
@@ -32,10 +50,16 @@ func (s *Store) StartRun(ctx context.Context, jobID string, phase state.Phase) (
 	if err != nil {
 		return Run{}, err
 	}
-	r := Run{ID: id, JobID: jobID, Phase: phase, StartedAt: s.nowText()}
+	now := s.nowText()
+	r := Run{ID: id, JobID: jobID, Phase: phase, StartedAt: now, HeartbeatAt: now, OwnerInstance: s.instanceID}
 	if _, err := s.db.ExecContext(ctx,
-		`INSERT INTO runs (id, job_id, phase, started_at, rows_done, stub) VALUES (?, ?, ?, ?, 0, 0)`,
-		r.ID, r.JobID, string(r.Phase), r.StartedAt); err != nil {
+		`INSERT INTO runs (id, job_id, phase, started_at, heartbeat_at, owner_instance, rows_done, stub)
+		 VALUES (?, ?, ?, ?, ?, ?, 0, 0)`,
+		r.ID, r.JobID, string(r.Phase), r.StartedAt, r.HeartbeatAt, r.OwnerInstance); err != nil {
+		// 唯一索引 idx_runs_one_active 把「一个任务两个活跃 run」关死在库层面。
+		if strings.Contains(err.Error(), "UNIQUE") {
+			return Run{}, fmt.Errorf("%w: 这个任务已经有一条未结束的运行（可能是上次进程被杀的残留，稍后会自动标记为 interrupted）", ErrConflict)
+		}
 		return Run{}, fmt.Errorf("写入运行记录失败: %w", err)
 	}
 	return r, nil
@@ -68,8 +92,39 @@ func (s *Store) UpdateRunPhase(ctx context.Context, runID string, to state.Phase
 	return s.GetRun(ctx, runID)
 }
 
-// FinishRun closes a run with its terminal phase and error/exit code.
-func (s *Store) FinishRun(ctx context.Context, runID string, to state.Phase, lastError string, exitCode int) (Run, error) {
+// TouchRun refreshes the liveness heartbeat for a running run.
+func (s *Store) TouchRun(ctx context.Context, runID string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE runs SET heartbeat_at = ? WHERE id = ?`, s.nowText(), runID)
+	return err
+}
+
+// RecoverStaleRuns closes runs whose owning process stopped heart-beating
+// (killed -9,机器断电). Called by `serve` at startup only: CLI commands open the
+// same database and must not "recover" a run that a live server is driving.
+//
+// 判据用「最后心跳早于 staleAfter」而不是「owner 不是我」——同一台机器上重启
+// 会拿到新的 boot epoch，但 run 的 owner_instance 是部署身份，重启后不变。
+func (s *Store) RecoverStaleRuns(ctx context.Context, staleAfter time.Duration) (int, error) {
+	if staleAfter <= 0 {
+		staleAfter = 2 * time.Minute
+	}
+	cutoff := s.now().Add(-staleAfter).UTC().Format(time.RFC3339)
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE runs
+		    SET ended_at = ?, finish_reason = ?,
+		        last_error = COALESCE(last_error, '进程在运行中被终止，心跳已过期；这一轮没有正常收尾')
+		  WHERE ended_at IS NULL
+		    AND COALESCE(heartbeat_at, started_at) < ?`,
+		s.nowText(), FinishInterrupted, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
+}
+
+// FinishRun closes a run with its terminal phase, error/exit code and why.
+func (s *Store) FinishRun(ctx context.Context, runID string, to state.Phase, lastError string, exitCode int, finishReason string) (Run, error) {
 	cur, err := s.GetRun(ctx, runID)
 	if err != nil {
 		return Run{}, err
@@ -78,8 +133,8 @@ func (s *Store) FinishRun(ctx context.Context, runID string, to state.Phase, las
 		return Run{}, fmt.Errorf("非法的阶段迁移 %s → %s（这是程序错误）", cur.Phase, to)
 	}
 	if _, err := s.db.ExecContext(ctx,
-		`UPDATE runs SET phase=?, ended_at=?, last_error=?, exit_code=? WHERE id=?`,
-		string(to), s.nowText(), nullIfEmpty(lastError), exitCode, runID); err != nil {
+		`UPDATE runs SET phase=?, ended_at=?, last_error=?, exit_code=?, finish_reason=?, heartbeat_at=? WHERE id=?`,
+		string(to), s.nowText(), nullIfEmpty(lastError), exitCode, nullIfEmpty(finishReason), s.nowText(), runID); err != nil {
 		return Run{}, err
 	}
 	return s.GetRun(ctx, runID)
@@ -100,7 +155,8 @@ func (s *Store) SetRunError(ctx context.Context, runID, msg string) error {
 }
 
 const runCols = `id, job_id, phase, started_at, COALESCE(ended_at,''), rows_done,
-	lag_bytes, lag_ms, COALESCE(last_error,''), exit_code, stub`
+	lag_bytes, lag_ms, COALESCE(last_error,''), exit_code, stub,
+	COALESCE(heartbeat_at,''), COALESCE(owner_instance,''), COALESCE(finish_reason,'')`
 
 func scanRun(sc interface{ Scan(...any) error }) (Run, error) {
 	var r Run
@@ -109,7 +165,8 @@ func scanRun(sc interface{ Scan(...any) error }) (Run, error) {
 	var exit sql.NullInt64
 	var stub int
 	if err := sc.Scan(&r.ID, &r.JobID, &phase, &r.StartedAt, &r.EndedAt, &r.RowsDone,
-		&lagBytes, &lagMs, &r.LastError, &exit, &stub); err != nil {
+		&lagBytes, &lagMs, &r.LastError, &exit, &stub,
+		&r.HeartbeatAt, &r.OwnerInstance, &r.FinishReason); err != nil {
 		return Run{}, err
 	}
 	r.Phase = state.Phase(phase)

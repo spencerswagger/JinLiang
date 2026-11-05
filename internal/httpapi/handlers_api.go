@@ -400,14 +400,24 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, http.StatusBadRequest, plainError("%v", err))
 		return
 	}
-	job, err := s.store.ImportYAML(r.Context(), raw, control.ImportOptions{Actor: actorOf(r)})
-	if err != nil {
+	report, err := s.store.ImportYAMLDocs(r.Context(), raw, control.ImportOptions{Actor: actorOf(r)})
+	// 有跳过时仍然把成功的部分报出来，但状态码不是 201：调用方必须知道「不是全都进了」。
+	if err != nil && report.Total == 0 {
 		s.fail(w, r, err)
 		return
 	}
-	_ = s.store.Audit(r.Context(), actorOf(r), control.ActionJobImport, map[string]any{"job_id": job.ID})
-	sum, _ := s.store.GetJobSummary(r.Context(), job.ID)
-	writeJSON(w, http.StatusCreated, sum)
+	ids := make([]string, 0, len(report.Imported))
+	for _, job := range report.Imported {
+		ids = append(ids, job.ID)
+	}
+	_ = s.store.Audit(r.Context(), actorOf(r), control.ActionJobImport, map[string]any{
+		"job_ids": ids, "imported": report.ImportedCount(), "skipped": len(report.Skipped),
+	})
+	status := http.StatusCreated
+	if len(report.Skipped) > 0 {
+		status = http.StatusMultiStatus // 207：部分成功
+	}
+	writeJSON(w, status, report)
 }
 
 // readYAMLBody accepts either a raw yaml body or {"yaml": "..."} JSON.

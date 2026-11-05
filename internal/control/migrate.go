@@ -75,6 +75,26 @@ var migrations = []migration{
 			`CREATE INDEX IF NOT EXISTS idx_audit_at ON audit(at DESC)`,
 		},
 	},
+	{
+		Version: 2,
+		Name:    "runs-liveness",
+		Stmts: []string{
+			// 进程被杀后，原来那行会永远 ended_at IS NULL：历史页永久显示「在跑」，
+			// 而且还能再开第二个 run。三列 + 一条 partial unique index 把这件事关死。
+			`ALTER TABLE runs ADD COLUMN heartbeat_at TEXT`,
+			`ALTER TABLE runs ADD COLUMN owner_instance TEXT`,
+			// completed | failed | stopped | interrupted —— 「手动停止」不再伪装成 exit_code=0 的正常结束。
+			`ALTER TABLE runs ADD COLUMN finish_reason TEXT`,
+			// 建唯一索引前先结掉余留的活跃行（迁移时本进程还没开始跑任务），
+			// 否则一个历史遗留的重复活跃行会让整条迁移失败。
+			`UPDATE runs
+			    SET ended_at = COALESCE(heartbeat_at, started_at),
+			        finish_reason = COALESCE(finish_reason, 'interrupted')
+			  WHERE ended_at IS NULL`,
+			`CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_one_active
+			    ON runs(job_id) WHERE ended_at IS NULL`,
+		},
+	},
 }
 
 // migrate applies every migration newer than the recorded schema_version.
