@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/spencerswagger/jinliang/internal/control"
+	"github.com/spencerswagger/jinliang/internal/core"
 	"github.com/spencerswagger/jinliang/internal/dsn"
 	"github.com/spencerswagger/jinliang/internal/netcheck"
 )
@@ -334,50 +335,93 @@ func (s *Server) handlePreflight(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
-	run, err := s.store.Runner().Start(r.Context(), r.PathValue("id"), actorOf(r))
+	ctx := r.Context()
+	id := r.PathValue("id")
+	job, err := s.store.GetJob(ctx, id)
 	if err != nil {
-		if errors.Is(err, control.ErrRunInProgress) {
-			s.writeError(w, r, http.StatusConflict, apiError{
-				Class:   "user_action",
-				Message: "这个任务正在跑",
-				Why:     "同一个任务同时跑两份会互相覆盖（多实例靠目标端租约，本机靠这一层）",
-				Next:    []string{"等它跑完（GET /api/jobs/{id} 看 runs）", "或先 POST /pause 停下来"},
-				Risk:    "无",
-			})
-			return
-		}
 		s.fail(w, r, err)
 		return
 	}
+	if err := s.startJob(ctx, job, actorOf(r)); err != nil {
+		if errors.Is(err, control.ErrRunInProgress) {
+			s.writeError(w, r, http.StatusConflict, apiError{
+				Class:   "user_action",
+				Message: "这个任务暂时起不来：控制库里还有一条未结束的运行",
+				Why: "一个任务同时只允许一条活跃运行（库里有唯一索引挡着）。" +
+					"如果上一次是进程被强杀（没有心跳），引擎会在下一次启动时把它收尾成「已中断」再接管——" +
+					"所以这里拒绝的通常是「真的还有另一个进程在写」",
+				Next: []string{
+					"打开任务页看实时事件：GET /api/jobs/{id}/events",
+					"确认没有别的进程在跑（多实例部署时尤其要看）：看那条 run 的 owner_instance",
+					"确实卡住了：等心跳过期（默认 90 秒）后重试，或 POST /api/jobs/{id}/stop",
+				},
+				Risk: "无：位点与数据同事务提交，重跑从断点继续",
+			})
+			return
+		}
+		// 引擎能力边界（例如 MySQL 目标端）是「用户可修正」的问题：422 + 四段式，
+		// 而不是 202 之后什么都没发生。
+		s.writeError(w, r, http.StatusUnprocessableEntity, apiError{
+			Class:   "user_action",
+			Message: "引擎暂时跑不了这种组合",
+			Why:     err.Error(),
+			Next: []string{
+				"把目标端换成一个 PostgreSQL 连接（新建连接 → 任务页改目标）",
+				"MySQL 目标端在 B2；现在可以先只验证源端读取与 full copy",
+			},
+			Risk: "无：这条在开跑之前就挡住了，不会留下半截数据",
+		})
+		return
+	}
+	// 202 + 事件流地址：run 是异步的，结果从 /events 与 /api/runs 看。
 	writeJSON(w, http.StatusAccepted, map[string]any{
-		"run":     run,
-		"stub":    true,
-		"message": "B0 骨架运行已开始：只推进阶段，不搬运数据。事件流：GET /api/jobs/{id}/events",
+		"accepted": true,
+		"job_id":   job.ID,
+		"events":   "/api/jobs/" + job.ID + "/events",
+		"message":  "已开始执行（B1 引擎）。阶段与进度看事件流；错误会带四段式（code/why/next/risk）",
 	})
 }
 
-func (s *Server) handlePause(w http.ResponseWriter, r *http.Request) {
-	if err := s.store.Runner().Pause(r.Context(), r.PathValue("id")); err != nil {
-		s.runControlError(w, r, err)
-		return
+// notImplementedPause 说明「引擎还没有暂停」这件事，而不是回 202 假装接收。
+func notImplementedPause() apiError {
+	return apiError{
+		Class:   "user_action",
+		Message: "引擎还不支持暂停",
+		Why: "B1 的引擎只有「取消」一种停下方式：它会提交位点、按「已停止」收尾（不是失败）。" +
+			"做真的「暂停/恢复」需要在阶段之间设安全停点，属于下一步的工作",
+		Next: []string{
+			"想现在停下：POST /api/jobs/{id}/stop（当前事务提交完就停，不会丢数据）",
+			"停下来的那一轮，下次 run 会从目标端已提交的位点接着跑，不会重搬已经同步过的数据",
+		},
+		Risk: "停止会让这一轮标记为「已停止」（不是失败）：位点与数据同事务提交，重跑从断点继续",
 	}
-	writeJSON(w, http.StatusAccepted, map[string]any{"ok": true, "paused": true})
+}
+
+func (s *Server) handlePause(w http.ResponseWriter, r *http.Request) {
+	s.writeError(w, r, http.StatusNotImplemented, notImplementedPause())
 }
 
 func (s *Server) handleResume(w http.ResponseWriter, r *http.Request) {
-	if err := s.store.Runner().Resume(r.Context(), r.PathValue("id")); err != nil {
-		s.runControlError(w, r, err)
-		return
-	}
-	writeJSON(w, http.StatusAccepted, map[string]any{"ok": true, "paused": false})
+	s.writeError(w, r, http.StatusNotImplemented, apiError{
+		Class:   "user_action",
+		Message: "引擎没有「恢复」这个动作",
+		Why:     "因为暂停没有实现：停止之后再跑一次，引擎会从目标端已提交的位点继续",
+		Next:    []string{"直接 POST /api/jobs/{id}/run —— 会从断点续跑，不会重搬已提交的数据"},
+		Risk:    "无",
+	})
 }
 
 func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
-	if err := s.store.Runner().Stop(r.Context(), r.PathValue("id")); err != nil {
-		s.runControlError(w, r, err)
+	id := r.PathValue("id")
+	if !s.stopJob(id) {
+		s.runControlError(w, r, control.ErrNoActiveRun)
 		return
 	}
-	writeJSON(w, http.StatusAccepted, map[string]any{"ok": true, "stopped": true})
+	_ = s.store.Audit(r.Context(), actorOf(r), "job.stop", map[string]any{"job_id": id})
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"stopping": true,
+		"message":  "已发出停止；引擎会提交位点并按「已中断」收尾，重跑从断点继续",
+	})
 }
 
 func (s *Server) runControlError(w http.ResponseWriter, r *http.Request, err error) {
@@ -666,3 +710,23 @@ func safeFilename(s string) string {
 // 暴露警告自相矛盾。统一用 internal/netcheck（与首启守卫同一份实现）。
 
 func isLoopback(listen string) bool { return netcheck.IsLoopbackListen(listen) }
+
+// handleCodes 把错误码表交给前端。
+//
+// 为什么需要它：SSE 的 error 事件只有 message + code + next，**没有 why/risk**，
+// 而「为什么会这样」与「这么做的风险」正是四段式的后两段。让前端按 code 来查表，
+// 比在每条事件里重复塞字段更省（也让码表只有一处权威：core.Catalogue）。
+func (s *Server) handleCodes(w http.ResponseWriter, r *http.Request) {
+	specs := core.Catalogue()
+	out := make(map[string]apiError, len(specs))
+	for _, sp := range specs {
+		out[string(sp.Code)] = apiError{
+			Code: string(sp.Code), Class: string(sp.Class), Message: sp.Message,
+			Why: sp.Why, Next: sp.Next, Risk: sp.Risk,
+		}
+	}
+	// 码表随二进制版本变，不是用户数据：允许浏览器私有缓存 5 分钟，
+	// 免得每打开一个任务页都重新拉一遍（页面里只拉一次，但刷新会重来）。
+	w.Header().Set("Cache-Control", "private, max-age=300")
+	writeJSON(w, http.StatusOK, map[string]any{"codes": out, "count": len(out)})
+}

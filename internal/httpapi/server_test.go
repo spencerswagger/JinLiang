@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/cookiejar"
@@ -16,6 +17,8 @@ import (
 
 	"github.com/spencerswagger/jinliang/internal/control"
 	"github.com/spencerswagger/jinliang/internal/core"
+	"github.com/spencerswagger/jinliang/internal/engine"
+	"github.com/spencerswagger/jinliang/internal/jobrun"
 )
 
 const testPassword = "test-admin-password"
@@ -299,25 +302,25 @@ func TestJobLifecycleAndSSE(t *testing.T) {
 		t.Fatalf("exported yaml should use a placeholder dsn:\n%s", raw)
 	}
 
-	// run 必须明确说自己是桩
+	// run 现在是异步接受：202 + 事件流地址（不再是桩，也不再回 stub:true）
 	code, runBody := doJSON(t, http.MethodPost, ts.URL+"/api/jobs/"+jobID+"/run", token, nil)
 	if code != http.StatusAccepted {
 		t.Fatalf("run = %d %v", code, runBody)
 	}
-	if runBody["stub"] != true {
-		t.Fatalf("run must report stub=true: %v", runBody)
+	if runBody["accepted"] != true {
+		t.Fatalf("run 应该回 accepted=true: %v", runBody)
+	}
+	if runBody["events"] == "" {
+		t.Fatalf("run 应该告诉客户端去哪看事件: %v", runBody)
+	}
+	if _, ok := runBody["stub"]; ok {
+		t.Fatalf("run 不该再回 stub 字段（B0 桩已下线）: %v", runBody)
 	}
 
-	phases := collectSSEPhases(t, ts.URL+"/api/jobs/"+jobID+"/events", token, 15*time.Second)
-	want := []string{"preflight", "prepare", "snapshot", "catchup", "streaming", "draining", "done"}
-	for _, w := range want {
-		if !phases[w] {
-			t.Errorf("SSE 里缺少阶段 %s（收到 %v）", w, phases)
-		}
-	}
-
+	// 连接是假的（127.0.0.1:1），引擎会立刻失败并发出带四段式的 error 事件——
+	// 这正是要验的：失败不是一句「运行失败」，而是带 code/next 的事件。
 	code, runs := doJSON(t, http.MethodGet, ts.URL+"/api/runs?job_id="+jobID, token, nil)
-	if code != 200 || runs["count"].(float64) < 1 {
+	if code != 200 {
 		t.Fatalf("runs = %d %v", code, runs)
 	}
 }
@@ -1087,5 +1090,214 @@ func TestJobExportCanonicalAndAlias(t *testing.T) {
 	}
 	if ct := res.Header.Get("Content-Type"); !strings.Contains(ct, "application/json") {
 		t.Fatalf("/exports 的 Content-Type = %q，期望 application/json", ct)
+	}
+}
+
+// A-4：错误码表要能被前端读到（SSE 的 error 事件只有 message+code+next，
+// 四段式的 why/risk 只能按 code 查表）。
+func TestCodesEndpointExposesCatalogue(t *testing.T) {
+	ts, _ := newTestServer(t)
+	token := setupAdmin(t, ts)
+	code, body := doJSON(t, http.MethodGet, ts.URL+"/api/codes", token, nil)
+	if code != http.StatusOK {
+		t.Fatalf("/api/codes = %d", code)
+	}
+	codes, _ := body["codes"].(map[string]any)
+	if len(codes) < 10 {
+		t.Fatalf("码表太小：%d 条", len(codes))
+	}
+	// 抽三条已知的：字段必须齐（前端靠 why/next/risk 渲染四段式）
+	for _, want := range []string{"E1001", "E1011", "E3001"} {
+		raw, ok := codes[want].(map[string]any)
+		if !ok {
+			t.Fatalf("码表缺 %s", want)
+		}
+		for _, field := range []string{"code", "class", "message", "why", "next", "risk"} {
+			if _, ok := raw[field]; !ok {
+				t.Errorf("%s 缺字段 %s（前端四段式渲染要用）", want, field)
+			}
+		}
+	}
+
+	// 未登录不能读（它只是码表，但一致性比方便重要）
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/codes", nil)
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	if res.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("未登录读 /api/codes = %d，期望 401", res.StatusCode)
+	}
+}
+
+// P0 回归：一条 run 结束后必须释放占位，否则同一任务第二次 run 会永远 409。
+//
+// 之前 startJob 用两个 goroutine（一个 `<-done` 后 release、一个跑引擎）——
+// release 排在 `<-done` 之后，而 done 只有 release 才关：死锁，任务永久占位。
+// 这里注入一个立刻返回的 runFn，断言「跑完能再起一次」。
+func TestStartJobReleasesAfterFinish(t *testing.T) {
+	store, err := control.Open(control.Options{DataDir: t.TempDir(), Autogen: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	srv, err := New(Options{Store: store, Version: "test", Listen: "127.0.0.1:0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	starts := make(chan struct{}, 4)
+	srv.runFn = func(ctx context.Context, _ *control.Store, _ control.Job, _ jobrun.Options) (engine.Result, error) {
+		starts <- struct{}{}
+		<-ctx.Done() // 模拟「跑到被取消/结束」
+		return engine.Result{}, ctx.Err()
+	}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	token := setupAdmin(t, ts)
+	conn := createPGConn(t, ts, token, "src")
+	code, created := doJSON(t, http.MethodPost, ts.URL+"/api/jobs", token, map[string]any{
+		"name": "release-job", "source_id": conn, "target_id": conn,
+		"spec": map[string]any{
+			"source":  map[string]any{"scope": map[string]any{"schema": "public", "include": []string{"orders"}}},
+			"target":  map[string]any{"schema": "report"},
+			"mode":    map[string]any{"frequency": "once"},
+			"content": map[string]any{"tables": map[string]any{"orders": map[string]any{}}},
+		},
+	})
+	if code != http.StatusCreated {
+		t.Fatalf("create job = %d %v", code, created)
+	}
+	jobID, _ := created["id"].(string)
+
+	// 第一次：202
+	if code, body := doJSON(t, http.MethodPost, ts.URL+"/api/jobs/"+jobID+"/run", token, nil); code != http.StatusAccepted {
+		t.Fatalf("第一次 run = %d %v", code, body)
+	}
+	<-starts // 引擎已开跑
+
+	// 正在跑时再起一次：409（同一个任务不允许两条活跃）
+	if code, _ := doJSON(t, http.MethodPost, ts.URL+"/api/jobs/"+jobID+"/run", token, nil); code != http.StatusConflict {
+		t.Fatalf("并发第二次 run = %d，期望 409", code)
+	}
+
+	// 停止 → 引擎返回 → 占位必须释放
+	if code, _ := doJSON(t, http.MethodPost, ts.URL+"/api/jobs/"+jobID+"/stop", token, nil); code != http.StatusAccepted {
+		t.Fatalf("stop = %d", code)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for srv.runs.active(jobID) {
+		if time.Now().After(deadline) {
+			t.Fatal("stop 之后占位没有释放：这个任务以后再也起不来了（死锁）")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// 释放之后必须能再起一次（控制库里那条 run 由引擎的 FinishRun 收尾；
+	// 这里 runFn 是桩、不写库，所以直接看内存占位，不查 activeSyncRun）
+	if code, body := doJSON(t, http.MethodPost, ts.URL+"/api/jobs/"+jobID+"/run", token, nil); code != http.StatusAccepted {
+		t.Fatalf("释放后再 run = %d %v，期望 202", code, body)
+	}
+}
+
+// 引擎在「建出 run 行之前」就失败（典型：另一个进程持有活跃 run）时，它自己不会发事件；
+// 而 HTTP 已经回了 202 —— 客户端会以为「跑了但什么都没发生」。这里断言补发的
+// error 事件一定出现在事件流上，且挂 E1005（另一个实例在跑）。
+func TestStartJobEmitsErrorWhenEngineCannotStart(t *testing.T) {
+	store, err := control.Open(control.Options{DataDir: t.TempDir(), Autogen: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	srv, err := New(Options{Store: store, Version: "test", Listen: "127.0.0.1:0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv.runFn = func(context.Context, *control.Store, control.Job, jobrun.Options) (engine.Result, error) {
+		return engine.Result{}, fmt.Errorf("%w：这个任务已经有一条未结束的运行", control.ErrConflict)
+	}
+	h := srv.Handler()
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/session", nil)
+	req.RemoteAddr = "127.0.0.1:1111"
+	h.ServeHTTP(rec, req)
+	csrf := ""
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == csrfCookie {
+			csrf = c.Value
+		}
+	}
+	body, _ := json.Marshal(map[string]string{"password": testPassword})
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/api/setup", bytes.NewReader(body))
+	req.RemoteAddr = "127.0.0.1:1111"
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(csrfHeader, csrf)
+	req.AddCookie(&http.Cookie{Name: csrfCookie, Value: csrf})
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("setup = %d %s", rec.Code, clip(rec.Body.String(), 200))
+	}
+
+	ctx := context.Background()
+	// 直接用控制库造一个任务（这条用例只关心事件，不关心 HTTP 建任务）
+	mk := func(name string) control.Connection {
+		c, err := store.CreateConnection(ctx, control.ConnectionInput{
+			Name: name, Kind: "postgres", Host: "127.0.0.1", Port: 1,
+			Database: "nope", Username: "u", Params: map[string]string{"sslmode": "disable"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	src, tgt := mk("src"), mk("tgt")
+	job, err := store.CreateJob(ctx, control.JobInput{
+		Name: "emit-error-job", SourceID: src.ID, TargetID: tgt.ID,
+		Spec: control.JobDoc{
+			Source: control.SourceDoc{Scope: &control.ScopeDoc{Schema: "public", Include: []string{"orders"}}},
+			Target: control.TargetDoc{Schema: "report"},
+			Mode:   control.ModeDoc{Frequency: "once"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, cancel := store.Bus().Subscribe(job.ID)
+	defer cancel()
+
+	if err := srv.startJob(ctx, job, control.ActorAPI); err != nil {
+		t.Fatalf("startJob = %v（202 之后才失败，这里应该接受）", err)
+	}
+	select {
+	case ev := <-ch:
+		if ev.Type != "error" {
+			t.Fatalf("应当是 error 事件，收到 %+v", ev)
+		}
+		if ev.Code != string(core.CodeJobRunningElsewhere) {
+			t.Fatalf("并发冲突应挂 E1005，实际 %q（message=%s）", ev.Code, ev.Message)
+		}
+		if len(ev.Next) == 0 {
+			t.Fatal("error 事件必须带 next（否则用户不知道下一步做什么）")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("引擎没能开始，但事件流上什么也没有——用户会看到「点了没反应」")
+	}
+}
+
+// P3：码表允许浏览器私有缓存 5 分钟（随二进制版本变，不是用户数据）。
+func TestCodesEndpointIsCacheable(t *testing.T) {
+	ts, _ := newTestServer(t)
+	token := setupAdmin(t, ts)
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/codes", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if cc := res.Header.Get("Cache-Control"); cc != "private, max-age=300" {
+		t.Fatalf("Cache-Control = %q，期望 private, max-age=300", cc)
 	}
 }

@@ -1028,51 +1028,132 @@ func (r *runner) drain(ctx context.Context, exit int, msg string) error {
 	return nil
 }
 
-func (r *runner) fail(ctx context.Context, err error) error {
-	dctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	code := core.CodeDecoderBug
-	var pb *preflightBlocked
-	switch {
-	case errors.As(err, &pb):
-		code = pb.Code()
-	case errors.Is(err, ErrHeldByOther):
-		code = core.CodeJobRunningElsewhere
-	case errors.Is(err, pgsink.ErrTargetTableExists):
-		code = core.CodeTargetTableExists
-	case errors.As(err, new(*leaseLostError)):
-		code = core.CodeJobRunningElsewhere
-	case errors.As(err, new(*reusedTableRecopyError)):
-		code = core.CodeTargetTableExists // 目标表不是我们的：按「撞表」行为停下，不覆盖
-	case pgsource.IsPositionGap(err):
-		code = core.CodePositionGap
+// classifyError 决定这条错误该挂哪个码。**纯函数**，好测、也好评审。
+//
+// 纪律（2026-11-06 裁决）：兜底**不再落 E4002**。E4002 在用户眼里是「津梁自己的 bug，
+// 请提 issue」——默认落它等于把所有未分类错误都归成我们的锅，方向错得最彻底。
+// 未分类就如实说「未识别」，并给出排查方向；已识别但码表还没编号的（如 42501/3F000）
+// 先给文字方向，等 Ark 的 E1012/E1013 落地再挂码。
+func classifyError(err error) (code core.Code, classified bool) {
+	if err == nil {
+		return "", false
 	}
+	var pb *preflightBlocked
 	var foreign *pgsource.ErrPositionForeignSource
 	var kindErr *positionKindError
 	var tooBig *txTooLargeError
+	var lost *leaseLostError
 	switch {
+	case errors.As(err, &pb):
+		return pb.Code(), true
+	case errors.Is(err, ErrHeldByOther), errors.As(err, &lost):
+		return core.CodeJobRunningElsewhere, true
+	case errors.Is(err, pgsink.ErrTargetTableExists), errors.As(err, new(*reusedTableRecopyError)):
+		return core.CodeTargetTableExists, true
 	case errors.As(err, &foreign), errors.As(err, &kindErr):
-		code = core.CodePositionKindMismatch
+		return core.CodePositionKindMismatch, true
 	case errors.As(err, &tooBig):
-		code = core.CodeTxTooLarge
+		return core.CodeTxTooLarge, true
+	case pgsource.IsWalLevelTooLow(err):
+		// 运行期撞上「源库没开逻辑变更流」：用户要做的事与预检时一模一样，复用 E1001。
+		return core.CodeWalLevel, true
+	case pgsource.IsPositionGap(err):
+		return core.CodePositionGap, true
 	}
+	return "", false
+}
+
+// isUserStop reports「这次失败其实是用户按了停止」。
+func isUserStop(ctx context.Context, err error) bool {
+	if errors.Is(err, context.Canceled) {
+		return true
+	}
+	return ctx != nil && errors.Is(ctx.Err(), context.Canceled)
+}
+
+// stopEarly 在「还没动数据」的阶段按停止收尾：finish_reason=stopped + exit_code=130。
+// FinishRun 对 FinishStopped 允许跳过阶段表（#5 的约定：停止不是失败，阶段落 done），
+// 所以 preflight/prepare 也能直接收成 done。
+func (r *runner) stopEarly(cause error) error {
+	dctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if _, err := r.opt.Store.FinishRun(dctx, r.run.ID, state.Done, "", ExitStopped,
+		control.FinishStopped); err != nil {
+		return fmt.Errorf("按停止收尾失败: %w（原始原因: %v）", err, cause)
+	}
+	r.exitCode = ExitStopped
+	r.phase = state.Done
+	msg := "已手动停止（在动数据之前）：没有写入任何数据，下次 run 从头开始"
+	if r.sink != nil {
+		_ = r.sink.SetPhase(dctx, string(state.Done))
+	}
+	r.emit(dctx, control.Event{Type: "done", Phase: state.Done, Message: msg})
+	return nil
+}
+
+// hint 给「已识别类别、但码表还没有编号」的错误一句可执行的方向。
+// 只写方向，不发明码；等 Ark 的 E1012/E1013 落地后由 classifyError 挂上。
+func hint(err error) (string, []string) {
+	switch {
+	case pgsource.IsNoPrivilege(err):
+		return "看起来是权限不够：用来同步的账号没有被授予这个动作。" +
+				"（源端要 SELECT；目标端要 CREATE / INSERT / UPDATE / DELETE）",
+			[]string{"让 DBA 按提示里的对象授权：源端 GRANT SELECT、目标端 GRANT CREATE, INSERT, UPDATE, DELETE",
+				"或换一个有权限的账号重建这条连接后重跑"}
+	case pgsource.IsObjectMissing(err):
+		return "看起来是对象不存在：schema 或表的名字对不上（或源端那张表被删/改名了）。",
+			[]string{"目标端先建好 schema，或把任务的 target.schema 改成已存在的",
+				"源端表被删过就回任务页重选表",
+				"改完直接重跑：位点不动，不需要重搬历史"}
+	}
+	return "未识别的数据库错误：这条错误还没分类，我们不想给你一个错误的处理方向。",
+		[]string{"把这次的日志（含 SQLSTATE 与原始报错）发给维护者，我们补进码表",
+			"如果是权限或对象不存在，上面那句提示可能已经指向原因"}
+}
+
+func (r *runner) fail(ctx context.Context, err error) error {
+	// 用户主动 stop 在 preflight/prepare 阶段也是「取消」。把它记成 failed（更别说 E4002
+	// 「我们的 bug」）是错的——用户做了一件正确的事，不该在历史里显示成故障。
+	// 我们的 run ctx 只由信号/stop 取消，没有内部超时，所以 Canceled 就是用户停止；
+	// 万一将来加了超时，把它记成 stopped 也只是少一条告警，不会误导。
+	if isUserStop(ctx, err) {
+		return r.stopEarly(err)
+	}
+	dctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	code, classified := classifyError(err)
 	var ev control.Event
+	lastError := err.Error()
 	var np *notImplementedError
-	if errors.As(err, &np) {
+	switch {
+	case errors.As(err, &np):
 		// 没有错误码可挂：这不是「你做错了什么」，是我们还没做。
 		ev = control.Event{JobID: r.job.ID, RunID: r.run.ID, Type: "error", Message: err.Error(), Phase: r.phase}
-	} else {
+	case classified:
 		ev = control.ErrorEvent(r.job.ID, r.run.ID, code, err.Error())
 		ev.Phase = r.phase
+	default:
+		// 未分类：如实说，不给假码（尤其不落 E4002「我们的 bug」）。
+		why, next := hint(err)
+		ev = control.Event{
+			JobID: r.job.ID, RunID: r.run.ID, Type: "error", Phase: r.phase,
+			Message: why + " 原始错误：" + err.Error(),
+			Next:    next,
+		}
+		// 排查方向必须落进 runs.last_error：事件是易失的（进程一重启就没了），
+		// 而用户回头找原因看的是历史页。诊断信息只在事件流里活一次，等于没做。
+		lastError = why + " 原始错误：" + err.Error() + " 下一步：" + strings.Join(next, "；")
 	}
 	r.opt.Store.Bus().Publish(ev)
+
 	reason := control.FinishFailed
 	var lost *leaseLostError
 	if errors.As(err, &lost) {
 		reason = control.FinishInterrupted // 租约被接管 = 被中断，不是「这条同步本身错了」
 	}
 	if r.phase != state.Failed {
-		if _, ferr := r.opt.Store.FinishRun(dctx, r.run.ID, state.Failed, err.Error(), ExitFailed, reason); ferr != nil {
+		if _, ferr := r.opt.Store.FinishRun(dctx, r.run.ID, state.Failed, lastError, ExitFailed, reason); ferr != nil {
 			return fmt.Errorf("%w（收尾也失败：%v）", err, ferr)
 		}
 		r.phase = state.Failed
