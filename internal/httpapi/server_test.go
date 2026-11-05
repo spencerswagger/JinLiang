@@ -751,14 +751,12 @@ func TestUnknownAPIPathReturnsJSON404(t *testing.T) {
 	}
 }
 
-// P0-2 回归：被任务引用的连接不许改坐标（否则 job_key 失配、同一同步变两个任务）；
-// 没被引用的连接仍然可以改。
-func TestCannotChangeCoordinatesOfReferencedConnection(t *testing.T) {
+// P0-2 回归（硬要求）：被任务引用的连接不许改坐标——「连接就是身份」，拒绝而不是
+// 静默重算 job_key。断言三件事：409、原任务 job_key 一个字没变、四段式说明「连接就是身份」。
+func TestReferencedConnectionCoordinatesAreLocked(t *testing.T) {
 	ts, _ := newTestServer(t)
-	ctx := context.Background()
 	token := setupAdmin(t, ts)
-	src := createPGConn(t, ts, token, "src")     // 127.0.0.1:1
-	other := createPGConn(t, ts, token, "other") // 同样没被引用
+	src := createPGConn(t, ts, token, "src")
 
 	body := map[string]any{
 		"name": "coords-job", "source_id": src, "target_id": src,
@@ -768,11 +766,17 @@ func TestCannotChangeCoordinatesOfReferencedConnection(t *testing.T) {
 			"mode":   map[string]any{"frequency": "once"},
 		},
 	}
-	if code, created := doJSON(t, http.MethodPost, ts.URL+"/api/jobs", token, body); code != http.StatusCreated {
+	code, created := doJSON(t, http.MethodPost, ts.URL+"/api/jobs", token, body)
+	if code != http.StatusCreated {
 		t.Fatalf("create job = %d %v", code, created)
 	}
+	jobID, _ := created["id"].(string)
+	keyBefore, _ := created["job_key"].(string)
+	if jobID == "" || keyBefore == "" {
+		t.Fatalf("建任务没拿到 id/job_key: %v", created)
+	}
 
-	// 1) 被引用 → 改 host 必须 409
+	// 改 host（坐标变了）→ 必须 409
 	code, resp := doJSON(t, http.MethodPut, ts.URL+"/api/connections/"+src, token, map[string]any{
 		"name": "src", "kind": "postgres", "host": "10.0.0.9", "port": 5432,
 		"database": "nope", "username": "u", "params": map[string]string{"sslmode": "disable"},
@@ -781,31 +785,58 @@ func TestCannotChangeCoordinatesOfReferencedConnection(t *testing.T) {
 		t.Fatalf("改被引用连接的坐标 = %d %v，期望 409", code, resp)
 	}
 	errObj, _ := resp["error"].(map[string]any)
-	if errObj == nil || !strings.Contains(errObj["message"].(string), "身份") {
-		t.Fatalf("409 必须说明「连接就是身份」：%v", resp)
+	if errObj == nil {
+		t.Fatalf("409 必须带四段式信封：%v", resp)
+	}
+	if msg, _ := errObj["message"].(string); !strings.Contains(msg, "身份") {
+		t.Errorf("409 文案必须说明「连接就是身份」，实际 %q", msg)
+	}
+	if nxt, _ := errObj["next"].([]any); len(nxt) == 0 {
+		t.Error("409 必须给下一步（新建连接 / 只改名字口令）")
 	}
 
-	// 2) 同样被引用，但只改名/口令 → 允许
+	// 原任务的身份必须一个字都没变（拒绝，而不是静默重算）
+	code, after := doJSON(t, http.MethodGet, ts.URL+"/api/jobs/"+jobID, token, nil)
+	if code != http.StatusOK {
+		t.Fatalf("读回任务 = %d", code)
+	}
+	jobObj, _ := after["job"].(map[string]any)
+	if got, _ := jobObj["job_key"].(string); got != keyBefore {
+		t.Errorf("被拒之后 job_key 变了：%q → %q（必须是拒绝，不能静默重算）", keyBefore, got)
+	}
+	if code, jobs := doJSON(t, http.MethodGet, ts.URL+"/api/jobs", token, nil); code != http.StatusOK ||
+		jobs["count"].(float64) != 1 {
+		t.Errorf("任务数应仍为 1，实际 %v", jobs)
+	}
+
+	// 只改名字/口令不属于坐标变化 → 允许
 	if code, resp := doJSON(t, http.MethodPut, ts.URL+"/api/connections/"+src, token, map[string]any{
 		"name": "src-renamed", "kind": "postgres", "host": "127.0.0.1", "port": 1,
 		"database": "nope", "username": "u", "password": "new-secret",
 		"params": map[string]string{"sslmode": "disable"},
 	}); code != http.StatusOK {
-		t.Fatalf("只改名字/口令应允许，实际 %d %v", code, resp)
+		t.Errorf("只改名字/口令应允许，实际 %d %v", code, resp)
 	}
+}
 
-	// 3) 没被引用 → 改坐标允许
-	if code, resp := doJSON(t, http.MethodPut, ts.URL+"/api/connections/"+other, token, map[string]any{
-		"name": "other", "kind": "postgres", "host": "10.0.0.9", "port": 5432,
+// P0-2 回归（硬要求）：没被任何任务引用的连接，改坐标仍然允许。
+func TestUnreferencedConnectionCoordinatesCanChange(t *testing.T) {
+	ts, _ := newTestServer(t)
+	token := setupAdmin(t, ts)
+	conn := createPGConn(t, ts, token, "free")
+
+	code, resp := doJSON(t, http.MethodPut, ts.URL+"/api/connections/"+conn, token, map[string]any{
+		"name": "free", "kind": "postgres", "host": "10.0.0.9", "port": 5432,
 		"database": "nope", "username": "u", "params": map[string]string{"sslmode": "disable"},
-	}); code != http.StatusOK {
+	})
+	if code != http.StatusOK {
 		t.Fatalf("改未被引用连接的坐标应允许，实际 %d %v", code, resp)
 	}
-
-	// 4) 指纹仍是同一个任务（P0-2 的实质：jobs 不会变多）
-	_ = ctx
+	if host, _ := resp["host"].(string); host != "10.0.0.9" {
+		t.Errorf("host 没改成功：%v", resp["host"])
+	}
 	if code, jobs := doJSON(t, http.MethodGet, ts.URL+"/api/jobs", token, nil); code != http.StatusOK ||
-		jobs["count"].(float64) != 1 {
-		t.Fatalf("改完连接后任务数应仍为 1，实际 %v", jobs)
+		jobs["count"].(float64) != 0 {
+		t.Errorf("这个测试不该产生任务，实际 %v", jobs)
 	}
 }
