@@ -327,3 +327,47 @@ func TestAdvanceToNeverGoesBackwards(t *testing.T) {
 }
 
 func ctx() context.Context { return context.Background() }
+
+// 引擎产出的每一批都必须过 source.ValidateBatch——这条守住「事务要么整体可见、
+// 要么不出现」：批里不会出现半个事务，Commit 之后的裸数据事件也一定先有 EvBegin。
+func TestEveryProducedBatchPassesValidateBatch(t *testing.T) {
+	sink := &fakeSink{}
+	src := &fakeSource{}
+	b := newTestBatcher(sink, src, 2) // 故意用小批次，逼出多次提交
+
+	// 事务 1：2 行（刚好触发按 batch_rows 提交）
+	_ = b.Add(ctx(), ev(source.EvBegin, ""))
+	src.last, _ = pgsource.ParsePayload("0/100")
+	_ = b.Add(ctx(), ev(source.EvInsert, ""))
+	_ = b.Add(ctx(), ev(source.EvInsert, ""))
+	_ = b.Add(ctx(), commitEvent(src, "0/100"))
+
+	// 事务 2：1 行（留在 pending 里，靠 Flush 提交）
+	_ = b.Add(ctx(), ev(source.EvBegin, ""))
+	_ = b.Add(ctx(), ev(source.EvUpdate, ""))
+	_ = b.Add(ctx(), commitEvent(src, "0/200"))
+
+	// 事务 3：空事务（只推进位点）
+	_ = b.Add(ctx(), ev(source.EvBegin, ""))
+	_ = b.Add(ctx(), commitEvent(src, "0/300"))
+
+	if err := b.Flush(ctx()); err != nil {
+		t.Fatal(err)
+	}
+	if len(sink.batches) < 2 {
+		t.Fatalf("应该至少产生 2 批，得到 %d", len(sink.batches))
+	}
+	for i, batch := range sink.batches {
+		if err := source.ValidateBatch(batch); err != nil {
+			t.Fatalf("第 %d 批没过 ValidateBatch: %v（批=%v）", i, err, kinds(batch))
+		}
+	}
+}
+
+func kinds(evs []source.Event) []source.EventKind {
+	out := make([]source.EventKind, len(evs))
+	for i, e := range evs {
+		out[i] = e.Kind
+	}
+	return out
+}
