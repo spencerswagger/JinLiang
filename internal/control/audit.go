@@ -105,6 +105,28 @@ func RunStateLabel(r Run) string {
 	return PhaseLabel(r.Phase)
 }
 
+// RunBadgeClass 是同一套口径的「颜色」：文案说「已停止」，颜色就不能是绿色的 ok。
+//
+// 规则：只有 completed 才是 ok；stopped 是中性偏警示（warn）；interrupted/failed 是 bad。
+// 没结束的运行按 phase 粗分（paused 用 warn，failed 用 bad，其余不染色）。
+func RunBadgeClass(r Run) string {
+	switch r.FinishReason {
+	case FinishCompleted:
+		return "ok"
+	case FinishStopped:
+		return "warn"
+	case FinishInterrupted, FinishFailed:
+		return "bad"
+	}
+	switch r.Phase {
+	case state.Failed:
+		return "bad"
+	case state.Paused:
+		return "warn"
+	}
+	return ""
+}
+
 func PhaseLabel(p state.Phase) string {
 	switch p {
 	case state.Idle:
