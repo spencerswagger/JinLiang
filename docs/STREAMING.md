@@ -14,10 +14,11 @@
 `INSERT…SELECT` 灌 2000 万行是真实场景；继续撑下去是 OOM（进程直接没了，看不出原因），
 而 `E1011` 是可读的、带下一步的失败（拆事务 / 调上限，风险写清「调高会推高峰值内存」）。
 
-**配置口径（诚实记录）**：上限的默认值是代码里的常量（128 MB / 100 万事件），要改得改代码；
-`reliability.tx_oversize` 在 `schema/job.schema.json` 里目前只是 `spill | fail` 的取值开关，
-**数值上限（`bytes` / `events`）的 yaml 形状还没定**——所以"调高上限"这一步暂时没有正规入口，
-这是已知缺口，不是用户不会用。
+**配置口径（诚实记录）**：上限的默认值是代码里的常量（128 MB / 100 万事件）。要调高，目前只有
+**环境变量**：`JINLIANG_TX_MAX_BYTES` / `JINLIANG_TX_MAX_EVENTS`（MySQL 源已接；PostgreSQL 源尚未接，
+见 B1 遗留）。`reliability.tx_oversize` 在 `schema/job.schema.json` 里目前只是 `spill | fail` 的取值开关，
+**数值上限（`bytes` / `events`）的 yaml 形状还没定，B2 落**——在那之前别对用户说"改 job.yaml 的
+`tx_oversize.events`"，那个键会被 schema 校验直接拒掉。
 
 **顺序**：事务内按源顺序；跨事务按提交顺序。写入端单线程，任何并行都在源端按表拆分。
 
