@@ -922,23 +922,60 @@ func (r *relation) row(t *pglogrepl.TupleData) (source.Row, error) {
 	return row, nil
 }
 
-// IsPositionGap reports "the slot/ WAL we needed is gone" — E3001, the one case
-// where the answer is "reload everything" (docs/ERRORS.md).
+// 位点不连续（E3001）**只能**由位点专属信号判定。
+//
+// 纪律（2026-11-06 裁决）：**禁止用泛化子串匹配错误类别**。这里的匹配表曾经有裸的
+// "does not exist"，于是 `schema "x" does not exist`（SQLSTATE 3F000）会被判成
+// 「进度不连续」，把用户引去 `--resync` 重搬全量——而真实原因是 schema 名字写错了。
+// 加新条件前先问：这个信号**只**可能来自位点/变更流水吗？答不上来就别加。
 func IsPositionGap(err error) bool {
 	if err == nil {
 		return false
 	}
-	if pgwire.SQLState(err) == "58P01" { // undefined_file: WAL segment removed
+	if pgwire.SQLState(err) == "58P01" { // undefined_file：WAL 段已被删除
 		return true
 	}
 	msg := strings.ToLower(err.Error())
-	for _, s := range []string{
-		"replication slot", "does not exist", "requested wal segment",
-		"has already been removed", "invalid replication slot",
-	} {
-		if strings.Contains(msg, s) {
+	// 每条都必须同时出现「位点对象」和「失效动作」两类词，缺一不算。
+	pairs := [][2]string{
+		{"replication slot", "invalidated"},
+		{"replication slot", "does not exist"},
+		{"replication slot", "has been dropped"},
+		{"requested wal segment", "has already been removed"},
+		{"could not find wal", ""},
+	}
+	for _, p := range pairs {
+		if strings.Contains(msg, p[0]) && (p[1] == "" || strings.Contains(msg, p[1])) {
 			return true
 		}
+	}
+	return false
+}
+
+// IsWalLevelTooLow reports「源库没开逻辑变更流」（E1001）。
+// PG 在跑起来之后才撞上这个条件时抛 SQLSTATE 55000 + 消息含 wal_level。
+// 码表的单位是「用户要做什么」而不是「在哪个阶段发现」，所以复用 E1001：
+// 预检撞上要做的事与运行期撞上是同一件（ALTER SYSTEM + 重启）。
+func IsWalLevelTooLow(err error) bool {
+	if err == nil {
+		return false
+	}
+	if pgwire.SQLState(err) != "55000" && pgwire.SQLState(err) != "0A000" {
+		return false
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "wal_level")
+}
+
+// IsNoPrivilege reports「账号没有被授予这个动作」（SQLSTATE 42501）。
+func IsNoPrivilege(err error) bool {
+	return err != nil && pgwire.SQLState(err) == "42501"
+}
+
+// IsObjectMissing reports「schema/表/列不存在」（3F000 / 42P01 / 42703）。
+func IsObjectMissing(err error) bool {
+	switch pgwire.SQLState(err) {
+	case "3F000", "42P01", "42703":
+		return true
 	}
 	return false
 }
