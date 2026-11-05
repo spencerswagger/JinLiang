@@ -655,6 +655,7 @@ func (s *Source) Stream(ctx context.Context, from Position, onEvent source.Event
 	rels := map[uint32]*relation{}
 	standbyDeadline := time.Now().Add(time.Second)
 	var inTx bool
+	var curTx string // 当前事务的 TxID：数据事件也要带上，引擎据此认「续段」
 
 	for {
 		if err := ctx.Err(); err != nil {
@@ -694,7 +695,7 @@ func (s *Source) Stream(ctx context.Context, from Position, onEvent source.Event
 						return fmt.Errorf("解析变更数据失败: %w", err)
 					}
 					s.serverEnd.Store(uint64(xld.ServerWALEnd))
-					if err := s.handleWAL(ctx, xld.WALData, xld.WALStart, rels, &inTx, onEvent); err != nil {
+					if err := s.handleWAL(ctx, xld.WALData, xld.WALStart, rels, &inTx, &curTx, onEvent); err != nil {
 						return err
 					}
 				}
@@ -771,7 +772,7 @@ func (s *Source) LastCommit() Position { return Position{LSN: pglogrepl.LSN(s.la
 func (s *Source) AckedPosition() Position { return Position{LSN: pglogrepl.LSN(s.ackLSN.Load())} }
 
 func (s *Source) handleWAL(ctx context.Context, data []byte, walStart pglogrepl.LSN,
-	rels map[uint32]*relation, inTx *bool, onEvent source.EventHandler) error {
+	rels map[uint32]*relation, inTx *bool, curTx *string, onEvent source.EventHandler) error {
 
 	msg, err := pglogrepl.Parse(data)
 	if err != nil {
@@ -786,7 +787,8 @@ func (s *Source) handleWAL(ctx context.Context, data []byte, walStart pglogrepl.
 		rels[m.RelationID] = rel
 	case *pglogrepl.BeginMessage:
 		*inTx = true
-		return onEvent(ctx, source.Event{Kind: source.EvBegin, TxID: fmt.Sprint(m.Xid), CommitTS: m.CommitTime})
+		*curTx = fmt.Sprint(m.Xid)
+		return onEvent(ctx, source.Event{Kind: source.EvBegin, TxID: *curTx, CommitTS: m.CommitTime})
 	case *pglogrepl.CommitMessage:
 		*inTx = false
 		pos := Position{LSN: m.TransactionEndLSN}
@@ -795,9 +797,11 @@ func (s *Source) handleWAL(ctx context.Context, data []byte, walStart pglogrepl.
 		}
 		s.lastCommit.Store(uint64(pos.LSN))
 		s.Ack(pos)
+		txID := *curTx
+		*curTx = ""
 		return onEvent(ctx, source.Event{
 			Kind:     source.EvCommit,
-			TxID:     fmt.Sprint(m.CommitLSN),
+			TxID:     txID,
 			CommitTS: m.CommitTime,
 		})
 	case *pglogrepl.InsertMessage:
@@ -809,7 +813,8 @@ func (s *Source) handleWAL(ctx context.Context, data []byte, walStart pglogrepl.
 		if err != nil {
 			return err
 		}
-		return onEvent(ctx, source.Event{Kind: source.EvInsert, Table: rel.ref, Relation: rel.table, New: row})
+		return onEvent(ctx, source.Event{Kind: source.EvInsert, Table: rel.ref, Relation: rel.table,
+			TxID: *curTx, New: row})
 	case *pglogrepl.UpdateMessage:
 		rel := rels[m.RelationID]
 		if rel == nil {
@@ -823,7 +828,8 @@ func (s *Source) handleWAL(ctx context.Context, data []byte, walStart pglogrepl.
 		if err != nil {
 			return err
 		}
-		return onEvent(ctx, source.Event{Kind: source.EvUpdate, Table: rel.ref, Relation: rel.table, New: row, Old: old})
+		return onEvent(ctx, source.Event{Kind: source.EvUpdate, Table: rel.ref, Relation: rel.table,
+			TxID: *curTx, New: row, Old: old})
 	case *pglogrepl.DeleteMessage:
 		rel := rels[m.RelationID]
 		if rel == nil {
@@ -833,11 +839,13 @@ func (s *Source) handleWAL(ctx context.Context, data []byte, walStart pglogrepl.
 		if err != nil {
 			return err
 		}
-		return onEvent(ctx, source.Event{Kind: source.EvDelete, Table: rel.ref, Relation: rel.table, Old: old})
+		return onEvent(ctx, source.Event{Kind: source.EvDelete, Table: rel.ref, Relation: rel.table,
+			TxID: *curTx, Old: old})
 	case *pglogrepl.TruncateMessage:
 		for _, r := range m.RelationIDs {
 			if rel := rels[r]; rel != nil {
-				if err := onEvent(ctx, source.Event{Kind: source.EvTruncate, Table: rel.ref, Relation: rel.table}); err != nil {
+				if err := onEvent(ctx, source.Event{Kind: source.EvTruncate, Table: rel.ref, Relation: rel.table,
+					TxID: *curTx}); err != nil {
 					return err
 				}
 			}

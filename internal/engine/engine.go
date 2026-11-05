@@ -318,6 +318,38 @@ func humanLag(n int64) string {
 	return fmt.Sprintf("%.1f %s", v, units[i])
 }
 
+// knownSourceKinds 是位点串里允许出现的端点类型。source.SplitPosition 只管分段与
+// 版本，**不校验 kind 取值域**（`foo:v1:x` 它能过），所以对账这一步必须在引擎里补。
+var knownSourceKinds = map[string]bool{
+	dsn.KindPostgres: true,
+	dsn.KindMySQL:    true,
+}
+
+// positionKindError is E1010: the checkpoint names a source this job is not.
+type positionKindError struct {
+	got  string
+	want string
+}
+
+func (e *positionKindError) Error() string {
+	if !knownSourceKinds[e.got] {
+		return fmt.Sprintf("目标库里的同步进度标记写着来源类型 %q，不是本工具认得的类型（只有 postgres / mysql）", e.got)
+	}
+	return fmt.Sprintf("目标库里的同步进度标记是 %s 写的，而这次连的是 %s：换回对应的源，或重新开始同步", e.got, e.want)
+}
+
+// assertPositionKind 校验位点的来源类型：必须是已知类型，且与本任务的源一致。
+func assertPositionKind(p source.Position, want string) error {
+	if p == nil {
+		return nil
+	}
+	got := p.Kind()
+	if !knownSourceKinds[got] || got != want {
+		return &positionKindError{got: got, want: want}
+	}
+	return nil
+}
+
 // caughtUpAt decides "we have replayed everything the source has announced".
 // Using the server's WAL end (from keepalives) instead of "no events recently"
 // matters on a big backlog: replaying 2 GB of WAL emits no data events, and a
@@ -753,6 +785,9 @@ func (r *runner) stream(ctx context.Context, res *Result) error {
 			if err != nil {
 				return err
 			}
+			if err := assertPositionKind(parsed, r.src.Kind()); err != nil {
+				return err
+			}
 			p, ok := parsed.(pgsource.Position)
 			if !ok {
 				return fmt.Errorf("%w：这个源给出的位点类型是 %T，引擎不认识", source.ErrPositionMalformed, parsed)
@@ -956,9 +991,10 @@ func (r *runner) fail(ctx context.Context, err error) error {
 		code = core.CodePositionGap
 	}
 	var foreign *pgsource.ErrPositionForeignSource
+	var kindErr *positionKindError
 	var tooBig *txTooLargeError
 	switch {
-	case errors.As(err, &foreign):
+	case errors.As(err, &foreign), errors.As(err, &kindErr):
 		code = core.CodePositionKindMismatch
 	case errors.As(err, &tooBig):
 		code = core.CodeTxTooLarge
