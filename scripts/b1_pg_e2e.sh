@@ -3,6 +3,7 @@
 #
 #   ROWS=1000000 scripts/b1_pg_e2e.sh ./dist/jinliang            # continuous+initial：全量+增量+校验
 #   ROWS=1000000 scripts/b1_pg_e2e.sh ./dist/jinliang once       # once：只搬存量，跑完即终态
+#   ROWS=300000  scripts/b1_pg_e2e.sh ./dist/jinliang append     # append：目标表是用户自己的，中途崩不许清
 #   ROWS=1000000 scripts/b1_pg_e2e.sh ./dist/jinliang kill         # 快照中途 kill -9 再重启
 #   ROWS=10000000 scripts/b1_pg_e2e.sh ./dist/jinliang             # 1000 万行
 #
@@ -95,6 +96,38 @@ YAML
 
 echo "== 3. 导入任务 =="
 "$BIN" import --file "$JOB" --data-dir "$DATA"
+
+if [ "$MODE" = "append" ]; then
+  echo "== 4. append 模式：目标表是用户自己的，全量中途崩后不许清空 =="
+  psql_dst "DROP TABLE IF EXISTS orders" >/dev/null
+  psql_dst "CREATE TABLE orders (id bigint PRIMARY KEY, payload text NOT NULL,
+            amount numeric(12,2), created_at timestamptz)" >/dev/null
+  psql_dst "INSERT INTO orders VALUES (900001,'user-1',1,now()),(900002,'user-2',2,now()),(900003,'user-3',3,now())" >/dev/null
+  "$BIN" run --job b1-orders --data-dir "$DATA" --stop-after 900s > "$WORK/run1.log" 2>&1 &
+  PID=$!
+  for _ in $(seq 1 160); do
+    grep -q "第 2 块" "$WORK/run1.log" 2>/dev/null && break
+    sleep 0.5
+  done
+  kill -9 "$PID" 2>/dev/null || true
+  wait "$PID" 2>/dev/null || true
+  BEFORE=$(psql_dst "SELECT count(*) FROM orders WHERE id BETWEEN 900001 AND 900003")
+  echo "   已 kill -9（快照进行中）；用户自己的行还有 $BEFORE 行"
+  timeout 300 "$BIN" run --job b1-orders --data-dir "$DATA" --stop-when-idle 5s > "$WORK/run2.log" 2>&1 || true
+  grep -E "是你自己的表" "$WORK/run2.log" | head -2 || true
+  AFTER=$(psql_dst "SELECT count(*) FROM orders WHERE id BETWEEN 900001 AND 900003")
+  echo "   重启后用户行数：$AFTER"
+  if [ "$AFTER" != "3" ]; then
+    echo "FAIL: 重搬把用户原有的行删掉了（$AFTER/3）——这正是 Owl 必改 1"
+    exit 1
+  fi
+  if ! grep -q "是你自己的表" "$WORK/run2.log"; then
+    echo "FAIL: 没有明确拒绝，用户不知道发生了什么"
+    exit 1
+  fi
+  echo "PASS: append + 中途 kill：拒绝清空用户表，3 行完好"
+  exit 0
+fi
 
 if [ "$MODE" = "once" ]; then
   echo "== 4. once：只搬存量，跑完即终态 =="
