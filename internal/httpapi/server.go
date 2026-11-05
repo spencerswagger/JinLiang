@@ -126,6 +126,10 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/jobs/{id}", s.wrap(s.handleGetJob, roleUser))
 	s.mux.HandleFunc("PUT /api/jobs/{id}", s.wrap(s.handleUpdateJob, roleUser))
 	s.mux.HandleFunc("DELETE /api/jobs/{id}", s.wrap(s.handleDeleteJob, roleUser))
+	// 导出：/export 是规范路径（docs/CONTROL-PLANE.md §4.3），/yaml 是保留一个
+	// 周期的弃用别名。两条走同一个 handler，body 逐字节相同；别名**不加**任何
+	// warning 字段，免得破坏正在解析它的脚本。
+	s.mux.HandleFunc("GET /api/jobs/{id}/export", s.wrap(s.handleExportJob, roleUser))
 	s.mux.HandleFunc("GET /api/jobs/{id}/yaml", s.wrap(s.handleExportJob, roleUser))
 	s.mux.HandleFunc("POST /api/jobs/{id}/preflight", s.wrap(s.handlePreflight, roleUser))
 	s.mux.HandleFunc("POST /api/jobs/{id}/run", s.wrap(s.handleRun, roleUser))

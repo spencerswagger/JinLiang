@@ -130,7 +130,7 @@ var specs = []Spec{
 		Message: "没有这个接口",
 		Why:     "控制面的接口清单在 docs/CONTROL-PLANE.md §4；不在这张表里的路径不会假装成功，也不会被网页兜底吞掉",
 		Next: []string{
-			"对一下 §4 的路径（注意 /api/jobs/{id}/yaml 是导出，/api/jobs/{id}/verify 还没做）",
+			"对一下 §4 的路径（导出是 GET /api/jobs/{id}/export；/yaml 是旧别名，会保留一个周期）",
 			"B1 才会补 verify / gc：在那之前它们会明确告诉你「没有这个接口」",
 		},
 		Risk: "无：这条只影响调用方判断，不会改动任何数据",

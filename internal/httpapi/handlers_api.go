@@ -9,6 +9,7 @@ import (
 
 	"github.com/spencerswagger/jinliang/internal/control"
 	"github.com/spencerswagger/jinliang/internal/dsn"
+	"github.com/spencerswagger/jinliang/internal/netcheck"
 )
 
 // ── 连接 ────────────────────────────────────────────────────
@@ -645,11 +646,4 @@ func safeFilename(s string) string {
 	return out
 }
 
-func isLoopback(listen string) bool {
-	host := listen
-	if i := strings.LastIndex(listen, ":"); i >= 0 {
-		host = listen[:i]
-	}
-	host = strings.Trim(host, "[]")
-	return host == "127.0.0.1" || host == "localhost" || host == "::1" || host == ""
-}
+func isLoopback(listen string) bool { return netcheck.IsLoopbackListen(listen) }
