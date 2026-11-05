@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"github.com/spencerswagger/jinliang/internal/control"
+	"github.com/spencerswagger/jinliang/internal/core"
 	"github.com/spencerswagger/jinliang/internal/jobrun"
 )
 
@@ -153,9 +154,24 @@ func (s *Server) startJob(ctx context.Context, job control.Job, actor string) er
 			s.runs.release(job.ID)
 		}()
 		_, err := run(runCtx, s.store, job, jobrun.Options{Actor: actor})
-		if err != nil && !errors.Is(err, context.Canceled) {
-			s.logf("job %s 运行结束于错误: %v", job.ID, err)
+		if err == nil || errors.Is(err, context.Canceled) {
+			return
 		}
+		// 引擎在「还没建出 run 行」之前就失败时（典型：另有一个进程持有活跃 run），
+		// 它自己不会发事件——HTTP 已经回了 202，客户端会以为「跑了但什么都没发生」。
+		// 这里补一条 error 事件，让事件流上一定看得见原因。
+		s.logf("job %s 未能开始: %v", job.ID, err)
+		ev := control.Event{
+			JobID: job.ID, Type: "error", Phase: "preflight",
+			Message: err.Error(),
+		}
+		if errors.Is(err, control.ErrConflict) {
+			ev.Code = string(core.CodeJobRunningElsewhere)
+			if spec, ok := core.Lookup(core.CodeJobRunningElsewhere); ok {
+				ev.Next = spec.Next
+			}
+		}
+		s.store.Bus().Publish(ev)
 	}()
 	return nil
 }

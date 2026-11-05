@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/cookiejar"
@@ -1196,5 +1197,91 @@ func TestStartJobReleasesAfterFinish(t *testing.T) {
 	// 这里 runFn 是桩、不写库，所以直接看内存占位，不查 activeSyncRun）
 	if code, body := doJSON(t, http.MethodPost, ts.URL+"/api/jobs/"+jobID+"/run", token, nil); code != http.StatusAccepted {
 		t.Fatalf("释放后再 run = %d %v，期望 202", code, body)
+	}
+}
+
+// 引擎在「建出 run 行之前」就失败（典型：另一个进程持有活跃 run）时，它自己不会发事件；
+// 而 HTTP 已经回了 202 —— 客户端会以为「跑了但什么都没发生」。这里断言补发的
+// error 事件一定出现在事件流上，且挂 E1005（另一个实例在跑）。
+func TestStartJobEmitsErrorWhenEngineCannotStart(t *testing.T) {
+	store, err := control.Open(control.Options{DataDir: t.TempDir(), Autogen: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	srv, err := New(Options{Store: store, Version: "test", Listen: "127.0.0.1:0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv.runFn = func(context.Context, *control.Store, control.Job, jobrun.Options) (engine.Result, error) {
+		return engine.Result{}, fmt.Errorf("%w：这个任务已经有一条未结束的运行", control.ErrConflict)
+	}
+	h := srv.Handler()
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/session", nil)
+	req.RemoteAddr = "127.0.0.1:1111"
+	h.ServeHTTP(rec, req)
+	csrf := ""
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == csrfCookie {
+			csrf = c.Value
+		}
+	}
+	body, _ := json.Marshal(map[string]string{"password": testPassword})
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/api/setup", bytes.NewReader(body))
+	req.RemoteAddr = "127.0.0.1:1111"
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(csrfHeader, csrf)
+	req.AddCookie(&http.Cookie{Name: csrfCookie, Value: csrf})
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("setup = %d %s", rec.Code, clip(rec.Body.String(), 200))
+	}
+
+	ctx := context.Background()
+	// 直接用控制库造一个任务（这条用例只关心事件，不关心 HTTP 建任务）
+	mk := func(name string) control.Connection {
+		c, err := store.CreateConnection(ctx, control.ConnectionInput{
+			Name: name, Kind: "postgres", Host: "127.0.0.1", Port: 1,
+			Database: "nope", Username: "u", Params: map[string]string{"sslmode": "disable"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	src, tgt := mk("src"), mk("tgt")
+	job, err := store.CreateJob(ctx, control.JobInput{
+		Name: "emit-error-job", SourceID: src.ID, TargetID: tgt.ID,
+		Spec: control.JobDoc{
+			Source: control.SourceDoc{Scope: &control.ScopeDoc{Schema: "public", Include: []string{"orders"}}},
+			Target: control.TargetDoc{Schema: "report"},
+			Mode:   control.ModeDoc{Frequency: "once"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, cancel := store.Bus().Subscribe(job.ID)
+	defer cancel()
+
+	if err := srv.startJob(ctx, job, control.ActorAPI); err != nil {
+		t.Fatalf("startJob = %v（202 之后才失败，这里应该接受）", err)
+	}
+	select {
+	case ev := <-ch:
+		if ev.Type != "error" {
+			t.Fatalf("应当是 error 事件，收到 %+v", ev)
+		}
+		if ev.Code != string(core.CodeJobRunningElsewhere) {
+			t.Fatalf("并发冲突应挂 E1005，实际 %q（message=%s）", ev.Code, ev.Message)
+		}
+		if len(ev.Next) == 0 {
+			t.Fatal("error 事件必须带 next（否则用户不知道下一步做什么）")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("引擎没能开始，但事件流上什么也没有——用户会看到「点了没反应」")
 	}
 }
