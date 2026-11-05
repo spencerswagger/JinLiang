@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/spencerswagger/jinliang/internal/state"
 )
@@ -18,6 +19,9 @@ const (
 	SettingAdminSetAt    = "admin_password_set_at"
 	SettingDefaultBatch  = "default_batch_rows" // 新建向导的默认批次
 	SettingDefaultListen = "listen"             // 上次使用的监听地址（仅展示）
+	// SettingBootEpoch 每次进程启动重写一次：SSE 的 id 是 "<boot_epoch>-<seq>"，
+	// 客户端带着旧 epoch 重连时我们发 reset，而不是假装能补齐（events.go）。
+	SettingBootEpoch = "boot_epoch"
 )
 
 // Setting reads one settings row. The bool is false when the key is absent.
@@ -57,6 +61,9 @@ func (s *Store) Settings(ctx context.Context) (map[string]string, error) {
 		if k == SettingAdminHash {
 			continue // 口令哈希不出控制层
 		}
+		if k == SettingBootEpoch {
+			continue // 每次 serve 启动都会变，展示出来只会让人以为配置被改了
+		}
 		out[k] = v
 	}
 	return out, rows.Err()
@@ -72,6 +79,40 @@ func (s *Store) InstanceID(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("控制库缺少 instance_id（%s 可能被手工改过）", s.path)
 	}
 	return v, nil
+}
+
+// instanceIDValue is the cached id from Open (no DB round-trip on every run).
+func (s *Store) instanceIDValue() string { return s.instanceID }
+
+// StartBootEpoch writes a fresh epoch and pins the event bus to it.
+//
+// 只有 `serve` 调它：doctor/export/import 这些短命进程也会 Open 同一个控制库，
+// 如果它们也重写 epoch，设置页上的 boot_epoch 会一直跳，而且一个只跑 200ms 的
+// CLI 会把正在服务的那个进程的 epoch 概念搅乱（SSE id 是 <epoch>-<seq>）。
+func (s *Store) StartBootEpoch(ctx context.Context) string {
+	id, err := newInstanceID()
+	if err != nil {
+		// 生成不出 id 时保留 NewBus 的进程内随机 epoch：SSE 仍能工作，
+		// 只是重启后无法与旧 id 对齐（那本来就会发 reset）。
+		return s.bus.Epoch()
+	}
+	if err := s.SetSetting(ctx, SettingBootEpoch, id); err != nil {
+		return s.bus.Epoch()
+	}
+	s.bus.SetEpoch(id)
+	return id
+}
+
+// HeartbeatInterval is how often a running job refreshes its heartbeat.
+func (s *Store) HeartbeatInterval() time.Duration { return s.heartbeat }
+
+// StaleAfter is the window after which a silent run is considered dead:
+// three missed heartbeats (configurable indirectly via Options.Heartbeat).
+func StaleAfter(heartbeat time.Duration) time.Duration {
+	if heartbeat <= 0 {
+		heartbeat = DefaultHeartbeatInterval
+	}
+	return 3 * heartbeat
 }
 
 // newInstanceID delegates to internal/state so CLI runs and the control plane

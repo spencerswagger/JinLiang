@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/spencerswagger/jinliang/internal/control"
+	"github.com/spencerswagger/jinliang/internal/netcheck"
 )
 
 // 鉴权模型（docs/SECURITY.md §0、docs/CONTROL-PLANE.md §9）：
@@ -343,6 +344,29 @@ func (s *Server) clearSession(w http.ResponseWriter, r *http.Request) {
 // 「谁先设口令谁就是管理员」交给别人。token 由 GET /api/session 或 GET /setup 种下。
 func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	configured, err := s.store.AdminConfigured(ctx)
+	if err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, plainError("%v", err))
+		return
+	}
+	if configured {
+		// 已设过口令：这是幂等语义问题，先回答它，与来源无关。
+		s.writeError(w, r, http.StatusConflict, apiError{
+			Class:   "user_action",
+			Message: "管理员口令已经设置过了",
+			Why:     "首启只允许设置一次，避免别人在你之后把口令改掉",
+			Next:    []string{"用现有口令登录：POST /api/login"},
+			Risk:    "忘了口令只能删控制库重建（任务会丢，可用 export 的 yaml 重建）",
+		})
+		return
+	}
+	// A-1（从 #6 同批合入）：还没设口令时，只有本机能定这个口令。
+	// 顺序放在 CSRF 之前——先回答「你能不能做这件事」，再谈「这个请求是不是伪造的」。
+	// CSRF 挡不住直连：攻击者自己 GET 一次 /api/session 就能把 token 镜像进请求头。
+	if !netcheck.IsLoopbackRequest(r) {
+		s.writeError(w, r, http.StatusForbidden, setupLoopbackOnly())
+		return
+	}
 	if !s.csrfOK(r) {
 		s.writeError(w, r, http.StatusForbidden, apiError{
 			Class:   "user_action",
@@ -350,21 +374,6 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 			Why:     "首启端点也能被跨站请求打中；设口令这种写操作必须证明来自本页",
 			Next:    []string{"先 GET /api/session（会种下 jl_csrf cookie），再把它的值放进 X-CSRF-Token 头", "或者直接用浏览器打开首页走引导"},
 			Risk:    "无",
-		})
-		return
-	}
-	configured, err := s.store.AdminConfigured(ctx)
-	if err != nil {
-		s.writeError(w, r, http.StatusInternalServerError, plainError("%v", err))
-		return
-	}
-	if configured {
-		s.writeError(w, r, http.StatusConflict, apiError{
-			Class:   "user_action",
-			Message: "管理员口令已经设置过了",
-			Why:     "首启只允许设置一次，避免别人在你之后把口令改掉",
-			Next:    []string{"用现有口令登录：POST /api/login"},
-			Risk:    "忘了口令只能删控制库重建（任务会丢，可用 export 的 yaml 重建）",
 		})
 		return
 	}
@@ -393,6 +402,24 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 		"ok": true, "token": token,
 		"next": "POST /api/connections 建第一个连接（可以只传 dsn 一条串）",
 	})
+}
+
+// setupLoopbackOnly 是 A-1 的四段式文案：首启设口令只允许本机。
+//
+// 为什么 CSRF 在这里不够：攻击者自己 GET 一次 /api/session 就能把 jl_csrf 的值
+// 镜像进请求头，双提交对他形同虚设。真正的边界是「这个请求来自哪台机器」。
+func setupLoopbackOnly() apiError {
+	return apiError{
+		Class:   "user_action",
+		Message: "首次设置口令只能在跑控制台的那台机器上做",
+		Why: "控制台现在监听在别的机器也能访问的地址上，而管理员口令还没设：" +
+			"谁先设口令谁就是管理员，还能拿走全部连接凭证。这一步 CSRF 挡不住",
+		Next: []string{
+			"在跑 serve 的那台机器上打开 http://127.0.0.1:8080/setup 设置口令",
+			"或者先停掉，用 --listen 127.0.0.1 起一次，设好口令后再放开监听",
+		},
+		Risk: "无：这条只在还没设口令时生效，只听本机时不会触发",
+	}
 }
 
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {

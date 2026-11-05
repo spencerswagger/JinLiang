@@ -47,7 +47,10 @@ func loadTemplates() (map[string]*pageTemplate, *pageTemplate, fs.FS, error) {
 	}
 	funcs := template.FuncMap{
 		"phaseLabel": control.PhaseLabel,
-		"phaseHint":  control.PhaseHint,
+		// runState 用 finish_reason 覆盖 phase：`done` 既可能是「跑完了」也可能是
+		// 「用户手动停止」，只看 phase 会把手动停止显示成顺利完成（Ark P0-3）。
+		"runState":  control.RunStateLabel,
+		"phaseHint": control.PhaseHint,
 		"shortTime": func(s string) string {
 			t, err := time.Parse(time.RFC3339, s)
 			if err != nil {

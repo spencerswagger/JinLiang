@@ -101,7 +101,30 @@ func (in *ConnectionInput) Validate() error {
 	if in.Username == "" {
 		return fmt.Errorf("用户名不能为空")
 	}
+	// params 是自由键值（sslmode/charset/...），但口令类参数绝不能落控制库：
+	// params_json 是明文，列表接口还会原样回传——`{"params":{"sslpassword":"..."}}`
+	// 或 DSN 里 `?sslpassword=` 会让口令绕过 AES-GCM 直接躺在 db/-wal 里。
+	// 口令只有一个入口：password 字段（加密存储）。
+	for k := range in.Params {
+		if isSecretParamKey(k) {
+			return fmt.Errorf("%w: 参数 %q 是口令类，不能放进 params（它会明文存进控制库并被接口回传）。请用 password 字段，或从环境变量导入 DSN", ErrInvalid, k)
+		}
+	}
 	return nil
+}
+
+// secretParamKeys 是「一看就是口令」的参数名（大小写、- 与 _ 都不敏感）。
+// 宁严勿松：多拦一个不常用的参数，比让口令明文落盘好。
+var secretParamKeys = []string{"password", "sslpassword", "sslkey", "passphrase"}
+
+func isSecretParamKey(k string) bool {
+	norm := strings.ToLower(strings.NewReplacer("-", "", "_", "").Replace(strings.TrimSpace(k)))
+	for _, bad := range secretParamKeys {
+		if norm == bad {
+			return true
+		}
+	}
+	return false
 }
 
 // CreateConnection stores a connection, encrypting the password.
@@ -161,15 +184,9 @@ func (s *Store) UpdateConnection(ctx context.Context, id string, in ConnectionIn
 	// 被任务引用时改坐标，会让已有任务与指纹脱节：重新 import 同一份 yaml 就
 	// 会算出另一个指纹、变出第二个任务，B1 里就是两条写入流打同一张目标表。
 	// 所以这里守卫（与 DeleteConnection 的 ErrInUse 同构），要换地址请新建连接。
-	if coordsChanged(cur, in) {
-		n, err := s.CountJobsUsingConnection(ctx, id)
-		if err != nil {
-			return Connection{}, err
-		}
-		if n > 0 {
-			return Connection{}, fmt.Errorf("%w：有 %d 个任务把它当身份的一部分（改地址请新建一个连接，再把任务切过去）", ErrIdentityLocked, n)
-		}
-	}
+	//
+	// 「数引用」与「写回」在同一事务里：分开做会有 TOCTOU 窗口——刚数完是 0，
+	// 另一个请求建了引用它的任务，随后这次更新就把任务身份改掉了。
 	secret := cur.SecretEnc
 	switch {
 	case in.ClearPassword:
@@ -190,12 +207,32 @@ func (s *Store) UpdateConnection(ctx context.Context, id string, in ConnectionIn
 		return Connection{}, err
 	}
 	now := s.nowText()
-	if _, err := s.db.ExecContext(ctx,
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Connection{}, err
+	}
+	defer tx.Rollback() //nolint:errcheck // 成功路径已提交
+
+	if coordsChanged(cur, in) {
+		var n int
+		if err := tx.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM jobs WHERE source_id = ? OR target_id = ?`, id, id).Scan(&n); err != nil {
+			return Connection{}, err
+		}
+		if n > 0 {
+			return Connection{}, fmt.Errorf("%w：有 %d 个任务把它当身份的一部分（要换地址：新建连接 + 新建任务，然后把旧任务停用；有运行历史的任务不能再改源与目标）", ErrIdentityLocked, n)
+		}
+	}
+	if _, err := tx.ExecContext(ctx,
 		`UPDATE connections SET name=?, kind=?, host=?, port=?, database=?, username=?,
 		 secret_enc=?, params_json=?, updated_at=? WHERE id=?`,
 		in.Name, in.Kind, in.Host, in.Port, in.Database, in.Username,
 		secret, string(paramsJSON), now, id); err != nil {
 		return Connection{}, fmt.Errorf("更新连接失败: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return Connection{}, err
 	}
 	return s.GetConnection(ctx, id)
 }

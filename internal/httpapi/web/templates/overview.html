@@ -57,7 +57,7 @@
     <div class="row">
       {{if .LastRun}}
         <span class="badge {{if eq (printf "%s" .LastRun.Phase) "failed"}}bad{{else if eq (printf "%s" .LastRun.Phase) "done"}}ok{{end}}">
-          {{phaseLabel .LastRun.Phase}}</span>
+          {{runState .LastRun}}</span>
         {{if .LastRun.Stub}}<span class="badge stub">骨架运行</span>{{end}}
         <span class="meta">{{shortTime .LastRun.StartedAt}}</span>
       {{else}}
