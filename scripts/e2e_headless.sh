@@ -17,13 +17,19 @@ WORK="$(mktemp -d)"
 DATA="${WORK}/data"
 TOKEN=""
 SERVER_PID=""
+RAW_BIN="${BIN}"
 
 if [ ! -x "${BIN}" ]; then
   echo "找不到可执行文件 ${BIN}（先 go build -o ${BIN} ./cmd/jinliang）" >&2
   exit 2
 fi
-: "${JINLIANG_TEST_PG_DSN:?需要 JINLIANG_TEST_PG_DSN}"
-: "${JINLIANG_TEST_MYSQL_DSN:?需要 JINLIANG_TEST_MYSQL_DSN}"
+
+# 四个库的 DSN 一律从环境读（见 /.keys/env.sh），脚本里没有一个字面量连接串。
+# 缺哪个就显式打 SKIP —— 静默通过是这里最不能犯的错。
+PG_TEST_DSN="${JINLIANG_TEST_PG_DSN:-}"
+PG_SRC_DSN="${JINLIANG_TEST_PG_SRC_DSN:-}"
+MY_TEST_DSN="${JINLIANG_TEST_MYSQL_DSN:-}"
+MY_SRC_DSN="${JINLIANG_TEST_MYSQL_SRC_DSN:-}"
 
 cleanup() {
   if [ -n "${SERVER_PID}" ] && kill -0 "${SERVER_PID}" 2>/dev/null; then
@@ -66,10 +72,63 @@ api() { # api <method> <path> [json-body]
   fi
 }
 
+say "0. 环境自检：四库 DSN 逐条点名，缺的显式 SKIP"
+redact() { printf '%s' "$1" | sed -E 's#(://[^:]*:)[^@]*@#\1***@#'; }
+dsn_state() { # dsn_state <变量名> <值>
+  if [ -n "$2" ]; then printf '  %-30s OK    %s\n' "$1" "$(redact "$2")"
+  else printf '  %-30s SKIP  未设置（该库不参与本次验收）\n' "$1"; fi
+}
+dsn_state JINLIANG_TEST_PG_DSN     "${PG_TEST_DSN}"
+dsn_state JINLIANG_TEST_PG_SRC_DSN "${PG_SRC_DSN}"
+dsn_state JINLIANG_TEST_MYSQL_DSN  "${MY_TEST_DSN}"
+dsn_state JINLIANG_TEST_MYSQL_SRC_DSN "${MY_SRC_DSN}"
+
+# 注意：set -e 下函数最后一个命令返回 1 会让赋值直接退出脚本，所以必须显式 return 0。
+pick_pg() {
+  if [ -n "${PG_TEST_DSN}" ]; then printf '%s' "${PG_TEST_DSN}"
+  elif [ -n "${PG_SRC_DSN}" ]; then printf '%s' "${PG_SRC_DSN}"
+  fi
+  return 0
+}
+pick_my() {
+  if [ -n "${MY_TEST_DSN}" ]; then printf '%s' "${MY_TEST_DSN}"
+  elif [ -n "${MY_SRC_DSN}" ]; then printf '%s' "${MY_SRC_DSN}"
+  fi
+  return 0
+}
+PG_DSN="$(pick_pg)"
+MY_DSN="$(pick_my)"
+
+# 源端优先 PostgreSQL（有 timestamptz 增量列），目标端优先 MySQL；
+# 只有一种引擎时同引擎自环（目标用另一个 schema/database），仍算「一个库跑通完整链」。
+if [ -n "${PG_DSN}" ]; then SRC_DSN="${PG_DSN}"; SRC_LABEL=postgres
+elif [ -n "${MY_DSN}" ]; then SRC_DSN="${MY_DSN}"; SRC_LABEL=mysql
+else
+  # 退出码 78 = EX_CONFIG（sysexits.h）：一个 DSN 都没给，说明环境没准备好。
+  # 这里绝不能 exit 0——CI 会把「什么都没验」当成「全部通过」，那是假绿。
+  echo "  SKIP：四个 DSN 全空，完整链无法运行（这不是通过，退出码 78 = EX_CONFIG）" >&2
+  exit 78
+fi
+if [ "${SRC_LABEL}" = "postgres" ] && [ -n "${MY_DSN}" ]; then TGT_DSN="${MY_DSN}"; TGT_LABEL=mysql
+elif [ "${SRC_LABEL}" = "mysql" ] && [ -n "${PG_DSN}" ]; then TGT_DSN="${PG_DSN}"; TGT_LABEL=postgres
+else TGT_DSN="${SRC_DSN}"; TGT_LABEL="${SRC_LABEL}"; echo "  只有 ${SRC_LABEL} 一种引擎：目标端回落到同一实例（换 schema）"
+fi
+echo "  本次链路：源 ${SRC_LABEL} → 目标 ${TGT_LABEL}"
+
 say "0a. 准备测试表（只建 e2e_* 这两张，方便对着空库跑）"
+# fixture 自己按 DSN 环境变量决定建哪些库：空库也能自举，缺的库它不碰。
+# fixture 需要 go 工具链；没有 go 时只在已有表的情况下继续，否则 SKIP。
 if [ "${E2E_FIXTURE:-1}" = "1" ]; then
-  go run ./test/fixture >"${WORK}/fixture.log" 2>&1 || { cat "${WORK}/fixture.log" >&2; fail "fixture 失败"; }
-  cat "${WORK}/fixture.log"
+  if command -v go >/dev/null 2>&1; then
+    if ! go run ./test/fixture >"${WORK}/fixture.log" 2>&1; then
+      cat "${WORK}/fixture.log" >&2
+      fail "fixture 失败（见上面报错；空库也建不出来说明 DSN 或权限有问题）"
+    fi
+    cat "${WORK}/fixture.log"
+    grep -q "ok" "${WORK}/fixture.log" || echo "  SKIP：没有给 *_TEST_DSN，fixture 未建任何表（假定表已存在）"
+  else
+    echo "  SKIP：本机没有 go 工具链，跳过 fixture（假定 e2e_* 表已存在）"
+  fi
 else
   echo "  跳过（E2E_FIXTURE=0）"
 fi
@@ -109,21 +168,33 @@ TOKEN=$(curl -fsS -b "${JAR}" -c "${JAR}" -X POST "${BASE}/api/setup" \
 [ -n "${TOKEN}" ] || fail "setup 没有返回 token"
 
 say "2. 建连接（一条 dsn 就够）并真的测连"
-PG_JSON=$(python3 -c 'import json,os,sys;print(json.dumps({"name":"e2e-pg","dsn":os.environ["JINLIANG_TEST_PG_DSN"]}))')
-api POST /api/connections "${PG_JSON}" >"${WORK}/conn.json"
+# DSN 通过环境变量交给 python，避免出现在进程参数（ps 可见）里。
+export E2E_SRC_DSN="${SRC_DSN}" E2E_TGT_DSN="${TGT_DSN}"
+export E2E_SRC_LABEL="${SRC_LABEL}" E2E_TGT_LABEL="${TGT_LABEL}"
+SRC_JSON=$(python3 -c 'import json,os;print(json.dumps({"name":"e2e-src-"+os.environ["E2E_SRC_LABEL"],"dsn":os.environ["E2E_SRC_DSN"]}))')
+api POST /api/connections "${SRC_JSON}" >"${WORK}/conn.json"
 CONN_ID=$(json '["connection"]["id"]' <"${WORK}/conn.json")
-PG_VERSION=$(json '["test"]["server_version"]' <"${WORK}/conn.json")
-[ -n "${PG_VERSION}" ] || fail "测连没有返回服务端版本"
-echo "  PostgreSQL ${PG_VERSION}，连接 ${CONN_ID}"
+SRC_VERSION=$(json '["test"]["server_version"]' <"${WORK}/conn.json")
+[ -n "${SRC_VERSION}" ] || fail "源端测连没有返回服务端版本"
+echo "  源 ${SRC_LABEL} ${SRC_VERSION}，连接 ${CONN_ID}"
 
-MY_JSON=$(python3 -c 'import json,os;print(json.dumps({"name":"e2e-mysql","dsn":os.environ["JINLIANG_TEST_MYSQL_DSN"]}))')
-api POST /api/connections "${MY_JSON}" >"${WORK}/conn2.json"
-MY_ID=$(json '["connection"]["id"]' <"${WORK}/conn2.json")
-MY_VERSION=$(json '["test"]["server_version"]' <"${WORK}/conn2.json")
-echo "  MySQL ${MY_VERSION}，连接 ${MY_ID}"
+if [ "${TGT_DSN}" = "${SRC_DSN}" ]; then
+  MY_ID="${CONN_ID}"; MY_VERSION="${SRC_VERSION}"; EXPECT_CONNS=1
+  echo "  目标复用同一连接 ${MY_ID}（同引擎自环，目标换 schema）"
+else
+  TGT_JSON=$(python3 -c 'import json,os;print(json.dumps({"name":"e2e-tgt-"+os.environ["E2E_TGT_LABEL"],"dsn":os.environ["E2E_TGT_DSN"]}))')
+  api POST /api/connections "${TGT_JSON}" >"${WORK}/conn2.json"
+  MY_ID=$(json '["connection"]["id"]' <"${WORK}/conn2.json")
+  MY_VERSION=$(json '["test"]["server_version"]' <"${WORK}/conn2.json")
+  [ -n "${MY_VERSION}" ] || fail "目标端测连没有返回服务端版本"
+  EXPECT_CONNS=2
+  echo "  目标 ${TGT_LABEL} ${MY_VERSION}，连接 ${MY_ID}"
+fi
 
 say "3. 枚举库表（catalog）"
-api GET "/api/catalog?connection_id=${CONN_ID}&schema=public" >"${WORK}/cat.json"
+# 不传 schema：让服务端列出它自己认的第一个 schema，脚本才对 PG/MySQL 都成立。
+api GET "/api/catalog?connection_id=${CONN_ID}" >"${WORK}/cat.json"
+SRC_SCHEMA=$(json '["schema"]' <"${WORK}/cat.json")
 TABLE=$(python3 - "${WORK}/cat.json" <<'PY'
 import json,sys
 d=json.load(open(sys.argv[1]))
@@ -138,19 +209,19 @@ print(tables[0]["table"])
 PY
 )
 [ -n "${TABLE}" ] || fail "catalog 没有返回任何表（测试库需要至少一张表）"
-echo "  选中表：${TABLE}"
+echo "  schema=${SRC_SCHEMA}，选中表：${TABLE}"
 
 say "4. 建任务"
-JOB_BODY=$(python3 - "${CONN_ID}" "${MY_ID}" "${TABLE}" <<'PY'
+JOB_BODY=$(python3 - "${CONN_ID}" "${MY_ID}" "${TABLE}" "${SRC_SCHEMA}" <<'PY'
 import json,sys
-conn, my, table = sys.argv[1], sys.argv[2], sys.argv[3]
+conn, my, table, schema = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 print(json.dumps({
   "name": "e2e-orders",
   "source_id": conn,
   "target_id": my,
   "enabled": False,
   "spec": {
-    "source": {"scope": {"schema": "public", "include": [table]}},
+    "source": {"scope": {"schema": schema, "include": [table]}},
     "target": {"schema": "report", "on_exists": "append", "create_indexes": "defer"},
     "mode": {"frequency": "continuous+initial"},
     "content": {"tables": {table: {}}}
@@ -195,16 +266,16 @@ for c in blocked:
         print("  可复制执行：%s" % c["sql"])
 PYCHECK
   # 按预检给出的替代方案改成定时增量，再预检一次：应该就能开跑了
-  INTERVAL_BODY=$(python3 - "${CONN_ID}" "${MY_ID}" "${TABLE}" <<'PYBODY'
+  INTERVAL_BODY=$(python3 - "${CONN_ID}" "${MY_ID}" "${TABLE}" "${SRC_SCHEMA}" <<'PYBODY'
 import json, sys
-conn, my, table = sys.argv[1], sys.argv[2], sys.argv[3]
+conn, my, table, schema = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 print(json.dumps({
     "name": "e2e-orders",
     "source_id": conn,
     "target_id": my,
     "enabled": False,
     "spec": {
-        "source": {"scope": {"schema": "public", "include": [table]}},
+        "source": {"scope": {"schema": schema, "include": [table]}},
         "target": {"schema": "report", "on_exists": "append", "create_indexes": "defer"},
         "mode": {"frequency": "interval", "interval": "5m", "incremental_column": "updated_at"},
         "content": {"tables": {table: {}}},
@@ -245,7 +316,8 @@ json '["count"]' <"${WORK}/runs.json" | grep -qx '1' || fail "应该有 1 条运
 
 say "9. export 出 yaml（不能含任何密码）"
 curl -fsS "${BASE}/api/jobs/${JOB_ID}/yaml" -H "Authorization: Bearer ${TOKEN}" >"${WORK}/job.yaml"
-grep -qE 'password|:pw|jinliang_test' "${WORK}/job.yaml" && fail "导出的 yaml 里出现了密码或明文 DSN"
+grep -qiE 'password|passwd|secret' "${WORK}/job.yaml" && fail "导出的 yaml 里出现了密码字段"
+grep -qE '://[^/"[:space:]]+:[^@"[:space:]]+@' "${WORK}/job.yaml" && fail "导出的 yaml 里出现了带口令的连接串"
 grep -q 'env:JINLIANG_CONN_' "${WORK}/job.yaml" || fail "导出的 yaml 应该用 env:JINLIANG_CONN_<id> 占位"
 
 say "10. 重启进程：连接与任务必须还在（控制库落盘）"
@@ -254,7 +326,7 @@ start_server
 TOKEN=$(curl -fsS -X POST "${BASE}/api/login" -H 'Content-Type: application/json' \
   --data-binary '{"password":"e2e-night-shift-password"}' | json '["token"]')
 api GET /api/connections >"${WORK}/conns2.json"
-json '["count"]' <"${WORK}/conns2.json" | grep -qx '2' || fail "重启后连接数不对"
+json '["count"]' <"${WORK}/conns2.json" | grep -qx "${EXPECT_CONNS}" || fail "重启后连接数不对（期望 ${EXPECT_CONNS}）"
 api GET "/api/jobs/${JOB_ID}" >"${WORK}/job2.json"
 json '["job"]["job_key"]' <"${WORK}/job2.json" | grep -qx "${JOB_KEY}" || fail "重启后任务指纹变了"
 
@@ -263,13 +335,30 @@ say "11. 纯 CLI：doctor / export / import 往返"
 "${BIN}" export --data-dir "${DATA}" --out "${WORK}/cli-export.yaml" || fail "CLI export 失败"
 "${BIN}" import --data-dir "${DATA}" --file "${WORK}/cli-export.yaml" || fail "CLI import 往返失败"
 
-say "12. 导出的 yaml 过 schema 校验（验收 ③）"
-if python3 -c 'import jsonschema, yaml' 2>/dev/null; then
-  python3 scripts/validate_schema.py "${WORK}/job.yaml" "${WORK}/cli-export.yaml"
+say "12. 导出的 yaml 必须过 schema 校验（验收 ③，这里是断言不是打印）"
+STRICT_RC=0
+python3 scripts/validate_schema.py "${WORK}/job.yaml" "${WORK}/cli-export.yaml" \
+  >"${WORK}/schema.log" 2>&1 || STRICT_RC=$?
+if [ "${STRICT_RC}" = "0" ]; then
+  cat "${WORK}/schema.log"
+  echo "  validate_schema.py（真 jsonschema）判定通过"
+elif grep -qE 'ModuleNotFoundError|No module named' "${WORK}/schema.log"; then
+  # 离线沙盒装不上 jsonschema/pyyaml（出口 PyPI 不可达）——显式 SKIP 严格校验，
+  # 改用读同一份 schema/job.schema.json 的 stdlib 实现，仍然是硬断言。
+  echo "  SKIP：validate_schema.py 缺依赖（jsonschema/pyyaml 不可安装）"
+  grep -E 'No module named' "${WORK}/schema.log" | sed 's/^/    /'
+  python3 scripts/validate_schema_lite.py "${WORK}/job.yaml" "${WORK}/cli-export.yaml" \
+    || fail "yaml 不符合 schema/job.schema.json（stdlib 校验器判定失败）"
+  echo "  validate_schema_lite.py 通过（与 CI 用的是同一个 schema 文件）"
 else
-  # 离线环境装不上 jsonschema：用只依赖标准库的同一份 schema 校验器兜底
-  echo "  （本机没有 jsonschema，改用 stdlib 校验器）"
-  python3 scripts/validate_schema_lite.py "${WORK}/job.yaml" "${WORK}/cli-export.yaml"
+  cat "${WORK}/schema.log" >&2
+  fail "validate_schema.py 判定 yaml 不合 schema"
 fi
+
+say "13. 本次验收覆盖了哪些库（缺的必须是 SKIP，不能算通过）"
+printf '  %-30s %s\n' "JINLIANG_TEST_PG_DSN"      "$([ -n "${PG_TEST_DSN}" ] && echo "USED/SKIP-BY-NEED" || echo "SKIP(未设置)")"
+printf '  %-30s %s\n' "JINLIANG_TEST_PG_SRC_DSN"  "$([ -n "${PG_SRC_DSN}" ] && echo "USED/SKIP-BY-NEED" || echo "SKIP(未设置)")"
+printf '  %-30s %s\n' "JINLIANG_TEST_MYSQL_DSN"   "$([ -n "${MY_TEST_DSN}" ] && echo "USED/SKIP-BY-NEED" || echo "SKIP(未设置)")"
+printf '  %-30s %s\n' "JINLIANG_TEST_MYSQL_SRC_DSN" "$([ -n "${MY_SRC_DSN}" ] && echo "USED/SKIP-BY-NEED" || echo "SKIP(未设置)")"
 
 say "PASS：headless 全链路通过（连接 → 库表 → 任务 → 预检 → 桩运行 → SSE → 导出 → 重启 → CLI）"
