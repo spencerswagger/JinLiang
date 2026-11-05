@@ -50,7 +50,6 @@ type Store struct {
 	cipher     *Cipher
 	now        func() time.Time
 	bus        *Bus
-	runner     *Runner
 	instanceID string // settings.instance_id：审计、租约、run 的 owner 都用它
 	heartbeat  time.Duration
 }
@@ -134,7 +133,6 @@ func Open(opts Options) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
-	s.runner = newRunner(s)
 	return s, nil
 }
 
@@ -152,6 +150,9 @@ func (s *Store) Path() string { return s.path }
 
 // Cipher is the secret box for connection passwords.
 func (s *Store) Cipher() *Cipher { return s.cipher }
+
+// Bus exposes the event bus: the engine publishes, SSE and the CLI subscribe.
+func (s *Store) Bus() *Bus { return s.bus }
 
 // Now returns the store clock (RFC3339 UTC strings are what we persist).
 func (s *Store) Now() time.Time { return s.now() }
