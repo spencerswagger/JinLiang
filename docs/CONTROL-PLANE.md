@@ -67,6 +67,9 @@ CREATE TABLE runs (
   lag_bytes  INTEGER, lag_ms INTEGER,
   last_error TEXT,                         -- 错误码 + 一句话
   exit_code  INTEGER,
+  finish_reason  TEXT,                     -- completed | failed | stopped | interrupted（见下方）
+  heartbeat_at   TEXT,                     -- 运行中每 30s 刷新一次，用于判活
+  owner_instance TEXT,                     -- 起这一轮运行的实例（settings.instance_id）
   stub       INTEGER NOT NULL DEFAULT 0    -- 已弃用：保留一版兼容，B1 收口后删除（见下方）
 );
 
@@ -93,6 +96,24 @@ CREATE TABLE audit (
 ALTER TABLE runs ADD COLUMN kind TEXT NOT NULL DEFAULT 'sync';
 UPDATE runs SET kind = 'stub' WHERE stub = 1;   -- 回填历史桩运行
 ```
+
+**`runs.finish_reason` 的取值**：
+
+| 值 | 含义 |
+|---|---|
+| `completed` | 正常跑完 |
+| `failed` | 失败结束（`last_error` 里有错误码） |
+| `stopped` | 用户手动停止：phase 落 `done`，**但 `finish_reason='stopped'`**，绝不伪装成正常完成 |
+| `interrupted` | 进程被 kill / 断电 / 升级时发现的心跳过期遗留运行（phase 落 `failed`） |
+
+**存活与收尾口径**（`heartbeat_at` / `owner_instance`）：
+
+- 运行中每 **30s** 刷新一次 `heartbeat_at`；`owner_instance` 记起这一轮运行的实例身份（`settings.instance_id`）。
+- **`serve` 启动时只收「心跳过期 3 轮」的 open run**（3×30s＝90s；用 `COALESCE(heartbeat_at, started_at)` 早于阈值判定）：补 `ended_at`、`finish_reason='interrupted'`、非终态 phase 落 `failed`，`last_error` 写「进程在运行中被终止」。
+- **只收过期的，不无条件收所有 open run**：同一个控制库也会被 `export` / `import` / `run` 这类短命令打开，它们不该把 serve 手里正跑的那行标成中断——那会白放开活跃槽，还能再起第二个 run。所以这个收尾**只在 `serve` 启动时做，CLI 不做**。
+- 判据用「心跳过期」而不是「owner 不是我」：同机重启后 `instance_id` 不变，用 owner 判活会误杀正在跑的那一行。
+- 配一条 partial unique index `idx_runs_one_active`：同一任务同时只能有一行 open run（`ended_at IS NULL`）。
+- 这三列与索引由独立一条迁移加（同样是 `ADD COLUMN`，顺序：加列 → 收尾过期 run → 建唯一索引）。**迁移版本号必须唯一且严格递增**：同版本号的两条会被静默跳过（`migrate()` 只按读到的 `schema_version` 判断，不报错），后果是列永远不存在、`runs` 查询全线炸。
 
 - **「最近一次运行」只认 `kind='sync'`**：`verify` 与 `stub` 可以出现在历史列表里，但**不得进入「最近一次同步运行」的判定**——否则一轮校验或一轮桩运行会把真实同步进度盖掉，页面显示"刚跑过"，实际上从没同步。
 - **`runs` 是控制面的运行摘要，不是运行时位点**（§2 红线）：真权威位点在目标端 `_jl_*`，这里只记「这个任务跑到过哪一步」，位点永远不进控制库。
