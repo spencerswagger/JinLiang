@@ -212,6 +212,21 @@ func (s *Store) UpdateJob(ctx context.Context, id string, in JobInput) (Job, err
 		return Job{}, fmt.Errorf("%w: %v", ErrInvalid, err)
 	}
 	key := state.JobKey(identityDSN(src), identityDSN(tgt), doc.ScopeFingerprint())
+	if key != cur.JobKey {
+		// 改连接或改表范围 = 换身份。B1 起目标端的同步元数据（_jl_meta）是按
+		// job_key 存的，静默重算会让旧身份下的状态变成孤儿：新 run 从头再来，
+		// 旧书签没人回收，用户看到的是「数据重复」而不是「你改了配置」。
+		// 有运行历史就硬挡；没有历史（刚建还没跑过）允许改，那是正常的编辑。
+		var runs int
+		if err := s.db.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM runs WHERE job_id = ?`, id).Scan(&runs); err != nil {
+			return Job{}, err
+		}
+		if runs > 0 {
+			return Job{}, fmt.Errorf("%w：这个任务已经有 %d 条运行历史，换连接或改表范围会换掉它的身份（指纹 %s → %s），目标库里的同步状态会变成孤儿。要换就新建一个任务，再停用这个",
+				ErrIdentityLocked, runs, cur.JobKey, key)
+		}
+	}
 	specJSON, err := json.Marshal(doc)
 	if err != nil {
 		return Job{}, err
@@ -399,14 +414,69 @@ type ImportOptions struct {
 	DryRun bool
 }
 
-// ImportYAML turns a job.yaml into connections + a job. Existing connections are
-// reused (by placeholder id, then by coordinates) so repeated imports are
-// idempotent — GitOps needs that.
+// ImportSkip is one document that could not be imported. It is reported to the
+// user instead of being swallowed: "import 3 of 5" must never look like success.
+type ImportSkip struct {
+	Index  int    `json:"index"` // 1-based, 在输入里的第几份
+	Name   string `json:"name,omitempty"`
+	Reason string `json:"reason"`
+}
+
+// ImportReport is what a multi-document import did.
+type ImportReport struct {
+	Total    int          `json:"total"`
+	Imported []Job        `json:"imported"`
+	Skipped  []ImportSkip `json:"skipped"`
+	DryRun   bool         `json:"dry_run"`
+}
+
+// ImportedCount is the number of jobs written (or validated, for dry runs).
+func (r ImportReport) ImportedCount() int { return len(r.Imported) }
+
+// Summary is the one line the CLI prints and the UI shows.
+func (r ImportReport) Summary() string {
+	if r.DryRun {
+		return fmt.Sprintf("校验通过 %d 份 / 跳过 %d 份（dry-run，没有写入）", r.ImportedCount(), len(r.Skipped))
+	}
+	return fmt.Sprintf("导入 %d 份 / 跳过 %d 份", r.ImportedCount(), len(r.Skipped))
+}
+
+// ImportYAML turns one job.yaml document into connections + a job. Existing
+// connections are reused (by placeholder id, then by coordinates) so repeated
+// imports are idempotent — GitOps needs that.
 func (s *Store) ImportYAML(ctx context.Context, data []byte, opts ImportOptions) (Job, error) {
 	doc, err := ParseJobYAML(data)
 	if err != nil {
 		return Job{}, err
 	}
+	return s.importDoc(ctx, doc, opts)
+}
+
+// ImportYAMLDocs imports every document in a `---` stream (what `export --all`
+// writes). 单份失败不再让整批静默丢掉：成功的照写，失败的逐条回报，
+// 由调用方决定退出码（CLI 有跳过就非零退出，HTTP 返回 207）。
+func (s *Store) ImportYAMLDocs(ctx context.Context, data []byte, opts ImportOptions) (ImportReport, error) {
+	docs, err := ParseJobYAMLDocs(data)
+	if err != nil {
+		return ImportReport{}, err
+	}
+	rep := ImportReport{Total: len(docs), DryRun: opts.DryRun}
+	for i, doc := range docs {
+		job, err := s.importDoc(ctx, doc, opts)
+		if err != nil {
+			rep.Skipped = append(rep.Skipped, ImportSkip{Index: i + 1, Name: doc.Job, Reason: err.Error()})
+			continue
+		}
+		rep.Imported = append(rep.Imported, job)
+	}
+	if rep.ImportedCount() == 0 && len(rep.Skipped) > 0 {
+		return rep, fmt.Errorf("%s；第一份失败原因：%s", rep.Summary(), rep.Skipped[0].Reason)
+	}
+	return rep, nil
+}
+
+// importDoc is the single-document body shared by ImportYAML / ImportYAMLDocs.
+func (s *Store) importDoc(ctx context.Context, doc JobDoc, opts ImportOptions) (Job, error) {
 	if err := doc.Validate(); err != nil {
 		return Job{}, fmt.Errorf("%w: %v", ErrInvalid, err)
 	}

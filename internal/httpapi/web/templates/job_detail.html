@@ -95,7 +95,7 @@
     {{range .Runs}}
       <tr>
         <td class="mono">{{shortTime .StartedAt}}</td>
-        <td>{{phaseLabel .Phase}}{{if .Stub}} <span class="badge stub">桩</span>{{end}}</td>
+        <td>{{runState .}}{{if .Stub}} <span class="badge stub">桩</span>{{end}}</td>
         <td class="num">{{.RowsDone}}</td>
         <td class="mono">{{if .EndedAt}}{{shortTime .EndedAt}}{{else}}—{{end}}</td>
         <td>{{dash .LastError}}</td>

@@ -3,6 +3,7 @@ package control
 import (
 	"errors"
 	"fmt"
+	"io"
 	"regexp"
 	"strings"
 
@@ -332,16 +333,48 @@ func (d *JobDoc) Validate() error {
 	return nil
 }
 
-// ParseJobYAML decodes one job.yaml document (strict: unknown fields are an
-// error, matching the "no hidden switches" rule in docs/SPEC.md).
-func ParseJobYAML(data []byte) (JobDoc, error) {
-	var doc JobDoc
+// ParseJobYAMLDocs decodes every document in a `---`-separated stream.
+//
+// 为什么必须逐份：`export --all` 写出的是多文档（每份一个任务），而恢复备份时
+// 只 Decode 一次会静默丢掉除第一份以外的全部任务，退出码还是 0（Ark P0-2）。
+// 空文档（只有注释/空白）跳过；任何一份语法或字段错误都直接报错并指出是第几份。
+func ParseJobYAMLDocs(data []byte) ([]JobDoc, error) {
 	dec := yaml.NewDecoder(strings.NewReader(string(data)))
 	dec.KnownFields(true)
-	if err := dec.Decode(&doc); err != nil && err.Error() != "EOF" {
-		return JobDoc{}, fmt.Errorf("yaml 解析失败: %w", err)
+	var out []JobDoc
+	for i := 1; ; i++ {
+		var doc JobDoc
+		err := dec.Decode(&doc)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("yaml 第 %d 份解析失败: %w", i, err)
+		}
+		// 空文档（只有注释、`---` 之间的空白）不算一份任务
+		if strings.TrimSpace(doc.Job) == "" && doc.Source.DSN == "" && doc.Target.DSN == "" {
+			continue
+		}
+		out = append(out, doc)
 	}
-	return doc, nil
+	if len(out) == 0 {
+		return nil, errors.New("yaml 里没有任何任务（连 job: 都没有）")
+	}
+	return out, nil
+}
+
+// ParseJobYAML decodes exactly one job.yaml document (strict: unknown fields
+// are an error, matching the "no hidden switches" rule in docs/SPEC.md).
+// 多份输入会明确报错，而不是悄悄只取第一份。
+func ParseJobYAML(data []byte) (JobDoc, error) {
+	docs, err := ParseJobYAMLDocs(data)
+	if err != nil {
+		return JobDoc{}, err
+	}
+	if len(docs) != 1 {
+		return JobDoc{}, fmt.Errorf("这份 yaml 里有 %d 个任务；要导入多份请用 import（会逐份导入并回报 N/M）", len(docs))
+	}
+	return docs[0], nil
 }
 
 // MarshalJobYAML renders a document the way `jinliang export` writes it.

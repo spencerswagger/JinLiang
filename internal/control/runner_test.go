@@ -110,10 +110,19 @@ func TestRunnerPauseResume(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 等到快照阶段（能从 preflight 走到 paused 的阶段）再暂停
-	waitFor(t, "运行记录进入非 preflight 阶段", func() bool {
+	// 只在「能进入 paused」的阶段暂停：stage 表里 paused 只能从 snapshot/catchup/
+	// streaming 进；如果等到 draining 才暂停，那一刻已经没有可暂停的东西了，
+	// 测试会在 -race（更慢）下随机超时。
+	waitFor(t, "运行记录进入 snapshot/catchup/streaming", func() bool {
 		cur, err := s.GetRun(ctx, run.ID)
-		return err == nil && cur.Phase != state.Preflight
+		if err != nil {
+			return false
+		}
+		switch cur.Phase {
+		case state.Snapshot, state.Catchup, state.Streaming:
+			return true
+		}
+		return false
 	})
 	if err := s.Runner().Pause(ctx, job.ID); err != nil {
 		t.Fatal(err)

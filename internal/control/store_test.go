@@ -394,7 +394,7 @@ func TestRunsPersistAndPhaseTransitionsAreChecked(t *testing.T) {
 	if _, err := s.UpdateRunPhase(ctx, run.ID, "snapshot"); err != nil {
 		t.Fatalf("prepare → snapshot should be legal: %v", err)
 	}
-	if _, err := s.FinishRun(ctx, run.ID, "done", "", 0); err == nil {
+	if _, err := s.FinishRun(ctx, run.ID, "done", "", 0, FinishFailed); err == nil {
 		t.Fatal("snapshot → done is illegal and must be refused")
 	}
 	latest, err := s.LatestRun(ctx, job.ID)
