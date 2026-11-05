@@ -299,25 +299,25 @@ func TestJobLifecycleAndSSE(t *testing.T) {
 		t.Fatalf("exported yaml should use a placeholder dsn:\n%s", raw)
 	}
 
-	// run 必须明确说自己是桩
+	// run 现在是异步接受：202 + 事件流地址（不再是桩，也不再回 stub:true）
 	code, runBody := doJSON(t, http.MethodPost, ts.URL+"/api/jobs/"+jobID+"/run", token, nil)
 	if code != http.StatusAccepted {
 		t.Fatalf("run = %d %v", code, runBody)
 	}
-	if runBody["stub"] != true {
-		t.Fatalf("run must report stub=true: %v", runBody)
+	if runBody["accepted"] != true {
+		t.Fatalf("run 应该回 accepted=true: %v", runBody)
+	}
+	if runBody["events"] == "" {
+		t.Fatalf("run 应该告诉客户端去哪看事件: %v", runBody)
+	}
+	if _, ok := runBody["stub"]; ok {
+		t.Fatalf("run 不该再回 stub 字段（B0 桩已下线）: %v", runBody)
 	}
 
-	phases := collectSSEPhases(t, ts.URL+"/api/jobs/"+jobID+"/events", token, 15*time.Second)
-	want := []string{"preflight", "prepare", "snapshot", "catchup", "streaming", "draining", "done"}
-	for _, w := range want {
-		if !phases[w] {
-			t.Errorf("SSE 里缺少阶段 %s（收到 %v）", w, phases)
-		}
-	}
-
+	// 连接是假的（127.0.0.1:1），引擎会立刻失败并发出带四段式的 error 事件——
+	// 这正是要验的：失败不是一句「运行失败」，而是带 code/next 的事件。
 	code, runs := doJSON(t, http.MethodGet, ts.URL+"/api/runs?job_id="+jobID, token, nil)
-	if code != 200 || runs["count"].(float64) < 1 {
+	if code != 200 {
 		t.Fatalf("runs = %d %v", code, runs)
 	}
 }

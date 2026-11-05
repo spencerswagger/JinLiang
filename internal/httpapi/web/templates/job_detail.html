@@ -15,8 +15,8 @@
 
 <div class="card">
   <div class="row">
-    <span class="badge stub">B0 骨架</span>
-    <span class="meta">现在点「开始」只推进阶段、不搬数据；引擎在 B1 接上后才是真的同步。</span>
+    <span class="badge ok">B1 引擎</span>
+    <span class="meta">点「开始」会真的搬数据：预检 → 准备（建发布/书签）→ 全量 → 追增量 → 实时 → 收尾。进度与错误都在这条事件流里。</span>
   </div>
 </div>
 
@@ -33,18 +33,11 @@
       <input type="hidden" name="csrf_token" value="{{$.CSRF}}">
       <button class="primary" type="submit">开始</button>
     </form>
-    <form class="inline" method="post" action="/jobs/{{.Summary.ID}}/pause" data-once>
-      <input type="hidden" name="csrf_token" value="{{$.CSRF}}">
-      <button type="submit">暂停</button>
-    </form>
-    <form class="inline" method="post" action="/jobs/{{.Summary.ID}}/resume" data-once>
-      <input type="hidden" name="csrf_token" value="{{$.CSRF}}">
-      <button type="submit">恢复</button>
-    </form>
     <form class="inline" method="post" action="/jobs/{{.Summary.ID}}/stop" data-once>
       <input type="hidden" name="csrf_token" value="{{$.CSRF}}">
       <button type="submit">停止</button>
     </form>
+    <span class="meta">B1 引擎只有「停止」：会提交位点、按中断收尾；再点「开始」从断点继续。暂停/恢复要等引擎支持（见下）</span>
   </div>
 
   <h3>事件流</h3>
@@ -65,7 +58,7 @@
   <ul class="timeline">
     <li class="{{if .Active}}{{if eq (printf "%s" .Active.Phase) "preflight"}}current{{end}}{{end}}"><strong>预检</strong> <span class="meta">只读检查两端能力与表结构</span></li>
     <li><strong>准备</strong> <span class="meta">目标端准备表与同步元数据</span></li>
-    <li><strong>全量</strong> <span class="meta">把历史数据整块搬过去，可暂停</span></li>
+    <li><strong>全量</strong> <span class="meta">把历史数据整块搬过去；中途可以停止，重跑从断点继续</span></li>
     <li><strong>追增量</strong> <span class="meta">补上初始化期间的变更</span></li>
     <li><strong>实时</strong> <span class="meta">之后每次变更秒级同步</span></li>
     <li><strong>收尾</strong> <span class="meta">提交最后一批并释放占用</span></li>

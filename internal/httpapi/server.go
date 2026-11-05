@@ -38,6 +38,7 @@ type Server struct {
 	apiToken string
 	sessions *sessionStore
 	limiter  *loginLimiter
+	runs     *runRegistry
 	pages    map[string]*pageTemplate
 	partials *pageTemplate
 	static   fs.FS
@@ -64,6 +65,7 @@ func New(opts Options) (*Server, error) {
 		apiToken: opts.APIToken,
 		sessions: newSessionStore(now, 24*time.Hour),
 		limiter:  newLoginLimiter(now, 5, time.Minute),
+		runs:     newRunRegistry(),
 		version:  opts.Version,
 		started:  now(),
 		now:      now,

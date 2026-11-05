@@ -31,16 +31,38 @@
   var dot = document.getElementById("live-dot");
   var stream = document.getElementById("sse-source");
 
+  function esc(s) {
+    return String(s == null ? "" : s)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  }
+
   function appendLine(ev) {
     if (!log) return;
-    var row = document.createElement("div");
-    var cls = ev.type === "error" ? "err" : ev.type === "done" ? "ok" : "";
     var time = new Date().toLocaleTimeString();
-    row.className = cls;
+    var row = document.createElement("div");
+
+    if (ev.type === "error") {
+      // 错误必须是四段式：发生了什么 / 代码 / 你现在能做什么（按钮化的文字清单）。
+      // 引擎发的 error 事件带 code 与 next[]，照它渲染，不要自己编原因。
+      row.className = "err";
+      var next = (ev.next || []).map(function (n) {
+        return "<li>" + esc(n) + "</li>";
+      }).join("");
+      row.innerHTML =
+        '<h3>' + esc(ev.message || "出错了") +
+        (ev.code ? ' <span class="badge bad">' + esc(ev.code) + "</span>" : "") + "</h3>" +
+        (next ? "<ol>" + next + "</ol>" : "") +
+        '<p class="hint">' + esc(time) + "</p>";
+      log.appendChild(row);
+      log.scrollTop = log.scrollHeight;
+      return;
+    }
+
+    row.className = ev.type === "done" ? "ok" : "";
     row.innerHTML =
-      '<span class="t">' + time + "</span> " +
-      (ev.phase_label ? "[" + ev.phase_label + "] " : "") +
-      (ev.message || ev.type || "");
+      '<span class="t">' + esc(time) + "</span> " +
+      (ev.phase_label ? "[" + esc(ev.phase_label) + "] " : "") +
+      esc(ev.message || ev.type || "");
     log.appendChild(row);
     log.scrollTop = log.scrollHeight;
     while (log.childElementCount > 200) {
@@ -75,13 +97,18 @@
     ["phase", "progress", "note", "error", "done"].forEach(function (name) {
       es.addEventListener(name, onEvent);
     });
-    es.addEventListener("reset", function () {
-      // 控制面进程重启过：之前的序号失效，日志里明说一句，然后从新流继续。
+    es.addEventListener("reset", function (msg) {
+      // 控制面进程重启过：旧序号失效，服务端会从头重发。
+      // 必须先清空本地列表——否则上一进程的事件会与新的事件混在一起。
+      var reason = "控制面重启过，事件流已重置（下面从这一轮开头继续）";
+      try {
+        var p = JSON.parse(msg.data || "{}");
+        if (p.reason) reason = p.reason;
+      } catch (e) { /* 用默认文案 */ }
       if (log) {
+        log.innerHTML = "";
         var row = document.createElement("div");
-        row.className = "ev";
-        row.innerHTML = '<span class="t">' + new Date().toLocaleTimeString() + "</span> " +
-          "控制面重启过，事件流已重置（下面从这一轮开头继续）";
+        row.innerHTML = '<span class="t">' + new Date().toLocaleTimeString() + "</span> " + esc(reason);
         log.appendChild(row);
       }
     });

@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -19,7 +20,6 @@ type overviewData struct {
 	ActiveRuns  []control.Run
 	RunCount    int
 	FailedRuns  int
-	StubMode    bool
 	Healthy     bool
 	Problems    []string
 }
@@ -65,7 +65,7 @@ func (s *Server) pageOverview(w http.ResponseWriter, r *http.Request) {
 		Title: "总览", Nav: "overview",
 		Data: overviewData{
 			Jobs: jobs, Connections: views, ActiveRuns: active,
-			RunCount: len(runs), FailedRuns: failed, StubMode: true,
+			RunCount: len(runs), FailedRuns: failed,
 			Healthy: healthy, Problems: problems,
 		},
 	})
@@ -415,8 +415,8 @@ func (s *Server) pageJobDetail(w http.ResponseWriter, r *http.Request) {
 	}
 	runs, _ := s.store.ListRuns(ctx, sum.ID, 20)
 	var active *control.Run
-	if run, ok := s.store.Runner().Active(sum.ID); ok {
-		active = &run
+	if run, err := s.activeSyncRun(ctx, sum.ID); err == nil {
+		active = run
 	}
 	var tables []string
 	if doc.Content != nil {
@@ -457,7 +457,22 @@ func codesForChecks(rep source.Report) map[string]core.Spec {
 
 func (s *Server) pageJobRun(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if _, err := s.store.Runner().Start(r.Context(), id, control.ActorUI); err != nil {
+	job, err := s.store.GetJob(r.Context(), id)
+	if err != nil {
+		s.renderPartial(w, "error_card", plainError("%v", err))
+		return
+	}
+	if err := s.startJob(r.Context(), job, control.ActorUI); err != nil {
+		if errors.Is(err, control.ErrRunInProgress) {
+			s.renderPartial(w, "error_card", apiError{
+				Class:   "user_action",
+				Message: "这个任务已经在跑了",
+				Why:     "同一任务同时跑两份会互相覆盖",
+				Next:    []string{"先看下面的实时事件；要停下按「停止」"},
+				Risk:    "无",
+			})
+			return
+		}
 		s.renderPartial(w, "error_card", plainError("%v", err))
 		return
 	}
@@ -465,29 +480,34 @@ func (s *Server) pageJobRun(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) pageJobPause(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	if err := s.store.Runner().Pause(r.Context(), id); err != nil {
-		s.renderPartial(w, "error_card", plainError("%v", err))
-		return
-	}
-	http.Redirect(w, r, "/jobs/"+id, http.StatusSeeOther)
+	e := notImplementedPause()
+	s.renderPartial(w, "error_card", e)
 }
 
 func (s *Server) pageJobResume(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	if err := s.store.Runner().Resume(r.Context(), id); err != nil {
-		s.renderPartial(w, "error_card", plainError("%v", err))
-		return
+	e := apiError{
+		Class:   "user_action",
+		Message: "引擎没有「恢复」这个动作",
+		Why:     "暂停没实现，所以没有「恢复」；直接再点「开始」会从断点续跑",
+		Next:    []string{"点「开始」——已提交的数据不会重搬"},
+		Risk:    "无",
 	}
-	http.Redirect(w, r, "/jobs/"+id, http.StatusSeeOther)
+	s.renderPartial(w, "error_card", e)
 }
 
 func (s *Server) pageJobStop(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if err := s.store.Runner().Stop(r.Context(), id); err != nil {
-		s.renderPartial(w, "error_card", plainError("%v", err))
+	if !s.stopJob(id) {
+		s.renderPartial(w, "error_card", apiError{
+			Class:   "user_action",
+			Message: "这个任务没有在跑",
+			Why:     "停止只能作用在正在执行的任务上",
+			Next:    []string{"想跑就点「开始」"},
+			Risk:    "无",
+		})
 		return
 	}
+	_ = s.store.Audit(r.Context(), control.ActorUI, "job.stop", map[string]any{"job_id": id})
 	http.Redirect(w, r, "/jobs/"+id, http.StatusSeeOther)
 }
 

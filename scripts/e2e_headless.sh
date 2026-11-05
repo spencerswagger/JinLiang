@@ -291,28 +291,94 @@ PYBODY
   echo "  改成定时增量（watermark=updated_at）后 can_start=True：替代方案真的能走通"
 fi
 
-say "6. run（桩：只推进阶段，不搬数据）"
-api POST "/api/jobs/${JOB_ID}/run" >"${WORK}/run.json"
-json '["stub"]' <"${WORK}/run.json" | grep -qi true || fail "run 必须明确返回 stub=true"
+say "6. run 的能力边界：MySQL 目标端要明确拒绝（不能回 202 之后什么都不发生）"
+BOUNDARY_CODE=$(curl -s -o "${WORK}/run-boundary.json" -w '%{http_code}' \
+  -X POST "${BASE}/api/jobs/${JOB_ID}/run" -H "Authorization: Bearer ${TOKEN}")
+if [ "${TGT_LABEL}" = "postgres" ]; then
+  echo "  （本次目标端是 PostgreSQL，跳过边界检查）"
+else
+  [ "${BOUNDARY_CODE}" = "422" ] || fail "MySQL 目标端应返回 422，实际 ${BOUNDARY_CODE}"
+  python3 - "${WORK}/run-boundary.json" <<'PYB'
+import json,sys
+e=json.load(open(sys.argv[1]))["error"]
+assert "PostgreSQL" in e["why"] or "只支持" in e["message"], e
+assert e.get("next"), "能力边界也要给下一步"
+print("  422 + 四段式：%s" % e["message"])
+PYB
+fi
+
+say "6b. 建一个 PostgreSQL → PostgreSQL 的任务，跑真引擎"
+if [ "${SRC_LABEL}" != "postgres" ]; then
+  echo "  SKIP：本次只有 MySQL 源；B1 引擎是 PG→PG，跳过真跑"
+  REAL_JOB="${JOB_ID}"
+else
+  # 目标端用同一个 PG 连接的另一个 schema（fixture 已建好 jl_e2e_out）
+  api GET "/api/catalog?connection_id=${CONN_ID}&schema=${SRC_SCHEMA}" >"${WORK}/cat2.json"
+  PG_JOB=$(python3 - "${CONN_ID}" "${TABLE}" "${SRC_SCHEMA}" <<'PYP'
+import json,sys
+conn, table, schema = sys.argv[1], sys.argv[2], sys.argv[3]
+print(json.dumps({
+  "name": "e2e-pg2pg",
+  "source_id": conn,
+  "target_id": conn,
+  "enabled": False,
+  "spec": {
+    "source": {"scope": {"schema": schema, "include": [table]}},
+    "target": {"schema": "jl_e2e_out", "on_exists": "append", "create_indexes": "defer"},
+    "mode": {"frequency": "once"},
+    "content": {"tables": {table: {}}}
+  }
+}))
+PYP
+)
+  api POST /api/jobs "${PG_JOB}" >"${WORK}/pgjob.json"
+  REAL_JOB=$(json '["id"]' <"${WORK}/pgjob.json")
+  [ -n "${REAL_JOB}" ] || fail "建 PG→PG 任务失败"
+  ACC_CODE=$(curl -s -o "${WORK}/run2.json" -w '%{http_code}' -X POST \
+    "${BASE}/api/jobs/${REAL_JOB}/run" -H "Authorization: Bearer ${TOKEN}")
+  [ "${ACC_CODE}" = "202" ] || { cat "${WORK}/run2.json"; fail "run 应该异步接受（202），实际 ${ACC_CODE}"; }
+  json '["accepted"]' <"${WORK}/run2.json" | grep -qi true || fail "run 应返回 accepted=true"
+  json '["events"]'      <"${WORK}/run2.json" | grep -q '/events' || fail "run 应告诉客户端事件流地址"
+  echo "  202 accepted（异步），事件流：$(json '["events"]' <"${WORK}/run2.json")"
+fi
 
 say "7. 读 SSE，看阶段变化（不经浏览器；凭证只走请求头）"
 # query 里放 token 会被访问日志/历史/Referer 收走，所以这条路径必须被拒绝
 QTOKEN=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
-  "${BASE}/api/jobs/${JOB_ID}/events?token=${TOKEN}")
+  "${BASE}/api/jobs/${REAL_JOB}/events?token=${TOKEN}")
 [ "${QTOKEN}" = "401" ] || fail "?token= 形式的 SSE 应该被拒绝（401），实际 ${QTOKEN}"
 echo "  ?token= 被拒绝（401）：凭证不再进 URL"
-curl -sN --max-time 15 -H "Authorization: Bearer ${TOKEN}" \
-  "${BASE}/api/jobs/${JOB_ID}/events" >"${WORK}/sse.txt" || true
-DONE=$(grep -c '"type":"done"' "${WORK}/sse.txt" || true)
-[ "${DONE}" -ge 1 ] || { cat "${WORK}/sse.txt"; fail "SSE 里没有看到 done 事件"; }
-for phase in preflight prepare snapshot catchup streaming draining done; do
-  grep -q "\"phase\":\"${phase}\"" "${WORK}/sse.txt" || fail "SSE 里缺少阶段 ${phase}"
-done
-echo "  SSE 事件行数：$(wc -l <"${WORK}/sse.txt")，阶段全部出现"
+curl -sN --max-time 30 -H "Authorization: Bearer ${TOKEN}" \
+  "${BASE}/api/jobs/${REAL_JOB}/events" >"${WORK}/sse.txt" || true
+if [ "${SRC_LABEL}" != "postgres" ]; then
+  echo "  SKIP：没有 PG 源，无法产生真事件"
+else
+  grep -q '"type":"done"' "${WORK}/sse.txt" || { head -30 "${WORK}/sse.txt"; fail "SSE 里没有看到 done 事件"; }
+  for phase in prepare snapshot draining done; do
+    grep -q "\"phase\":\"${phase}\"" "${WORK}/sse.txt" || fail "SSE 里缺少阶段 ${phase}"
+  done
+  grep -q '"type":"progress"' "${WORK}/sse.txt" || fail "SSE 里没有 progress（全量进度）"
+  grep -q 'event: phase' "${WORK}/sse.txt" || fail "SSE 帧缺少 event: 行（浏览器要靠它订阅）"
+  echo "  SSE 事件行数：$(wc -l <"${WORK}/sse.txt")，阶段与进度都出现"
+fi
 
-say "8. 运行历史落库"
-api GET "/api/runs?job_id=${JOB_ID}" >"${WORK}/runs.json"
-json '["count"]' <"${WORK}/runs.json" | grep -qx '1' || fail "应该有 1 条运行记录"
+say "8. 运行历史落库（真引擎：phase=done、finish_reason=completed）"
+if [ "${SRC_LABEL}" != "postgres" ]; then
+  echo "  SKIP：没有真跑"
+else
+  api GET "/api/runs?job_id=${REAL_JOB}" >"${WORK}/runs.json"
+  python3 - "${WORK}/runs.json" <<'PYR'
+import json,sys
+d=json.load(open(sys.argv[1]))
+runs=d.get("runs") or []
+assert len(runs) >= 1, "应该有运行记录"
+r=runs[0]
+assert r["phase"] == "done", r
+assert r.get("finish_reason") == "completed", r
+assert r.get("kind") == "sync", r
+print("  运行记录：phase=%s finish_reason=%s rows=%s kind=%s" % (r["phase"], r.get("finish_reason"), r["rows_done"], r.get("kind")))
+PYR
+fi
 
 say "9. export 出 yaml（规范路径 /export；不能含任何密码）"
 curl -fsS "${BASE}/api/jobs/${JOB_ID}/export" -H "Authorization: Bearer ${TOKEN}" >"${WORK}/job.yaml"

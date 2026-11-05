@@ -15,6 +15,10 @@ var (
 	ErrConflict = errors.New("冲突")
 	// ErrInvalid: 输入不合法，消息本身已经是人话，可直接展示。
 	ErrInvalid = errors.New("输入不合法")
+	// ErrRunInProgress: 这个任务已经有一条未结束的运行。
+	ErrRunInProgress = errors.New("这个任务正在跑")
+	// ErrNoActiveRun: 暂停/停止时没有正在跑的任务。
+	ErrNoActiveRun = errors.New("这个任务没有在跑")
 	// ErrIdentityLocked: 这个连接的坐标是任务身份的一部分，被引用时不许改
 	// （改了 job_key 就与已建任务脱节，同一份同步能变成两个任务）。
 	ErrIdentityLocked = errors.New("连接坐标已锁定")

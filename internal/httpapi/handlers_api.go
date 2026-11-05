@@ -334,50 +334,87 @@ func (s *Server) handlePreflight(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
-	run, err := s.store.Runner().Start(r.Context(), r.PathValue("id"), actorOf(r))
+	ctx := r.Context()
+	id := r.PathValue("id")
+	job, err := s.store.GetJob(ctx, id)
 	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	if err := s.startJob(ctx, job, actorOf(r)); err != nil {
 		if errors.Is(err, control.ErrRunInProgress) {
 			s.writeError(w, r, http.StatusConflict, apiError{
 				Class:   "user_action",
-				Message: "这个任务正在跑",
-				Why:     "同一个任务同时跑两份会互相覆盖（多实例靠目标端租约，本机靠这一层）",
-				Next:    []string{"等它跑完（GET /api/jobs/{id} 看 runs）", "或先 POST /pause 停下来"},
+				Message: "这个任务已经在跑了",
+				Why:     "同一个任务同时跑两份会互相覆盖（多实例靠目标端租约，本进程靠这一层）",
+				Next:    []string{"打开任务页看实时事件：GET /api/jobs/{id}/events", "要停下就 POST /api/jobs/{id}/stop（位点已提交，重跑会从断点继续）"},
 				Risk:    "无",
 			})
 			return
 		}
-		s.fail(w, r, err)
+		// 引擎能力边界（例如 MySQL 目标端）是「用户可修正」的问题：422 + 四段式，
+		// 而不是 202 之后什么都没发生。
+		s.writeError(w, r, http.StatusUnprocessableEntity, apiError{
+			Class:   "user_action",
+			Message: "引擎暂时跑不了这种组合",
+			Why:     err.Error(),
+			Next: []string{
+				"把目标端换成一个 PostgreSQL 连接（新建连接 → 任务页改目标）",
+				"MySQL 目标端在 B2；现在可以先只验证源端读取与 full copy",
+			},
+			Risk: "无：这条在开跑之前就挡住了，不会留下半截数据",
+		})
 		return
 	}
+	// 202 + 事件流地址：run 是异步的，结果从 /events 与 /api/runs 看。
 	writeJSON(w, http.StatusAccepted, map[string]any{
-		"run":     run,
-		"stub":    true,
-		"message": "B0 骨架运行已开始：只推进阶段，不搬运数据。事件流：GET /api/jobs/{id}/events",
+		"accepted": true,
+		"job_id":   job.ID,
+		"events":   "/api/jobs/" + job.ID + "/events",
+		"message":  "已开始执行（B1 引擎）。阶段与进度看事件流；错误会带四段式（code/why/next/risk）",
 	})
 }
 
-func (s *Server) handlePause(w http.ResponseWriter, r *http.Request) {
-	if err := s.store.Runner().Pause(r.Context(), r.PathValue("id")); err != nil {
-		s.runControlError(w, r, err)
-		return
+// notImplementedPause 说明「引擎还没有暂停」这件事，而不是回 202 假装接收。
+func notImplementedPause() apiError {
+	return apiError{
+		Class:   "user_action",
+		Message: "引擎还不支持暂停",
+		Why: "B1 的引擎只有「取消」一种停下方式：它会提交位点、按中断收尾。" +
+			"做真的「暂停/恢复」需要在阶段之间设安全停点，属于下一步的工作",
+		Next: []string{
+			"想现在停下：POST /api/jobs/{id}/stop（位点会提交，重跑从断点继续）",
+			"或者等这个任务自己跑完，再在任务页改配置",
+		},
+		Risk: "停止会让这一轮标记为「已中断」，但不会丢数据——位点与数据同事务提交",
 	}
-	writeJSON(w, http.StatusAccepted, map[string]any{"ok": true, "paused": true})
+}
+
+func (s *Server) handlePause(w http.ResponseWriter, r *http.Request) {
+	s.writeError(w, r, http.StatusNotImplemented, notImplementedPause())
 }
 
 func (s *Server) handleResume(w http.ResponseWriter, r *http.Request) {
-	if err := s.store.Runner().Resume(r.Context(), r.PathValue("id")); err != nil {
-		s.runControlError(w, r, err)
-		return
-	}
-	writeJSON(w, http.StatusAccepted, map[string]any{"ok": true, "paused": false})
+	s.writeError(w, r, http.StatusNotImplemented, apiError{
+		Class:   "user_action",
+		Message: "引擎没有「恢复」这个动作",
+		Why:     "因为暂停没有实现：停止之后再跑一次，引擎会从目标端已提交的位点继续",
+		Next:    []string{"直接 POST /api/jobs/{id}/run —— 会从断点续跑，不会重搬已提交的数据"},
+		Risk:    "无",
+	})
 }
 
 func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
-	if err := s.store.Runner().Stop(r.Context(), r.PathValue("id")); err != nil {
-		s.runControlError(w, r, err)
+	id := r.PathValue("id")
+	if !s.stopJob(id) {
+		s.runControlError(w, r, control.ErrNoActiveRun)
 		return
 	}
-	writeJSON(w, http.StatusAccepted, map[string]any{"ok": true, "stopped": true})
+	_ = s.store.Audit(r.Context(), actorOf(r), "job.stop", map[string]any{"job_id": id})
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"stopping": true,
+		"message":  "已发出停止；引擎会提交位点并按「已中断」收尾，重跑从断点继续",
+	})
 }
 
 func (s *Server) runControlError(w http.ResponseWriter, r *http.Request, err error) {

@@ -59,6 +59,8 @@ func fixturePG(ctx context.Context, raw string) error {
 		`CREATE TABLE IF NOT EXISTS e2e_logs (
 			message text
 		)`,
+		// B1 引擎是 PG→PG：e2e 用这条 schema 当目标端，避免与源端 public 撞表。
+		`CREATE SCHEMA IF NOT EXISTS jl_e2e_out`,
 		`INSERT INTO e2e_customers (name, city)
 		 SELECT 'demo-'||g, 'city-'||(g%5)
 		 FROM generate_series(1,3) g
