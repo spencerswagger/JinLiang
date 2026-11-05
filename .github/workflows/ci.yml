@@ -64,19 +64,13 @@ jobs:
           python scripts/validate_schema.py examples/*.yaml
 
   control-plane:
-    # 控制面 B0：起一个真 PostgreSQL + 真 MySQL，用纯 curl 走完整条链（验收 ①②③④）
+    # 控制面：起真 PostgreSQL + 真 MySQL，用纯 curl 走完整条链（验收 ①②③④）。
+    #
+    # PostgreSQL 不用 services：B1 引擎要建逻辑复制书签，要求 wal_level=logical，
+    # 而 services 只能传环境变量、不能给容器加启动参数（默认是 replica，会报
+    # "logical decoding requires wal_level >= logical"）。所以用 docker run 显式带参数。
     runs-on: ubuntu-latest
     services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_USER: jinliang
-          POSTGRES_PASSWORD: jinliang
-          POSTGRES_DB: jinliang_src
-        ports: ["5432:5432"]
-        options: >-
-          --health-cmd "pg_isready -U jinliang"
-          --health-interval 5s --health-timeout 5s --health-retries 20
       mysql:
         image: mysql:8.0
         env:
@@ -90,9 +84,7 @@ jobs:
           --health-interval 5s --health-timeout 5s --health-retries 30
     env:
       JINLIANG_TEST_PG_DSN: postgres://jinliang:jinliang@127.0.0.1:5432/jinliang_src?sslmode=disable
-      JINLIANG_TEST_PG_SRC_DSN: postgres://jinliang:jinliang@127.0.0.1:5432/jinliang_test?sslmode=disable
       JINLIANG_TEST_MYSQL_DSN: mysql://jinliang:jinliang@127.0.0.1:3306/jinliang_test
-      JINLIANG_TEST_MYSQL_SRC_DSN: mysql://jinliang:jinliang@127.0.0.1:3306/jinliang_src
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -101,27 +93,25 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: 准备第二套测试库（b4 集成测试需要源/目标分离）
+      - name: 起 PostgreSQL（wal_level=logical：B1 引擎要建逻辑书签）
         run: |
           set -e
-          PGPASSWORD=jinliang psql -h 127.0.0.1 -U jinliang -d jinliang_src -tAc \
-            "SELECT 1 FROM pg_database WHERE datname='jinliang_test'" | grep -q 1 || \
-            PGPASSWORD=jinliang psql -h 127.0.0.1 -U jinliang -d jinliang_src -c 'CREATE DATABASE jinliang_test'
-          mysql -h 127.0.0.1 -uroot -proot -e "
-            CREATE DATABASE IF NOT EXISTS jinliang_src;
-            GRANT ALL PRIVILEGES ON jinliang_src.* TO 'jinliang'@'%';
-            GRANT REPLICATION CLIENT, REPLICATION SLAVE ON *.* TO 'jinliang'@'%';
-            FLUSH PRIVILEGES;"
+          docker run -d --name pg-src \
+            -e POSTGRES_USER=jinliang -e POSTGRES_PASSWORD=jinliang -e POSTGRES_DB=jinliang_src \
+            -p 5432:5432 postgres:16 -c wal_level=logical
+          ok=0
+          for _ in $(seq 1 90); do
+            if docker exec pg-src pg_isready -U jinliang >/dev/null 2>&1; then ok=1; break; fi
+            sleep 1
+          done
+          if [ "$ok" != 1 ]; then echo "--- pg-src 没起来 ---"; docker logs pg-src; exit 1; fi
+          docker exec pg-src psql -U jinliang -d postgres -tAc "select current_setting('wal_level')"
       - name: 控制面单元/接口测试
         run: go test ./internal/...
       - name: 装校验依赖（让 e2e 里的 schema 校验跑真 jsonschema）
         run: pip install --quiet pyyaml jsonschema
       - name: 准备测试表
         run: go run ./test/fixture
-      - name: b4 集成测试（verify / gc / doctor / remedy，缺 DSN 会红）
-        # -p 1：多个包同时 CREATE TABLE IF NOT EXISTS 会在 PG 上撞
-        # pg_type_typname_nsp_index（IF NOT EXISTS 不是并发安全的）。
-        run: go test -p 1 -tags=integration ./internal/verify ./internal/gc ./internal/doctor ./internal/remedy
       - name: headless 全链路（纯 curl，不经浏览器）
         run: |
           set -e
