@@ -441,4 +441,4 @@ printf '  %-30s %s\n' "JINLIANG_TEST_PG_SRC_DSN"  "$([ -n "${PG_SRC_DSN}" ] && e
 printf '  %-30s %s\n' "JINLIANG_TEST_MYSQL_DSN"   "$([ -n "${MY_TEST_DSN}" ] && echo "USED/SKIP-BY-NEED" || echo "SKIP(未设置)")"
 printf '  %-30s %s\n' "JINLIANG_TEST_MYSQL_SRC_DSN" "$([ -n "${MY_SRC_DSN}" ] && echo "USED/SKIP-BY-NEED" || echo "SKIP(未设置)")"
 
-say "PASS：headless 全链路通过（连接 → 库表 → 任务 → 预检 → 桩运行 → SSE → 导出 → 重启 → CLI）"
+say "PASS：headless 全链路通过（连接 → 库表 → 任务 → 预检 → 能力边界 → 真引擎全量 → SSE 阶段与进度 → 导出 → 重启 → CLI）"
