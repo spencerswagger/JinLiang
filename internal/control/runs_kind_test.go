@@ -198,6 +198,13 @@ func TestLatestRunIgnoresVerifyRows(t *testing.T) {
 	if verifyRun.Kind != RunKindVerify {
 		t.Fatalf("verify 运行的 kind = %q", verifyRun.Kind)
 	}
+	// 让 verify 行在时间上严格更晚：started_at 是 RFC3339（秒精度），同一秒内
+	// 两条记录谁「最新」只能靠 id 兜底，而 uuid7 在同毫秒内的尾部是随机的——
+	// 靠它排序会偶发失败（CI 已经抓到过一次）。这里显式把时间拉开，断言才稳。
+	if _, err := s.DB().ExecContext(ctx,
+		`UPDATE runs SET started_at = ? WHERE id = ?`, "2099-01-01T00:00:00Z", verifyRun.ID); err != nil {
+		t.Fatal(err)
+	}
 
 	latestAny, err := s.LatestRun(ctx, job.ID)
 	if err != nil {
