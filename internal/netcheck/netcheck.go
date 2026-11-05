@@ -71,16 +71,21 @@ func IsLoopbackClient(remoteAddr string) bool {
 var forwardingHeaders = []string{"Forwarded", "X-Forwarded-For", "X-Real-IP"}
 
 // IsLoopbackRequest reports whether this request provably came from this
-// machine: RemoteAddr 是本机，**且** 没有任何转发头。
+// machine: RemoteAddr 是本机，**且** 没有出现任何转发头。
 //
-// 注意：不解析转发头里的内容（那是不可信输入），只看「有没有」。
+// 注意：不解析转发头里的内容（那是不可信输入），只看「这个头在不在」。
+//
+// 为什么用 len(Values) 而不是 TrimSpace(Get()) != ""：`X-Forwarded-For: "  "`
+// （空白值）在 TrimSpace 之后是空串，会被判成「没有转发头」→ 本机 → 放行。
+// 反代如果原样透传客户端的头，远端就能这样绕过首启守卫（fail-open）。
+// 头的存在本身就是「请求至少经过一跳」的证据，空白值同样是证据。
 func IsLoopbackRequest(r *http.Request) bool {
 	if r == nil {
 		return false
 	}
 	for _, h := range forwardingHeaders {
-		if strings.TrimSpace(r.Header.Get(h)) != "" {
-			return false // 有转发头 = 请求至少经过一跳，不能算本机
+		if len(r.Header.Values(h)) > 0 {
+			return false // 头存在（哪怕是空白）= 请求至少经过一跳，不能算本机
 		}
 	}
 	return IsLoopbackClient(r.RemoteAddr)

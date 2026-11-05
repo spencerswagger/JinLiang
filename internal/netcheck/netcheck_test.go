@@ -93,7 +93,13 @@ func TestIsLoopbackRequestRejectsForwardedTraffic(t *testing.T) {
 		{"本机 + X-Real-IP", "127.0.0.1:54321", map[string]string{"X-Real-IP": "203.0.113.9"}, false},
 		{"本机 + Forwarded", "127.0.0.1:54321",
 			map[string]string{"Forwarded": "for=203.0.113.9"}, false},
-		{"本机 + 空转发头（空串不算）", "127.0.0.1:54321", map[string]string{"X-Forwarded-For": "  "}, true},
+		// Owl 的 fail-open 复现：空白值过去被 TrimSpace 成空串 → 判本机 → 放行。
+		// 现在按「头存在即拒绝」，四种写法都必须 false。
+		{"本机 + 空白值", "127.0.0.1:54321", map[string]string{"X-Forwarded-For": "  "}, false},
+		{"本机 + 单空格", "127.0.0.1:54321", map[string]string{"X-Real-IP": " "}, false},
+		{"本机 + 纯 tab", "127.0.0.1:54321", map[string]string{"Forwarded": "\t"}, false},
+		{"本机 + 空值逗号", "127.0.0.1:54321", map[string]string{"X-Forwarded-For": ",,"}, false},
+		{"本机 + 空串", "127.0.0.1:54321", map[string]string{"X-Forwarded-For": ""}, false},
 		{"非本机，无转发头", "10.0.0.9:5555", nil, false},
 		{"非本机 + 转发头", "10.0.0.9:5555", map[string]string{"X-Forwarded-For": "203.0.113.9"}, false},
 		{"[::1] 无转发头", "[::1]:5555", nil, true},
