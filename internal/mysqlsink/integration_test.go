@@ -410,6 +410,11 @@ var _ = time.Now
 
 // 同一批 DDL 应用两次必须幂等（这是「DDL 隐式提交」那条必改的验收标准）。
 // 旧实现里 DDL 塞在数据事务中：崩在「DDL 之后、位点写入之前」后重放 → 1061 Duplicate key name → 永久卡死。
+//
+// 注意强度：这里是**同一进程连着调两次 Apply**，不是 kill -9 后的新进程重放。
+// 幂等判据全部落在库里（information_schema 的列/索引/类型），新进程只多一个空的
+// uniqueCache，因此真实崩溃重放只会比这条更保守；但**真正的 kill -9 重放验证归
+// B2 的崩溃恢复矩阵**（`feat/b2-*` 的真库用例），别把这条当成已经验过崩溃重放。
 func TestIntegrationDDLReplayIsIdempotent(t *testing.T) {
 	ctx := context.Background()
 	s := openSink(t, nil)
@@ -466,6 +471,12 @@ func TestIntegrationDDLReplayIsIdempotent(t *testing.T) {
 }
 
 // 数据先落、位点后落：DDL 被白名单拒绝时，数据已提交但位点不动（重放靠 upsert 幂等）。
+//
+// 顺手记一个边界（未做，先留痕）：`TRUNCATE` 走的是「独立执行、不做幂等判定」那条路——
+// 重复执行 TRUNCATE 本身无害，但如果 `TRUNCATE` 与它之后的数据被切到**不同批次**，
+// 批次之间崩就会看到「截断了、新数据没到」的中间态。要收这个口子的话，做法是在
+// `TRUNCATE` 前后各写一次位点（或把 TRUNCATE 与同表后续数据强制放在同一批），
+// 现在按「先留痕、不扩范围」处理。
 func TestIntegrationDataCommitsBeforeRejectedDDL(t *testing.T) {
 	ctx := context.Background()
 	s := openSink(t, nil)
