@@ -1,6 +1,9 @@
 package control
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // 迁移版本号必须唯一且严格递增。
 //
@@ -36,5 +39,26 @@ func TestMigrationVersionsAreUniqueAndOrdered(t *testing.T) {
 	}
 	if len(migrations) < 2 {
 		t.Fatalf("至少应该有两条迁移（初始 + runs-kind）")
+	}
+}
+
+// 启动时的自检：迁移表里出现同版本号时，migrate() 必须直接报错，
+// 而不是静默跳过后来的那条（那会让列永远不存在）。
+func TestMigrateRejectsDuplicateVersionsAtStartup(t *testing.T) {
+	// 临时塞一条同版本号的迁移，跑完恢复。
+	orig := migrations
+	defer func() { migrations = orig }()
+	dup := migrations[len(migrations)-1]
+	dup.Name = "duplicate-for-test"
+	migrations = append(append([]migration{}, migrations...), dup)
+
+	// 「启动直接报错」：Open 就应该失败，而不是等某条查询炸掉。
+	store, err := Open(Options{DataDir: t.TempDir(), Autogen: true})
+	if err == nil {
+		store.Close()
+		t.Fatal("同版本号的迁移表必须让启动失败")
+	}
+	if !strings.Contains(err.Error(), "迁移表损坏") {
+		t.Fatalf("错误信息应指出迁移表损坏，实际 %v", err)
 	}
 }

@@ -217,6 +217,15 @@ func columnExists(ctx context.Context, tx *sql.Tx, table, column string) (bool, 
 
 // migrate applies every migration newer than the recorded schema_version.
 func (s *Store) migrate(ctx context.Context) error {
+	// 先自检迁移表本身：版本号必须严格递增且唯一。
+	// 两条同版本号时，已经升到该版本的库会把两条都跳过（不是报错），后来那条带来的
+	// 列永远不存在——沉默的坏，直到某条查询炸掉。宁可启动就拒绝。
+	for i := 1; i < len(migrations); i++ {
+		if migrations[i].Version <= migrations[i-1].Version {
+			return fmt.Errorf("控制库迁移表损坏：版本号 %d（%s）没有大于 %d（%s）——这是程序错误，不是你的配置问题，请把这条报给我们",
+				migrations[i].Version, migrations[i].Name, migrations[i-1].Version, migrations[i-1].Name)
+		}
+	}
 	// settings 是版本号的落脚点，先无条件建好（幂等），否则没法读版本。
 	if _, err := s.db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS settings (k TEXT PRIMARY KEY, v TEXT NOT NULL)`); err != nil {
 		return fmt.Errorf("初始化 settings 失败: %w", err)
