@@ -95,7 +95,11 @@ jobs:
           PGPASSWORD=jinliang psql -h 127.0.0.1 -U jinliang -d jinliang_src -tAc \
             "SELECT 1 FROM pg_database WHERE datname='jinliang_test'" | grep -q 1 || \
             PGPASSWORD=jinliang psql -h 127.0.0.1 -U jinliang -d jinliang_src -c 'CREATE DATABASE jinliang_test'
-          mysql -h 127.0.0.1 -ujinliang -pjinliang -e 'CREATE DATABASE IF NOT EXISTS jinliang_src'
+          mysql -h 127.0.0.1 -uroot -proot -e "
+            CREATE DATABASE IF NOT EXISTS jinliang_src;
+            GRANT ALL PRIVILEGES ON jinliang_src.* TO 'jinliang'@'%';
+            GRANT REPLICATION CLIENT, REPLICATION SLAVE ON *.* TO 'jinliang'@'%';
+            FLUSH PRIVILEGES;"
       - name: 控制面单元/接口测试
         run: go test ./internal/...
       - name: 装校验依赖（让 e2e 里的 schema 校验跑真 jsonschema）
