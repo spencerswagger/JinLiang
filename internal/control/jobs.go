@@ -341,7 +341,8 @@ func (s *Store) ListJobs(ctx context.Context) ([]JobSummary, error) {
 		if c, ok := names[out[i].TargetID]; ok {
 			out[i].TargetName, out[i].TargetKind = c.Name, c.Kind
 		}
-		if run, err := s.LatestRun(ctx, out[i].ID); err == nil {
+		// 列表页的「最近一次运行」只认同步运行：verify 也写 runs，但它不是同步
+		if run, err := s.LatestSyncRun(ctx, out[i].ID); err == nil {
 			out[i].LastRun = &run
 		}
 	}
@@ -362,7 +363,7 @@ func (s *Store) GetJobSummary(ctx context.Context, id string) (JobSummary, error
 	if c, err := s.GetConnection(ctx, j.TargetID); err == nil {
 		sum.TargetName, sum.TargetKind = c.Name, c.Kind
 	}
-	if run, err := s.LatestRun(ctx, id); err == nil {
+	if run, err := s.LatestSyncRun(ctx, id); err == nil {
 		sum.LastRun = &run
 	}
 	return sum, nil

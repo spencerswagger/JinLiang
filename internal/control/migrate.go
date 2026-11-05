@@ -27,6 +27,9 @@ type migration struct {
 	// 放在事务里是故意的：迁移版本号与它带来的数据形态必须一起提交，
 	// 否则版本号已经前进、索引却没建上，下次启动再也不会补。
 	After func(ctx context.Context, tx *sql.Tx, s *Store) error
+	// Fn 用于需要先看当前结构再决定的迁移（例如「列不存在才加」）。
+	// 与 Stmts 二选一；一起给时先跑 Stmts 再跑 Fn。
+	Fn func(ctx context.Context, tx *sql.Tx) error
 }
 
 // migrations 是控制库的全部结构历史。字段名严格对齐 CONTROL-PLANE §3。
@@ -95,6 +98,17 @@ var migrations = []migration{
 		},
 		After: closeOnlyStaleRunsThenIndex,
 	},
+	{
+		// 版本号说明：PR #5（runs-liveness）占用了 2，本分支顺延一版。
+		// 撞版本号的后果不是「报错」而是「静默跳过」——库已经是 2 时两条 v2 都会被
+		// 跳过，kind 列永远不存在，runs 查询全线炸。见 migrate_versions_test.go。
+		Version: 3,
+		Name:    "runs-kind",
+		// hugo 裁决：runs 用 kind 表达「这一轮是什么运行」（sync | verify | stub），
+		// 布尔 stub 的反面是「默认真跑」——任何漏标记的新写入方都会被历史页当成真同步。
+		// 兼容：stub 列保留一版（B1 收口后再删），历史行照旧可读。
+		Fn: migrateRunsKind,
+	},
 }
 
 // closeOnlyStaleRunsThenIndex 是 v2 的收尾。
@@ -147,8 +161,71 @@ func closeOnlyStaleRunsThenIndex(ctx context.Context, tx *sql.Tx, s *Store) erro
 	return nil
 }
 
+// migrateRunsKind 给 runs 加 kind 并回填旧行的 stub=1 → 'stub'。
+//
+// 幂等：先看 sqlite_master/pragma 里有没有这一列，有就跳过 ALTER；
+// 回填也只在加列成功后做一次，所以重跑不会重复写、不会报错。
+func migrateRunsKind(ctx context.Context, tx *sql.Tx) error {
+	has, err := columnExists(ctx, tx, "runs", "kind")
+	if err != nil {
+		return err
+	}
+	if !has {
+		if _, err := tx.ExecContext(ctx,
+			`ALTER TABLE runs ADD COLUMN kind TEXT NOT NULL DEFAULT 'sync'`); err != nil {
+			return fmt.Errorf("给 runs 加 kind 列失败: %w", err)
+		}
+	}
+	// 旧库里的桩运行：stub=1 的行必须是 'stub'，否则历史页会把它们当真同步。
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE runs SET kind = 'stub' WHERE stub = 1 AND kind <> 'stub'`); err != nil {
+		return fmt.Errorf("回填 runs.kind 失败: %w", err)
+	}
+	return nil
+}
+
+// columnExists 查 sqlite 的列清单（PRAGMA 不能用参数绑定，所以只接受我们自己的表名）。
+func columnExists(ctx context.Context, tx *sql.Tx, table, column string) (bool, error) {
+	switch table {
+	case "runs", "jobs", "connections", "settings", "audit":
+	default:
+		return false, fmt.Errorf("columnExists: 不接受表名 %q", table)
+	}
+	rows, err := tx.QueryContext(ctx, `PRAGMA table_info(`+table+`)`)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			cid     int
+			name    string
+			ctype   string
+			notnull int
+			dflt    sql.NullString
+			pk      int
+		)
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			return false, err
+		}
+		if strings.EqualFold(name, column) {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
+}
+
 // migrate applies every migration newer than the recorded schema_version.
 func (s *Store) migrate(ctx context.Context) error {
+	// 先自检迁移表本身：版本号必须严格递增且唯一。
+	// 两条同版本号时，已经升到该版本的库会把两条都跳过（不是报错），后来那条带来的
+	// 列永远不存在——沉默的坏，直到某条查询炸掉。宁可启动就拒绝。
+	for i := 1; i < len(migrations); i++ {
+		if migrations[i].Version <= migrations[i-1].Version {
+			return fmt.Errorf("控制库迁移表损坏：版本号 %d（%s）没有大于 %d（%s）——这是程序错误，不是你的配置问题，请把这条报给我们",
+				migrations[i].Version, migrations[i].Name, migrations[i-1].Version, migrations[i-1].Name)
+		}
+	}
 	// settings 是版本号的落脚点，先无条件建好（幂等），否则没法读版本。
 	if _, err := s.db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS settings (k TEXT PRIMARY KEY, v TEXT NOT NULL)`); err != nil {
 		return fmt.Errorf("初始化 settings 失败: %w", err)
@@ -198,6 +275,11 @@ func (s *Store) applyMigration(ctx context.Context, m migration) error {
 	if m.After != nil {
 		if err := m.After(ctx, tx, s); err != nil {
 			return err
+		}
+	}
+	if m.Fn != nil {
+		if err := m.Fn(ctx, tx); err != nil {
+			return fmt.Errorf("迁移 %d 的自定义步骤失败: %w", m.Version, err)
 		}
 	}
 	if _, err := tx.ExecContext(ctx,

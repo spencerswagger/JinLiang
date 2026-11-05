@@ -77,7 +77,7 @@ func TestMigrationV2UpgradesExistingV1Database(t *testing.T) {
 	}
 
 	for _, col := range []string{"heartbeat_at", "owner_instance", "finish_reason"} {
-		if !columnExists(t, v2, "runs", col) {
+		if !hasColumn(t, v2, "runs", col) {
 			t.Fatalf("迁移后 runs 缺少列 %s", col)
 		}
 	}
@@ -118,16 +118,16 @@ func TestMigrationV2UpgradesExistingV1Database(t *testing.T) {
 	}
 
 	// 迁移后仍能正常开新 run（唯一索引没有把业务挡住）。
-	if _, err := v2.StartRun(ctx, freshJob.ID, "preflight"); err == nil {
+	if _, err := v2.StartRun(ctx, freshJob.ID, "preflight", RunKindSync); err == nil {
 		// freshJob 还有一条 open run，唯一索引应该挡住第二次。
 		t.Fatal("同一任务第二条活跃 run 应被唯一索引拒绝")
 	}
-	if _, err := v2.StartRun(ctx, job.ID, "preflight"); err != nil {
+	if _, err := v2.StartRun(ctx, job.ID, "preflight", RunKindSync); err != nil {
 		t.Fatalf("收尾过的任务应该能重新开跑: %v", err)
 	}
 }
 
-func columnExists(t *testing.T, s *Store, table, column string) bool {
+func hasColumn(t *testing.T, s *Store, table, column string) bool {
 	t.Helper()
 	rows, err := s.DB().QueryContext(context.Background(), `SELECT name FROM pragma_table_info(?)`, table)
 	if err != nil {
