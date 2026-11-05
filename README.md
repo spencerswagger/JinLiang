@@ -52,11 +52,23 @@ WAL / binlog / 复制槽 / 位点这些底层概念由工具负责探测、代�
 | [docs/PLAN.md](docs/PLAN.md) | `plan` 的人类模板与 `--json` 输出、确认规则 |
 | [docs/ROADMAP.md](docs/ROADMAP.md) | 里程碑与每阶段的验收判据 |
 | [docs/IDENTITY.md](docs/IDENTITY.md) | 身份与命名：多实例连同一个库如何不冲突、不误删、不双写 |
+| [docs/ERRORS.md](docs/ERRORS.md) | 错误码全集（四段式提示：发生了什么/为什么/能做什么/风险） |
+| [docs/CONNECTOR-SDK.md](docs/CONNECTOR-SDK.md) | 新增一个数据库要做什么：接口、建表规则、测试矩阵、验收五条 |
+| [docs/DECISIONS.md](docs/DECISIONS.md) | 14 条决策记录（选了什么/为什么/代价），改设计前先读 |
 | [docs/OPEN-QUESTIONS.md](docs/OPEN-QUESTIONS.md) | 已决与未决清单 |
+| [schema/job.schema.json](schema/job.schema.json) | 任务定义的 JSON Schema（编辑器与 AI 助手都靠它理解配置） |
 | [examples/job.yaml](examples/job.yaml) | 任务定义示例（带全部字段与注释） |
 
 代码层契约已可编译、可测试：`internal/source/contract.go`、`internal/sink/contract.go`、
 `internal/catalog/typemap.go`（15 个用例）、`internal/state/phase.go`（状态机 17 个断言）。
+
+## 自检
+
+```bash
+gofmt -l .                                   # 空
+go vet ./... && go test ./...                # 绿
+python scripts/validate_schema.py examples/*.yaml
+```
 
 ## 目录
 

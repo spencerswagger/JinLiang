@@ -35,3 +35,16 @@ jobs:
             [ -f "$d/testmatrix.yaml" ] || { echo "missing $d/testmatrix.yaml"; fail=1; }
           done
           exit $fail
+
+  schema:
+    # job.yaml 必须能被 JSON Schema 校验（编辑器/AI 助手也靠它理解配置）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: validate examples against schema
+        run: |
+          pip install --quiet pyyaml jsonschema
+          python scripts/validate_schema.py examples/*.yaml

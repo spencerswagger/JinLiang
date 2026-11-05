@@ -1,0 +1,153 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/spencerswagger/JinLiang/blob/main/schema/job.schema.json",
+  "title": "jinliang job",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "job", "source", "target", "mode"],
+  "properties": {
+    "version": { "const": 1 },
+    "job": {
+      "type": "string", "minLength": 1, "maxLength": 64,
+      "description": "展示名，可重复；任务身份由「源+目标+范围」指纹决定（docs/IDENTITY.md）"
+    },
+    "instance": {
+      "type": "string", "maxLength": 32,
+      "description": "可选：显式实例 ID；留空则读本地 state 或自动生成"
+    },
+    "source": {
+      "type": "object", "additionalProperties": false, "required": ["kind", "dsn"],
+      "properties": {
+        "kind": { "enum": ["postgres", "mysql"] },
+        "dsn": { "$ref": "#/$defs/dsn" },
+        "scope": {
+          "type": "object", "additionalProperties": false,
+          "properties": {
+            "schema": { "type": "string" },
+            "include": { "type": "array", "items": { "type": "string" } },
+            "exclude": { "type": "array", "items": { "type": "string" } }
+          }
+        },
+        "snapshot": {
+          "type": "object", "additionalProperties": false,
+          "properties": {
+            "chunk_rows": { "type": "integer", "minimum": 1000 },
+            "conns": { "type": "integer", "minimum": 1, "maximum": 16 },
+            "max_read_qps": { "type": "integer", "minimum": 1 }
+          }
+        }
+      }
+    },
+    "target": {
+      "type": "object", "additionalProperties": false, "required": ["kind", "dsn"],
+      "properties": {
+        "kind": { "enum": ["postgres", "mysql"] },
+        "dsn": { "$ref": "#/$defs/dsn" },
+        "schema": { "type": "string" },
+        "on_exists": { "enum": ["error", "append", "recreate"], "default": "error" },
+        "create_indexes": { "enum": ["defer", "now", "none"], "default": "defer" }
+      }
+    },
+    "mode": {
+      "type": "object", "additionalProperties": false, "required": ["frequency"],
+      "properties": {
+        "frequency": { "enum": ["once", "continuous+initial", "continuous", "interval", "full_interval"] },
+        "interval": { "type": "string", "description": "5m / 1h / cron:0 */2 * * *" },
+        "incremental_column": { "type": "string", "description": "interval 模式必填：水位列" },
+        "lookback": { "$ref": "#/$defs/duration" },
+        "max_ops_per_sec": { "type": "integer", "minimum": 1 }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "frequency": { "enum": ["interval", "full_interval"] } }, "required": ["frequency"] },
+          "then": { "required": ["interval"] }
+        },
+        {
+          "if": { "properties": { "frequency": { "enum": ["interval"] } }, "required": ["frequency"] },
+          "then": { "required": ["incremental_column"] }
+        }
+      ]
+    },
+    "content": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "tables": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object", "additionalProperties": false,
+            "properties": {
+              "columns": {
+                "type": "object", "additionalProperties": false,
+                "properties": {
+                  "include": { "type": "array", "items": { "type": "string" } },
+                  "exclude": { "type": "array", "items": { "type": "string" } },
+                  "map": {
+                    "type": "object", "additionalProperties": { "type": "string" },
+                    "description": "列名 -> 强制目标类型"
+                  }
+                }
+              },
+              "where": { "type": "string", "description": "受限表达式：列比较 + 常量，不支持子查询" },
+              "transform": { "type": "array", "items": { "type": "object", "minProperties": 1 } }
+            }
+          }
+        },
+        "schema_follow": { "enum": ["off", "whitelist"], "default": "whitelist" }
+      }
+    },
+    "conflict": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "policy": { "enum": ["manual", "source_wins", "target_wins", "newest"], "default": "manual" },
+        "log_table": { "type": "string" }
+      }
+    },
+    "reliability": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "lease_ttl": { "$ref": "#/$defs/duration" },
+        "batch_rows": { "type": "integer", "minimum": 1, "maximum": 50000 },
+        "batch_delay": { "$ref": "#/$defs/duration" },
+        "retry": {
+          "type": "object", "additionalProperties": false,
+          "properties": {
+            "max": { "type": "integer", "minimum": 0 },
+            "backoff": { "type": "array", "items": { "$ref": "#/$defs/duration" } }
+          }
+        },
+        "dead_letter": {
+          "type": "object", "additionalProperties": false,
+          "properties": {
+            "max_rows": { "type": "integer", "minimum": 0 },
+            "on_error_ratio": { "type": "number", "minimum": 0, "maximum": 1 },
+            "store_row": { "enum": ["full", "none"], "default": "full" }
+          }
+        },
+        "tx_oversize": { "enum": ["spill", "fail"], "default": "spill" }
+      }
+    },
+    "guard": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "slot_warn_lag": { "$ref": "#/$defs/size" },
+        "slot_warn_seconds": { "$ref": "#/$defs/duration" },
+        "on_exceed": { "enum": ["pause", "invalidate", "advance"], "default": "pause" }
+      }
+    },
+    "observability": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "metrics_addr": { "type": "string" },
+        "log_level": { "enum": ["debug", "info", "warn", "error"], "default": "info" }
+      }
+    }
+  },
+  "$defs": {
+    "dsn": {
+      "type": "string", "pattern": "^(env:|file:)",
+      "description": "只接受 env:NAME 或 file:/path；禁止明文"
+    },
+    "duration": { "type": "string", "pattern": "^[0-9]+(ms|s|m|h)$" },
+    "size": { "type": "string", "pattern": "^[0-9]+(KB|MB|GB|TB)$" }
+  }
+}

@@ -327,6 +327,10 @@ Go 主干 · **MIT** · 对外开源 · 一期只做 MySQL 与 PostgreSQL（含�
 - [PLAN.md](PLAN.md)：`plan` 的输出与交互。
 - [ROADMAP.md](ROADMAP.md)：里程碑与验收判据。
 - [IDENTITY.md](IDENTITY.md)：job_key / instance_id / 对象命名的三层身份，多实例共存与孤儿所有权。
+- [ERRORS.md](ERRORS.md)：错误码全集与四段式文案纪律。
+- [CONNECTOR-SDK.md](CONNECTOR-SDK.md)：连接器开发指引与建表规则。
+- [DECISIONS.md](DECISIONS.md)：14 条决策记录（ADR）。
+- `schema/job.schema.json`：任务定义的 JSON Schema，CI 用 `scripts/validate_schema.py` 校验示例。
 - [OPEN-QUESTIONS.md](OPEN-QUESTIONS.md)：未决清单。
 - 代码契约：[`internal/source/contract.go`](../internal/source/contract.go)、[`internal/sink/contract.go`](../internal/sink/contract.go) —— 已编译通过，CI 校验。
 
