@@ -130,7 +130,11 @@ func (s *Store) Catalog(ctx context.Context, connID, schema string) (CatalogResu
 		}
 	}
 	if out.Schema == "" {
-		out.Schema = defaultCatalogSchema(ep, out.Schemas)
+		if len(out.Schemas) > 0 {
+			out.Schema = out.Schemas[0]
+		} else {
+			out.Schema = "public"
+		}
 	}
 	cat, err := conn.Catalog(ctx, source.Scope{Schema: out.Schema})
 	if err != nil {
@@ -139,21 +143,6 @@ func (s *Store) Catalog(ctx context.Context, connID, schema string) (CatalogResu
 	out.Tables, out.Views = cat.Tables, cat.Views
 	out.ElapsedMS = time.Since(start).Milliseconds()
 	return out, nil
-}
-
-// defaultCatalogSchema 决定「没显式选 schema 时列哪个 schema 的表」。
-//
-// MySQL 的 schema 就是库名：必须用 DSN 里那个库，不能拿账号能看见的第一个库——
-// 那个常常是别的库（比如 jinliang_src），界面就会列出错的表。
-// PostgreSQL 里 database 与 schema 是两回事，仍取搜索路径的第一个 schema。
-func defaultCatalogSchema(ep dsn.Endpoint, schemas []string) string {
-	if ep.Kind == dsn.KindMySQL && ep.Database != "" {
-		return ep.Database
-	}
-	if len(schemas) > 0 {
-		return schemas[0]
-	}
-	return "public"
 }
 
 // PreflightJob assembles the checks for one job and returns the four-state

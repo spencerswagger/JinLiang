@@ -4,6 +4,3 @@
 *.out
 .jinliang/
 .DS_Store
-
-# e2e 本地证据（不入库）
-.e2e-evidence/
