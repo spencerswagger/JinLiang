@@ -2,10 +2,16 @@
 
 每个里程碑的验收都是**可执行的检查**，不是"感觉完成"。
 
-## M0 设计（当前）
+## M0 设计（已完成 2026-11-05）
 
 - 产出：DESIGN / SPEC / TYPE-MAPPING / SNAPSHOT / PLAN / ARCHITECTURE / RUNTIME / STREAMING / CONFLICT / VERIFY / SECURITY / BUILD / STATE-SCHEMA / OPEN-QUESTIONS。
 - 完成判据：接口能编译、类型字典有测试、阶段机有测试、CI 绿。
+
+## M0.5 控制面（新增，必须先于 M1）
+
+- 内容：内嵌 SQLite 数据模型（connections/jobs/runs/settings/audit）、凭证加密、REST API、SSE、内嵌 WebUI 骨架（总览 / 连接管理 / 新建任务向导 / 任务详情）、首启建管理员、`serve`/`import`/`export`/`run --job`。
+- 验收：从零起 `serve` → 建连接（测连成功）→ 建任务（选表）→ 预检 → run → 详情页 SSE 实时看到阶段与行数；控制库重启后任务仍在；导出 yaml 能被 `schema/job.schema.json` 校验。
+- 判据：不经浏览器也能用 API 跑完全流程（headless 可达）。
 
 ## M1 核心闭环（PG -> PG）
 

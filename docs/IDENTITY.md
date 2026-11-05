@@ -7,7 +7,7 @@
 
 | 层 | 由什么决定 | 用途 | 不用于 |
 |---|---|---|---|
-| **job_key** | 「源 + 目标 + 范围」的 sha256 前 10 位 base32 | 任务身份、状态表主键、对象命名、租约排他 | 展示 |
+| **job_key** | 「源 + 目标 + 范围」的 sha256 前 10 位 base32，**存在控制库 `jobs.job_key`** | 任务身份、状态表主键、对象命名、租约排他 | 展示 |
 | **instance_id** | 首次启动随机生成（16 字节 → 26 位 base32），登记在目标库 `_jl_instance` | 审计、租约持有者、对象所有权、MySQL `server_id` 派生 | 判断是否同一任务 |
 | **object name** | `jl_<job_key>` / `jl_<job_key>_<n>` | 源端 slot / publication / 临时快照 | 展示 |
 

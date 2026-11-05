@@ -10,6 +10,12 @@ CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version=$(git describe 
 - 产物 <25 MB 是设计目标（L5 性能基线里会检查）。
 - `gofmt -l` 为空、`go vet` 干净、`go test ./...` 全绿是合入前提（CI 已强制）。
 
+## 1A. 控制面内嵌
+
+- WebUI 用 `embed.FS` 打进二进制（模板 + htmx + 一份手写 CSS），**不引入 Node 构建链**。
+- 控制库用纯 Go SQLite（`modernc.org/sqlite`），保持 `CGO_ENABLED=0` 与交叉编译。
+- 体积预算：UI 资源 <1 MB，SQLite 驱动约 +3 MB ⇒ 仍守 <25 MB 目标。
+
 ## 2. 发布物
 
 | 文件 | 说明 |

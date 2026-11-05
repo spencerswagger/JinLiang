@@ -2,15 +2,17 @@
 
 ## 1. 形态
 
-**单静态二进制，零外部依赖，无 Kafka。** 一个进程既能做一次性迁移，也能长期跑增量。
+**单静态二进制，零外部依赖，无 Kafka。** 一个进程同时是控制面（内嵌 SQLite + WebUI）与执行面（同步引擎）。
 `CGO_ENABLED=0`（驱动全用纯 Go：pgx / go-mysql），交叉编译到 linux(amd64/arm64) 与 darwin。
 
 ## 2. 分层与依赖方向
 
 ```
-cmd/jinliang            CLI 解析、退出码、人类/JSON 输出
+cmd/jinliang            CLI（serve / import / export / run --job / doctor）
    │
-internal/core           任务编排：生命周期、背压、批处理、错误分类
+internal/control        控制面：SQLite 存储、凭证加密、REST API、SSE、内嵌 WebUI
+   │
+internal/core           执行面：生命周期、背压、批处理、错误分类
    ├── internal/preflight   探测与预检（三级报告 + 代做动作）
    ├── internal/catalog     库表枚举、类型映射、目标端建表
    ├── internal/transform   声明式转换（映射/过滤/脱敏/计算列）

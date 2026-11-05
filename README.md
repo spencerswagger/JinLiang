@@ -2,7 +2,7 @@
 
 > 津梁：渡口与桥。在异构数据库之间摆渡数据。
 
-**状态：设计阶段，暂无可用功能。** 当前仓库只有骨架、连接器可测性清单与设计文档。
+**状态：设计阶段（2026-11-05 收口后按「WebUI 控制面」重排）。** 当前仓库只有骨架、连接器可测性清单与设计文档；实现从 M0.5 控制面开始。
 
 ## 这是什么
 
@@ -37,6 +37,7 @@ WAL / binlog / 复制槽 / 位点这些底层概念由工具负责探测、代�
 
 | 文档 | 内容 |
 |---|---|
+| **[docs/CONTROL-PLANE.md](docs/CONTROL-PLANE.md)** | **控制面（最新口径）：内嵌数据库 + WebUI 是一等公民；两个数据库的分工、数据模型、API、凭证加密、UI 结构与测试** |
 | [docs/DESIGN.md](docs/DESIGN.md) | 设计基线：原则、版本矩阵、降级补偿、性能与测试架构 |
 | [docs/SPEC.md](docs/SPEC.md) | `job.yaml`、命令面与退出码、预检清单、错误模型、指标 |
 | [docs/TYPE-MAPPING.md](docs/TYPE-MAPPING.md) | 类型映射字典与探测兜底 |
@@ -73,10 +74,12 @@ python scripts/validate_schema.py examples/*.yaml
 ## 目录
 
 ```
-cmd/jinliang/        命令行入口
+cmd/jinliang/        入口：serve / import / export / run --job / doctor
+internal/control/    控制面：SQLite 存储、凭证加密、REST API、SSE、内嵌 WebUI
 internal/            core / source / sink / transform / state / preflight / catalog / gc / testkit
 connectors/          连接器（各带 testmatrix.yaml）
 docs/                设计文档
+web/                 模板 + 静态资源（embed 进二进制，无 Node 构建）
 ```
 
 ## 许可证

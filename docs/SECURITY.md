@@ -1,5 +1,12 @@
 # 安全
 
+## 0. 控制面凭证（2026-11-05 新增）
+
+- 连接的密码存控制库 `connections.secret_enc`：**AES-256-GCM**，每条独立 nonce。
+- 密钥：`--key-file`（强制 0600）→ `JINLIANG_KEY` → 首次启动生成 `data-dir/key`（0600）。
+- UI 与 API **永不回传明文**（只回 `has_secret: true`）；导出 yaml 时省略密码或写 `env:` 占位。
+- 控制库本身 0600；`--data-dir` 不允许落在世界可读目录。
+
 ## 1. 凭证
 
 - 只接受 `env:NAME` 与 `file:/path`；**禁止**在 yaml 或命令行里写明文 DSN。
