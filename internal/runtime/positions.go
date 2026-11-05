@@ -172,8 +172,37 @@ func CompareLSN(a, b string) (int, bool) {
 	return 0, true
 }
 
-// BinlogPos parses "mysql-bin.000003:1234" (file, offset).
+// BinlogPos parses either a plain "mysql-bin.000003:1234" coordinate or the
+// versioned form connectors write into `_jl_meta.position`:
+//
+//	mysql:v1;file=mysql-bin.000003;pos=1234
+//	v1;file=mysql-bin.000003;pos=1234
+//
+// 两种格式都要认：B2/B3 一旦把带版本前缀的位点写进目标库，一致性级不能每条
+// 都报 position_unparseable。带 GTID 的位点（gtid:…）这里返回 ok=false，
+// 由上层明确报「无法判定」，不猜。
 func BinlogPos(s string) (string, int64, bool) {
+	s = strings.TrimSpace(s)
+	if i := strings.Index(s, "file="); i >= 0 {
+		file := s[i+len("file="):]
+		if j := strings.IndexAny(file, ";,"); j >= 0 {
+			file = file[:j]
+		}
+		file = strings.TrimSpace(file)
+		posIdx := strings.Index(s, "pos=")
+		if file == "" || posIdx < 0 {
+			return "", 0, false
+		}
+		posStr := s[posIdx+len("pos="):]
+		if j := strings.IndexAny(posStr, ";,"); j >= 0 {
+			posStr = posStr[:j]
+		}
+		n, err := strconv.ParseInt(strings.TrimSpace(posStr), 10, 64)
+		if err != nil {
+			return "", 0, false
+		}
+		return file, n, true
+	}
 	i := strings.LastIndexByte(s, ':')
 	if i <= 0 || i == len(s)-1 {
 		return "", 0, false
