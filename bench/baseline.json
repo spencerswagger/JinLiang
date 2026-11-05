@@ -1,0 +1,30 @@
+{
+  "metric": "b6-baseline",
+  "rows": 100000,
+  "batch_rows": 500,
+  "warmup_batches": 2,
+  "snapshot_rows_per_sec": 167965.0,
+  "rows_per_sec": 10544.0,
+  "p50_ms": 45.66,
+  "p99_ms": 61.7,
+  "idle_mb": 15.9,
+  "cold_start_ms": 27,
+  "binary_mb": 19.12,
+  "binary_bytes": 20045984,
+  "cpu_model": "AMD Ryzen 5 1500X Quad-Core Processor",
+  "num_cpu": 8,
+  "thresholds": {
+    "rows_per_sec_min": 20000,
+    "p99_ms_max": 100,
+    "idle_mb_max": 80,
+    "cold_start_ms_max": 200,
+    "binary_mb_max": 25
+  },
+  "verdict": {
+    "snapshot_rows_per_sec": "PASS",
+    "p99_ms": "PASS",
+    "idle_mb": "PASS",
+    "cold_start_ms": "PASS",
+    "binary_mb": "PASS"
+  }
+}

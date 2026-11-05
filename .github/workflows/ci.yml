@@ -62,6 +62,8 @@ jobs:
         run: |
           pip install --quiet pyyaml jsonschema
           python scripts/validate_schema.py examples/*.yaml
+      - name: testmatrix 覆盖 9 PG × 4 MySQL（required/nightly 分层）
+        run: python scripts/check_testmatrix.py
 
   control-plane:
     # 控制面 B0：起一个真 PostgreSQL + 真 MySQL，用纯 curl 走完整条链（验收 ①②③④）
@@ -119,9 +121,9 @@ jobs:
       - name: 准备测试表
         run: go run ./test/fixture
       - name: b4 集成测试（verify / gc / doctor / remedy，缺 DSN 会红）
-        # -p 1：多个包同时 CREATE TABLE IF NOT EXISTS 会在 PG 上撞
-        # pg_type_typname_nsp_index（IF NOT EXISTS 不是并发安全的）。
-        run: go test -p 1 -tags=integration ./internal/verify ./internal/gc ./internal/doctor ./internal/remedy
+        # 每个包用自己的 schema（jl_test_verify / jl_test_gc / jl_test_remedy），
+        # 因此可以并行跑；不再需要 -p 1。
+        run: go test -tags=integration ./internal/verify ./internal/gc ./internal/doctor ./internal/remedy
       - name: headless 全链路（纯 curl，不经浏览器）
         run: |
           set -e

@@ -1,0 +1,161 @@
+name: nightly
+
+# nightly 门禁：全矩阵（9 PG × 4 MySQL）+ 全量集成 + 性能基线。
+# 阈值不是「跑一下看看」：
+#   - 矩阵：testmatrix.yaml 里 9/4 个版本逐个起真库，任一版本红即失败；
+#   - 集成：所有 -tags=integration 包（含 engine / mysqlsource）；
+#   - 性能：scripts/bench.sh --enforce（20k 行/s、p99≤100ms、空转≤80MB、冷启≤200ms、<25MB）。
+on:
+  schedule:
+    - cron: "0 18 * * *" # 02:00 CST
+  workflow_dispatch:
+
+jobs:
+  pg-matrix:
+    # 每个 PG 大版本起一套真库，跑 verify/gc/doctor/remedy 的集成用例。
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: ["10", "11", "12", "13", "14", "15", "16", "17", "18"]
+    services:
+      postgres:
+        image: postgres:${{ matrix.pg }}
+        env:
+          POSTGRES_USER: jinliang
+          POSTGRES_PASSWORD: jinliang
+          POSTGRES_DB: jinliang_src
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U jinliang"
+          --health-interval 5s --health-timeout 5s --health-retries 30
+    env:
+      JINLIANG_TEST_PG_SRC_DSN: postgres://jinliang:jinliang@127.0.0.1:5432/jinliang_src?sslmode=disable
+      JINLIANG_TEST_PG_DSN: postgres://jinliang:jinliang@127.0.0.1:5432/jinliang_test?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.x"
+      - name: 第二套库
+        run: |
+          set -e
+          PGPASSWORD=jinliang psql -h 127.0.0.1 -U jinliang -d jinliang_src -c 'CREATE DATABASE jinliang_test'
+      - name: PG ${{ matrix.pg }} 集成（verify/gc/doctor/remedy）
+        run: go test -tags=integration ./internal/verify ./internal/gc ./internal/doctor ./internal/remedy
+
+  mysql-matrix:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mysql: ["5.7", "8.0", "8.4", "9.4"]
+    services:
+      mysql:
+        image: mysql:${{ matrix.mysql }}
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_USER: jinliang
+          MYSQL_PASSWORD: jinliang
+          MYSQL_DATABASE: jinliang_test
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -proot"
+          --health-interval 5s --health-timeout 5s --health-retries 40
+    env:
+      JINLIANG_TEST_MYSQL_DSN: mysql://jinliang:jinliang@127.0.0.1:3306/jinliang_test
+      JINLIANG_TEST_MYSQL_SRC_DSN: mysql://jinliang:jinliang@127.0.0.1:3306/jinliang_src
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.x"
+      - name: 第二套库 + 复制权限
+        run: |
+          set -e
+          mysql -h 127.0.0.1 -uroot -proot -e "
+            CREATE DATABASE IF NOT EXISTS jinliang_src;
+            GRANT ALL PRIVILEGES ON jinliang_src.* TO 'jinliang'@'%';
+            GRANT REPLICATION CLIENT, REPLICATION SLAVE ON *.* TO 'jinliang'@'%';
+            FLUSH PRIVILEGES;"
+      - name: MySQL ${{ matrix.mysql }} 集成（mysqlsource/verify/doctor）
+        run: go test -tags=integration ./internal/mysqlsource ./internal/verify ./internal/doctor
+
+  integration:
+    # 一套 PG + 一套 MySQL，跑所有集成包（engine 的重搬用例也在这里）。
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: jinliang
+          POSTGRES_PASSWORD: jinliang
+          POSTGRES_DB: jinliang_src
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U jinliang"
+          --health-interval 5s --health-timeout 5s --health-retries 30
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_USER: jinliang
+          MYSQL_PASSWORD: jinliang
+          MYSQL_DATABASE: jinliang_test
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -ujinliang -pjinliang"
+          --health-interval 5s --health-timeout 5s --health-retries 40
+    env:
+      JINLIANG_TEST_PG_SRC_DSN: postgres://jinliang:jinliang@127.0.0.1:5432/jinliang_src?sslmode=disable
+      JINLIANG_TEST_PG_DSN: postgres://jinliang:jinliang@127.0.0.1:5432/jinliang_test?sslmode=disable
+      JINLIANG_TEST_MYSQL_DSN: mysql://jinliang:jinliang@127.0.0.1:3306/jinliang_test
+      JINLIANG_TEST_MYSQL_SRC_DSN: mysql://jinliang:jinliang@127.0.0.1:3306/jinliang_src
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.x"
+      - name: 准备两套库
+        run: |
+          set -e
+          PGPASSWORD=jinliang psql -h 127.0.0.1 -U jinliang -d jinliang_src -c 'CREATE DATABASE jinliang_test'
+          mysql -h 127.0.0.1 -uroot -proot -e "
+            CREATE DATABASE IF NOT EXISTS jinliang_src;
+            GRANT ALL PRIVILEGES ON jinliang_src.* TO 'jinliang'@'%';
+            GRANT REPLICATION CLIENT, REPLICATION SLAVE ON *.* TO 'jinliang'@'%';
+            FLUSH PRIVILEGES;"
+      - name: 全量集成（含 engine / mysqlsource）
+        run: go test -tags=integration ./internal/...
+
+  bench:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: jinliang
+          POSTGRES_PASSWORD: jinliang
+          POSTGRES_DB: jinliang_src
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U jinliang"
+          --health-interval 5s --health-timeout 5s --health-retries 30
+    env:
+      JINLIANG_TEST_PG_DSN: "postgres://jinliang:jinliang@127.0.0.1:5432/jinliang_test?sslmode=disable"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.x"
+      - name: 第二套库
+        run: |
+          set -e
+          PGPASSWORD=jinliang psql -h 127.0.0.1 -U jinliang -d jinliang_src -c 'CREATE DATABASE jinliang_test'
+      - name: 性能基线（不达标即红）
+        run: scripts/bench.sh --enforce --out bench/latest.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-report-${{ github.run_id }}
+          path: bench/latest.json
