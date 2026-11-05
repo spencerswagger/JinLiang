@@ -1064,11 +1064,37 @@ func classifyError(err error) (code core.Code, classified bool) {
 }
 
 // isUserStop reports「这次失败其实是用户按了停止」。
+//
+// **要区分的是「谁 cancel 的」，不是「超时还是取消」**：`errors.Is(Canceled)` 与
+// `errors.Is(DeadlineExceeded)` 互不匹配，但 `ctx.Err()` 那一半不可靠——带 deadline
+// 的 ctx 若先被 parent cancel，返回的也是 Canceled。所以这里只认「ctx 被父级取消
+// 且不是我们自己 cancel 的」：内部 cancel（`loseLease`）在 fail() 里已被提前拦掉，
+// 调用方保证不会走到这里。
 func isUserStop(ctx context.Context, err error) bool {
 	if errors.Is(err, context.Canceled) {
 		return true
 	}
 	return ctx != nil && errors.Is(ctx.Err(), context.Canceled)
+}
+
+// failLostLease 是「租约被接管/续不上」的收尾：interrupted + E1005，**不是**用户停止。
+// 之前它会被误判成 stopped（因为 loseLease 自己 cancel 了 runCtx），历史页上看不出真原因。
+func (r *runner) failLostLease(ctx context.Context, err error) error {
+	dctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	why, _ := r.leaseWhy.Load().(string)
+	msg := "租约丢了（" + why + "）：另一个实例接管了这个任务，本进程已停止写入"
+	ev := control.ErrorEvent(r.job.ID, r.run.ID, core.CodeJobRunningElsewhere, msg)
+	ev.Phase = r.phase
+	r.opt.Store.Bus().Publish(ev)
+	if r.phase != state.Failed {
+		if _, ferr := r.opt.Store.FinishRun(dctx, r.run.ID, state.Failed, msg, ExitFailed,
+			control.FinishInterrupted); ferr != nil {
+			return fmt.Errorf("%w（收尾也失败：%v）", err, ferr)
+		}
+		r.phase = state.Failed
+	}
+	return err
 }
 
 // stopEarly 在「还没动数据」的阶段按停止收尾：finish_reason=stopped + exit_code=130。
@@ -1112,10 +1138,11 @@ func hint(err error) (string, []string) {
 }
 
 func (r *runner) fail(ctx context.Context, err error) error {
-	// 用户主动 stop 在 preflight/prepare 阶段也是「取消」。把它记成 failed（更别说 E4002
-	// 「我们的 bug」）是错的——用户做了一件正确的事，不该在历史里显示成故障。
-	// 我们的 run ctx 只由信号/stop 取消，没有内部超时，所以 Canceled 就是用户停止；
-	// 万一将来加了超时，把它记成 stopped 也只是少一条告警，不会误导。
+	// 丢租约优先于「用户停止」：loseLease 自己也会 cancel(runCtx)，所以丢租约之后
+	// 那个 ctx 带着 Canceled 进来——先判停止会把它记成「用户点的」。
+	if r.leaseLost.Load() || errors.As(err, new(*leaseLostError)) {
+		return r.failLostLease(ctx, err)
+	}
 	if isUserStop(ctx, err) {
 		return r.stopEarly(err)
 	}

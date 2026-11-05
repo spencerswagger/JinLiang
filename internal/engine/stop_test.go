@@ -170,3 +170,65 @@ func TestUnclassifiedErrorHintPersistsToLastError(t *testing.T) {
 		})
 	}
 }
+
+// 丢租约**不是**用户停止：loseLease 自己会 cancel(runCtx)，所以进 fail() 时 ctx 已经
+// 是 Canceled —— 之前这个误判把「另一个实例接管」记成「用户点了停止 +130 + done」，
+// 历史页显示「已手动停止」，真原因彻底消失。Owl 的探针就是撞到这条。
+func TestLeaseLostIsInterruptedNotStopped(t *testing.T) {
+	for _, phase := range []state.Phase{state.Preflight, state.Streaming} {
+		t.Run(string(phase), func(t *testing.T) {
+			store, jobID := newControlStore(t)
+			run, err := store.StartRun(context.Background(), jobID, phase, control.RunKindSync)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// 造出「租约已丢」的状态：run ctx 被 cancel（loseLease 的行为）+ leaseLost 置位
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			r := &runner{opt: Options{Store: store}, job: control.Job{ID: jobID}, run: run, phase: phase}
+			r.leaseLost.Store(true)
+			r.leaseWhy.Store("租约被别的实例接管了")
+			r.cancelRun = cancel
+
+			err = r.fail(ctx, r.leaseLostError())
+			if err == nil {
+				t.Fatal("丢租约应返回错误（不是静默成功）")
+			}
+
+			got, gerr := store.GetRun(context.Background(), run.ID)
+			if gerr != nil {
+				t.Fatal(gerr)
+			}
+			if got.FinishReason != control.FinishInterrupted {
+				t.Fatalf("丢租约应记 interrupted，得到 %q（被误判成用户停止？）", got.FinishReason)
+			}
+			if got.ExitCode != nil && *got.ExitCode == ExitStopped {
+				t.Fatal("丢租约不能记成 130（那是「用户主动停止」）")
+			}
+			if got.Phase != state.Failed {
+				t.Fatalf("丢租约的阶段应为 failed，得到 %s", got.Phase)
+			}
+			if !strings.Contains(got.LastError, "租约") {
+				t.Fatalf("last_error 必须写清是租约原因，得到 %q", got.LastError)
+			}
+		})
+	}
+}
+
+// 反过来守住：用户真 stop 时（leaseLost 未置位）仍然记 stopped +130，
+// 别为了修这条把用户停止又改回 failed。
+func TestUserStopStillStoppedAfterLeaseFix(t *testing.T) {
+	store, jobID := newControlStore(t)
+	run, err := store.StartRun(context.Background(), jobID, state.Preflight, control.RunKindSync)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := &runner{opt: Options{Store: store}, job: control.Job{ID: jobID}, run: run, phase: state.Preflight}
+	if err := r.fail(context.Background(), context.Canceled); err != nil {
+		t.Fatalf("用户停止不该返回错误: %v", err)
+	}
+	got, _ := store.GetRun(context.Background(), run.ID)
+	if got.FinishReason != control.FinishStopped || got.ExitCode == nil || *got.ExitCode != ExitStopped {
+		t.Fatalf("用户停止应仍是 stopped+130，得到 %q %v", got.FinishReason, got.ExitCode)
+	}
+}
