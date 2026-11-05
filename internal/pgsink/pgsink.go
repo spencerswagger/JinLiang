@@ -423,6 +423,11 @@ func (s *Sink) EnsureSchema(ctx context.Context, _ source.Catalog) ([]source.Act
 		if err := s.createTable(ctx, ti); err != nil {
 			return actions, err
 		}
+		// 登记所有权：只有「本任务建的表」才允许在重搬时清空。
+		// append 模式复用用户已有表，那些表永远不会进这个名单。
+		if err := s.recordObjectLocked(ctx, tableObjectName(ti.ref), "table"); err != nil {
+			return actions, err
+		}
 		actions = append(actions, source.Action{
 			ID: "create:" + key, What: "在目标端建了表 " + ti.ref.Table,
 			SQL:     s.createTableSQL(ti),
@@ -923,12 +928,41 @@ func (s *Sink) TruncateTable(ctx context.Context, ref source.TableRef) error {
 	return err
 }
 
+// tableObjectName is how a created target table is registered in `_jl_object`.
+func tableObjectName(ref source.TableRef) string {
+	return "table:" + ref.Schema + "." + ref.Table
+}
+
+// DidCreateTable reports whether this job created the target table (as opposed
+// to reusing a table the user already had). 重搬全量前必须问这一句：
+// append 模式复用用户表时，表里的行不全是我们的，不能清。
+func (s *Sink) DidCreateTable(ctx context.Context, ref source.TableRef) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	q := fmt.Sprintf(`SELECT count(*) FROM %s WHERE object_name=$1 AND job_key=$2 AND dropped_at IS NULL`,
+		s.stateTable("_jl_object"))
+	var n int
+	if err := s.conn.QueryRow(ctx, q, tableObjectName(ref), s.opt.JobKey).Scan(&n); err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
 // RecordObject registers an object we created on the source side, so `gc` can
 // later decide whether it is an orphan (docs/STATE-SCHEMA.md §4).
 func (s *Sink) RecordObject(ctx context.Context, name, kind string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	q := fmt.Sprintf(`INSERT INTO %s (object_name, object_kind, job_key, instance_id)
+		VALUES ($1,$2,$3,$4) ON CONFLICT (object_name) DO UPDATE SET dropped_at=NULL`,
+		s.stateTable("_jl_object"))
+	_, err := s.conn.Exec(ctx, q, name, kind, s.opt.JobKey, s.opt.InstanceID)
+	return err
+}
+
+// recordObjectLocked is RecordObject for callers that already hold mu.
+func (s *Sink) recordObjectLocked(ctx context.Context, name, kind string) error {
 	q := fmt.Sprintf(`INSERT INTO %s (object_name, object_kind, job_key, instance_id)
 		VALUES ($1,$2,$3,$4) ON CONFLICT (object_name) DO UPDATE SET dropped_at=NULL`,
 		s.stateTable("_jl_object"))

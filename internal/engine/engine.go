@@ -314,6 +314,46 @@ func caughtUpAt(applied, startupTarget, serverWALEnd pgsource.Position) bool {
 	return applied.Compare(target) >= 0
 }
 
+// recopyAction decides whether a half-copied table may be truncated before the
+// copy is redone.
+//
+// 只有「这张表是本任务建的」才允许清：append 模式复用用户表时，表里本来就有
+// 用户的行，清掉等于删别人数据。这种表我们无从分辨哪些行是本次写的（设计上
+// 不往用户表里塞标记列），所以**宁可停下来说清楚**，让用户选：
+//   - 想让我们重建 → target.on_exists: recreate（明确会清空）；
+//   - 想保留原表 → 手动清掉本次写入的行后重跑；
+//   - 或换一个空的 target.schema。
+//
+// 返回 (true, nil) 表示可以清；(false, err) 表示必须停下。
+func (r *runner) recopyAction(ctx context.Context, ref source.TableRef) (bool, error) {
+	ours, err := r.sink.DidCreateTable(ctx, ref)
+	if err != nil {
+		return false, fmt.Errorf("查不到目标表 %s 是谁建的（读 _jl_object 失败）: %w", ref.Table, err)
+	}
+	if ours {
+		return true, nil
+	}
+	return false, &reusedTableRecopyError{table: ref.Table, jobKey: r.job.JobKey, schema: ref.Schema}
+}
+
+// reusedTableRecopyError stops a recopy that would have to delete rows this job
+// did not write. It is E1002-ish (目标表已存在/不覆盖) but the situation is
+// specific, so it carries its own sentence.
+type reusedTableRecopyError struct {
+	table  string
+	jobKey string
+	schema string
+}
+
+func (e *reusedTableRecopyError) Error() string {
+	return fmt.Sprintf("上次全量搬到一半就断了，而目标表 %s 是你自己的表（不是本任务建的）："+
+		"重搬会先清空它，那会连你原有的行一起删掉，所以我停在这里。\n"+
+		"你现在能做什么：1) 想让我们重建：把 target.on_exists 改成 recreate（会清空这张表）；"+
+		"2) 想保留原表：手动删掉本任务写进去的行后重跑（进度表 %s._jl_chunk 里有 job_key=%s 与块范围）；"+
+		"3) 换一个空的 target.schema。\n"+
+		"风险：选 1 会清空这张表。", e.table, e.schema, e.jobKey)
+}
+
 // initialCopyDone reports whether a previous run finished the initial copy.
 func initialCopyDone(phase, position string) bool {
 	if position == "" {
@@ -560,8 +600,8 @@ func (r *runner) snapshot(ctx context.Context) error {
 	// 视图，那些行既不全也过期（源端期间可能删过行），必须先清掉，否则搬完会多出
 	// 源端已经没有的行 —— 那就是「重」。
 	//
-	// 只清「有块断点」的表：那说明那些行确实是我们上一次写进去的，
-	// 不动用户自己灌进去的数据。
+	// 但「清」只能清**本任务自己建的表**：append 模式会复用用户已有的表，那张表
+	// 里的行不全是我们的，清了就是删用户数据（Owl 审出来的 P0）。
 	if r.priorPhase == string(state.Snapshot) {
 		done, err := r.sink.DoneChunks(ctx)
 		if err != nil {
@@ -570,6 +610,13 @@ func (r *runner) snapshot(ctx context.Context) error {
 		for name := range done {
 			ref, ok := r.tableByName(name)
 			if !ok {
+				continue
+			}
+			truncate, err := r.recopyAction(ctx, ref)
+			if err != nil {
+				return err
+			}
+			if !truncate {
 				continue
 			}
 			if err := r.sink.TruncateTable(ctx, ref); err != nil {
@@ -833,6 +880,8 @@ func (r *runner) fail(ctx context.Context, err error) error {
 		code = core.CodeJobRunningElsewhere
 	case errors.Is(err, pgsink.ErrTargetTableExists):
 		code = core.CodeTargetTableExists
+	case errors.As(err, new(*reusedTableRecopyError)):
+		code = core.CodeTargetTableExists // 目标表不是我们的：按「撞表」行为停下，不覆盖
 	case pgsource.IsPositionGap(err):
 		code = core.CodePositionGap
 	}
