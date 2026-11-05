@@ -135,23 +135,24 @@ func (s *Server) startJob(ctx context.Context, job control.Job, actor string) er
 
 	// 故意用 context.Background：run 的生命周期比 HTTP 请求长，请求返回后还要继续跑。
 	runCtx, cancel := context.WithCancel(context.Background())
-	rj, ok := s.runs.claim(job.ID, cancel)
-	if !ok {
+	if _, ok := s.runs.claim(job.ID, cancel); !ok {
 		cancel()
 		return control.ErrRunInProgress
 	}
 	_ = s.store.Audit(ctx, actor, control.ActionJobRun, map[string]any{"job_id": job.ID, "engine": "b1"})
 
+	// 只有一个 goroutine：跑引擎，跑完（或取消后）释放占位。
+	//
+	// 之前这里写成两个 goroutine（一个 <-done 后 release、一个跑引擎）——那是死锁：
+	// done 只有 release 才关，而 release 又排在 <-done 之后，于是永远不释放，
+	// 同一个任务第二次 run 会永远 409。P0，已由 TestStartJobReleasesAfterFinish 钉住。
+	run := s.runFn
 	go func() {
 		defer func() {
 			cancel()
 			s.runs.release(job.ID)
 		}()
-		<-rj.done
-	}()
-
-	go func() {
-		_, err := jobrun.Run(runCtx, s.store, job, jobrun.Options{Actor: actor})
+		_, err := run(runCtx, s.store, job, jobrun.Options{Actor: actor})
 		if err != nil && !errors.Is(err, context.Canceled) {
 			s.logf("job %s 运行结束于错误: %v", job.ID, err)
 		}

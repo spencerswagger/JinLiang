@@ -16,6 +16,8 @@ import (
 
 	"github.com/spencerswagger/jinliang/internal/control"
 	"github.com/spencerswagger/jinliang/internal/core"
+	"github.com/spencerswagger/jinliang/internal/engine"
+	"github.com/spencerswagger/jinliang/internal/jobrun"
 )
 
 const testPassword = "test-admin-password"
@@ -1125,5 +1127,74 @@ func TestCodesEndpointExposesCatalogue(t *testing.T) {
 	res.Body.Close()
 	if res.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("未登录读 /api/codes = %d，期望 401", res.StatusCode)
+	}
+}
+
+// P0 回归：一条 run 结束后必须释放占位，否则同一任务第二次 run 会永远 409。
+//
+// 之前 startJob 用两个 goroutine（一个 `<-done` 后 release、一个跑引擎）——
+// release 排在 `<-done` 之后，而 done 只有 release 才关：死锁，任务永久占位。
+// 这里注入一个立刻返回的 runFn，断言「跑完能再起一次」。
+func TestStartJobReleasesAfterFinish(t *testing.T) {
+	store, err := control.Open(control.Options{DataDir: t.TempDir(), Autogen: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	srv, err := New(Options{Store: store, Version: "test", Listen: "127.0.0.1:0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	starts := make(chan struct{}, 4)
+	srv.runFn = func(ctx context.Context, _ *control.Store, _ control.Job, _ jobrun.Options) (engine.Result, error) {
+		starts <- struct{}{}
+		<-ctx.Done() // 模拟「跑到被取消/结束」
+		return engine.Result{}, ctx.Err()
+	}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	token := setupAdmin(t, ts)
+	conn := createPGConn(t, ts, token, "src")
+	code, created := doJSON(t, http.MethodPost, ts.URL+"/api/jobs", token, map[string]any{
+		"name": "release-job", "source_id": conn, "target_id": conn,
+		"spec": map[string]any{
+			"source":  map[string]any{"scope": map[string]any{"schema": "public", "include": []string{"orders"}}},
+			"target":  map[string]any{"schema": "report"},
+			"mode":    map[string]any{"frequency": "once"},
+			"content": map[string]any{"tables": map[string]any{"orders": map[string]any{}}},
+		},
+	})
+	if code != http.StatusCreated {
+		t.Fatalf("create job = %d %v", code, created)
+	}
+	jobID, _ := created["id"].(string)
+
+	// 第一次：202
+	if code, body := doJSON(t, http.MethodPost, ts.URL+"/api/jobs/"+jobID+"/run", token, nil); code != http.StatusAccepted {
+		t.Fatalf("第一次 run = %d %v", code, body)
+	}
+	<-starts // 引擎已开跑
+
+	// 正在跑时再起一次：409（同一个任务不允许两条活跃）
+	if code, _ := doJSON(t, http.MethodPost, ts.URL+"/api/jobs/"+jobID+"/run", token, nil); code != http.StatusConflict {
+		t.Fatalf("并发第二次 run = %d，期望 409", code)
+	}
+
+	// 停止 → 引擎返回 → 占位必须释放
+	if code, _ := doJSON(t, http.MethodPost, ts.URL+"/api/jobs/"+jobID+"/stop", token, nil); code != http.StatusAccepted {
+		t.Fatalf("stop = %d", code)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for srv.runs.active(jobID) {
+		if time.Now().After(deadline) {
+			t.Fatal("stop 之后占位没有释放：这个任务以后再也起不来了（死锁）")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// 释放之后必须能再起一次（控制库里那条 run 由引擎的 FinishRun 收尾；
+	// 这里 runFn 是桩、不写库，所以直接看内存占位，不查 activeSyncRun）
+	if code, body := doJSON(t, http.MethodPost, ts.URL+"/api/jobs/"+jobID+"/run", token, nil); code != http.StatusAccepted {
+		t.Fatalf("释放后再 run = %d %v，期望 202", code, body)
 	}
 }
