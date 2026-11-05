@@ -79,7 +79,7 @@ CREATE TABLE audit (
 
 ## 4. API 面
 
-**鉴权三档**：`公开`（不需要登录，只用于首启与存活探测）· `已配置`（只要求管理员口令已设置，未设置时回 428 并引导 `/api/setup`）· `需登录`（会话 cookie 或 `Authorization: Bearer`）。
+**鉴权三档**：`公开`（不需要登录，只用于首启与存活探测；个别端点另有「仅本机」限定，见对应行）· `已配置`（只要求管理员口令已设置，未设置时回 428 并引导 `/api/setup`）· `需登录`（会话 cookie 或 `Authorization: Bearer`）。
 
 **CSRF**：只有「cookie 会话 + 写方法」需要 `X-CSRF-Token`（双提交）；带 `Authorization: Bearer` 的请求不需要——Bearer 不会被浏览器自动带上，不存在跨站伪造。
 
@@ -89,7 +89,7 @@ CREATE TABLE audit (
 |---|---|---|---|---|---|---|
 | GET | `/api/health` | 存活探测，只回版本与 uptime | 公开 | 不需要 | 是（只读） | 200 |
 | GET | `/api/session` | 是否已设口令、调用方是否已登录；**顺带种下 `jl_csrf` cookie**（首启端点要 CSRF，token 只能由 GET 侧发） | 公开 | 不需要 | 是（只读） | 200 |
-| POST | `/api/setup` | 设置管理员口令（argon2id），只允许一次；成功后发会话 | 公开（限速 5 次/分钟） | **需要** | 否（第二次 409） | 201 |
+| POST | `/api/setup` | 设置管理员口令（argon2id），只允许一次；成功后发会话。**只接受本机来源**：非本机 403（判定同时要求 `RemoteAddr` 是本机，且请求不带 `Forwarded` / `X-Forwarded-For` / `X-Real-IP` 任一转发头——带了就按非本机处理）。反代场景请先在控制台本机完成首启 | 公开，**仅本机**（限速 5 次/分钟） | **需要** | 否（第二次 409） | 201 |
 | POST | `/api/login` | 口令换会话 token | 公开（限速 5 次/分钟） | 不需要（此时还没有会话） | 否（每次发新会话） | 200 |
 | POST | `/api/logout` | 丢掉当前会话并清 cookie | 已配置 | 需要 | 是 | 200 |
 | GET | `/api/meta` | 版本、`instance_id`、`schema_version`、`data_dir`、鉴权模式 | 已配置 | 不需要 | 是（只读） | 200 |
@@ -142,7 +142,7 @@ CREATE TABLE audit (
 
 - `GET /api/jobs/{id}/verify`、`GET /api/gc`：**B1 才做**。在那之前它们返回 404 + `E1009`，不做假装成功的空实现。
 - 其他任何未注册的 `/api/*`：一律返回 **404 + JSON 错误信封（`E1009`）**，绝不落到 WebUI 的 `GET /` 上被 HTML 兜底——否则「这个接口到底有没有实现」就再也自证不了了。
-- **注册路由必须带方法**（`GET /api/x` 这种）。无方法的前缀注册（`/api/`）会与 `GET /` 的路径宽度冲突并在注册期 panic；这是实测结论，不是风格偏好。
+- **注册路由必须带方法**（`GET /api/x` 这种），前缀与精确路径都不例外。不带方法的前缀注册（`/api/`）会与 `GET /` 的路径宽度冲突并在注册期 panic；不带方法的**精确**路径（`/api/gc`）同样会与 `GET /api/` 的兜底冲突 panic。带方法之后更具体的模式优先，兜底不会挡住将来新增的路由。这是实测结论，不是风格偏好。
 
 错误一律走 `internal/core/codes.go` 的结构：`{code, class, message, why, next[], risk}`，UI 直接渲染四段式卡片，不需要翻译。
 
