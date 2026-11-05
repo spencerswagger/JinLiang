@@ -271,6 +271,9 @@ Go 主干 · **MIT** · 对外开源 · 一期只做 MySQL 与 PostgreSQL（含�
 
 - [SPEC.md](SPEC.md)：任务定义 `job.yaml`、命令面与退出码、预检清单（PG-01…/MY-01…）、错误模型（E1xxx/E2xxx/E3xxx/E4xxx）、指标名、一致性校验协议。
 - [STATE-SCHEMA.md](STATE-SCHEMA.md)：`_ds_*` 表 DDL（PG / MySQL 两版）、位点与数据同事务的三种崩溃点分析、恢复时序、孤儿清理四判定。
+- [TYPE-MAPPING.md](TYPE-MAPPING.md)：类型映射字典与探测兜底。
+- [SNAPSHOT.md](SNAPSHOT.md)：初始化分块、一致性起点、断点与接缝。
+- [PLAN.md](PLAN.md)：`plan` 的输出与交互。
 - 代码契约：[`internal/source/contract.go`](../internal/source/contract.go)、[`internal/sink/contract.go`](../internal/sink/contract.go) —— 已编译通过，CI 校验。
 
 ## 附：真机证据（仅校验设计假设，不作项目依赖）

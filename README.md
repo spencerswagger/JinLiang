@@ -36,6 +36,9 @@ WAL / binlog / 复制槽 / 位点这些底层概念由工具负责探测、代�
 | [docs/DESIGN.md](docs/DESIGN.md) | 设计基线：原则、版本矩阵、降级补偿、性能与测试架构 |
 | [docs/SPEC.md](docs/SPEC.md) | 实现级：`job.yaml`、命令面、预检清单、错误模型、指标、校验协议 |
 | [docs/STATE-SCHEMA.md](docs/STATE-SCHEMA.md) | 状态表 DDL、位点与数据同事务的幂等证明、崩溃恢复时序、孤儿清理 |
+| [docs/TYPE-MAPPING.md](docs/TYPE-MAPPING.md) | 类型映射字典（PG↔MySQL 逐类型，标无损/lossy/需确认）、utf8mb4 行宽等三个坑、探测兜底 |
+| [docs/SNAPSHOT.md](docs/SNAPSHOT.md) | 全量初始化：按主键形态分块、并发与限速、一致性起点（PG 导出视图 / MySQL 毫秒锁）、断点、与增量接缝 |
+| [docs/PLAN.md](docs/PLAN.md) | `plan` 的人类模板与 `--json` 输出、估算、交互确认规则 |
 | [examples/job.yaml](examples/job.yaml) | 任务定义示例（带全部字段与注释） |
 
 代码层的契约已经落地，可编译可校验：`internal/source/contract.go`（连接器接口与能力探测）、`internal/sink/contract.go`（写入与同事务提交位点）。
