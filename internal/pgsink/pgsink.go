@@ -544,7 +544,7 @@ func TypeMapLoss(col source.Column) (catalog.Mapping, bool) {
 // BulkApply writes one snapshot chunk: data, chunk marker and position commit
 // together. The stage table + INSERT ... SELECT gives upsert semantics, so a
 // restarted snapshot can re-read a table without duplicating rows.
-func (s *Sink) BulkApply(ctx context.Context, ti *tableInfo, chunkNo int, rows []source.Row, pos string, from, to string) error {
+func (s *Sink) BulkApply(ctx context.Context, ti *tableInfo, chunkNo int, rows [][]any, pos string, from, to string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -569,8 +569,8 @@ func (s *Sink) BulkApply(ctx context.Context, ti *tableInfo, chunkNo int, rows [
 		for i, r := range rows {
 			vals := make([]any, len(ti.cols))
 			for j := range ti.cols {
-				if j < len(r.Values) {
-					vals[j] = r.Values[j].Any()
+				if j < len(r) {
+					vals[j] = r[j]
 				}
 			}
 			values[i] = vals
@@ -655,7 +655,7 @@ func (s *Sink) upsertTx(ctx context.Context, tx pgx.Tx, ev source.Event) error {
 	params := make([]any, len(ti.cols))
 	for i := range ti.cols {
 		if i < len(ev.New.Values) {
-			params[i] = ev.New.Values[i].Any()
+			params[i] = valueOf(ev.New.Values[i])
 		}
 	}
 	if _, err := tx.Exec(ctx, q, params...); err != nil {
@@ -679,7 +679,7 @@ func (s *Sink) deleteTx(ctx context.Context, tx pgx.Tx, ev source.Event) error {
 		where = append(where, fmt.Sprintf("%s = $%d::text::%s", pgwire.Quote(ti.pk[i]), i+1, ti.types[idx]))
 		var v any
 		if idx < len(ev.Old.Values) {
-			v = ev.Old.Values[idx].Any()
+			v = valueOf(ev.Old.Values[idx])
 		}
 		params = append(params, v)
 	}
@@ -915,6 +915,28 @@ func updateSetList(ti *tableInfo) string {
 		sets = append(sets, fmt.Sprintf("%s = EXCLUDED.%s", pgwire.Quote(c), pgwire.Quote(c)))
 	}
 	return strings.Join(sets, ", ")
+}
+
+// valueOf turns a decoded cell back into a driver parameter. It lives here (not
+// on source.Value) because the shared contract is Ark's to change.
+func valueOf(v source.Value) any {
+	switch v.Kind {
+	case source.KindInt:
+		return v.I
+	case source.KindUint:
+		return v.U
+	case source.KindFloat:
+		return v.F
+	case source.KindString, source.KindJSON:
+		return v.S
+	case source.KindBytes:
+		return v.B
+	case source.KindTime:
+		return v.T
+	case source.KindBool:
+		return v.I != 0
+	}
+	return nil
 }
 
 func nullStr(s string) any {

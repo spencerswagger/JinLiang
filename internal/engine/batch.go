@@ -28,6 +28,10 @@ type applier interface {
 
 type acker interface {
 	Ack(pos pgsource.Position)
+	// LastCommit is the LSN of the last committed source transaction; the
+	// batcher snapshots it on EvCommit (the shared Event struct carries no
+	// position field — that contract belongs to Ark).
+	LastCommit() pgsource.Position
 }
 
 type batcher struct {
@@ -106,8 +110,8 @@ func (b *batcher) Add(ctx context.Context, ev source.Event) error {
 		}
 		b.cur = b.cur[:0]
 		b.inTx = false
-		if ev.Position != "" {
-			if p, err := pgsource.ParsePosition(ev.Position); err == nil {
+		if b.src != nil {
+			if p := b.src.LastCommit(); p.Compare(b.pendPos) > 0 {
 				b.pendPos = p
 			}
 		}

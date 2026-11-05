@@ -214,6 +214,12 @@ func (r *runner) execute(ctx context.Context, res *Result) error {
 	if err := r.preflight(ctx); err != nil {
 		return r.fail(ctx, err)
 	}
+	// B1 的范围就两条路径。定时增量（interval / full_interval）没有实现调度器，
+	// 与其跑一半让人以为成了，不如在动数据之前就说清楚。
+	if m := r.mode(); m == "interval" || m == "full_interval" {
+		return r.fail(ctx, &notImplementedError{fmt.Sprintf(
+			"定时增量（mode.frequency=%s）在 B1 未实现；已实现的是 once（只搬存量）与 continuous+initial（存量+实时）", m)})
+	}
 	if err := r.prepare(ctx); err != nil {
 		return r.fail(ctx, err)
 	}
@@ -808,8 +814,15 @@ func (r *runner) fail(ctx context.Context, err error) error {
 	case pgsource.IsPositionGap(err):
 		code = core.CodePositionGap
 	}
-	ev := control.ErrorEvent(r.job.ID, r.run.ID, code, err.Error())
-	ev.Phase = r.phase
+	var ev control.Event
+	var np *notImplementedError
+	if errors.As(err, &np) {
+		// 没有错误码可挂：这不是「你做错了什么」，是我们还没做。
+		ev = control.Event{JobID: r.job.ID, RunID: r.run.ID, Type: "error", Message: err.Error(), Phase: r.phase}
+	} else {
+		ev = control.ErrorEvent(r.job.ID, r.run.ID, code, err.Error())
+		ev.Phase = r.phase
+	}
 	r.opt.Store.Bus().Publish(ev)
 	if r.phase != state.Failed {
 		if _, ferr := r.opt.Store.FinishRun(dctx, r.run.ID, state.Failed, err.Error(), ExitFailed); ferr != nil {
@@ -822,6 +835,13 @@ func (r *runner) fail(ctx context.Context, err error) error {
 
 // stoppedError ends the stream early. ok means "this is a normal finish"
 // (caught up + idle), not a human pressing Ctrl-C.
+// notImplementedError marks a segment B1 deliberately did not build. It is not
+// a user-action error: there is nothing to fix on their side, they just need a
+// mode that exists.
+type notImplementedError struct{ msg string }
+
+func (e *notImplementedError) Error() string { return e.msg }
+
 type stoppedError struct {
 	msg string
 	ok  bool

@@ -94,6 +94,10 @@ type Source struct {
 	// 真的闲下来了（解码位置 == 发送位置），此时把位点推到那里是安全的。
 	keepEnd  atomic.Uint64
 	keepPrev atomic.Uint64
+	// lastCommit is the LSN of the last committed source transaction. The
+	// engine reads it when it flushes a batch: Event 里没有（也不该有）位点字段，
+	// 共享契约由 Ark 维护。
+	lastCommit atomic.Uint64
 
 	tables map[string]*tableInfo
 	order  []string
@@ -347,10 +351,14 @@ func (s *Source) SlotLagBytes(ctx context.Context) (int64, error) {
 // ── 全量：分块读（块 = 一个目标事务） ─────────────────────────
 
 // Chunk is one resumable unit of the initial copy.
+//
+// Rows 里是**驱动原生值**（pgx 已经解好的 int64/time.Time/[]byte/…），不是
+// source.Value：全量这条路径不该把 numeric/uuid/数组先降级成字符串再还原，
+// 而且共享契约（internal/source/contract.go）由 Ark 统一维护，我不往里加字段。
 type Chunk struct {
 	Table source.TableRef
 	No    int
-	Rows  []source.Row
+	Rows  [][]any
 	From  string // 本块起止（keyset 边界，供人核对；也是断点依据）
 	To    string
 }
@@ -415,7 +423,7 @@ func (s *Source) SnapshotChunks(ctx context.Context, opt source.SnapshotOpt, fn 
 // a full scan per page on big tables). No-PK tables use ctid, which is stable
 // inside the repeatable-read snapshot.
 func (s *Source) readPage(ctx context.Context, conn *pgx.Conn, ti *tableInfo,
-	cursor string, limit int64) ([]source.Row, string, error) {
+	cursor string, limit int64) ([][]any, string, error) {
 
 	noPK := len(ti.pk) == 0
 	cols := make([]string, 0, len(ti.cols)+1)
@@ -467,7 +475,7 @@ func (s *Source) readPage(ctx context.Context, conn *pgx.Conn, ti *tableInfo,
 	}
 	defer rows.Close()
 
-	var out []source.Row
+	var out [][]any
 	var lastVals []any
 	var lastCtid string
 	for rows.Next() {
@@ -483,11 +491,7 @@ func (s *Source) readPage(ctx context.Context, conn *pgx.Conn, ti *tableInfo,
 			lastCtid, _ = vals[0].(string)
 			offset = 1
 		}
-		row := source.Row{Table: ti.ref, Values: make([]source.Value, len(vals)-offset)}
-		for i, v := range vals[offset:] {
-			row.Values[i] = source.Value{Kind: source.KindRaw, V: v}
-		}
-		out = append(out, row)
+		out = append(out, vals[offset:])
 		if !noPK {
 			lastVals = vals
 		}
@@ -708,6 +712,11 @@ func (s *Source) Ack(pos Position) {
 	}
 }
 
+// LastCommit is the LSN of the most recent committed source transaction.
+// The engine snapshots it at flush time, so the position it writes is always
+// "the last transaction included in this batch".
+func (s *Source) LastCommit() Position { return Position{LSN: pglogrepl.LSN(s.lastCommit.Load())} }
+
 // AckedPosition reports what the source has been told we applied.
 func (s *Source) AckedPosition() Position { return Position{LSN: pglogrepl.LSN(s.ackLSN.Load())} }
 
@@ -734,12 +743,12 @@ func (s *Source) handleWAL(ctx context.Context, data []byte, walStart pglogrepl.
 		if m.TransactionEndLSN == 0 {
 			pos = Position{LSN: m.CommitLSN}
 		}
+		s.lastCommit.Store(uint64(pos.LSN))
 		s.Ack(pos)
 		return onEvent(ctx, source.Event{
 			Kind:     source.EvCommit,
 			TxID:     fmt.Sprint(m.CommitLSN),
 			CommitTS: m.CommitTime,
-			Position: pos.String(),
 		})
 	case *pglogrepl.InsertMessage:
 		rel := rels[m.RelationID]

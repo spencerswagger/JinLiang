@@ -113,10 +113,6 @@ const (
 	KindTime
 	KindBool
 	KindJSON
-	// KindRaw carries a driver-native value (pgx already decoded it). The
-	// snapshot path uses it so a value never round-trips through text: numeric,
-	// uuid, interval and arrays keep their exact representation.
-	KindRaw
 )
 
 // Value is one decoded cell. Decoders fill exactly one payload field.
@@ -128,35 +124,6 @@ type Value struct {
 	S    string
 	B    []byte
 	T    time.Time
-	V    any // KindRaw payload
-}
-
-// Any converts a decoded cell back into the Go value a driver takes as a
-// parameter. Sinks use it so they never have to switch on ValueKind themselves.
-func (v Value) Any() any {
-	switch v.Kind {
-	case KindNull:
-		return nil
-	case KindInt:
-		return v.I
-	case KindUint:
-		return v.U
-	case KindFloat:
-		return v.F
-	case KindString:
-		return v.S
-	case KindBytes:
-		return v.B
-	case KindTime:
-		return v.T
-	case KindBool:
-		return v.I != 0
-	case KindJSON:
-		return v.S
-	case KindRaw:
-		return v.V
-	}
-	return nil
 }
 
 // Row is one table row in column order (column names come from the catalog).
@@ -199,9 +166,6 @@ type Event struct {
 	TxID     string    // 用于把同一事务的事件串起来
 	CommitTS time.Time // 源端提交时间；拿不到时为零值（PG track_commit_timestamp=off）
 	DDL      string    // EvDDL 时的原始语句
-	// Position is set on EvCommit: the checkpoint this transaction makes
-	// durable once its data lands (docs/STATE-SCHEMA.md §2).
-	Position string
 }
 
 // EventHandler consumes the stream; returning an error stops the stream.

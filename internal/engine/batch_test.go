@@ -38,17 +38,25 @@ func (f *fakeSink) Apply(ctx context.Context, evs []source.Event, pos source.Pos
 	return nil
 }
 
-type fakeSource struct{ acked []string }
+// fakeSource 记住确认过的位点，并扮演「源端最后提交位点」这一角色：
+// 位点不从 Event 上取（共享契约里 Event 没有位点字段），而是 Flush 时向源端要。
+type fakeSource struct {
+	acked []string
+	last  pgsource.Position
+}
 
 func (f *fakeSource) Ack(pos pgsource.Position) { f.acked = append(f.acked, pos.String()) }
 
-func ev(kind source.EventKind, pos string) source.Event {
-	e := source.Event{Kind: kind}
-	if pos != "" {
-		e.Position = pos
-	}
-	return e
+func (f *fakeSource) LastCommit() pgsource.Position { return f.last }
+
+// commitEvent 模拟「源端提交了某个事务」，返回对应的 Commit 事件。
+func commitEvent(src *fakeSource, pos string) source.Event {
+	p, _ := pgsource.ParsePosition(pos)
+	src.last = p
+	return source.Event{Kind: source.EvCommit}
 }
+
+func ev(kind source.EventKind, _ string) source.Event { return source.Event{Kind: kind} }
 
 func newTestBatcher(sink applier, src acker, rows int) *batcher {
 	return newBatcher(sink, src, rows, time.Millisecond, pgsource.Position{}, nil)
@@ -63,7 +71,7 @@ func TestBatcherKeepsSourceTransactionAtomic(t *testing.T) {
 	_ = b.Add(context.Background(), ev(source.EvBegin, ""))
 	_ = b.Add(context.Background(), ev(source.EvInsert, ""))
 	_ = b.Add(context.Background(), ev(source.EvInsert, ""))
-	_ = b.Add(context.Background(), ev(source.EvCommit, "0/100"))
+	_ = b.Add(context.Background(), commitEvent(src, "0/100"))
 	if len(sink.batches) != 0 {
 		t.Fatalf("没攒够 batch_rows 就提交了：%d 批", len(sink.batches))
 	}
@@ -92,7 +100,7 @@ func TestBatcherGroupCommitUsesLastPosition(t *testing.T) {
 		for i := 0; i < tx.rows; i++ {
 			_ = b.Add(context.Background(), ev(source.EvInsert, ""))
 		}
-		_ = b.Add(context.Background(), ev(source.EvCommit, tx.pos))
+		_ = b.Add(context.Background(), commitEvent(src, tx.pos))
 	}
 	if err := b.Flush(context.Background()); err != nil {
 		t.Fatal(err)
@@ -111,13 +119,14 @@ func TestBatcherGroupCommitUsesLastPosition(t *testing.T) {
 // 单个大事务超过 batch_rows 时立刻提交，不拆事务。
 func TestBatcherFlushesOversizedTransactionImmediately(t *testing.T) {
 	sink := &fakeSink{}
-	b := newTestBatcher(sink, &fakeSource{}, 3)
+	src := &fakeSource{}
+	b := newTestBatcher(sink, src, 3)
 
 	_ = b.Add(context.Background(), ev(source.EvBegin, ""))
 	for i := 0; i < 5; i++ {
 		_ = b.Add(context.Background(), ev(source.EvInsert, ""))
 	}
-	_ = b.Add(context.Background(), ev(source.EvCommit, "0/300"))
+	_ = b.Add(context.Background(), commitEvent(src, "0/300"))
 
 	if len(sink.batches) != 1 {
 		t.Fatalf("大事务应在 COMMIT 时立刻提交，得到 %d 批", len(sink.batches))
@@ -135,7 +144,7 @@ func TestBatcherDoesNotAckWhenApplyFails(t *testing.T) {
 
 	_ = b.Add(context.Background(), ev(source.EvBegin, ""))
 	_ = b.Add(context.Background(), ev(source.EvInsert, ""))
-	_ = b.Add(context.Background(), ev(source.EvCommit, "0/400"))
+	_ = b.Add(context.Background(), commitEvent(src, "0/400"))
 	if err := b.Flush(context.Background()); err == nil {
 		t.Fatal("Apply 失败时 Flush 必须返回错误")
 	}
@@ -164,7 +173,7 @@ func TestBatcherEmptyTransactionKeepsPosition(t *testing.T) {
 	src := &fakeSource{}
 	b := newTestBatcher(sink, src, 100)
 	_ = b.Add(context.Background(), ev(source.EvBegin, ""))
-	_ = b.Add(context.Background(), ev(source.EvCommit, "0/500"))
+	_ = b.Add(context.Background(), commitEvent(src, "0/500"))
 	if err := b.Flush(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -249,10 +258,11 @@ func TestTableSelectionByPattern(t *testing.T) {
 // Apply 改成不带位点。
 func TestApplyAlwaysCarriesPosition(t *testing.T) {
 	sink := &fakeSink{}
-	b := newTestBatcher(sink, &fakeSource{}, 1)
+	src := &fakeSource{}
+	b := newTestBatcher(sink, src, 1)
 	_ = b.Add(context.Background(), ev(source.EvBegin, ""))
 	_ = b.Add(context.Background(), ev(source.EvInsert, ""))
-	_ = b.Add(context.Background(), ev(source.EvCommit, "0/900"))
+	_ = b.Add(context.Background(), commitEvent(src, "0/900"))
 	if err := b.Flush(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -279,7 +289,7 @@ func TestAdvanceToRefusesWhileTransactionInFlight(t *testing.T) {
 	}
 
 	// 提交之后仍然有「待落库的批」，这时也不许绕过数据去推位点。
-	_ = b.Add(ctx(), ev(source.EvCommit, "0/700"))
+	_ = b.Add(ctx(), commitEvent(src, "0/700"))
 	if err := b.AdvanceTo(ctx(), pos); err != nil {
 		t.Fatal(err)
 	}

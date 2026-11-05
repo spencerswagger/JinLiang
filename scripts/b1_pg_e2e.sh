@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # B1 验收：PostgreSQL → PostgreSQL 真链路。
 #
-#   ROWS=1000000 scripts/b1_pg_e2e.sh ./dist/jinliang            # 全量 + 增量 + 校验
+#   ROWS=1000000 scripts/b1_pg_e2e.sh ./dist/jinliang            # continuous+initial：全量+增量+校验
+#   ROWS=1000000 scripts/b1_pg_e2e.sh ./dist/jinliang once       # once：只搬存量，跑完即终态
 #   ROWS=1000000 scripts/b1_pg_e2e.sh ./dist/jinliang kill         # 快照中途 kill -9 再重启
 #   ROWS=10000000 scripts/b1_pg_e2e.sh ./dist/jinliang             # 1000 万行
 #
@@ -66,6 +67,8 @@ psql_src "DO \$\$ DECLARE p text; BEGIN FOR p IN SELECT pubname FROM pg_publicat
 # CHUNK_ROWS：块大小。kill 模式要打到"快照第 2 块"，块太多/太少都不稳，
 # 所以 CI 里把它调小（行数少也能有好几块）。
 CHUNK=${CHUNK_ROWS:-100000}
+FREQ=continuous+initial
+[ "$MODE" = "once" ] && FREQ=once
 cat > "$JOB" <<YAML
 version: 1
 job: b1-orders
@@ -82,7 +85,7 @@ target:
   schema: public
   on_exists: append
 mode:
-  frequency: continuous+initial
+  frequency: $FREQ
 reliability:
   batch_rows: 5000
 YAML
@@ -90,7 +93,22 @@ YAML
 echo "== 3. 导入任务 =="
 "$BIN" import --file "$JOB" --data-dir "$DATA"
 
-if [ "$MODE" = "kill" ]; then
+if [ "$MODE" = "once" ]; then
+  echo "== 4. once：只搬存量，跑完即终态 =="
+  time "$BIN" run --job b1-orders --data-dir "$DATA" --verify > "$WORK/run1.log" 2>&1
+  grep -E "全量完成|校验|结果：" "$WORK/run1.log" | tail -4
+  psql_dst "SELECT phase FROM _jl_meta" | sed 's/^/   目标端阶段：/'
+  SRCFP=$(fingerprint psql_src)
+  DSTFP=$(fingerprint psql_dst)
+  echo "   源端 $SRCFP"
+  echo "   目标 $DSTFP"
+  if [ "$SRCFP" != "$DSTFP" ]; then
+    echo "FAIL: once 搬完之后源与目标不一致"
+    exit 1
+  fi
+  echo "PASS: $ROWS 行，模式 once（只搬存量），指纹一致 $SRCFP"
+  exit 0
+elif [ "$MODE" = "kill" ]; then
   echo "== 4. 全量中途 kill -9 =="
   "$BIN" run --job b1-orders --data-dir "$DATA" --stop-after 600s > "$WORK/run1.log" 2>&1 &
   PID=$!
