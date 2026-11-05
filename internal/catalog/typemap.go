@@ -114,7 +114,7 @@ func Map(from, to Engine, sourceType string) (Mapping, bool) {
 		"postgres->mysql:inet":                        {"varchar(45)", Lossless, ""},
 		"postgres->mysql:cidr":                        {"varchar(45)", Lossless, ""},
 		"postgres->mysql:macaddr":                     {"varchar(17)", Lossless, ""},
-		"postgres->mysql:json":                        {"json", Lossless, ""},
+		"postgres->mysql:json":                        {"json", Lossy, "同 jsonb：MySQL 侧大整数与高精度小数按 double 失真；键序与重复键处理不同"},
 		"postgres->mysql:jsonb":                       {"json", Lossy, "键序与重复键处理不同；MySQL 侧大整数与高精度小数会按 double 失真"},
 		"postgres->mysql:text":                        {"text", Lossless, ""},
 		"postgres->mysql:bytea":                       {"longblob", Lossless, ""},
