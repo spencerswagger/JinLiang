@@ -953,6 +953,22 @@ func TestSetupOnlyFromLoopbackBeforeConfigured(t *testing.T) {
 		t.Error("403 必须给下一步（本机打开 /setup，或 --listen 127.0.0.1 起一次）")
 	}
 
+	// ①b Owl 复现的绕过：控制台只听 127.0.0.1 + 同机反代时，远端请求的
+	// RemoteAddr 恒为 127.0.0.1。带任一转发头就必须按非本机 403。
+	for _, hdr := range []string{"X-Forwarded-For", "X-Real-IP", "Forwarded"} {
+		rec = httptest.NewRecorder()
+		req = httptest.NewRequest(http.MethodPost, "/api/setup", bytes.NewReader(body))
+		req.RemoteAddr = "127.0.0.1:54321"
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set(csrfHeader, csrf)
+		req.AddCookie(&http.Cookie{Name: csrfCookie, Value: csrf})
+		req.Header.Set(hdr, "203.0.113.9")
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("本机 RemoteAddr + %s 头 = %d，期望 403（反代绕过）", hdr, rec.Code)
+		}
+	}
+
 	// ② 本机 + 未配置 → 正常建立管理员
 	rec = httptest.NewRecorder()
 	req = httptest.NewRequest(http.MethodGet, "/api/session", nil)

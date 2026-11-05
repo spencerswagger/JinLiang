@@ -8,6 +8,7 @@ package netcheck
 
 import (
 	"net"
+	"net/http"
 	"strings"
 )
 
@@ -59,4 +60,28 @@ func IsLoopbackClient(remoteAddr string) bool {
 		return false
 	}
 	return ip.IsLoopback()
+}
+
+// forwardingHeaders 是反向代理会加的「原始客户端」头。
+//
+// 为什么它决定安全判定：标准部署里「控制台只听 127.0.0.1 + 同机 nginx 反代」时，
+// 每个远端请求的 RemoteAddr **都是** 127.0.0.1——只看 IP 等于把门敞开。
+// 所以 A-1 的守卫用 IsLoopbackRequest：只要带了任何一个转发头，就按非本机处理
+// （fail-closed），宁可让反代场景的人回本机首启一次，也不让远端抢先当管理员。
+var forwardingHeaders = []string{"Forwarded", "X-Forwarded-For", "X-Real-IP"}
+
+// IsLoopbackRequest reports whether this request provably came from this
+// machine: RemoteAddr 是本机，**且** 没有任何转发头。
+//
+// 注意：不解析转发头里的内容（那是不可信输入），只看「有没有」。
+func IsLoopbackRequest(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	for _, h := range forwardingHeaders {
+		if strings.TrimSpace(r.Header.Get(h)) != "" {
+			return false // 有转发头 = 请求至少经过一跳，不能算本机
+		}
+	}
+	return IsLoopbackClient(r.RemoteAddr)
 }

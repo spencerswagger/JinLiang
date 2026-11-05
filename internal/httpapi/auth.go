@@ -362,7 +362,7 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 	}
 	// A-1：还没设口令时，只有本机能定这个口令。
 	// 顺序放在 CSRF 之前——先回答「你能不能做这件事」，再谈「这个请求是不是伪造的」。
-	if !netcheck.IsLoopbackClient(r.RemoteAddr) {
+	if !netcheck.IsLoopbackRequest(r) {
 		s.writeError(w, r, http.StatusForbidden, setupLoopbackOnly())
 		return
 	}
