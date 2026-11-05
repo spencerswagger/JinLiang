@@ -79,20 +79,69 @@ CREATE TABLE audit (
 
 ## 4. API 面
 
-| 方法 | 路径 | 说明 |
-|---|---|---|
-| GET | `/api/connections` | 列表（密码永远不回传，只回 `has_secret: true`） |
-| POST/PUT | `/api/connections[/{id}]` | 新建/修改；保存前自动跑一次连通性与能力探测 |
-| POST | `/api/connections/{id}/test` | 单测连接（返回版本、能力、耗时） |
-| GET | `/api/catalog?connection_id=…&schema=…` | 枚举库表给 UI 勾选（带行数估算/主键/类型） |
-| GET/POST/PUT | `/api/jobs[/{id}]` | 任务 CRUD（`spec_json` 与 yaml schema 同构） |
-| POST | `/api/jobs/{id}/preflight` | 预检报告（四态） |
-| POST | `/api/jobs/{id}/run` `\|/pause` `\|/resume` `\|/stop` | 控制 |
-| GET | `/api/jobs/{id}/events` | **SSE**：阶段迁移、批次提交、延迟、错误（UI 实时刷新） |
-| GET | `/api/jobs/{id}/verify` | 校验（流式进度） |
-| GET | `/api/jobs/{id}/export` | 导出 yaml（与 `job.schema.json` 一致） |
-| POST | `/api/jobs/import` | 导入 yaml（先校验、再预览 diff、再确认） |
-| GET | `/api/doctor` `/api/gc` | 体检与孤儿清理（默认 dry-run） |
+**鉴权三档**：`公开`（不需要登录，只用于首启与存活探测）· `已配置`（只要求管理员口令已设置，未设置时回 428 并引导 `/api/setup`）· `需登录`（会话 cookie 或 `Authorization: Bearer`）。
+
+**CSRF**：只有「cookie 会话 + 写方法」需要 `X-CSRF-Token`（双提交）；带 `Authorization: Bearer` 的请求不需要——Bearer 不会被浏览器自动带上，不存在跨站伪造。
+
+### 4.1 认证与首启
+
+| 方法 | 路径 | 说明 | 鉴权 | CSRF | 幂等 | 成功 |
+|---|---|---|---|---|---|---|
+| GET | `/api/health` | 存活探测，只回版本与 uptime | 公开 | 不需要 | 是（只读） | 200 |
+| GET | `/api/session` | 是否已设口令、调用方是否已登录；**顺带种下 `jl_csrf` cookie**（首启端点要 CSRF，token 只能由 GET 侧发） | 公开 | 不需要 | 是（只读） | 200 |
+| POST | `/api/setup` | 设置管理员口令（argon2id），只允许一次；成功后发会话 | 公开（限速 5 次/分钟） | **需要** | 否（第二次 409） | 201 |
+| POST | `/api/login` | 口令换会话 token | 公开（限速 5 次/分钟） | 不需要（此时还没有会话） | 否（每次发新会话） | 200 |
+| POST | `/api/logout` | 丢掉当前会话并清 cookie | 已配置 | 需要 | 是 | 200 |
+| GET | `/api/meta` | 版本、`instance_id`、`schema_version`、`data_dir`、鉴权模式 | 已配置 | 不需要 | 是（只读） | 200 |
+
+### 4.2 连接
+
+| 方法 | 路径 | 说明 | 鉴权 | CSRF | 幂等 | 成功 |
+|---|---|---|---|---|---|---|
+| GET | `/api/connections` | 列表（密码永远不回传，只回 `has_secret: true`） | 需登录 | 不需要 | 是（只读） | 200 |
+| POST | `/api/connections` | 新建；可只传 `dsn` 一条串；保存后自动跑一次测连（测连失败不阻断保存） | 需登录 | 需要 | **否**（同坐标重复 POST 会得到两条连接） | 201 |
+| GET | `/api/connections/{id}` | 单条（含 `used_by_jobs`） | 需登录 | 不需要 | 是（只读） | 200 |
+| PUT | `/api/connections/{id}` | 修改；**被任务引用时坐标（`kind/host/port/database/username`）不可改**，改则 409 `ErrIdentityLocked`（见 `docs/IDENTITY.md` §2.1）；改名称/口令/`params` 允许 | 需登录 | 需要 | 是（同 body 重复提交结果一致） | 200 |
+| DELETE | `/api/connections/{id}` | 删除；仍被任务引用时 409 | 需登录 | 需要 | 是（第二次 404） | 200 |
+| POST | `/api/connections/{id}/test` | 单测连接（版本、能力、耗时）；**连通失败也回 200**，看 `ok` 字段 | 需登录 | 需要 | 是（会刷新 `last_test_*`） | 200 |
+| GET | `/api/catalog?connection_id=…&schema=…` | 枚举库表给 UI 勾选（带行数估算/主键/类型） | 需登录 | 不需要 | 是（只读） | 200 |
+
+### 4.3 任务
+
+| 方法 | 路径 | 说明 | 鉴权 | CSRF | 幂等 | 成功 |
+|---|---|---|---|---|---|---|
+| GET | `/api/jobs` | 列表（带两端连接名与最近一次运行） | 需登录 | 不需要 | 是（只读） | 200 |
+| POST | `/api/jobs` | 新建（`spec_json` 与 yaml schema 同构）；同指纹 409 并指向已有任务 | 需登录 | 需要 | 否（同指纹 409） | 201 |
+| GET | `/api/jobs/{id}` | 单条 = 任务 + `spec` + 最近 20 次运行 | 需登录 | 不需要 | 是（只读） | 200 |
+| PUT | `/api/jobs/{id}` | 修改（保留 `id` 与 `created_at`） | 需登录 | 需要 | 是（同 body 一致；改完指纹撞别的任务 409） | 200 |
+| DELETE | `/api/jobs/{id}` | 删除任务，**连同它的运行历史**（审计记录保留） | 需登录 | 需要 | 是（第二次 404） | 200 |
+| POST | `/api/jobs/{id}/preflight` | 预检报告（四态：`ok`/`autofixable`/`warn`/`blocked`），只读 | 需登录 | 需要 | 是（只读） | 200 |
+| POST | `/api/jobs/{id}/run` | 开始一轮运行；已经是运行中则 409 | 需登录 | 需要 | 否（同任务不并行） | 202 |
+| POST | `/api/jobs/{id}/pause` | 在安全点暂停；没在跑则 409 | 需登录 | 需要 | 是（重复暂停无副作用） | 202 |
+| POST | `/api/jobs/{id}/resume` | 从暂停恢复；没暂停则 400 | 需登录 | 需要 | 否 | 202 |
+| POST | `/api/jobs/{id}/stop` | 收尾后结束；没在跑则 409 | 需登录 | 需要 | 是（重复停止无副作用） | 202 |
+| GET | `/api/jobs/{id}/events` | **SSE**：阶段迁移、批次提交、延迟、错误（UI 实时刷新）；只认会话 cookie 或 `Authorization` 头，**不接受 query 里的 token** | 需登录 | 不需要（只读） | 是 | 200 |
+| GET | `/api/jobs/{id}/yaml` | 导出 yaml（与 `job.schema.json` 一致，完整 JobDoc）；会记一条审计 | 需登录 | 不需要 | 是（只读） | 200 |
+| POST | `/api/jobs/import` | 导入 yaml（先校验再落库）；同指纹是**更新**既有任务，不是报冲突 | 需登录 | 需要 | **是**（同坐标复用连接、同指纹更新任务） | 201（新建与更新都回 201，现状） |
+| GET | `/api/export` | 导出全部任务，每份之间用 `---` 分隔 | 需登录 | 不需要 | 是（只读） | 200 |
+
+> 命名待裁定：§4 旧稿的导出路径写的是 `/api/jobs/{id}/export`，实现（以及 `E1009` 的提示文案）用的是 `/yaml`；两者是否统一成一个名字，由设计裁定，本表按实现记录。
+
+### 4.4 运维
+
+| 方法 | 路径 | 说明 | 鉴权 | CSRF | 幂等 | 成功 |
+|---|---|---|---|---|---|---|
+| GET | `/api/runs` | 运行历史（`?job_id=` 过滤、`?limit=` 上限 500）；按 `started_at` 倒序 | 需登录 | 不需要 | 是（只读） | 200 |
+| GET | `/api/audit` | 控制面操作审计（`?limit=`）；按 `at` 倒序 | 需登录 | 不需要 | 是（只读） | 200 |
+| GET | `/api/settings` | 设置项 + `instance_id` / `schema_version` / 密钥来源 / 监听地址 | 需登录 | 不需要 | 是（只读） | 200 |
+| PUT | `/api/settings` | 改设置（当前只允许 `default_batch_rows`），白名单外 400 | 需登录 | 需要 | 是 | 200 |
+| GET | `/api/doctor` | 体检：控制库完整性、数据量、活跃运行、监听地址风险 | 需登录 | 不需要 | 是（只读） | 200 |
+
+### 4.5 未实现与未注册的路径
+
+- `GET /api/jobs/{id}/verify`、`GET /api/gc`：**B1 才做**。在那之前它们返回 404 + `E1009`，不做假装成功的空实现。
+- 其他任何未注册的 `/api/*`：一律返回 **404 + JSON 错误信封（`E1009`）**，绝不落到 WebUI 的 `GET /` 上被 HTML 兜底——否则「这个接口到底有没有实现」就再也自证不了了。
+- **注册路由必须带方法**（`GET /api/x` 这种）。无方法的前缀注册（`/api/`）会与 `GET /` 的路径宽度冲突并在注册期 panic；这是实测结论，不是风格偏好。
 
 错误一律走 `internal/core/codes.go` 的结构：`{code, class, message, why, next[], risk}`，UI 直接渲染四段式卡片，不需要翻译。
 
