@@ -28,7 +28,7 @@ reliability:
 
 - **向后兼容**：`spill | fail` 的字符串写法**继续有效**，旧 yaml 不受影响；`job.schema.json` 用 `oneOf` 同时接受两种形状（`examples/job.yaml` 是旧写法、`examples/job-tx-oversize.yaml` 是新写法，CI 每轮都校验这两份）。
 - **环境变量**：`JINLIANG_TX_MAX_BYTES` / `JINLIANG_TX_MAX_EVENTS` 仍可用，只在 yaml 没给对应项时生效。
-- **实现进度（重要）**：`schema` 与本文先定形状，**解析尚未落地**——`internal/control/jobspec.go` 现在仍只认字符串，所以在那之前把对象写法写进 yaml，`jinliang import` / `POST /api/jobs` 会在解析阶段报错（不是静默忽略）。B5 一起接：`jobspec` 的解析 + 引擎 `txLimits()` 的取值顺序。**在那之前请用字符串写法或环境变量。**
+- **实现进度**：`jobspec` 的解析**已支持两种形态**（旧字符串与对象都能 import/export，旧写法导出后仍是字符串）；`bytes` / `events` 的**运行期读取**在 B5 接（引擎 `txLimits()` 改调 `TxOversizeDoc.Limits()`，取值顺序即上面那条）——在那之前它们只被校验与保存，运行期仍取环境变量/内置默认。
 - `spill` 仍未实现（见上表）：两种 `mode` 当前都表现为「超限即报 `E1011`」，区别要等 spill-to-disk 落地。
 
 **顺序**：事务内按源顺序；跨事务按提交顺序。写入端单线程，任何并行都在源端按表拆分。

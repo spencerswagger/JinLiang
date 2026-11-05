@@ -104,7 +104,8 @@ type ReliabilityDoc struct {
 	BatchDelay string         `yaml:"batch_delay,omitempty" json:"batch_delay,omitempty"`
 	Retry      *RetryDoc      `yaml:"retry,omitempty" json:"retry,omitempty"`
 	DeadLetter *DeadLetterDoc `yaml:"dead_letter,omitempty" json:"dead_letter,omitempty"`
-	TxOversize string         `yaml:"tx_oversize,omitempty" json:"tx_oversize,omitempty"`
+	// TxOversize 同时接受旧字符串（spill|fail）与对象（mode/bytes/events），见 txoversize.go。
+	TxOversize *TxOversizeDoc `yaml:"tx_oversize,omitempty" json:"tx_oversize,omitempty"`
 }
 
 // RetryDoc is the backoff ladder.
@@ -312,7 +313,9 @@ func (d *JobDoc) Validate() error {
 			}
 			oneOf("reliability.dead_letter.store_row", dl.StoreRow, "full", "none")
 		}
-		oneOf("reliability.tx_oversize", r.TxOversize, "spill", "fail")
+		for _, msg := range r.TxOversize.Problems() {
+			add("%s", msg)
+		}
 	}
 	// guard
 	if g := d.Guard; g != nil {
