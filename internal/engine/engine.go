@@ -120,6 +120,16 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 	tgtEP := endpointOf(tgtConn, tgtSecret)
 
 	run, err := opt.Store.StartRun(ctx, job.ID, state.Preflight)
+	if err != nil && errors.Is(err, control.ErrConflict) {
+		// 控制面有「一个任务只允许一条活跃 run」的约束（#5）。进程被 kill -9 之后
+		// 那条 run 会永久占位，直接报错等于「崩过一次就再也跑不了」。
+		// 我们只在**能证明它已经死了**的时候替它收尾：目标端租约写着 pid 已不在/已过期。
+		if reclaimed, rerr := reclaimAbandonedRun(ctx, opt.Store, job, tgtEP, schemaOf(doc, tgtConn)); rerr != nil {
+			return res, rerr
+		} else if reclaimed {
+			run, err = opt.Store.StartRun(ctx, job.ID, state.Preflight)
+		}
+	}
 	if err != nil {
 		return res, err
 	}
@@ -146,6 +156,47 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 		res.ExitCode = ExitFailed
 	}
 	return res, err
+}
+
+// reclaimAbandonedRun closes a run row left behind by a killed process, but only
+// when the target-side lease proves that nobody is running it any more.
+//
+// 为什么需要：控制面的「一任务一活跃 run」是库层唯一索引（#5），进程被 kill -9
+// 之后那条行没人收尾，下次 `run --job` 直接被拒。控制面自己的收尾是 `serve` 启动时
+// 按心跳过期做的（90 秒），headless 场景等不起。这里用**目标端租约**作证据：
+// 租约过期、或 label 里的 pid 已经不在 → 那一轮确实死了，收尾成 interrupted。
+func reclaimAbandonedRun(ctx context.Context, store *control.Store, job control.Job,
+	ep dsn.Endpoint, schema string) (bool, error) {
+
+	active, err := store.ActiveRuns(ctx)
+	if err != nil {
+		return false, nil // 查不到就当没这事，让原来那条冲突错误冒上去
+	}
+	for _, run := range active {
+		if run.JobID != job.ID {
+			continue
+		}
+		holder, err := pgsink.ReadLease(ctx, ep, schema, job.JobKey)
+		if err != nil || !holder.Abandoned(time.Now(), pgsink.ProcessAlive) {
+			return false, nil
+		}
+		_, err = store.FinishRun(ctx, run.ID, state.Failed,
+			"上一次运行随进程退出中断（kill -9 或断电）；进度以目标端 _jl_meta 为准，重启会从断点续跑",
+			ExitFailed, control.FinishInterrupted)
+		if err != nil {
+			return false, fmt.Errorf("收尾上一次被中断的运行失败: %w", err)
+		}
+		return true, nil
+	}
+	return false, nil
+}
+
+// schemaOf is targetSchema as a free function (Run() needs it before the runner exists).
+func schemaOf(doc control.JobDoc, tgt control.Connection) string {
+	if s := strings.TrimSpace(doc.Target.Schema); s != "" {
+		return s
+	}
+	return tgt.Database
 }
 
 func endpointOf(c control.Connection, secret string) dsn.Endpoint {
@@ -925,7 +976,13 @@ func (r *runner) drain(ctx context.Context, exit int, msg string) error {
 			r.note(dctx, "把书签往前推时出错（不影响已提交的数据）："+err.Error())
 		}
 	}
-	if _, err := r.opt.Store.FinishRun(dctx, r.run.ID, state.Done, "", exit); err != nil {
+	// finish_reason 说清「为什么结束」：正常跑完 completed、用户按停 stopped。
+	// 阶段都落 done——「停止」不是失败，别在历史页把它显示成失败。
+	reason := control.FinishCompleted
+	if exit == ExitStopped {
+		reason = control.FinishStopped
+	}
+	if _, err := r.opt.Store.FinishRun(dctx, r.run.ID, state.Done, "", exit, reason); err != nil {
 		return err
 	}
 	if r.sink != nil {
@@ -973,8 +1030,13 @@ func (r *runner) fail(ctx context.Context, err error) error {
 		ev.Phase = r.phase
 	}
 	r.opt.Store.Bus().Publish(ev)
+	reason := control.FinishFailed
+	var lost *leaseLostError
+	if errors.As(err, &lost) {
+		reason = control.FinishInterrupted // 租约被接管 = 被中断，不是「这条同步本身错了」
+	}
 	if r.phase != state.Failed {
-		if _, ferr := r.opt.Store.FinishRun(dctx, r.run.ID, state.Failed, err.Error(), ExitFailed); ferr != nil {
+		if _, ferr := r.opt.Store.FinishRun(dctx, r.run.ID, state.Failed, err.Error(), ExitFailed, reason); ferr != nil {
 			return fmt.Errorf("%w（收尾也失败：%v）", err, ferr)
 		}
 		r.phase = state.Failed

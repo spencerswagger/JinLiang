@@ -1,10 +1,17 @@
 package pgsink
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v5"
+
+	"github.com/spencerswagger/jinliang/internal/dsn"
+	"github.com/spencerswagger/jinliang/internal/pgwire"
 )
 
 // 租约的语义（docs/STATE-SCHEMA.md §3）：同一个 job_key 同时只允许一个实例写。
@@ -94,3 +101,57 @@ func leaseTakeover(cur leaseRow, exists bool, now time.Time, instanceID string,
 	}
 	return true, fmt.Sprintf("接管了本机崩溃进程（pid %d）留下的租约", pid)
 }
+
+// LeaseHolder is who holds (or last held) a job's lease — read-only view.
+type LeaseHolder struct {
+	Exists     bool
+	InstanceID string
+	Label      string
+	Expires    time.Time
+}
+
+// ReadLease reads the lease row without taking it. 用来回答一个问题：
+// 「这个任务现在到底还有没有活着的进程在跑」——崩溃重启时，控制库里的
+// runs 行是死的、看不出来，目标端的租约才是可信的。
+func ReadLease(ctx context.Context, ep dsn.Endpoint, schema, jobKey string) (LeaseHolder, error) {
+	if schema == "" {
+		schema = "public"
+	}
+	conn, err := pgwire.Connect(ctx, ep)
+	if err != nil {
+		return LeaseHolder{}, err
+	}
+	defer conn.Close(ctx)
+	q := fmt.Sprintf(`SELECT instance_id, COALESCE(label,''), expires_at FROM %s.%s WHERE job_key=$1`,
+		pgwire.Quote(schema), pgwire.Quote("_jl_lease"))
+	var h LeaseHolder
+	err = conn.QueryRow(ctx, q, jobKey).Scan(&h.InstanceID, &h.Label, &h.Expires)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return LeaseHolder{}, nil
+	}
+	if err != nil {
+		return LeaseHolder{}, err
+	}
+	h.Exists = true
+	return h, nil
+}
+
+// Abandoned reports whether nobody is actually running under this lease:
+// 过期了，或者 label 里的 pid 已经不在（kill -9 之后就是这种）。
+func (h LeaseHolder) Abandoned(now time.Time, alive func(int) bool) bool {
+	if !h.Exists {
+		return true
+	}
+	if h.Expires.Before(now) {
+		return true
+	}
+	pid, _, ok := parseLeaseLabel(h.Label)
+	if !ok {
+		return false // 说不清就不动
+	}
+	return !alive(pid)
+}
+
+// ProcessAlive exposes the platform liveness probe for callers that need to
+// judge a lease holder (engine's crash recovery path).
+func ProcessAlive(pid int) bool { return processAlive(pid) }
