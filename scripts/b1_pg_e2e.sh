@@ -84,6 +84,9 @@ target:
   dsn: env:JINLIANG_TEST_PG_DSN
   schema: public
   on_exists: append
+content:
+  tables:
+    orders: {}
 mode:
   frequency: $FREQ
 reliability:

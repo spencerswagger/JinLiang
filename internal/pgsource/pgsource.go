@@ -406,7 +406,7 @@ type Chunk struct {
 	Table source.TableRef
 	No    int
 	Rows  [][]any
-	From  string // 本块起止（keyset 边界，供人核对；也是断点依据）
+	From  string // 本块起止（keyset 边界，供人核对；块进度标记的依据，不是断点续传）
 	To    string
 }
 
@@ -486,7 +486,7 @@ func (s *Source) readPage(ctx context.Context, conn *pgx.Conn, ti *tableInfo,
 	var args []any
 	switch {
 	case noPK:
-		// 无主键：按 ctid 游标（表级断点，预检已警告过重来成本）
+		// 无主键：按 ctid 游标（只能表级重来，预检已警告过成本）
 		if cursor != "" {
 			sel += " WHERE ctid > $1::text::tid"
 			args = append(args, cursor)

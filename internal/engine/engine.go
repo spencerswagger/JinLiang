@@ -725,7 +725,7 @@ func (r *runner) snapshot(ctx context.Context) error {
 			r.note(ctx, "清空了上次没搬完的 "+name+"（重搬全量，避免留下源端已删除的行）")
 		}
 	}
-	// 新的一次全量用的是一个新导出视图，旧的块断点没有意义。
+	// 新的一次全量用的是一个新导出视图，旧的块进度标记没有意义。
 	if err := r.sink.ResetChunks(ctx); err != nil {
 		return err
 	}

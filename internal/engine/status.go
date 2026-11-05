@@ -92,17 +92,25 @@ func StatusFor(ctx context.Context, opt Options) (Status, error) {
 		return st, nil
 	}
 	defer src.Close()
-	if parsed, err := src.ParsePosition(st.Position); err == nil {
-		pos, ok := parsed.(pgsource.Position)
-		if !ok {
-			st.Note = "目标库里的位点本工具不认识，可能被别的程序写过"
-			return st, nil
-		}
-		if !pos.IsZero() {
-			if cur, err := src.CurrentLSN(ctx); err == nil {
-				st.LagBytes = int64(cur.LSN) - int64(pos.LSN)
-				if st.LagBytes < 0 {
-					st.LagBytes = 0
+	if st.Position != "" {
+		parsed, err := src.ParsePosition(st.Position)
+		switch {
+		case err != nil:
+			// 不静默：位点解析不了说明目标库里的进度标记被改过或版本不认，
+			// 这种情况必须让人看见（以前这里直接忽略，看起来像「没有位点」）。
+			st.Note = "目标库里的进度标记解析失败：" + err.Error()
+		default:
+			pos, ok := parsed.(pgsource.Position)
+			if !ok {
+				st.Note = "目标库里的位点本工具不认识，可能被别的程序写过"
+				break
+			}
+			if !pos.IsZero() {
+				if cur, err := src.CurrentLSN(ctx); err == nil {
+					st.LagBytes = int64(cur.LSN) - int64(pos.LSN)
+					if st.LagBytes < 0 {
+						st.LagBytes = 0
+					}
 				}
 			}
 		}

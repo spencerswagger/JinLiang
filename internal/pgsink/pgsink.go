@@ -647,7 +647,11 @@ func TypeMapLoss(col source.Column) (catalog.Mapping, bool) {
 	return catalog.Map(catalog.Postgres, catalog.Postgres, col.Type)
 }
 
-// ── 全量：一块一个事务（数据 + 块断点 + 位点） ───────────────────
+// ── 全量：一块一个事务（数据 + 块进度标记 + 位点） ─────────────────
+//
+// 说清楚一件事：这些块标记**不是「断点续传」**。恢复时是把整张表重搬一遍
+// （新的导出一致性视图），块标记只用来回答两件事：这张表上次是不是我们写的、
+// 写到第几块了（给人看进度）。跨进程复用同一个快照视图是不成立的。
 
 // BulkApply writes one snapshot chunk: data, chunk marker and position commit
 // together. The stage table + INSERT ... SELECT gives upsert semantics, so a
@@ -694,7 +698,8 @@ func (s *Sink) BulkApply(ctx context.Context, ti *tableInfo, chunkNo int, rows [
 		}
 	}
 
-	// 块断点：重启时能看出「哪些块已经落地」，也让人能核对进度。
+	// 块进度：重启时能看出「哪些块落地过」，也让人能核对进度。
+	// 注意：恢复走的是整表重搬，不是从这里接着搬（见本节开头说明）。
 	ck := fmt.Sprintf(`INSERT INTO %s (job_key, table_name, chunk_no, range_from, range_to, done, rows)
 		VALUES ($1,$2,$3,$4,$5,true,$6)
 		ON CONFLICT (job_key, table_name, chunk_no) DO UPDATE SET done=true, rows=EXCLUDED.rows`,
