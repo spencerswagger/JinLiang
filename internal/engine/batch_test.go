@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -441,3 +442,67 @@ type fakePosition string
 
 func (f fakePosition) String() string { return string(f) + ":v1:x" }
 func (f fakePosition) Kind() string   { return string(f) }
+
+// 租约被接管/续不上时，必须**真的停下来**：只 emit 一句话然后继续写，
+// 等于两个进程同时写同一张目标表（Owl 的必改 2）。
+func TestWatchLeaseCancelsRunWhenLeaseStolen(t *testing.T) {
+	r := &runner{leaseTTL: time.Minute}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	r.cancelRun = cancel
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		r.watchLease(ctx, 5*time.Millisecond, func(context.Context) (bool, error) {
+			return false, nil // 被接管
+		})
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("watchLease 应该在被接管后立刻返回")
+	}
+	if !r.leaseLost.Load() {
+		t.Fatal("丢了租约必须置 leaseLost")
+	}
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("丢了租约必须 cancel 整个 run（否则写路径继续跑）")
+	}
+	if err := r.leaseLostError(); !strings.Contains(err.Error(), "租约丢了") {
+		t.Fatalf("错误文案应说清是租约丢了，得到: %v", err)
+	}
+}
+
+// 一次续租失败不算丢（网络抖一下就停会把任务打断），连续两次才停。
+func TestWatchLeaseToleratesSingleRenewFailure(t *testing.T) {
+	r := &runner{leaseTTL: time.Minute}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	r.cancelRun = cancel
+
+	calls := 0
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		r.watchLease(ctx, 5*time.Millisecond, func(context.Context) (bool, error) {
+			calls++
+			if calls == 1 {
+				return false, errors.New("网络抖了一下")
+			}
+			return true, nil
+		})
+	}()
+	time.Sleep(80 * time.Millisecond)
+	cancel()
+	<-done
+	if r.leaseLost.Load() {
+		t.Fatal("单次失败不该判定丢租约")
+	}
+	if calls < 2 {
+		t.Fatalf("应该继续续租，实际只调了 %d 次", calls)
+	}
+}
