@@ -120,3 +120,19 @@ func TestReplicationStreamRejectsUpperCaseTLSKey(t *testing.T) {
 		}
 	}
 }
+
+func TestReplicationStreamAcceptsUppercaseOffValues(t *testing.T) {
+	// 键与值都要大小写归一：`TLS=OFF` / `Tls=False` / `TLS=NONE` 是「明确承认明文」，
+	// 必须放行，否则用户按大写写了反而被拒——那会把人推向「干脆不写 tls」。
+	for _, key := range []string{"tls", "TLS", "Tls"} {
+		for _, val := range []string{"off", "OFF", "False", "FALSE", "none", "NONE", "disabled", "Disabled", ""} {
+			s := &Source{ep: dsn.Endpoint{
+				Host: "127.0.0.1", Port: 3306, Database: "shop", Username: "u",
+				Params: map[string]string{key: val},
+			}}
+			if err := s.checkReplicationTLS(); err != nil {
+				t.Fatalf("%s=%q 属于「明确不要 TLS」，应放行: %v", key, val, err)
+			}
+		}
+	}
+}
