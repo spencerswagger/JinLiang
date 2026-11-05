@@ -159,6 +159,32 @@ func Build(in Input, opts Options) Plan {
 		}
 		plan.Decisions = append(plan.Decisions, d)
 	}
+
+	// 第二遍：publication 没有 active 语义，只能靠「同 job_key 的 slot 是否仍在读」
+	// 判断。否则租约缺失/过期时，正在跑的 publication 会落进「本实例创建且空闲」，
+	// 默认档就被删掉 —— 结果是 slot 活着、publication 没了，下次重连才炸。
+	activeJobs := map[string]bool{}
+	for _, d := range plan.Decisions {
+		if d.Kind == "slot" && d.Active && d.JobKey != "" {
+			activeJobs[d.JobKey] = true
+		}
+	}
+	for i := range plan.Decisions {
+		d := &plan.Decisions[i]
+		if d.Kind != "publication" || !d.Delete || !activeJobs[d.JobKey] {
+			continue
+		}
+		plan.Counts[d.Verdict]--
+		if d.Owner == in.InstanceID {
+			d.Verdict = InUseByThisInstance
+		} else {
+			d.Verdict = InUseByOtherInstance
+		}
+		d.Delete = false
+		plan.Deletable--
+		plan.Counts[d.Verdict]++
+		d.Reason += "；同任务的同步书签仍在读（active=true），发布清单可能仍在使用"
+	}
 	return plan
 }
 

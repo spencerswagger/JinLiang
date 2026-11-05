@@ -106,6 +106,58 @@ func TestForceAllowsIdleOtherInstanceObject(t *testing.T) {
 	}
 }
 
+// Regression for Owl #10 item 2: publication has no active flag, so a running
+// job's publication must be protected by the still-active slot of the same job
+// even when the lease is missing/expired.
+func TestPublicationProtectedWhileSameJobSlotIsActive(t *testing.T) {
+	now := time.Now()
+	in := Input{
+		InstanceID:    "me",
+		Now:           now,
+		RegistryKnown: true,
+		Registered: []runtime.Object{
+			{Name: "jl_jobpub0001_1", Kind: "slot", JobKey: "jobpub0001", InstanceID: "me"},
+			{Name: "jl_jobpub0001", Kind: "publication", JobKey: "jobpub0001", InstanceID: "me"},
+		},
+		// 租约缺失：只看 publication 自己的字段会误判成「本实例创建且空闲」。
+		Live: []LiveObject{
+			{Name: "jl_jobpub0001_1", Kind: "slot", Active: true, Exists: true},
+			{Name: "jl_jobpub0001", Kind: "publication", Exists: true},
+		},
+	}
+	p := Build(in, Options{DryRun: true})
+	if d := verdictOf(p, "jl_jobpub0001"); d.Verdict != InUseByThisInstance || d.Delete {
+		t.Fatalf("publication must be protected by the active slot: %+v", d)
+	}
+	if p.Deletable != 0 {
+		t.Fatalf("deletable=%d, want 0", p.Deletable)
+	}
+}
+
+func TestPublicationIsEligibleWhenJobIsIdle(t *testing.T) {
+	now := time.Now()
+	in := Input{
+		InstanceID:    "me",
+		Now:           now,
+		RegistryKnown: true,
+		Registered: []runtime.Object{
+			{Name: "jl_jobpub0002_1", Kind: "slot", JobKey: "jobpub0002", InstanceID: "me"},
+			{Name: "jl_jobpub0002", Kind: "publication", JobKey: "jobpub0002", InstanceID: "me"},
+		},
+		Live: []LiveObject{
+			{Name: "jl_jobpub0002_1", Kind: "slot", Active: false, Exists: true},
+			{Name: "jl_jobpub0002", Kind: "publication", Exists: true},
+		},
+	}
+	p := Build(in, Options{DryRun: true})
+	if d := verdictOf(p, "jl_jobpub0002"); d.Verdict != OwnedByThisInstance || !d.Delete {
+		t.Fatalf("idle publication should be eligible: %+v", d)
+	}
+	if p.Deletable != 2 {
+		t.Fatalf("deletable=%d, want 2 (slot + publication)", p.Deletable)
+	}
+}
+
 func TestUnknownNeverDeletedEvenWithForce(t *testing.T) {
 	now := time.Now()
 	in := baseInput(now)

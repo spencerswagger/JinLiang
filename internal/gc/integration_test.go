@@ -142,4 +142,31 @@ func TestGCIntegrationOtherInstanceSlotIsNeverTouched(t *testing.T) {
 	if d := find(forced, "jl_gctest_1"); d.Delete {
 		t.Fatalf("--force must not delete a leased other-instance slot: %+v", d)
 	}
+
+	// publication 的真库用例：登记为本实例、空闲 → 可清；真删后应从源端消失。
+	_, _ = src.Exec(ctx, `DROP PUBLICATION IF EXISTS jl_gctestpub`)
+	mustExec(t, src, `CREATE PUBLICATION jl_gctestpub FOR ALL TABLES`)
+	mustExec(t, tgt, `INSERT INTO _jl_object (object_name, object_kind, job_key, instance_id)
+		VALUES ('jl_gctestpub','publication','gctestpub','me')
+		ON CONFLICT (object_name) DO UPDATE SET dropped_at = NULL`)
+	t.Cleanup(func() { _, _ = src.Exec(context.Background(), `DROP PUBLICATION IF EXISTS jl_gctestpub`) })
+
+	pubPlan, err := gc.Load(ctx, src, tgt, "me", gc.Options{DryRun: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub := find(pubPlan, "jl_gctestpub")
+	if pub.Verdict != gc.OwnedByThisInstance || !pub.Delete {
+		t.Fatalf("idle publication should be eligible: %+v", pub)
+	}
+	if _, err := gc.Execute(ctx, pubPlan, src); err != nil {
+		t.Fatal(err)
+	}
+	pubs, err := src.Publications(ctx, "jl_gctestpub")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pubs) != 0 {
+		t.Fatalf("publication should be dropped, still present: %+v", pubs)
+	}
 }
