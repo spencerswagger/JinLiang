@@ -13,6 +13,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 )
@@ -27,7 +28,8 @@ func main() {
   jinliang serve    [--listen 127.0.0.1:8080] [--data-dir DIR] [--key-file FILE] [--api-token TOKEN]
   jinliang import   --file job.yaml [--dry-run] [--data-dir DIR]
   jinliang export   [--job ID|NAME] [--out FILE] [--all] [--data-dir DIR]
-  jinliang run      --job ID|NAME [--json] [--data-dir DIR]
+  jinliang run      --job ID|NAME [--json] [--snapshot-only] [--verify] [--data-dir DIR]
+  jinliang status   [--job ID|NAME] [--json] [--verify] [--data-dir DIR]
   jinliang doctor   [--json] [--data-dir DIR]
   jinliang version
 
@@ -57,6 +59,8 @@ func main() {
 		err = cmdExport(args)
 	case "run":
 		err = cmdRun(args)
+	case "status":
+		err = cmdStatus(args)
 	case "doctor":
 		err = cmdDoctor(args)
 	case "help", "-h", "--help":
@@ -68,6 +72,11 @@ func main() {
 		os.Exit(2)
 	}
 	if err != nil {
+		var ec *exitError
+		if errors.As(err, &ec) {
+			fmt.Fprintf(os.Stderr, "jinliang %s: %v\n", cmd, err)
+			os.Exit(ec.code)
+		}
 		fmt.Fprintf(os.Stderr, "jinliang %s: %v\n", cmd, err)
 		os.Exit(1)
 	}
