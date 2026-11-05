@@ -46,13 +46,16 @@ type Options struct {
 }
 
 type tableInfo struct {
-	ref      source.TableRef
-	cols     []string
-	types    []string
-	pk       []string
-	pkIdx    []int
-	hasPK    bool
-	colIndex map[string]int
+	ref   source.TableRef
+	cols  []string
+	types []string
+	// collations[i] 是第 i 列的排序规则（空 = 用类型/库的默认）。跨库必须带上：
+	// 排序规则不同会让唯一索引判重与 ORDER BY 结果悄悄变样。
+	collations []string
+	pk         []string
+	pkIdx      []int
+	hasPK      bool
+	colIndex   map[string]int
 }
 
 // Sink is the PostgreSQL write side. It owns one dedicated connection: writes
@@ -122,6 +125,7 @@ func buildTables(cat source.Catalog) (map[string]*tableInfo, []string) {
 			ti.colIndex[c.Name] = len(ti.cols)
 			ti.cols = append(ti.cols, c.Name)
 			ti.types = append(ti.types, c.Type)
+			ti.collations = append(ti.collations, c.Collation)
 		}
 		for _, name := range ti.pk {
 			if idx, ok := ti.colIndex[name]; ok {
@@ -416,6 +420,9 @@ func (s *Sink) createTableSQL(ti *tableInfo) string {
 			b.WriteString(", ")
 		}
 		b.WriteString(pgwire.Quote(col) + " " + ti.types[i])
+		if coll := ti.collation(i); coll != "" {
+			b.WriteString(" COLLATE " + pgwire.Quote(coll))
+		}
 	}
 	if ti.hasPK {
 		quoted := make([]string, len(ti.pk))
@@ -435,13 +442,24 @@ func (s *Sink) createTable(ctx context.Context, ti *tableInfo) error {
 	return nil
 }
 
+// collation returns the explicit collation of column i ("" = type default).
+func (ti *tableInfo) collation(i int) string {
+	if i < len(ti.collations) {
+		return ti.collations[i]
+	}
+	return ""
+}
+
 // reconcileColumns adds missing columns (the whitelisted "add column" DDL) and
 // refuses to guess when an existing column has a different type.
 func (s *Sink) reconcileColumns(ctx context.Context, ti *tableInfo) error {
 	rows, err := s.conn.Query(ctx,
-		`SELECT a.attname, format_type(a.atttypid, a.atttypmod)
+		`SELECT a.attname, format_type(a.atttypid, a.atttypmod),
+		        COALESCE(co.collname, '')
 		 FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid
 		 JOIN pg_namespace n ON n.oid=c.relnamespace
+		 JOIN pg_type t ON t.oid=a.atttypid
+		 LEFT JOIN pg_collation co ON co.oid=a.attcollation AND a.attcollation <> t.typcollation
 		 WHERE n.nspname=$1 AND c.relname=$2 AND a.attnum>0 AND NOT a.attisdropped`,
 		ti.ref.Schema, ti.ref.Table)
 	if err != nil {
@@ -449,12 +467,14 @@ func (s *Sink) reconcileColumns(ctx context.Context, ti *tableInfo) error {
 	}
 	defer rows.Close()
 	have := map[string]string{}
+	haveColl := map[string]string{}
 	for rows.Next() {
-		var name, typ string
-		if err := rows.Scan(&name, &typ); err != nil {
+		var name, typ, coll string
+		if err := rows.Scan(&name, &typ, &coll); err != nil {
 			return err
 		}
 		have[name] = typ
+		haveColl[name] = coll
 	}
 	if err := rows.Err(); err != nil {
 		return err
@@ -470,10 +490,20 @@ func (s *Sink) reconcileColumns(ctx context.Context, ti *tableInfo) error {
 				return fmt.Errorf("%w: 目标表 %s 的列 %s 是 %s，源端是 %s",
 					ErrTypeMismatch, ti.ref.Table, col, typ, ti.types[i])
 			}
+			if want := ti.collation(i); want != "" && haveColl[col] != want {
+				// 排序规则不同 → 唯一索引判重与 ORDER BY 会不一致，而且是静默的。
+				return fmt.Errorf("%w: 目标表 %s 的列 %s 排序规则是 %q，源端是 %q；"+
+					"要么改成一致（ALTER TABLE ... ALTER COLUMN %s TYPE %s COLLATE %q），要么换目标 schema",
+					ErrCollationMismatch, ti.ref.Table, col, haveColl[col], want, col, ti.types[i], want)
+			}
 			continue
 		}
+		def := ti.types[i]
+		if coll := ti.collation(i); coll != "" {
+			def += " COLLATE " + pgwire.Quote(coll)
+		}
 		stmt := fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s",
-			pgwire.Qualified(ti.ref.Schema, ti.ref.Table), pgwire.Quote(col), ti.types[i])
+			pgwire.Qualified(ti.ref.Schema, ti.ref.Table), pgwire.Quote(col), def)
 		if _, err := s.conn.Exec(ctx, stmt); err != nil {
 			return fmt.Errorf("给目标表 %s 加列 %s 失败: %w", ti.ref.Table, col, err)
 		}
@@ -486,6 +516,10 @@ var ErrTargetTableExists = errors.New("目标端已经有同名表")
 
 // ErrTypeMismatch means the target column cannot hold the source value as-is.
 var ErrTypeMismatch = errors.New("目标表的列类型和源端不一致")
+
+// ErrCollationMismatch means the two sides sort/compare the same text column
+// differently — upsert 判重会静默走偏，必须当成结构不兼容处理。
+var ErrCollationMismatch = errors.New("目标表的列排序规则和源端不一致")
 
 func compatibleType(have, want string) bool {
 	hb, _ := splitType(have)

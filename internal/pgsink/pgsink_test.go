@@ -1,6 +1,7 @@
 package pgsink
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -125,5 +126,37 @@ func TestCreateTableSQL(t *testing.T) {
 	want := `CREATE TABLE "public"."orders" ("id" bigint, "payload" text, "amount" numeric(12,2), PRIMARY KEY ("id"))`
 	if got != want {
 		t.Fatalf("建表语句不对:\n 得到 %s\n 期望 %s", got, want)
+	}
+}
+
+// 跨库搬 text 列必须带上排序规则：否则唯一索引判重与 ORDER BY 会静默走偏。
+func TestCreateTableCarriesCollation(t *testing.T) {
+	cat := source.Catalog{Tables: []source.Table{{
+		TableRef: source.TableRef{Schema: "public", Table: "t"},
+		Columns: []source.Column{
+			{Name: "id", Type: "bigint"},
+			{Name: "name", Type: "text", Collation: "C"},
+			{Name: "note", Type: "text"},
+		},
+		PrimaryKey:  []string{"id"},
+		HasStablePK: true,
+	}}}
+	tables, _ := buildTables(cat)
+	got := (&Sink{}).createTableSQL(tables["public.t"])
+	want := `CREATE TABLE "public"."t" ("id" bigint, "name" text COLLATE "C", "note" text, PRIMARY KEY ("id"))`
+	if got != want {
+		t.Fatalf("建表语句应带排序规则:\n 得到 %s\n 期望 %s", got, want)
+	}
+}
+
+// ValidateBatch 必须跑在**碰数据库之前**：非法批次整批不落，不能先写一半。
+func TestApplyRejectsInvalidBatchBeforeTouchingTarget(t *testing.T) {
+	s := &Sink{} // 没有连接：只要碰到 conn 就会 panic，能证明校验在前
+	err := s.Apply(context.Background(), []source.Event{{Kind: source.EvBegin}}, nil)
+	if err == nil {
+		t.Fatal("没有 EvCommit 收尾的批次必须被拒绝")
+	}
+	if !strings.Contains(err.Error(), "事务边界") {
+		t.Fatalf("错误应说明是事务边界问题，得到 %v", err)
 	}
 }

@@ -146,11 +146,12 @@ type Source struct {
 }
 
 type tableInfo struct {
-	ref      source.TableRef
-	cols     []string
-	types    []string
-	pk       []string
-	colIndex map[string]int
+	ref        source.TableRef
+	cols       []string
+	types      []string
+	collations []string // 与 cols 同序；空 = 类型/库默认排序规则
+	pk         []string
+	colIndex   map[string]int
 }
 
 // Open dials the source (no writes, no state tables here).
@@ -166,6 +167,7 @@ func Open(ctx context.Context, opt Options) (*Source, error) {
 			ti.colIndex[c.Name] = len(ti.cols)
 			ti.cols = append(ti.cols, c.Name)
 			ti.types = append(ti.types, c.Type)
+			ti.collations = append(ti.collations, c.Collation)
 		}
 		key := t.Schema + "." + t.Table
 		s.tables[key] = ti
@@ -866,11 +868,14 @@ func (s *Source) buildRelation(m *pglogrepl.RelationMessage) (*relation, error) 
 		}
 		rel.columns = append(rel.columns, col.Name)
 		rel.mapTo = append(rel.mapTo, idx)
-		typ := ""
+		typ, coll := "", ""
 		if idx < len(ti.types) {
 			typ = ti.types[idx]
 		}
-		tbl.Columns = append(tbl.Columns, source.Column{Name: col.Name, Type: typ})
+		if idx < len(ti.collations) {
+			coll = ti.collations[idx]
+		}
+		tbl.Columns = append(tbl.Columns, source.Column{Name: col.Name, Type: typ, Collation: coll})
 	}
 	rel.table = tbl
 	return rel, nil

@@ -490,7 +490,10 @@ func (r *runner) prepare(ctx context.Context) error {
 		return err
 	}
 	r.priorPhase = phaseInTarget
-	r.needSnapshot = r.mode() != "continuous" && !initialCopyDone(phaseInTarget, posInTarget)
+	// once = 「搬一次」：再跑一次就应该再搬一次（upsert 幂等），不能因为上次跑完过
+	// 就什么都不做然后假装成功。只有 continuous+initial 才按「上次到哪了」续跑。
+	r.needSnapshot = r.mode() != "continuous" &&
+		(r.mode() == "once" || !initialCopyDone(phaseInTarget, posInTarget))
 	prep, err := src.Prepare(ctx, pgsource.PrepareOptions{Snapshot: r.needSnapshot})
 	if err != nil {
 		return fmt.Errorf("准备源端对象失败: %w", err)
@@ -785,6 +788,15 @@ func (r *runner) drain(ctx context.Context, exit int, msg string) error {
 	r.exitCode = exit
 	dctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
+	if r.phase != state.Draining && !state.CanTransition(r.phase, state.Draining) {
+		// 有些阶段不能直接进 Draining（例如 once 发现「没有可搬的存量」时还停在
+		// Prepare）。按状态机允许的路径补一步空转，而不是硬写一个非法终态。
+		if state.CanTransition(r.phase, state.Streaming) {
+			if err := r.phaseTo(dctx, state.Streaming); err != nil {
+				return err
+			}
+		}
+	}
 	if r.phase != state.Draining && state.CanTransition(r.phase, state.Draining) {
 		if err := r.phaseTo(dctx, state.Draining); err != nil {
 			return err
