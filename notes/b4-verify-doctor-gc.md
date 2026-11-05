@@ -106,6 +106,27 @@ $ scripts/check_binary_size.sh dist/jinliang
 binary dist/jinliang: 19591328 bytes (18 MB), limit 25 MB → OK
 ```
 
+## Owl 复审整改（4 条，各自一个 commit）
+
+1. **幽灵 run 不再按 started_at 判死**：`RunInfo` 加 `HeartbeatAt` / `HeartbeatKnown`，
+   判定改为 `COALESCE(heartbeat_at, started_at)` + `StaleAfter(30s)=90s`（与
+   runs-liveness 同一口径）；旧控制库没有心跳列时只 `warn`，不把健康系统判红。
+   适配器直接探测 `runs.heartbeat_at` 列（#5 合并前后都可用）。
+   测试：`TestLongRunWithFreshHeartbeatIsHealthy`、`TestLongRunWithoutHeartbeatIsWarningNotProblem`、
+   `TestGhostRunDetected`（心跳过期才 problem）。
+2. **publication 不再被默认档误删**：第二遍判定——同 `job_key` 的 slot 仍 `active`
+   时，publication 一并判 `InUseByThisInstance`/`InUseByOtherInstance` 且 `Delete=false`。
+   测试：`TestPublicationProtectedWhileSameJobSlotIsActive`、`TestPublicationIsEligibleWhenJobIsIdle`；
+   真库用例 `TestGCIntegrationOtherInstanceSlotIsNeverTouched` 里补了
+   `CREATE PUBLICATION jl_gctestpub` → 计划可清 → 真删 → 源端消失。
+3. **版本化 binlog 位点**：`BinlogPos` 先解析 `file=…;pos=…`（带不带 `mysql:v1;` 前缀都行），
+   再退回 `file:pos`；`gtid:` 明确 `ok=false`。
+   测试：`TestBinlogPosFormats`（9 个用例，含两种格式与畸形输入）。
+4. **remedy 有测试了**：`TestRetryDeadLetterIsIdempotentAndDoesNotMovePosition`
+   ——重放两次：目标表只有一行、第二次报「不存在」、`_jl_meta.position` 保持 `POS-1`。
+
+CI 集成步骤同步加上 `./internal/remedy`。
+
 ## 共享契约与边界
 
 - 未改 `internal/source/contract.go`、`internal/sink/contract.go`；未动 `internal/engine`、`internal/mysqlsource`、`internal/control`、`internal/httpapi`。
