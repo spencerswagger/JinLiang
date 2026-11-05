@@ -66,12 +66,21 @@ type TableRef struct {
 }
 
 // Column is one catalog column.
+//
+// Type 是**完整类型文本**，含长度/精度/unsigned（`varchar(255)`、`numeric(12, 2)`、
+// `bigint unsigned`、`datetime(6)`）。`catalog.normalizeType` 就按这个形状解析，
+// 别在这里塞 charset 之类的修饰——那是下面两个字段的事。
 type Column struct {
 	Name     string  `json:"name"`
 	Type     string  `json:"type"`
 	Nullable bool    `json:"nullable"`
 	Default  *string `json:"default,omitempty"`
 	Comment  string  `json:"comment,omitempty"`
+	// Charset / Collation 是源端的字符集与排序规则（可空：非字符类型或拿不到时留空）。
+	// MySQL 的 binlog_row_metadata=FULL 与 PG 的 relation message 都给了这两项，
+	// 不落进契约就只能丢掉或硬塞进 Type——那会让跨字符集的 upsert 判重与排序悄悄不一致。
+	Charset   string `json:"charset,omitempty"`
+	Collation string `json:"collation,omitempty"`
 }
 
 // Table is one catalog table.
@@ -138,8 +147,29 @@ type RowHandler func(ctx context.Context, row Row) error
 // Position is an opaque, comparable checkpoint. Concrete types live in each
 // connector package (PGPosition, MySQLPosition) and serialize to one string
 // that is written to the target database inside the same transaction as data.
+//
+// 契约（2026-11-05 裁决，为三轨并行定最小公共面）：
+//   - String() 是**唯一**落到目标库的形态，格式固定为 "<kind>:v1:<payload>"：
+//     kind 是产生它的连接类型（postgres / mysql），v1 是位点格式版本，
+//     payload 由连接器自己定义（PG 的 "0/16B6C50"、MySQL 的 "mysql-bin.000003:1234"
+//     或 GTID 集合）。位点是写进目标库、要跨版本存活的，格式一变旧库就读不懂；
+//     **加版本前缀这件事现在零成本，以后是迁移**。解析入口见 SplitPosition。
+//   - Kind() **只表达端点类型**（`postgres` / `mysql`），取值与 Endpoint.Kind() 同值；
+//     **不返回位点变体**。位点变体（例如 MySQL 的 `file_pos` 与 `gtid` 两套坐标）
+//     由连接器自己的坐标表达——MySQL 用 `Coordinate()` 返回 `mysql_file_pos` / `mysql_gtid`
+//     并写进 payload（`;coord=…`），不进 Kind()。
+//     为什么：Kind() 的消费方是引擎做「这个位点属于哪个源」的对账；让它返回细分值，
+//     等于逼引擎知道每种源的内部变体，这层抽象就白做了。
+//   - 前缀里的 kind 也只写 `postgres` / `mysql`，变体永远在 payload 里（见上一条）。
+//     引擎拿它做对账：kind 与当前源不匹配时给 E1010（user_action：换回对应的源，或重新开始同步），
+//     **不要用 E3001**——那是「变更流水接不上，建议 --resync 重搬全量」，
+//     拿它报「这串位点是 MySQL 的、你连的是 PG」会把用户引去重搬一遍全量。
+//   - 位点只在**事务边界**上前进（见 sink.Sink.Apply 的不变量与 ValidateBatch），
+//     因此两次提交之间的比较只需要可判等，不需要全序。
 type Position interface {
 	String() string
+	// Kind 返回产生这个位点的连接类型（postgres / mysql）。
+	Kind() string
 }
 
 // EventKind classifies one change event.
@@ -166,6 +196,14 @@ type Event struct {
 	TxID     string    // 用于把同一事务的事件串起来
 	CommitTS time.Time // 源端提交时间；拿不到时为零值（PG track_commit_timestamp=off）
 	DDL      string    // EvDDL 时的原始语句
+	// Relation 是这条事件的行镜像所依据的列定义（2026-11-05 裁决）。
+	//   - 非 nil：New/Old 的 Values 按这份 Table.Columns 的顺序对齐。PG 的 Relation
+	//     消息、MySQL 开了 binlog_row_metadata=FULL 时都能直接给出，两者不需要互相迁就。
+	//   - nil：按 EnsureSchema 时那份 catalog 对齐（连接器没拿到更细的元数据）。
+	// 源端 DDL 之后，连接器必须先发一条**带新 Relation** 的事件（EvDDL 本身或其紧随的事件），
+	// 再发按新列定义的数据事件——否则引擎无从判断"这一行有哪几列"，只能按旧 catalog 猜错。
+	// 实现约定：同一版定义请复用同一个指针（指针相等即同一版），不要每条事件都新建。
+	Relation *Table
 }
 
 // EventHandler consumes the stream; returning an error stops the stream.
@@ -248,6 +286,13 @@ type Source interface {
 	Snapshot(ctx context.Context, opt SnapshotOpt, onRow RowHandler) (Position, error)
 	// Stream emits changes from pos until ctx is cancelled.
 	Stream(ctx context.Context, from Position, onEvent EventHandler) error
+	// ParsePosition 把目标库里存着的位点串还原成连接器自己的类型（2026-11-05 裁决）。
+	//
+	// 为什么放在 Source 上而不是让引擎自己解析：位点串的格式归连接器所有，引擎不该
+	// import 具体连接器包（否则 engine 与 pgsource/mysqlsource 互相依赖）。
+	// 解析失败按「位点与本连接类型不匹配或已损坏」处理，返回错误让上层给 E3001，
+	// 不要静默回落到全量重搬。
+	ParsePosition(raw string) (Position, error)
 	// Advance moves the source-side checkpoint forward (slot advance / purge).
 	Advance(ctx context.Context, to Position) error
 	// Cleanup removes objects this job created (slot, publication, temp snapshot).
