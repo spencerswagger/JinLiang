@@ -110,7 +110,7 @@ UPDATE runs SET kind = 'stub' WHERE stub = 1;   -- 回填历史桩运行
 |---|---|---|---|---|---|---|
 | GET | `/api/health` | 存活探测，只回版本与 uptime | 公开 | 不需要 | 是（只读） | 200 |
 | GET | `/api/session` | 是否已设口令、调用方是否已登录；**顺带种下 `jl_csrf` cookie**（首启端点要 CSRF，token 只能由 GET 侧发） | 公开 | 不需要 | 是（只读） | 200 |
-| POST | `/api/setup` | 设置管理员口令（argon2id），只允许一次；成功后发会话。**只接受本机来源**：非本机 403（判定同时要求 `RemoteAddr` 是本机，且请求不带 `Forwarded` / `X-Forwarded-For` / `X-Real-IP` 任一转发头——带了就按非本机处理）。反代场景请先在控制台本机完成首启 | 公开，**仅本机**（限速 5 次/分钟） | **需要** | 否（第二次 409） | 201 |
+| POST | `/api/setup` | 设置管理员口令（argon2id），只允许一次；成功后发会话。反代场景请先在控制台本机完成首启 | **仅本机**（未设口令时：非本机 → 403；已配置 → 409；限速 5 次/分钟）。「本机」= `RemoteAddr` 是 loopback **且** 请求不带 `Forwarded` / `X-Forwarded-For` / `X-Real-IP` 任一转发头——带了就按非本机 fail-closed | **需要** | 否（第二次 409） | 201 |
 | POST | `/api/login` | 口令换会话 token | 公开（限速 5 次/分钟） | 不需要（此时还没有会话） | 否（每次发新会话） | 200 |
 | POST | `/api/logout` | 丢掉当前会话并清 cookie | 已配置 | 需要 | 是 | 200 |
 | GET | `/api/meta` | 版本、`instance_id`、`schema_version`、`data_dir`、鉴权模式 | 已配置 | 不需要 | 是（只读） | 200 |
