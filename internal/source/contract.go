@@ -66,12 +66,21 @@ type TableRef struct {
 }
 
 // Column is one catalog column.
+//
+// Type 是**完整类型文本**，含长度/精度/unsigned（`varchar(255)`、`numeric(12, 2)`、
+// `bigint unsigned`、`datetime(6)`）。`catalog.normalizeType` 就按这个形状解析，
+// 别在这里塞 charset 之类的修饰——那是下面两个字段的事。
 type Column struct {
 	Name     string  `json:"name"`
 	Type     string  `json:"type"`
 	Nullable bool    `json:"nullable"`
 	Default  *string `json:"default,omitempty"`
 	Comment  string  `json:"comment,omitempty"`
+	// Charset / Collation 是源端的字符集与排序规则（可空：非字符类型或拿不到时留空）。
+	// MySQL 的 binlog_row_metadata=FULL 与 PG 的 relation message 都给了这两项，
+	// 不落进契约就只能丢掉或硬塞进 Type——那会让跨字符集的 upsert 判重与排序悄悄不一致。
+	Charset   string `json:"charset,omitempty"`
+	Collation string `json:"collation,omitempty"`
 }
 
 // Table is one catalog table.
@@ -140,12 +149,17 @@ type RowHandler func(ctx context.Context, row Row) error
 // that is written to the target database inside the same transaction as data.
 //
 // 契约（2026-11-05 裁决，为三轨并行定最小公共面）：
-//   - String() 是**唯一**落到目标库的形态，必须自描述到能独立解析（PG 的 "0/16B6C50"、
-//     MySQL 的 "mysql-bin.000003:1234" 或 GTID 集合），不依赖进程内状态；
-//   - Kind() 与 Endpoint.Kind() 同值（postgres / mysql），引擎用它做对账：位点串与连接
-//     类型不匹配时给 E3001，而不是猜；
-//   - 位点只在**事务边界**上前进（见 sink.Sink.Apply 的不变量），因此两次提交之间的
-//     比较只需要可判等，不需要全序。
+//   - String() 是**唯一**落到目标库的形态，格式固定为 "<kind>:v1:<payload>"：
+//     kind 是产生它的连接类型（postgres / mysql），v1 是位点格式版本，
+//     payload 由连接器自己定义（PG 的 "0/16B6C50"、MySQL 的 "mysql-bin.000003:1234"
+//     或 GTID 集合）。位点是写进目标库、要跨版本存活的，格式一变旧库就读不懂；
+//     **加版本前缀这件事现在零成本，以后是迁移**。解析入口见 SplitPosition。
+//   - Kind() 与 Endpoint.Kind() 同值（postgres / mysql）。引擎用它做对账：
+//     位点串的 kind 与当前源不匹配时给 E1010（user_action：换回对应的源，或重新开始同步），
+//     **不要用 E3001**——那是「变更流水接不上，建议 --resync 重搬全量」，
+//     拿它报「这串位点是 MySQL 的、你连的是 PG」会把用户引去重搬一遍全量。
+//   - 位点只在**事务边界**上前进（见 sink.Sink.Apply 的不变量与 ValidateBatch），
+//     因此两次提交之间的比较只需要可判等，不需要全序。
 type Position interface {
 	String() string
 	// Kind 返回产生这个位点的连接类型（postgres / mysql）。

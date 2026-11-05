@@ -21,23 +21,24 @@ type Code string
 // Error codes. Prefix digit encodes class: 1xx user_action, 2xx retryable,
 // 3xx fatal, 4xx bug.
 const (
-	CodeWalLevel            Code = "E1001" // 源库没开变更流水
-	CodeTargetTableExists   Code = "E1002" // 目标表已存在
-	CodeNoReplicationPerm   Code = "E1003" // 账号没有读变更的许可
-	CodeReplicaLoop         Code = "E1004" // 连到只读副本
-	CodeJobRunningElsewhere Code = "E1005" // 另一个实例在跑
-	CodeViewNoStream        Code = "E1006" // 视图没有变更流
-	CodeSecretPerm          Code = "E1007" // 私钥文件权限不对（安全底线）
-	CodeConnUnreachable     Code = "E1008" // 连不上对端数据库（控制面测连/枚举用）
-	CodeAPINotFound         Code = "E1009" // 这个接口不存在（未实现的 /api 路径）
-	CodeTargetReset         Code = "E2001" // 目标连接被重置
-	CodeSourceTimeout       Code = "E2002" // 源库连接超时
-	CodeLockTimeout         Code = "E2003" // 目标库锁等待超时
-	CodePositionGap         Code = "E3001" // 同步进度已不连续
-	CodeSchemaTooNew        Code = "E3002" // 状态表版本比二进制新
-	CodeControlDBBroken     Code = "E3010" // 控制库读不动（sqlite 损坏/版本不符）
-	CodeUnsupportedType     Code = "E4001" // 未支持的类型（应已兜底）
-	CodeDecoderBug          Code = "E4002" // 解码器内部不一致
+	CodeWalLevel             Code = "E1001" // 源库没开变更流水
+	CodeTargetTableExists    Code = "E1002" // 目标表已存在
+	CodeNoReplicationPerm    Code = "E1003" // 账号没有读变更的许可
+	CodeReplicaLoop          Code = "E1004" // 连到只读副本
+	CodeJobRunningElsewhere  Code = "E1005" // 另一个实例在跑
+	CodeViewNoStream         Code = "E1006" // 视图没有变更流
+	CodeSecretPerm           Code = "E1007" // 私钥文件权限不对（安全底线）
+	CodeConnUnreachable      Code = "E1008" // 连不上对端数据库（控制面测连/枚举用）
+	CodeAPINotFound          Code = "E1009" // 这个接口不存在（未实现的 /api 路径）
+	CodePositionKindMismatch Code = "E1010" // 目标库里的位点属于别的数据库类型
+	CodeTargetReset          Code = "E2001" // 目标连接被重置
+	CodeSourceTimeout        Code = "E2002" // 源库连接超时
+	CodeLockTimeout          Code = "E2003" // 目标库锁等待超时
+	CodePositionGap          Code = "E3001" // 同步进度已不连续
+	CodeSchemaTooNew         Code = "E3002" // 状态表版本比二进制新
+	CodeControlDBBroken      Code = "E3010" // 控制库读不动（sqlite 损坏/版本不符）
+	CodeUnsupportedType      Code = "E4001" // 未支持的类型（应已兜底）
+	CodeDecoderBug           Code = "E4002" // 解码器内部不一致
 )
 
 // Spec is everything the user sees for one error: the four-part prompt
@@ -132,6 +133,16 @@ var specs = []Spec{
 			"B1 才会补 verify / gc：在那之前它们会明确告诉你「没有这个接口」",
 		},
 		Risk: "无：这条只影响调用方判断，不会改动任何数据",
+	},
+	{
+		Code: CodePositionKindMismatch, Class: UserAction,
+		Message: "进度标记与当前源对不上",
+		Why:     "目标库里存的进度是另一种数据库写的（比如 MySQL 的位点、这次连的却是 PostgreSQL），我们不知道该从哪儿接着读",
+		Next: []string{
+			"换回当初那个源再跑：进度标记只能对着产生它的那种源用",
+			"确实要换源：删掉目标端的同步元数据后重跑，会重搬一次全量",
+		},
+		Risk: "重搬全量期间目标端数据会短暂不一致，耗时随数据量增长",
 	},
 	{
 		Code: CodeControlDBBroken, Class: Fatal,
