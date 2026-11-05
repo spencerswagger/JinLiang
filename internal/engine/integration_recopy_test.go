@@ -112,10 +112,19 @@ func cfgOf(t *testing.T, dsn string) *pgx.ConnConfig {
 	return cfg
 }
 
-// 这是 Owl 要的那条可证伪用例：
-// 目标端预置 3 行（用户自己的表，append 模式复用它）→ 上次全量搬到一半（phase=snapshot、有块标记）
-// → 重启重搬 → **那 3 行必须还在**。
+// 这是 Owl 要的那条可证伪用例：目标端**预置 3 行**（用户自己的表，append 模式复用它）
+// → 上次全量搬到一半（phase=snapshot、有块标记）→ 重启重搬 → **那 3 行必须还在**。
 //
+// 为什么「预置行」是这条用例不可省的构造（Owl 的两条证据，写在这里防止以后被简化掉）：
+//  1. CI 里 `scripts/b1_pg_e2e.sh` 的 kill/append 用例，目标库是**这一轮自己建的空表**，
+//     同一段代码换成「用户预置 3 行」就是数据丢失 —— 空表跑绿证明不了这条安全。
+//  2. 默认 `on_exists: error` 时根本进不到 snapshot()：崩后表已存在，EnsureSchema 先返回
+//     ErrTargetTableExists；`recreate` 在 prepare 阶段已经 DROP、清空是冗余。
+//     也就是说「崩在快照中间 → 清空半截表」**只对 append 成立**，而 append 恰恰是唯一
+//     不该清的模式。唯一可达的 TRUNCATE 路径正好落在错误的分支上。
+//
+// 所以判据必须是「这张表是不是本任务建的」（_jl_object 的 table:<schema>.<table>），
+// 不能用「有没有块标记」——BulkApply 对 append 复用的表也会无条件写块标记。
 // 修之前这条会红：旧代码只看「有块标记」就 TRUNCATE，把用户的行一起清掉。
 func TestRecopyDoesNotWipeReusedTable(t *testing.T) {
 	srcDSN, dstDSN := dsns(t)
