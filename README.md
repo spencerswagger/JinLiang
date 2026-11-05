@@ -29,7 +29,16 @@ WAL / binlog / 复制槽 / 位点这些底层概念由工具负责探测、代�
 - **能力运行时探测**，不按版本号分支（8.4 移除了 `SHOW MASTER STATUS`，PG 10 没有 slot 磁盘阀）。
 - **测试矩阵驱动**：每个连接器必须带 `testmatrix.yaml`，缺失即 CI 红；影子模型对拍一致性。
 
-完整设计见 [docs/DESIGN.md](docs/DESIGN.md)。
+## 文档
+
+| 文档 | 内容 |
+|---|---|
+| [docs/DESIGN.md](docs/DESIGN.md) | 设计基线：原则、版本矩阵、降级补偿、性能与测试架构 |
+| [docs/SPEC.md](docs/SPEC.md) | 实现级：`job.yaml`、命令面、预检清单、错误模型、指标、校验协议 |
+| [docs/STATE-SCHEMA.md](docs/STATE-SCHEMA.md) | 状态表 DDL、位点与数据同事务的幂等证明、崩溃恢复时序、孤儿清理 |
+| [examples/job.yaml](examples/job.yaml) | 任务定义示例（带全部字段与注释） |
+
+代码层的契约已经落地，可编译可校验：`internal/source/contract.go`（连接器接口与能力探测）、`internal/sink/contract.go`（写入与同事务提交位点）。
 
 ## 目录
 
