@@ -7,6 +7,7 @@ import (
 
 	"github.com/spencerswagger/jinliang/internal/control"
 	"github.com/spencerswagger/jinliang/internal/core"
+	"github.com/spencerswagger/jinliang/internal/netcheck"
 	"github.com/spencerswagger/jinliang/internal/source"
 )
 
@@ -129,7 +130,13 @@ func (s *Server) pageSetup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	csrf := s.ensureCSRFCookie(w, r)
-	s.renderPage(w, r, "setup.html", pageData{Title: "首次启动", Nav: "setup", CSRF: csrf})
+	data := pageData{Title: "首次启动", Nav: "setup", CSRF: csrf}
+	if !netcheck.IsLoopbackClient(r.RemoteAddr) {
+		// A-1：先告诉他为什么提交不了，而不是让他填完再吃 403
+		e := setupLoopbackOnly()
+		data.Err = &e
+	}
+	s.renderPage(w, r, "setup.html", data)
 }
 
 func (s *Server) pageSetupSubmit(w http.ResponseWriter, r *http.Request) {
@@ -137,6 +144,12 @@ func (s *Server) pageSetupSubmit(w http.ResponseWriter, r *http.Request) {
 	configured, _ := s.store.AdminConfigured(ctx)
 	if configured {
 		http.Redirect(w, r, "/login", http.StatusSeeOther)
+		return
+	}
+	// A-1：还没设口令时，只有本机能定这个口令（表单入口同样守）
+	if !netcheck.IsLoopbackClient(r.RemoteAddr) {
+		e := setupLoopbackOnly()
+		s.renderPage(w, r, "setup.html", pageData{Title: "首次启动", Nav: "setup", Err: &e})
 		return
 	}
 	_ = r.ParseForm()

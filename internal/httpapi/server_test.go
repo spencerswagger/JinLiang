@@ -495,11 +495,13 @@ func getRaw(t *testing.T, url, token string) string {
 	return string(raw)
 }
 
+// clip 按 rune 截断：按字节切会把中文切出半个字，测试输出就不是合法 UTF-8。
 func clip(s string, n int) string {
-	if len(s) <= n {
+	r := []rune(s)
+	if len(r) <= n {
 		return s
 	}
-	return s[:n] + "…"
+	return string(r[:n]) + "…"
 }
 
 // TestUIFormsCreateConnectionAndJob 覆盖向导的表单路径：它和 JSON API 是两条
@@ -752,7 +754,8 @@ func TestUnknownAPIPathReturnsJSON404(t *testing.T) {
 }
 
 // P0-2 回归（硬要求）：被任务引用的连接不许改坐标——「连接就是身份」，拒绝而不是
-// 静默重算 job_key。断言三件事：409、原任务 job_key 一个字没变、四段式说明「连接就是身份」。
+// 静默重算 job_key。五个坐标字段逐个钉住（Owl 指出只钉 host 时，把 coordsChanged
+// 收窄到只比 host 仍会全绿，等于没测）。
 func TestReferencedConnectionCoordinatesAreLocked(t *testing.T) {
 	ts, _ := newTestServer(t)
 	token := setupAdmin(t, ts)
@@ -776,23 +779,45 @@ func TestReferencedConnectionCoordinatesAreLocked(t *testing.T) {
 		t.Fatalf("建任务没拿到 id/job_key: %v", created)
 	}
 
-	// 改 host（坐标变了）→ 必须 409
-	code, resp := doJSON(t, http.MethodPut, ts.URL+"/api/connections/"+src, token, map[string]any{
-		"name": "src", "kind": "postgres", "host": "10.0.0.9", "port": 5432,
-		"database": "nope", "username": "u", "params": map[string]string{"sslmode": "disable"},
-	})
-	if code != http.StatusConflict {
-		t.Fatalf("改被引用连接的坐标 = %d %v，期望 409", code, resp)
+	// createPGConn 建出来的基准值是这些；下面每次只改一个字段。
+	base := func() map[string]any {
+		return map[string]any{
+			"name": "src", "kind": "postgres", "host": "127.0.0.1", "port": 1,
+			"database": "nope", "username": "u",
+			"params": map[string]string{"sslmode": "disable"},
+		}
 	}
-	errObj, _ := resp["error"].(map[string]any)
-	if errObj == nil {
-		t.Fatalf("409 必须带四段式信封：%v", resp)
+	// 五个坐标字段，逐个改成不同的值
+	coords := []struct {
+		field string
+		value any
+		why   string
+	}{
+		{"kind", "mysql", "换引擎类型"},
+		{"host", "10.0.0.9", "换主机"},
+		{"port", 5432, "换端口"},
+		{"database", "other_db", "换库"},
+		{"username", "other_user", "换账号"},
 	}
-	if msg, _ := errObj["message"].(string); !strings.Contains(msg, "身份") {
-		t.Errorf("409 文案必须说明「连接就是身份」，实际 %q", msg)
-	}
-	if nxt, _ := errObj["next"].([]any); len(nxt) == 0 {
-		t.Error("409 必须给下一步（新建连接 / 只改名字口令）")
+	for _, c := range coords {
+		payload := base()
+		payload[c.field] = c.value
+		code, resp := doJSON(t, http.MethodPut, ts.URL+"/api/connections/"+src, token, payload)
+		if code != http.StatusConflict {
+			t.Errorf("改坐标 %s（%s）= %d %v，期望 409", c.field, c.why, code, resp)
+			continue
+		}
+		errObj, _ := resp["error"].(map[string]any)
+		if errObj == nil {
+			t.Errorf("%s：409 必须带四段式信封，实际 %v", c.field, resp)
+			continue
+		}
+		if msg, _ := errObj["message"].(string); !strings.Contains(msg, "身份") {
+			t.Errorf("%s：409 文案必须说明「连接就是身份」，实际 %q", c.field, msg)
+		}
+		if nxt, _ := errObj["next"].([]any); len(nxt) == 0 {
+			t.Errorf("%s：409 必须给下一步（新建连接 / 只改名字口令）", c.field)
+		}
 	}
 
 	// 原任务的身份必须一个字都没变（拒绝，而不是静默重算）
@@ -809,13 +834,35 @@ func TestReferencedConnectionCoordinatesAreLocked(t *testing.T) {
 		t.Errorf("任务数应仍为 1，实际 %v", jobs)
 	}
 
-	// 只改名字/口令不属于坐标变化 → 允许
-	if code, resp := doJSON(t, http.MethodPut, ts.URL+"/api/connections/"+src, token, map[string]any{
-		"name": "src-renamed", "kind": "postgres", "host": "127.0.0.1", "port": 1,
-		"database": "nope", "username": "u", "password": "new-secret",
-		"params": map[string]string{"sslmode": "disable"},
-	}); code != http.StatusOK {
-		t.Errorf("只改名字/口令应允许，实际 %d %v", code, resp)
+	// 非坐标字段：改名字、改口令都必须放行（不能误锁）
+	for _, c := range []struct {
+		field string
+		value any
+	}{
+		{"name", "src-renamed"},
+		{"password", "new-secret"},
+	} {
+		payload := base()
+		payload[c.field] = c.value
+		if code, resp := doJSON(t, http.MethodPut, ts.URL+"/api/connections/"+src, token, payload); code != http.StatusOK {
+			t.Errorf("改非坐标字段 %s 应允许，实际 %d %v", c.field, code, resp)
+		}
+	}
+
+	// 连接确实没被改脏
+	code, conn := doJSON(t, http.MethodGet, ts.URL+"/api/connections/"+src, token, nil)
+	if code != http.StatusOK {
+		t.Fatalf("读回连接 = %d", code)
+	}
+	for _, f := range []struct {
+		field string
+		want  any
+	}{
+		{"kind", "postgres"}, {"host", "127.0.0.1"}, {"database", "nope"}, {"username", "u"},
+	} {
+		if got := conn[f.field]; got != f.want {
+			t.Errorf("坐标 %s 被改动了：%v（应仍为 %v）", f.field, got, f.want)
+		}
 	}
 }
 
@@ -838,5 +885,191 @@ func TestUnreferencedConnectionCoordinatesCanChange(t *testing.T) {
 	if code, jobs := doJSON(t, http.MethodGet, ts.URL+"/api/jobs", token, nil); code != http.StatusOK ||
 		jobs["count"].(float64) != 0 {
 		t.Errorf("这个测试不该产生任务，实际 %v", jobs)
+	}
+}
+
+// A-1 回归（本轮最值钱的一条）：--listen 0.0.0.0 且尚未设口令时，局域网里第一个
+// 来访者能不能抢到管理员？不能——首启设口令只允许本机来源。
+//
+// 注意这里必须自己构造 RemoteAddr：httptest.NewServer 的连接永远是 127.0.0.1，
+// 测不到「远端来访」，所以直接调 Handler。
+func TestSetupOnlyFromLoopbackBeforeConfigured(t *testing.T) {
+	store, err := control.Open(control.Options{DataDir: t.TempDir(), Autogen: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	srv, err := New(Options{Store: store, Version: "test", Listen: "0.0.0.0:8080"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := srv.Handler()
+
+	// 远端来访者先 GET /api/session 拿到 jl_csrf（攻击者也能做到），
+	// 再把同一个值放进 X-CSRF-Token —— 这正是 CSRF 在这里不构成防线的原因。
+	remote := "192.168.1.50:5555"
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/session", nil)
+	req.RemoteAddr = remote
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("远端 GET /api/session = %d（这个端点本来就是公开的）", rec.Code)
+	}
+	csrf := ""
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == csrfCookie {
+			csrf = c.Value
+		}
+	}
+	if csrf == "" {
+		t.Fatal("GET /api/session 没种下 jl_csrf")
+	}
+
+	// ① 远端 + 未配置 → 403，且文案说清「只在本机做」
+	body, _ := json.Marshal(map[string]string{"password": testPassword})
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/api/setup", bytes.NewReader(body))
+	req.RemoteAddr = remote
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(csrfHeader, csrf)
+	req.AddCookie(&http.Cookie{Name: csrfCookie, Value: csrf})
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("远端首启设口令 = %d，期望 403（body=%s）", rec.Code, clip(rec.Body.String(), 200))
+	}
+	var env struct {
+		Error struct {
+			Message string   `json:"message"`
+			Next    []string `json:"next"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+		t.Fatalf("403 不是 JSON 信封：%v（%s）", err, clip(rec.Body.String(), 200))
+	}
+	if !strings.Contains(env.Error.Message, "跑控制台的那台机器") {
+		t.Errorf("403 文案必须说明「只能在跑控制台的那台机器上做」，实际 %q", env.Error.Message)
+	}
+	if len(env.Error.Next) == 0 {
+		t.Error("403 必须给下一步（本机打开 /setup，或 --listen 127.0.0.1 起一次）")
+	}
+
+	// ② 本机 + 未配置 → 正常建立管理员
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/session", nil)
+	req.RemoteAddr = "127.0.0.1:43210"
+	h.ServeHTTP(rec, req)
+	localCSRF := ""
+	for _, c := range rec.Result().Cookies() {
+		if c.Name == csrfCookie {
+			localCSRF = c.Value
+		}
+	}
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/api/setup", bytes.NewReader(body))
+	req.RemoteAddr = "127.0.0.1:43210"
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(csrfHeader, localCSRF)
+	req.AddCookie(&http.Cookie{Name: csrfCookie, Value: localCSRF})
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("本机首启设口令 = %d，期望 201（body=%s）", rec.Code, clip(rec.Body.String(), 200))
+	}
+
+	// ③ 已配置之后行为不变：远端再打 setup 是 409（已设过），不是 403
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/api/setup", bytes.NewReader(body))
+	req.RemoteAddr = remote
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(csrfHeader, csrf)
+	req.AddCookie(&http.Cookie{Name: csrfCookie, Value: csrf})
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("已配置后远端 setup = %d，期望 409（守卫只在前置条件下生效）", rec.Code)
+	}
+}
+
+// A-1 的表单入口同样守住：远端 POST /setup 必须被挡下并给出说明页。
+func TestSetupFormOnlyFromLoopback(t *testing.T) {
+	store, err := control.Open(control.Options{DataDir: t.TempDir(), Autogen: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	srv, err := New(Options{Store: store, Version: "test", Listen: "0.0.0.0:8080"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := srv.Handler()
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/setup", nil)
+	req.RemoteAddr = "10.0.0.9:5555"
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("远端 GET /setup = %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "本机") {
+		t.Error("远端 GET /setup 应该先说明「只在本机做」")
+	}
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/setup",
+		strings.NewReader("password="+testPassword+"&password2="+testPassword))
+	req.RemoteAddr = "10.0.0.9:5555"
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	h.ServeHTTP(rec, req)
+	if rec.Code == http.StatusSeeOther {
+		t.Fatal("远端 POST /setup 不该成功建立管理员")
+	}
+	if configured, _ := store.AdminConfigured(context.Background()); configured {
+		t.Fatal("远端 POST /setup 之后管理员口令竟然被设上了")
+	}
+}
+
+// 导出路径对齐（Ark 的 §4.3）：/export 为规范，/yaml 是保留一个周期的别名。
+// 两条 body 必须逐字节相同、别名不带额外 warning 字段；/exports（多个 s）仍 404。
+func TestJobExportCanonicalAndAlias(t *testing.T) {
+	ts, _ := newTestServer(t)
+	token := setupAdmin(t, ts)
+	conn := createPGConn(t, ts, token, "src")
+	code, created := doJSON(t, http.MethodPost, ts.URL+"/api/jobs", token, map[string]any{
+		"name": "export-job", "source_id": conn, "target_id": conn,
+		"spec": map[string]any{
+			"source":  map[string]any{"scope": map[string]any{"schema": "public", "include": []string{"orders"}}},
+			"target":  map[string]any{"schema": "report"},
+			"mode":    map[string]any{"frequency": "once"},
+			"content": map[string]any{"tables": map[string]any{"orders": map[string]any{}}},
+		},
+	})
+	if code != http.StatusCreated {
+		t.Fatalf("create job = %d %v", code, created)
+	}
+	jobID, _ := created["id"].(string)
+
+	canonical := getRaw(t, ts.URL+"/api/jobs/"+jobID+"/export", token)
+	alias := getRaw(t, ts.URL+"/api/jobs/"+jobID+"/yaml", token)
+	if canonical == "" || alias == "" {
+		t.Fatalf("导出为空：/export=%q /yaml=%q", clip(canonical, 40), clip(alias, 40))
+	}
+	if canonical != alias {
+		t.Fatalf("/export 与 /yaml 的 body 不一致：\n/export:\n%s\n/yaml:\n%s", canonical, alias)
+	}
+	if !strings.Contains(canonical, "version: 1") {
+		t.Fatalf("/export 返回的不是 job.yaml：%s", clip(canonical, 80))
+	}
+
+	// 拼错的 /exports 不能被兜到别名上
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/jobs/"+jobID+"/exports", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusNotFound {
+		t.Fatalf("/exports = %d，期望 404", res.StatusCode)
+	}
+	if ct := res.Header.Get("Content-Type"); !strings.Contains(ct, "application/json") {
+		t.Fatalf("/exports 的 Content-Type = %q，期望 application/json", ct)
 	}
 }

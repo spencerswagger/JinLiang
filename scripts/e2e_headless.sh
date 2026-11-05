@@ -314,8 +314,13 @@ say "8. 运行历史落库"
 api GET "/api/runs?job_id=${JOB_ID}" >"${WORK}/runs.json"
 json '["count"]' <"${WORK}/runs.json" | grep -qx '1' || fail "应该有 1 条运行记录"
 
-say "9. export 出 yaml（不能含任何密码）"
-curl -fsS "${BASE}/api/jobs/${JOB_ID}/yaml" -H "Authorization: Bearer ${TOKEN}" >"${WORK}/job.yaml"
+say "9. export 出 yaml（规范路径 /export；不能含任何密码）"
+curl -fsS "${BASE}/api/jobs/${JOB_ID}/export" -H "Authorization: Bearer ${TOKEN}" >"${WORK}/job.yaml"
+# 弃用别名 /yaml 必须返回逐字节相同的内容（保留一个周期，之后移除时同步改 E1009 文案）
+curl -fsS "${BASE}/api/jobs/${JOB_ID}/yaml" -H "Authorization: Bearer ${TOKEN}" >"${WORK}/job-alias.yaml"
+cmp -s "${WORK}/job.yaml" "${WORK}/job-alias.yaml" \
+  || fail "/export 与弃用别名 /yaml 返回的内容不一致（别名必须逐字节相同）"
+echo "  /export 与 /yaml 内容一致（别名可用，规范路径已生效）"
 grep -qiE 'password|passwd|secret' "${WORK}/job.yaml" && fail "导出的 yaml 里出现了密码字段"
 grep -qE '://[^/"[:space:]]+:[^@"[:space:]]+@' "${WORK}/job.yaml" && fail "导出的 yaml 里出现了带口令的连接串"
 grep -q 'env:JINLIANG_CONN_' "${WORK}/job.yaml" || fail "导出的 yaml 应该用 env:JINLIANG_CONN_<id> 占位"
