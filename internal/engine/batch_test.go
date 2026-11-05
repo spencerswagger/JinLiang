@@ -506,3 +506,52 @@ func TestWatchLeaseToleratesSingleRenewFailure(t *testing.T) {
 		t.Fatalf("应该继续续租，实际只调了 %d 次", calls)
 	}
 }
+
+// Owl 必改 4：未提交的源事务 `cur` 必须有上限——几十万行的单事务全量驻留内存
+// 就是 OOM（进程直接没了，看不出原因）。宁可报 E1011 停下。
+func TestBatcherStopsOversizedTransaction(t *testing.T) {
+	sink := &fakeSink{}
+	src := &fakeSource{}
+	b := newTestBatcher(sink, src, 1_000_000) // 让 batch_rows 永远不触发，单测只看事务上限
+	b.maxTxEvents = 3
+	b.maxTxBytes = 1 << 30
+
+	_ = b.Add(ctx(), source.Event{Kind: source.EvBegin, TxID: "7"})
+	var err error
+	for i := 0; i < 10; i++ {
+		if err = b.Add(ctx(), source.Event{Kind: source.EvInsert, TxID: "7"}); err != nil {
+			break
+		}
+	}
+	if err == nil {
+		t.Fatal("单事务超过上限必须报错，不能一直吃内存")
+	}
+	var tooBig *txTooLargeError
+	if !errors.As(err, &tooBig) {
+		t.Fatalf("应该是 txTooLargeError（E1011），得到 %T（%v）", err, err)
+	}
+	// 四段式的基本要素：发生了什么 + 能做什么 + 风险
+	msg := err.Error()
+	for _, want := range []string{"事务太大", "拆成几个小事务", "JINLIANG_TX_MAX_BYTES", "风险"} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("文案缺 %q：%s", want, msg)
+		}
+	}
+	if len(sink.batches) != 0 || len(src.acked) != 0 {
+		t.Fatal("报错之后不许落库、也不许推进位点")
+	}
+}
+
+// 上限可以从环境变量调（与 Data 的 #11 用同一组变量名）。
+func TestTxLimitsFromEnv(t *testing.T) {
+	t.Setenv("JINLIANG_TX_MAX_BYTES", "1234")
+	t.Setenv("JINLIANG_TX_MAX_EVENTS", "56")
+	bytes, events := txLimits()
+	if bytes != 1234 || events != 56 {
+		t.Fatalf("环境变量没生效：%d %d", bytes, events)
+	}
+	t.Setenv("JINLIANG_TX_MAX_EVENTS", "不是数字")
+	if _, events := txLimits(); events != defaultMaxTxEvents {
+		t.Fatalf("非法值应回落到默认，得到 %d", events)
+	}
+}
