@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/spencerswagger/jinliang/internal/control"
+	"github.com/spencerswagger/jinliang/internal/core"
 )
 
 const testPassword = "test-admin-password"
@@ -690,5 +691,121 @@ func TestSSEAuthChannels(t *testing.T) {
 	defer cres.Body.Close()
 	if cres.StatusCode != http.StatusOK {
 		t.Fatalf("cookie 通道 SSE = %d，期望 200", cres.StatusCode)
+	}
+}
+
+// P0-1 回归：未注册的 /api/* 必须回 404 + JSON 信封，不能被 WebUI 的
+// "GET /" 兜底吞成 200 HTML——否则「这个接口有没有实现」就无法自证。
+func TestUnknownAPIPathReturnsJSON404(t *testing.T) {
+	ts, _ := newTestServer(t)
+	token := setupAdmin(t, ts)
+
+	cases := []struct{ method, path string }{
+		{http.MethodGet, "/api/nope"},
+		{http.MethodGet, "/api/gc"},
+		{http.MethodPost, "/api/gc"},
+		{http.MethodGet, "/api/jobs/x/verify"},
+		{http.MethodDelete, "/api/nope"},
+	}
+	for _, c := range cases {
+		req, err := http.NewRequest(c.method, ts.URL+c.path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(res.Body)
+		res.Body.Close()
+
+		if res.StatusCode != http.StatusNotFound {
+			t.Errorf("%s %s = %d，期望 404（body 前 80 字节：%q）", c.method, c.path, res.StatusCode, clip(string(body), 80))
+		}
+		if ct := res.Header.Get("Content-Type"); !strings.Contains(ct, "application/json") {
+			t.Errorf("%s %s 的 Content-Type = %q，期望 application/json", c.method, c.path, ct)
+		}
+		var env struct {
+			Error struct {
+				Code    string   `json:"code"`
+				Message string   `json:"message"`
+				Next    []string `json:"next"`
+				Risk    string   `json:"risk"`
+			} `json:"error"`
+		}
+		if err := json.Unmarshal(body, &env); err != nil {
+			t.Fatalf("%s %s 返回的不是 JSON 信封: %v（%q）", c.method, c.path, err, clip(string(body), 120))
+		}
+		if env.Error.Code != string(core.CodeAPINotFound) {
+			t.Errorf("%s %s 的 code = %q，期望 %s", c.method, c.path, env.Error.Code, core.CodeAPINotFound)
+		}
+		if env.Error.Message == "" || len(env.Error.Next) == 0 {
+			t.Errorf("%s %s 的信封缺 message/next（四段式不完整）", c.method, c.path)
+		}
+	}
+
+	// 真接口不受兜底影响
+	if code, _ := doJSON(t, http.MethodGet, ts.URL+"/api/connections", token, nil); code != http.StatusOK {
+		t.Fatalf("已注册的接口被兜底吞掉了：/api/connections = %d", code)
+	}
+}
+
+// P0-2 回归：被任务引用的连接不许改坐标（否则 job_key 失配、同一同步变两个任务）；
+// 没被引用的连接仍然可以改。
+func TestCannotChangeCoordinatesOfReferencedConnection(t *testing.T) {
+	ts, _ := newTestServer(t)
+	ctx := context.Background()
+	token := setupAdmin(t, ts)
+	src := createPGConn(t, ts, token, "src")     // 127.0.0.1:1
+	other := createPGConn(t, ts, token, "other") // 同样没被引用
+
+	body := map[string]any{
+		"name": "coords-job", "source_id": src, "target_id": src,
+		"spec": map[string]any{
+			"source": map[string]any{"scope": map[string]any{"schema": "public"}},
+			"target": map[string]any{"schema": "report"},
+			"mode":   map[string]any{"frequency": "once"},
+		},
+	}
+	if code, created := doJSON(t, http.MethodPost, ts.URL+"/api/jobs", token, body); code != http.StatusCreated {
+		t.Fatalf("create job = %d %v", code, created)
+	}
+
+	// 1) 被引用 → 改 host 必须 409
+	code, resp := doJSON(t, http.MethodPut, ts.URL+"/api/connections/"+src, token, map[string]any{
+		"name": "src", "kind": "postgres", "host": "10.0.0.9", "port": 5432,
+		"database": "nope", "username": "u", "params": map[string]string{"sslmode": "disable"},
+	})
+	if code != http.StatusConflict {
+		t.Fatalf("改被引用连接的坐标 = %d %v，期望 409", code, resp)
+	}
+	errObj, _ := resp["error"].(map[string]any)
+	if errObj == nil || !strings.Contains(errObj["message"].(string), "身份") {
+		t.Fatalf("409 必须说明「连接就是身份」：%v", resp)
+	}
+
+	// 2) 同样被引用，但只改名/口令 → 允许
+	if code, resp := doJSON(t, http.MethodPut, ts.URL+"/api/connections/"+src, token, map[string]any{
+		"name": "src-renamed", "kind": "postgres", "host": "127.0.0.1", "port": 1,
+		"database": "nope", "username": "u", "password": "new-secret",
+		"params": map[string]string{"sslmode": "disable"},
+	}); code != http.StatusOK {
+		t.Fatalf("只改名字/口令应允许，实际 %d %v", code, resp)
+	}
+
+	// 3) 没被引用 → 改坐标允许
+	if code, resp := doJSON(t, http.MethodPut, ts.URL+"/api/connections/"+other, token, map[string]any{
+		"name": "other", "kind": "postgres", "host": "10.0.0.9", "port": 5432,
+		"database": "nope", "username": "u", "params": map[string]string{"sslmode": "disable"},
+	}); code != http.StatusOK {
+		t.Fatalf("改未被引用连接的坐标应允许，实际 %d %v", code, resp)
+	}
+
+	// 4) 指纹仍是同一个任务（P0-2 的实质：jobs 不会变多）
+	_ = ctx
+	if code, jobs := doJSON(t, http.MethodGet, ts.URL+"/api/jobs", token, nil); code != http.StatusOK ||
+		jobs["count"].(float64) != 1 {
+		t.Fatalf("改完连接后任务数应仍为 1，实际 %v", jobs)
 	}
 }
