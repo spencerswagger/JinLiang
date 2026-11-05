@@ -1,0 +1,89 @@
+{{define "content"}}
+<div class="spread">
+  <div>
+    <h1>总览</h1>
+    <p class="lead">所有配置都在本机控制库里，改完立刻生效；「job.yaml」只是导入导出用的搬运格式。</p>
+  </div>
+  <a class="btn primary" href="/jobs/new">新建任务</a>
+</div>
+
+<div class="wall">
+  <div class="cell"><div class="n">{{len .Data.Jobs}}</div><div class="k">任务</div></div>
+  <div class="cell"><div class="n">{{len .Data.Connections}}</div><div class="k">连接</div></div>
+  <div class="cell"><div class="n">{{len .Data.ActiveRuns}}</div><div class="k">正在跑</div></div>
+  <div class="cell"><div class="n">{{.Data.FailedRuns}}</div><div class="k">失败运行（最近 200 次）</div></div>
+</div>
+
+{{if not .Data.Healthy}}
+<div class="card">
+  <header><h3>体检有需要处理的事情</h3><a href="/diagnostics" class="meta">去诊断页</a></header>
+  <ul>{{range .Data.Problems}}<li>{{.}}</li>{{end}}</ul>
+</div>
+{{end}}
+
+{{if .Data.ActiveRuns}}
+<h2>正在跑</h2>
+{{range .Data.ActiveRuns}}
+<div class="card">
+  <div class="spread">
+    <div class="live"><span class="dot on"></span><strong>{{phaseLabel .Phase}}</strong>
+      <span class="meta">{{phaseHint .Phase}}</span></div>
+    <a class="meta" href="/jobs/{{.JobID}}">打开任务</a>
+  </div>
+  <div class="meta">开始于 {{shortTime .StartedAt}} · 已处理 {{.RowsDone}} 行{{if .Stub}} · <span class="badge stub">骨架运行</span>{{end}}</div>
+</div>
+{{end}}
+{{end}}
+
+<h2>任务</h2>
+{{if not .Data.Jobs}}
+<div class="card">
+  <h3>还没有任务</h3>
+  <p class="hint">一个任务 = 一个源库 + 一个目标库 + 一组表。点「新建任务」按向导走一遍，全程不用写配置文件。</p>
+  <a class="btn primary" href="/jobs/new">开始新建</a>
+</div>
+{{end}}
+
+{{range .Data.Jobs}}
+<div class="card">
+  <div class="spread">
+    <div>
+      <h3><a href="/jobs/{{.ID}}">{{.Name}}</a></h3>
+      <div class="meta">
+        {{.SourceName}}（{{.SourceKind}}）→ {{.TargetName}}（{{.TargetKind}}）
+        · 指纹 <span class="mono">{{.JobKey}}</span>
+      </div>
+    </div>
+    <div class="row">
+      {{if .LastRun}}
+        <span class="badge {{if eq (printf "%s" .LastRun.Phase) "failed"}}bad{{else if eq (printf "%s" .LastRun.Phase) "done"}}ok{{end}}">
+          {{phaseLabel .LastRun.Phase}}</span>
+        {{if .LastRun.Stub}}<span class="badge stub">骨架运行</span>{{end}}
+        <span class="meta">{{shortTime .LastRun.StartedAt}}</span>
+      {{else}}
+        <span class="badge">还没跑过</span>
+      {{end}}
+    </div>
+  </div>
+</div>
+{{end}}
+
+{{if .Data.Connections}}
+<h2>连接</h2>
+<div class="card">
+  <table>
+    <thead><tr><th>名字</th><th>类型</th><th>地址</th><th>上次测连</th></tr></thead>
+    <tbody>
+    {{range .Data.Connections}}
+      <tr>
+        <td><a href="/connections/{{.ID}}">{{.Name}}</a></td>
+        <td>{{.Kind}}</td>
+        <td class="mono">{{.Host}}:{{.Port}}/{{.Database}}</td>
+        <td>{{okOr .LastTestOK}}{{if .LastTestAt}} <span class="meta">{{shortTime .LastTestAt}}</span>{{end}}</td>
+      </tr>
+    {{end}}
+    </tbody>
+  </table>
+</div>
+{{end}}
+{{end}}

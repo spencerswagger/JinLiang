@@ -1,0 +1,12 @@
+{{define "content"}}
+<h1>登录</h1>
+<p class="lead">这是本机控制台。口令只存 argon2id 哈希，谁都不知道明文——包括我们。</p>
+
+<form method="post" action="/login" data-once>
+  <input type="hidden" name="csrf_token" value="{{.CSRF}}">
+  <label for="password">管理员口令</label>
+  <input id="password" name="password" type="password" autocomplete="current-password" autofocus required>
+  <p class="hint">连续输错会被限速（每分钟 5 次）。</p>
+  <button class="primary" type="submit">进入控制台</button>
+</form>
+{{end}}

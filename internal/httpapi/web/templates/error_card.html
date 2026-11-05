@@ -1,0 +1,12 @@
+{{define "error_card"}}
+{{if .}}
+<div class="err">
+  <h3>{{if .Message}}{{.Message}}{{else}}出错了{{end}}{{if .Code}} <span class="badge bad">{{.Code}}</span>{{end}}</h3>
+  <dl>
+    {{if .Why}}<dt>为什么</dt><dd>{{.Why}}</dd>{{end}}
+    {{if .Next}}<dt>你现在能做什么</dt><dd><ol>{{range .Next}}<li>{{.}}</li>{{end}}</ol></dd>{{end}}
+    {{if .Risk}}<dt>风险</dt><dd>{{.Risk}}</dd>{{end}}
+  </dl>
+</div>
+{{end}}
+{{end}}

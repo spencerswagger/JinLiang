@@ -1,0 +1,31 @@
+{{define "test_result_partial"}}
+{{if .OK}}
+<div class="ok-box">
+  <div class="row">
+    <span class="badge ok">连上了</span>
+    <strong>{{.Version}}</strong>
+    <span class="meta">{{.Latency}} ms</span>
+    <span class="badge {{if .TLS}}ok{{else}}warn{{end}}">{{if .TLS}}已加密{{else}}未加密{{end}}</span>
+  </div>
+  {{if .TLSWarning}}<p class="hint">{{.TLSWarning}}</p>{{end}}
+  {{if .Notes}}
+  <h3>能力提示</h3>
+  <ul class="checks">{{range .Notes}}<li><span class="d">{{.}}</span></li>{{end}}</ul>
+  {{end}}
+</div>
+{{else}}
+{{if .Spec}}
+<div class="err">
+  <h3>{{.Spec.Message}} <span class="badge bad">{{.Spec.Code}}</span></h3>
+  <dl>
+    <dt>发生了什么</dt><dd>{{.Message}}{{if .Step}}（卡在 {{.Step}} 这一步）{{end}}</dd>
+    <dt>为什么</dt><dd>{{.Spec.Why}}</dd>
+    <dt>你现在能做什么</dt><dd><ol>{{range .Spec.Next}}<li>{{.}}</li>{{end}}</ol></dd>
+    <dt>风险</dt><dd>{{.Spec.Risk}}</dd>
+  </dl>
+</div>
+{{else}}
+<div class="err"><h3>没连上</h3><p>{{.Message}}</p></div>
+{{end}}
+{{end}}
+{{end}}

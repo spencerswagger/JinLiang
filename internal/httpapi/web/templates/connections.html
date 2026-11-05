@@ -1,0 +1,32 @@
+{{define "content"}}
+<div class="spread">
+  <h1>连接</h1>
+  <a class="btn primary" href="/connections/new">新建连接</a>
+</div>
+<p class="lead">连接 = 一台数据库 + 一个账号。密码加密存在控制库里，页面与接口都不会回传明文。</p>
+
+{{if not .Data}}
+<div class="card">
+  <h3>还没有连接</h3>
+  <p class="hint">先建一个，向导会引导你填地址、账号，并在保存后自动测一次连通性。</p>
+  <a class="btn primary" href="/connections/new">新建第一个连接</a>
+</div>
+{{end}}
+
+{{range .Data}}
+<div class="card">
+  <div class="spread">
+    <div>
+      <h3><a href="/connections/{{.ID}}">{{.Name}}</a></h3>
+      <div class="meta mono">{{.Kind}}://{{.Username}}@{{.Host}}:{{.Port}}/{{.Database}}</div>
+    </div>
+    <div class="row">
+      <span class="badge {{if .LastTestOK}}ok{{else if .LastTestAt}}bad{{end}}">上次测连：{{okOr .LastTestOK}}</span>
+      {{if .TLSWarning}}<span class="badge warn">传输未强制校验</span>{{end}}
+      <span class="badge">{{.UsedByJobs}} 个任务在用</span>
+    </div>
+  </div>
+  {{if .LastTestMsg}}<div class="meta">{{.LastTestMsg}}</div>{{end}}
+</div>
+{{end}}
+{{end}}

@@ -1,0 +1,25 @@
+{{define "content"}}
+<h1>运行历史</h1>
+<p class="lead">每次运行一行。骨架运行（B0）会标「桩」：那一轮没有搬数据。</p>
+
+{{if .Data}}
+<div class="card">
+  <table>
+    <thead><tr><th>开始</th><th>任务</th><th>阶段</th><th>行数</th><th>错误</th></tr></thead>
+    <tbody>
+    {{range .Data}}
+      <tr>
+        <td class="mono">{{shortTime .Run.StartedAt}}</td>
+        <td><a href="/jobs/{{.Run.JobID}}">{{.Job}}</a></td>
+        <td>{{phaseLabel .Run.Phase}}{{if .Run.Stub}} <span class="badge stub">桩</span>{{end}}</td>
+        <td class="num">{{.Run.RowsDone}}</td>
+        <td>{{dash .Run.LastError}}</td>
+      </tr>
+    {{end}}
+    </tbody>
+  </table>
+</div>
+{{else}}
+<div class="card"><h3>还没有运行记录</h3><p class="hint">建好任务后点「开始」就会出现。</p></div>
+{{end}}
+{{end}}

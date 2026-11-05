@@ -1,0 +1,118 @@
+{{define "content"}}
+<h1>新建任务</h1>
+<p class="lead">四步：选两个连接 → 勾表 → 选频次 → 保存后先看预检。全程不会写你的数据库。</p>
+
+{{if not .Data.Connections}}
+<div class="card">
+  <h3>先建连接</h3>
+  <p class="hint">任务需要至少一个源连接和一个目标连接。</p>
+  <a class="btn primary" href="/connections/new">去新建连接</a>
+</div>
+{{else}}
+
+<form method="post" action="/jobs" data-once>
+  <input type="hidden" name="csrf_token" value="{{.CSRF}}">
+
+  <fieldset>
+    <legend>1 / 4 · 叫什么、从哪到哪</legend>
+    <label for="name">任务名（只做展示，可以重复）</label>
+    <input id="name" name="name" type="text" required maxlength="64" placeholder="例如：订单库 → 报表库">
+    <div class="grid2">
+      <div>
+        <label for="source_id">源连接（读）</label>
+        <select id="source_id" name="source_id" required
+                hx-get="/wizard/catalog" hx-target="#tables" hx-swap="innerHTML"
+                hx-trigger="change" hx-include="#source_schema"
+                hx-vals='{"side":"source"}'>
+          {{range .Data.Connections}}<option value="{{.ID}}">{{.Name}}（{{.Kind}}）</option>{{end}}
+        </select>
+        <label for="source_schema">源 schema</label>
+        <input id="source_schema" name="source_schema" type="text" value="public"
+               hx-get="/wizard/catalog" hx-target="#tables" hx-swap="innerHTML"
+               hx-trigger="change delay:400ms" hx-include="#source_id"
+               hx-vals='{"side":"source"}'>
+      </div>
+      <div>
+        <label for="target_id">目标连接（写）</label>
+        <select id="target_id" name="target_id" required>
+          {{range .Data.Connections}}<option value="{{.ID}}">{{.Name}}（{{.Kind}}）</option>{{end}}
+        </select>
+        <label for="target_schema">目标 schema / 库</label>
+        <input id="target_schema" name="target_schema" type="text" placeholder="例如 report">
+      </div>
+    </div>
+  </fieldset>
+
+  <fieldset>
+    <legend>2 / 4 · 选表</legend>
+    <div class="row">
+      <button type="button" class="ghost"
+              hx-get="/wizard/catalog" hx-target="#tables" hx-swap="innerHTML"
+              hx-include="#source_id, #source_schema" hx-vals='{"side":"source"}'>列出源库的表</button>
+      <span class="meta">会读出表名、行数估算、主键与列类型</span>
+    </div>
+    <div id="tables">
+      <p class="hint">点上面的按钮枚举表。勾选后保存，预检会确认这些表真的存在、有没有主键。</p>
+    </div>
+  </fieldset>
+
+  <fieldset>
+    <legend>3 / 4 · 多久跑一次</legend>
+    <label for="frequency">同步方式</label>
+    <select id="frequency" name="frequency" required>
+      <option value="once">一次性（搬完就结束）</option>
+      <option value="continuous+initial" selected>先全量，再实时（推荐）</option>
+      <option value="continuous">只跟随变更（目标端已有数据）</option>
+      <option value="interval">定时增量（按水位列查，不需要变更流水）</option>
+    </select>
+    <div class="grid2">
+      <div>
+        <label for="interval">间隔（定时增量时用）</label>
+        <input id="interval" name="interval" type="text" placeholder="5m / 1h">
+      </div>
+      <div>
+        <label for="incremental_column">水位列（定时增量必填）</label>
+        <input id="incremental_column" name="incremental_column" type="text" placeholder="updated_at">
+      </div>
+    </div>
+  </fieldset>
+
+  <fieldset>
+    <legend>4 / 4 · 安全阀（默认值就够用）</legend>
+    <div class="grid2">
+      <div>
+        <label for="on_exists">目标端已有同名表怎么办</label>
+        <select id="on_exists" name="on_exists">
+          <option value="error" selected>停下来问我（默认，最安全）</option>
+          <option value="append">追加进去</option>
+          <option value="recreate">清空重建</option>
+        </select>
+      </div>
+      <div>
+        <label for="create_indexes">索引什么时候建</label>
+        <select id="create_indexes" name="create_indexes">
+          <option value="defer" selected>同步完再建（最快）</option>
+          <option value="now">马上建</option>
+          <option value="none">不建</option>
+        </select>
+      </div>
+      <div>
+        <label for="batch_rows">每批行数</label>
+        <input id="batch_rows" name="batch_rows" type="number" value="500" min="1" max="50000">
+      </div>
+      <div>
+        <label for="chunk_rows">初始化分块行数</label>
+        <input id="chunk_rows" name="chunk_rows" type="number" value="100000" min="1000">
+      </div>
+      <div>
+        <label for="conns">初始化并发连接数</label>
+        <input id="conns" name="conns" type="number" value="4" min="1" max="16">
+      </div>
+    </div>
+  </fieldset>
+
+  <button class="primary" type="submit">保存任务</button>
+  <a class="btn" href="/">取消</a>
+</form>
+{{end}}
+{{end}}

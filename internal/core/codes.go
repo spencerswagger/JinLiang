@@ -28,11 +28,13 @@ const (
 	CodeJobRunningElsewhere Code = "E1005" // 另一个实例在跑
 	CodeViewNoStream        Code = "E1006" // 视图没有变更流
 	CodeSecretPerm          Code = "E1007" // 私钥文件权限不对（安全底线）
+	CodeConnUnreachable     Code = "E1008" // 连不上对端数据库（控制面测连/枚举用）
 	CodeTargetReset         Code = "E2001" // 目标连接被重置
 	CodeSourceTimeout       Code = "E2002" // 源库连接超时
 	CodeLockTimeout         Code = "E2003" // 目标库锁等待超时
 	CodePositionGap         Code = "E3001" // 同步进度已不连续
 	CodeSchemaTooNew        Code = "E3002" // 状态表版本比二进制新
+	CodeControlDBBroken     Code = "E3010" // 控制库读不动（sqlite 损坏/版本不符）
 	CodeUnsupportedType     Code = "E4001" // 未支持的类型（应已兜底）
 	CodeDecoderBug          Code = "E4002" // 解码器内部不一致
 )
@@ -108,6 +110,28 @@ var specs = []Spec{
 		Why:     "凭证文件被别的用户读到就等于密码泄露",
 		Next:    []string{"chmod 600 <文件路径>", "或者改用环境变量：dsn: env:JINLIANG_DSN"},
 		Risk:    "这是全产品唯一会硬停的地方（安全底线）",
+	},
+	{
+		Code: CodeConnUnreachable, Class: UserAction,
+		Message: "连不上这个数据库",
+		Why:     "地址、端口、账号口令、证书或防火墙，任意一项不对都会连不上；控制面只做只读探测，不会改对端任何东西",
+		Next: []string{
+			"点「重新测连」看这次的具体报错（它会告诉我卡在哪一步）",
+			"确认地址端口能通：在能上外网的那台机器上试 telnet 主机 端口",
+			"口令或证书改过的话，重新填一次口令再测",
+		},
+		Risk: "没有风险：测连只做只读查询（读版本号与权限），不写数据、不建对象",
+	},
+	{
+		Code: CodeControlDBBroken, Class: Fatal,
+		Message: "控制库文件读不动了",
+		Why:     "本机 SQLite 文件损坏，或它是更新版本的津梁写的（结构比当前二进制新）",
+		Next: []string{
+			"先备份整个数据目录（含 key 文件），别覆盖它",
+			"换了新版二进制才出现的话：换回新版本运行",
+			"确实损坏：删除控制库后用 jinliang import 从导出的 yaml 重建任务",
+		},
+		Risk: "重建会丢运行历史；凭证密文依赖 key 文件，key 丢了必须重新填一次口令",
 	},
 	{
 		Code: CodeTargetReset, Class: Retryable,

@@ -1,0 +1,63 @@
+{{define "content"}}
+{{with .Data}}
+<h1>诊断</h1>
+<p class="lead">控制台的体检结果。这里只做只读检查，不会碰你的数据库。</p>
+
+<div class="wall">
+  <div class="cell"><div class="n">{{if .Healthy}}正常{{else}}注意{{end}}</div><div class="k">整体</div></div>
+  <div class="cell"><div class="n">{{.Counts.jobs}}</div><div class="k">任务</div></div>
+  <div class="cell"><div class="n">{{.Counts.runs}}</div><div class="k">运行记录</div></div>
+  <div class="cell"><div class="n">{{.ActiveRuns}}</div><div class="k">正在跑</div></div>
+</div>
+
+{{if .Problems}}
+<div class="card">
+  <h3>需要处理</h3>
+  <ul class="checks">
+    {{range .Problems}}<li><span class="t">{{.}}</span></li>{{end}}
+  </ul>
+</div>
+{{else}}
+<div class="ok-box">没有发现问题：控制库完整、监听地址是本机、管理员口令已设置。</div>
+{{end}}
+
+<h2>控制库</h2>
+<div class="card">
+  <table>
+    <tbody>
+      <tr><th>完整性检查</th><td>{{if eq .Integrity "ok"}}<span class="badge ok">ok</span>{{else}}<span class="badge bad">{{.Integrity}}</span>{{end}}</td></tr>
+      <tr><th>schema 版本</th><td class="mono">{{.SchemaVersion}}</td></tr>
+      <tr><th>数据目录</th><td class="mono">{{.DataDir}}</td></tr>
+      <tr><th>库文件</th><td class="mono">{{.DBPath}}</td></tr>
+      <tr><th>库大小</th><td class="num">{{.DBBytes}} 字节</td></tr>
+      <tr><th>密钥来源</th><td>{{.KeySource}}{{if .KeyPath}} <span class="mono">{{.KeyPath}}</span>{{end}}</td></tr>
+      <tr><th>实例 ID</th><td class="mono">{{.Instance}}</td></tr>
+      <tr><th>监听</th><td class="mono">{{.Listen}}</td></tr>
+      <tr><th>版本</th><td class="mono">{{.Version}}</td></tr>
+    </tbody>
+  </table>
+  <p class="hint">备份 = 备份这个目录（含 key 文件）。没有 key 文件，密文解不开——这是特性，不是缺陷。</p>
+</div>
+
+<h2>最近动作（审计）</h2>
+{{if .Audit}}
+<div class="card">
+  <table>
+    <thead><tr><th>时间</th><th>谁</th><th>做了什么</th><th>详情</th></tr></thead>
+    <tbody>
+    {{range .Audit}}
+      <tr>
+        <td class="mono">{{shortTime .At}}</td>
+        <td>{{.Actor}}</td>
+        <td class="mono">{{.Action}}</td>
+        <td class="mono">{{clip .Detail 80}}</td>
+      </tr>
+    {{end}}
+    </tbody>
+  </table>
+</div>
+{{else}}
+<p class="hint">还没有动作记录。</p>
+{{end}}
+{{end}}
+{{end}}

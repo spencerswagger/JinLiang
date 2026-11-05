@@ -1,0 +1,55 @@
+{{define "content"}}
+{{with .Data}}
+<h1>{{.Conn.Name}}</h1>
+<p class="lead mono">{{.Conn.Kind}}://{{.Conn.Username}}@{{.Conn.Host}}:{{.Conn.Port}}/{{.Conn.Database}}</p>
+
+<div class="wall">
+  <div class="cell"><div class="n">{{if .Conn.HasSecret}}已存{{else}}无{{end}}</div><div class="k">口令</div></div>
+  <div class="cell"><div class="n">{{okOr .Conn.LastTestOK}}</div><div class="k">上次测连</div></div>
+  <div class="cell"><div class="n">{{.Conn.UsedByJobs}}</div><div class="k">任务在用</div></div>
+  <div class="cell"><div class="n">{{if .Conn.TLSWarning}}弱{{else}}强{{end}}</div><div class="k">传输保护</div></div>
+</div>
+
+{{if .Conn.TLSWarning}}<div class="card"><div class="badge warn">传输风险</div><p class="hint">{{.Conn.TLSWarning}}</p></div>{{end}}
+
+<h2>测连</h2>
+<div class="card">
+  <p class="hint">只做只读探测：读版本号与能力，不写任何数据、不建任何对象。</p>
+  <button class="primary" hx-post="/connections/{{.Conn.ID}}/test"
+          hx-target="#test-result" hx-swap="innerHTML" hx-headers='{"X-CSRF-Token": "{{$.CSRF}}"}'>重新测连</button>
+  <div id="test-result">
+    {{if .Conn.LastTestMsg}}<p class="hint">上次结果：{{.Conn.LastTestMsg}}</p>{{end}}
+  </div>
+</div>
+
+<h2>用到它的任务</h2>
+{{if .Jobs}}
+<div class="card">
+  <table>
+    <thead><tr><th>任务</th><th>角色</th><th>指纹</th></tr></thead>
+    <tbody>
+    {{range .Jobs}}
+      <tr>
+        <td><a href="/jobs/{{.ID}}">{{.Name}}</a></td>
+        <td>{{if eq .SourceID $.Data.Conn.ID}}源{{else}}目标{{end}}</td>
+        <td class="mono">{{.JobKey}}</td>
+      </tr>
+    {{end}}
+    </tbody>
+  </table>
+</div>
+{{else}}
+<p class="hint">还没有任务用这个连接。</p>
+{{end}}
+
+<h2>危险操作</h2>
+<div class="card">
+  <p class="hint">删掉连接后，引用它的任务会失效，所以有任务在用时不允许删。</p>
+  <form method="post" action="/connections/{{.Conn.ID}}/delete" data-once
+        onsubmit="return confirm('确定删除连接「{{.Conn.Name}}」？这会同时删掉它的加密口令。');">
+    <input type="hidden" name="csrf_token" value="{{$.CSRF}}">
+    <button class="danger" type="submit">删除这个连接</button>
+  </form>
+</div>
+{{end}}
+{{end}}

@@ -1,0 +1,58 @@
+{{define "content"}}
+<h1>新建连接</h1>
+<p class="lead">填完保存后会自动测一次连通性，并读出对端版本——不用你另外敲命令验证。</p>
+
+<form method="post" action="/connections" data-once>
+  <input type="hidden" name="csrf_token" value="{{.CSRF}}">
+
+  <fieldset>
+    <legend>它是什么</legend>
+    <label for="kind">数据库类型</label>
+    <select id="kind" name="kind" required>
+      <option value="postgres">PostgreSQL（源或目标）</option>
+      <option value="mysql">MySQL / MariaDB（源或目标）</option>
+    </select>
+    <label for="name">给它起个你认得出的名字</label>
+    <input id="name" name="name" type="text" placeholder="例如：生产订单库" required maxlength="64">
+  </fieldset>
+
+  <fieldset>
+    <legend>连到哪、用谁连</legend>
+    <div class="grid2">
+      <div>
+        <label for="host">主机</label>
+        <input id="host" name="host" type="text" placeholder="db.internal 或 127.0.0.1" required>
+      </div>
+      <div>
+        <label for="port">端口</label>
+        <input id="port" name="port" type="number" placeholder="5432 / 3306" min="1" max="65535">
+      </div>
+      <div>
+        <label for="database">数据库名</label>
+        <input id="database" name="database" type="text" required>
+      </div>
+      <div>
+        <label for="username">用户名</label>
+        <input id="username" name="username" type="text" required autocomplete="off">
+      </div>
+    </div>
+    <label for="password">口令</label>
+    <input id="password" name="password" type="password" autocomplete="new-password">
+    <p class="hint">口令用 AES-256-GCM 加密后存本机控制库；接口与页面永远只回「有没有存」，不回明文。</p>
+  </fieldset>
+
+  <fieldset>
+    <legend>传输安全</legend>
+    <label for="sslmode">PostgreSQL 的证书校验方式</label>
+    <select id="sslmode" name="sslmode">
+      <option value="verify-full" selected>verify-full（默认：校验证书，最安全）</option>
+      <option value="require">require（加密但不校验证书）</option>
+      <option value="prefer">prefer（能加密就加密）</option>
+      <option value="disable">disable（明文，仅限本机测试）</option>
+    </select>
+    <p class="hint">降到 verify-full 以下会被标红提示：链路上的数据可能被旁听。MySQL 走连接参数里的 tls。</p>
+  </fieldset>
+
+  <button class="primary" type="submit">保存并测连</button>
+</form>
+{{end}}

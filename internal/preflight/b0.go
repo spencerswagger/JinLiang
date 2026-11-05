@@ -1,0 +1,286 @@
+// Package preflight answers one question before anything is written:
+// 「现在按这个配置开跑，会发生什么、会不会卡住」。
+//
+// 每个结论都是四态之一（ok / autofixable / warn / blocked）。blocked 只在
+// 物理上做不到时使用，并且必须同时给出替代方案 —— 绝不因为"有风险"就拒绝
+// （docs/DESIGN.md：有问题就提示，不要阻断）。
+package preflight
+
+import (
+	"fmt"
+	"sort"
+	"strings"
+
+	"github.com/spencerswagger/jinliang/internal/core"
+	"github.com/spencerswagger/jinliang/internal/source"
+)
+
+// Input is everything the control plane already knows, handed over so this
+// package stays free of storage and driver dependencies.
+type Input struct {
+	JobName      string
+	SourceKind   string
+	TargetKind   string
+	SourceVer    string
+	TargetVer    string
+	SourceErr    string // 人话的连接错误；空表示已连上
+	TargetErr    string
+	SourceCaps   source.CapSet
+	SourceCat    *source.Catalog // nil 表示没读到（不阻断）
+	TargetCat    *source.Catalog // nil 表示没读到：目标表是否存在交给运行时判断
+	Tables       []string        // 用户勾选的表
+	Mode         string
+	Incremental  string
+	OnExists     string
+	BatchRows    int
+	SnapshotConn int
+	Lookback     string
+	TLSWarnings  []string
+}
+
+// Run produces the report the UI renders as cards.
+func Run(in Input) source.Report {
+	var checks []source.Check
+	add := func(c source.Check) { checks = append(checks, c) }
+
+	// ── 连通性 ───────────────────────────────────────────────
+	checks = append(checks, connCheck("NET-01", "源库", in.SourceKind, in.SourceVer, in.SourceErr)...)
+	checks = append(checks, connCheck("NET-02", "目标库", in.TargetKind, in.TargetVer, in.TargetErr)...)
+
+	// ── 传输加密 ─────────────────────────────────────────────
+	if len(in.TLSWarnings) > 0 {
+		add(source.Check{
+			ID: "TLS-01", Title: "连接没有强制校验证书",
+			Status: source.StatusWarn,
+			Detail: strings.Join(in.TLSWarnings, "；"),
+			Who:    "you",
+		})
+	} else {
+		add(source.Check{ID: "TLS-01", Title: "传输已加密且校验证书", Status: source.StatusOK, Detail: "证书校验通过"})
+	}
+
+	// ── 源端能力：能不能做实时增量 ───────────────────────────
+	if cap, ok := in.SourceCaps[source.CapCDC]; ok {
+		needsCDC := strings.Contains(in.Mode, "continuous")
+		switch {
+		case cap.Supported:
+			add(source.Check{ID: "CAP-01", Title: "源库可以读变更流水", Status: source.StatusOK,
+				Detail: "实时增量可用"})
+		case needsCDC:
+			// 缺变更流 = 这个模式物理上做不到（ERRORS.md: blocked 的定义）。
+			// 但我们不阻断人：卡片里给两条路——开流水，或改成定时增量。
+			detail := cap.Compensation.Note
+			if detail == "" {
+				detail = "源库没有开启变更流，实时增量读不到任何变更"
+			}
+			detail += "。改成「定时增量」（指定一个水位列，如 updated_at）不需要变更流，只要 SELECT 权限"
+			add(source.Check{
+				ID: "CAP-01", Title: "源库读不到变更流水",
+				Status: source.StatusBlocked, Code: string(core.CodeWalLevel),
+				Detail: detail,
+				Who:    "dba",
+				SQL:    cdcFixSQL(in.SourceKind),
+			})
+		default:
+			add(source.Check{ID: "CAP-01", Title: "本次模式不需要变更流水", Status: source.StatusOK,
+				Detail: "定时增量只需要 SELECT"})
+		}
+	}
+
+	// ── 表范围 ───────────────────────────────────────────────
+	checks = append(checks, scopeChecks(in)...)
+
+	// ── 模式相关 ─────────────────────────────────────────────
+	if in.Mode == "interval" {
+		if strings.TrimSpace(in.Incremental) == "" {
+			add(source.Check{ID: "MODE-01", Title: "定时增量缺水位列", Status: source.StatusBlocked,
+				Code:   string(core.CodeViewNoStream),
+				Detail: "frequency=interval 必须指定 incremental_column（例如 updated_at），否则我们不知道「哪些是新数据」",
+				Who:    "you"})
+		} else {
+			missing := tablesWithoutColumn(in.SourceCat, in.Tables, in.Incremental)
+			if len(missing) > 0 {
+				add(source.Check{ID: "MODE-01", Title: "部分表没有这个水位列", Status: source.StatusWarn,
+					Detail:   fmt.Sprintf("%s 里没有 %s：这些表只能整表重搬", strings.Join(missing, "、"), in.Incremental),
+					Affected: missing})
+			} else {
+				add(source.Check{ID: "MODE-01", Title: "水位列存在", Status: source.StatusOK,
+					Detail: fmt.Sprintf("选中的 %d 张表都有 %s", len(in.Tables), in.Incremental)})
+			}
+		}
+	}
+
+	// ── 目标端同名表 ─────────────────────────────────────────
+	if in.OnExists == "error" {
+		existing := existingTargetTables(in.TargetCat, in.Tables)
+		if len(existing) > 0 {
+			add(source.Check{
+				ID: "TARGET-01", Title: "目标端已经有同名表",
+				Status: source.StatusBlocked, Code: string(core.CodeTargetTableExists),
+				Detail:   fmt.Sprintf("%d 张表已存在（%s）。当前 on_exists=error，会停下来等你选", len(existing), preview(existing)),
+				Affected: existing, Who: "you",
+			})
+		} else if in.TargetCat != nil {
+			add(source.Check{ID: "TARGET-01", Title: "目标端没有同名表", Status: source.StatusOK, Detail: "可以直接建表"})
+		} else {
+			add(source.Check{ID: "TARGET-01", Title: "没读到目标端的表清单", Status: source.StatusWarn,
+				Detail: "目标端连上了但读不到表：开跑时会再检查一次，若同名表存在会停在这里"})
+		}
+	}
+
+	// ── 批次与并发 ───────────────────────────────────────────
+	if in.BatchRows < 1 || in.BatchRows > 50000 {
+		add(source.Check{ID: "BATCH-01", Title: "每批行数超出范围", Status: source.StatusBlocked,
+			Detail: fmt.Sprintf("batch_rows=%d，必须在 1–50000 之间", in.BatchRows), Who: "you"})
+	} else {
+		add(source.Check{ID: "BATCH-01", Title: "每批行数在安全范围", Status: source.StatusOK,
+			Detail: fmt.Sprintf("batch_rows=%d", in.BatchRows)})
+	}
+	if in.SnapshotConn > 16 {
+		add(source.Check{ID: "CONN-01", Title: "初始化并发太高", Status: source.StatusBlocked,
+			Detail: fmt.Sprintf("snapshot.conns=%d，最多 16：再高会把源库压住", in.SnapshotConn), Who: "you"})
+	}
+
+	rep := source.Report{Checks: checks}
+	rep.CanStart = true
+	for _, c := range checks {
+		if c.Status == source.StatusBlocked {
+			rep.CanStart = false
+		}
+	}
+	return rep
+}
+
+func connCheck(id, side, kind, version, errMsg string) []source.Check {
+	if errMsg != "" {
+		return []source.Check{{
+			ID: id, Title: side + "连不上", Status: source.StatusBlocked,
+			Code: string(core.CodeConnUnreachable), Detail: errMsg, Who: "you",
+		}}
+	}
+	v := version
+	if v == "" {
+		v = "版本未知"
+	}
+	return []source.Check{{
+		ID: id, Title: side + "可以连上", Status: source.StatusOK,
+		Detail: fmt.Sprintf("%s %s", kindLabel(kind), v),
+	}}
+}
+
+func kindLabel(kind string) string {
+	switch kind {
+	case "postgres":
+		return "PostgreSQL"
+	case "mysql":
+		return "MySQL"
+	}
+	return kind
+}
+
+func cdcFixSQL(kind string) string {
+	if kind == "mysql" {
+		return "SET GLOBAL log_bin = ON; SET GLOBAL binlog_format = ROW;  -- 需要重启一次生效"
+	}
+	return "ALTER SYSTEM SET wal_level = 'logical';  -- 然后重启一次实例"
+}
+
+func scopeChecks(in Input) []source.Check {
+	if in.SourceCat == nil {
+		return []source.Check{{ID: "SCOPE-01", Title: "没读到源端的表清单", Status: source.StatusWarn,
+			Detail: "连上了但列不出表：可能是权限不足，也可能 schema 写错了"}}
+	}
+	if len(in.Tables) == 0 {
+		return []source.Check{{ID: "SCOPE-01", Title: "还没选表", Status: source.StatusWarn,
+			Detail: "至少选一张表，否则这次同步什么都不会发生", Who: "you"}}
+	}
+	have := map[string]bool{}
+	for _, t := range in.SourceCat.Tables {
+		have[t.Table] = true
+	}
+	var missing, noPK []string
+	pk := map[string]bool{}
+	for _, t := range in.SourceCat.Tables {
+		pk[t.Table] = t.HasStablePK
+	}
+	for _, name := range in.Tables {
+		if !have[name] {
+			missing = append(missing, name)
+			continue
+		}
+		if !pk[name] && in.Mode != "once" && in.Mode != "full_interval" {
+			noPK = append(noPK, name)
+		}
+	}
+	var out []source.Check
+	if len(missing) > 0 {
+		sort.Strings(missing)
+		out = append(out, source.Check{
+			ID: "SCOPE-01", Title: "有表在源端不存在", Status: source.StatusBlocked,
+			Detail:   fmt.Sprintf("%s 找不到（可能改名了，或不在 %s 下）", strings.Join(missing, "、"), in.SourceCat.Tables[0].Schema),
+			Affected: missing, Who: "you",
+		})
+	} else {
+		out = append(out, source.Check{ID: "SCOPE-01", Title: "选中的表都在源端",
+			Status: source.StatusOK, Detail: fmt.Sprintf("%d 张表", len(in.Tables))})
+	}
+	if len(noPK) > 0 {
+		sort.Strings(noPK)
+		out = append(out, source.Check{
+			ID: "SCOPE-02", Title: "部分表没有主键", Status: source.StatusWarn,
+			Detail:   fmt.Sprintf("%s 没有主键：变更只能追加不能改，重复跑会插重复行", strings.Join(noPK, "、")),
+			Affected: noPK, Who: "you",
+		})
+	} else {
+		out = append(out, source.Check{ID: "SCOPE-02", Title: "选中的表都有主键",
+			Status: source.StatusOK, Detail: "可以安全地做 upsert"})
+	}
+	return out
+}
+
+func tablesWithoutColumn(cat *source.Catalog, tables []string, column string) []string {
+	if cat == nil {
+		return nil
+	}
+	has := map[string]bool{}
+	for _, t := range cat.Tables {
+		for _, c := range t.Columns {
+			if strings.EqualFold(c.Name, column) {
+				has[t.Table] = true
+			}
+		}
+	}
+	var out []string
+	for _, name := range tables {
+		if !has[name] {
+			out = append(out, name)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func existingTargetTables(cat *source.Catalog, tables []string) []string {
+	if cat == nil {
+		return nil
+	}
+	have := map[string]bool{}
+	for _, t := range cat.Tables {
+		have[t.Table] = true
+	}
+	var out []string
+	for _, name := range tables {
+		if have[name] {
+			out = append(out, name)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func preview(names []string) string {
+	if len(names) <= 3 {
+		return strings.Join(names, "、")
+	}
+	return strings.Join(names[:3], "、") + "…"
+}

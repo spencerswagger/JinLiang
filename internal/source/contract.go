@@ -193,6 +193,9 @@ type Check struct {
 	Who      string      `json:"who,omitempty"`  // you / dba / cloud-console
 	DocURL   string      `json:"doc_url,omitempty"`
 	Affected []string    `json:"affected,omitempty"`
+	// Code links this check to the four-part error card in docs/ERRORS.md, so
+	// the UI can render 「发生了什么/为什么/能做什么/风险」 without a lookup table.
+	Code string `json:"code,omitempty"`
 }
 
 // Report is the whole preflight result.

@@ -1,0 +1,14 @@
+{{define "content"}}
+<h1>第一次启动</h1>
+<p class="lead">先设一个管理员口令，然后建第一个数据库连接。之后所有配置都存在本机控制库里。</p>
+
+<form method="post" action="/setup" data-once>
+  <input type="hidden" name="csrf_token" value="{{.CSRF}}">
+  <label for="password">管理员口令（至少 10 个字符）</label>
+  <input id="password" name="password" type="password" autocomplete="new-password" autofocus required minlength="10">
+  <label for="password2">再输一次</label>
+  <input id="password2" name="password2" type="password" autocomplete="new-password" required minlength="10">
+  <p class="hint">口令只存 argon2id 哈希。忘了只能删控制库重建（任务可用导出的 yaml 恢复）。</p>
+  <button class="primary" type="submit">设置并继续</button>
+</form>
+{{end}}
