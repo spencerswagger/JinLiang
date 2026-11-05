@@ -160,10 +160,13 @@ jobs:
             -e POSTGRES_USER=jinliang -e POSTGRES_PASSWORD=jinliang -e POSTGRES_DB=jinliang_test \
             -p 55433:5432 postgres:16 -c wal_level=logical
           for c in pg-src pg-dst; do
+            # 不能只等 pg_isready：initdb 期间会先起一个临时实例应答，随后重启，
+            # 紧接着的 psql 会撞上 "the database system is shutting down"。
+            # 直接轮询真查询，能查通才算起好（与 control-plane job 同一修法）。
             ok=0
             for _ in $(seq 1 90); do
-              if docker exec "$c" pg_isready -U jinliang >/dev/null 2>&1; then ok=1; break; fi
-              sleep 1
+              if docker exec "$c" psql -U jinliang -d postgres -tAc "select 1" >/dev/null 2>&1; then ok=1; break; fi
+              sleep 2
             done
             if [ "$ok" != 1 ]; then echo "--- $c 没起来 ---"; docker logs "$c"; exit 1; fi
             docker exec "$c" psql -U jinliang -d postgres -tAc "select current_setting('wal_level')"

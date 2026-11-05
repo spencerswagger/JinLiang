@@ -50,6 +50,12 @@
   要做：一次性迁移把命中的键删除或改成 `***`，并在读取侧加同样的过滤；
   附一个 `doctor --check-secrets` 报告命中行数。**B1 开始前完成**。
 
+- **`E3010`（控制库损坏）在码表里但没接线**：`internal/core/codes.go` 有
+  `CodeControlDBBroken`（四段式齐全），但 `internal/control` 没有任何地方产生它——
+  `Store.Open` 的失败仍是裸 `fmt.Errorf`，`integrity_check` 不通过也只进 doctor 的 `problems`。
+  两条路选一：接进 `Open` / `integrity_check` 的失败路径（用户才知道该备份还是换版本），
+  或者从码表删掉。**别让它一直挂在码表里没人用**——`ERRORS.md` 的用户表里因此也没收这一行。
+
 ## M7 二期（不在本期承诺）
 
 同表双向、Web UI、Oracle/达梦/金仓、MQ sink、MariaDB。

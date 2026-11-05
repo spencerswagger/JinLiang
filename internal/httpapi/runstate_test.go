@@ -6,10 +6,12 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
 
 	"github.com/spencerswagger/jinliang/internal/control"
+	"github.com/spencerswagger/jinliang/internal/state"
 )
 
 // pageClient logs in and returns a cookie-carrying client for HTML pages.
@@ -135,5 +137,89 @@ func TestConnectionParamsRejectSecretKeys(t *testing.T) {
 	})
 	if code != http.StatusCreated {
 		t.Fatalf("普通参数不该被拦：%d %v", code, resp)
+	}
+}
+
+// Owl 收尾项：文案说「已停止」，颜色就不能是绿色的 ok。
+// 总览徽章的颜色必须与 runState 同一口径（finish_reason 优先于 phase）。
+func TestOverviewBadgeColorFollowsFinishReason(t *testing.T) {
+	ts, store := newTestServer(t)
+	setupAdmin(t, ts)
+	ctx := context.Background()
+
+	conn, err := store.CreateConnection(ctx, control.ConnectionInput{
+		Name: "源库", Kind: "postgres", Host: "127.0.0.1", Port: 1,
+		Database: "src", Username: "u", Password: "pw",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	type want struct {
+		reason string
+		text   string
+		class  string
+	}
+	cases := []want{
+		{control.FinishCompleted, "已完成", `class="badge ok"`},
+		{control.FinishStopped, "已停止", `class="badge warn"`},
+		{control.FinishInterrupted, "已中断", `class="badge bad"`},
+		{control.FinishFailed, "失败", `class="badge bad"`},
+	}
+	for i, c := range cases {
+		table := "t" + string(rune('a'+i))
+		job, err := store.CreateJob(ctx, control.JobInput{
+			Name: "任务-" + c.reason, SourceID: conn.ID, TargetID: conn.ID,
+			Spec: control.JobDoc{
+				Source:  control.SourceDoc{Scope: &control.ScopeDoc{Schema: "public", Include: []string{table}}},
+				Target:  control.TargetDoc{Schema: "report"},
+				Mode:    control.ModeDoc{Frequency: "once"},
+				Content: &control.ContentDoc{Tables: map[string]control.TableDoc{table: {}}},
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		run, err := store.StartRun(ctx, job.ID, state.Preflight, control.RunKindSync)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.UpdateRunPhase(ctx, run.ID, state.Prepare); err != nil {
+			t.Fatal(err)
+		}
+		// 终态阶段：completed/stopped 走 draining→done；failed/interrupted 走 failed。
+		phase, reason := state.Failed, c.reason
+		if c.reason == control.FinishCompleted || c.reason == control.FinishStopped {
+			for _, ph := range []state.Phase{state.Snapshot, state.Catchup, state.Streaming, state.Draining} {
+				if _, err := store.UpdateRunPhase(ctx, run.ID, ph); err != nil {
+					t.Fatal(err)
+				}
+			}
+			phase = state.Done
+		}
+		if _, err := store.FinishRun(ctx, run.ID, phase, "", 0, reason); err != nil {
+			t.Fatalf("%s: finish: %v", c.reason, err)
+		}
+	}
+
+	client := pageClient(t, ts)
+	page := getPage(t, client, ts.URL+"/")
+
+	// 从页面里抓出每个徽章的 (class, 文案)，再逐条比对：
+	// 直接按文案找下标会撞上统计卡里的「失败」字样，必须锚定在 span 上。
+	badgeRe := regexp.MustCompile(`(?s)<span class="badge ([a-z]*)">\s*([^<]+?)\s*</span>`)
+	got := map[string]string{}
+	for _, m := range badgeRe.FindAllStringSubmatch(page, -1) {
+		got[strings.TrimSpace(m[2])] = m[1]
+	}
+	for _, c := range cases {
+		class, ok := got[c.text]
+		if !ok {
+			t.Fatalf("总览里找不到「%s」的徽章（已抓到 %v）", c.text, got)
+		}
+		wantClass := strings.TrimSuffix(strings.TrimPrefix(c.class, `class="badge `), `"`)
+		if class != wantClass {
+			t.Fatalf("「%s」的徽章 class = %q，期望 %q", c.text, class, wantClass)
+		}
 	}
 }

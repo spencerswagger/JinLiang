@@ -496,3 +496,73 @@ func TestTxLimitsFromEnv(t *testing.T) {
 		t.Fatalf("非法值应回落到默认，得到 %d", events)
 	}
 }
+
+// 续段伪装成新事务开头：ValidateBatch 单看本批认不出（契约里明确写了这半边归引擎）。
+// 这里用「上一批提交过 TxID=42，这一批开头直接来一条 TxID=42 的数据事件」复现。
+func TestBatcherRejectsContinuationOfCommittedTransaction(t *testing.T) {
+	sink := &fakeSink{}
+	src := &fakeSource{}
+	b := newTestBatcher(sink, src, 100)
+
+	// 事务 42 正常提交
+	_ = b.Add(ctx(), source.Event{Kind: source.EvBegin, TxID: "42"})
+	_ = b.Add(ctx(), source.Event{Kind: source.EvInsert, TxID: "42"})
+	_ = b.Add(ctx(), commitEvent(src, "0/500"))
+	if err := b.Flush(ctx()); err != nil {
+		t.Fatal(err)
+	}
+
+	// 同一事务的后半段又来了，但没有新的 EvBegin
+	err := b.Add(ctx(), source.Event{Kind: source.EvInsert, TxID: "42"})
+	if err == nil {
+		t.Fatal("续段没有 EvBegin 时必须拦住：否则事务只落一半")
+	}
+	var cont *continuationError
+	if !errors.As(err, &cont) {
+		t.Fatalf("应该报 continuationError，得到 %T（%v）", err, err)
+	}
+	if len(sink.batches) != 1 {
+		t.Fatalf("拦住之后不该再落库，得到 %d 批", len(sink.batches))
+	}
+}
+
+// 不同事务的裸数据事件（TxID 对不上上次提交）仍然按「事务外事件」报错，不与续段混淆。
+func TestBatcherDistinguishesForeignBareEvent(t *testing.T) {
+	b := newTestBatcher(&fakeSink{}, &fakeSource{}, 100)
+	_ = b.Add(ctx(), source.Event{Kind: source.EvBegin, TxID: "1"})
+	_ = b.Add(ctx(), commitEvent(&fakeSource{}, "0/600"))
+	err := b.Add(ctx(), source.Event{Kind: source.EvInsert, TxID: "999"})
+	if err == nil {
+		t.Fatal("事务外的数据事件必须报错")
+	}
+	var cont *continuationError
+	if errors.As(err, &cont) {
+		t.Fatal("TxID 不是上一个已提交事务时，不该报成续段")
+	}
+}
+
+// 位点 kind 取值域的对账（SplitPosition 不管这个，契约要求引擎补）：
+// 以及「kind 与本任务的源不一致」→ E1010。
+func TestAssertPositionKind(t *testing.T) {
+	pg := pgsource.Position{}
+	if err := assertPositionKind(pg, "postgres"); err != nil {
+		t.Fatalf("postgres 位点在 postgres 任务上应通过: %v", err)
+	}
+	if err := assertPositionKind(pg, "mysql"); err == nil {
+		t.Fatal("postgres 位点在 mysql 任务上必须报错")
+	} else {
+		var ke *positionKindError
+		if !errors.As(err, &ke) {
+			t.Fatalf("应该是 positionKindError（映射 E1010），得到 %T", err)
+		}
+	}
+	// 未知 kind（foo:v1:x 能过 SplitPosition，但过不了这道对账）
+	if err := assertPositionKind(fakePosition("foo"), "postgres"); err == nil {
+		t.Fatal("未知的 kind 必须被拒")
+	}
+}
+
+type fakePosition string
+
+func (f fakePosition) String() string { return string(f) + ":v1:x" }
+func (f fakePosition) Kind() string   { return string(f) }

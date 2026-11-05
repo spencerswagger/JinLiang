@@ -49,8 +49,10 @@ func loadTemplates() (map[string]*pageTemplate, *pageTemplate, fs.FS, error) {
 		"phaseLabel": control.PhaseLabel,
 		// runState 用 finish_reason 覆盖 phase：`done` 既可能是「跑完了」也可能是
 		// 「用户手动停止」，只看 phase 会把手动停止显示成顺利完成（Ark P0-3）。
-		"runState":  control.RunStateLabel,
-		"phaseHint": control.PhaseHint,
+		"runState": control.RunStateLabel,
+		// 颜色与文案必须同一口径：phase=done + finish_reason=stopped 不能染成绿色。
+		"runBadgeClass": control.RunBadgeClass,
+		"phaseHint":     control.PhaseHint,
 		"shortTime": func(s string) string {
 			t, err := time.Parse(time.RFC3339, s)
 			if err != nil {

@@ -21,9 +21,21 @@
 |---|---|
 | `mode.frequency` | 五档：`once` / `continuous+initial` / `continuous` / `interval` / `full_interval`。只有前两类承诺秒级；`interval` 需要 `incremental_column` |
 | `mode.lookback` | 定时增量的重叠窗口：每轮从「水位 − lookback」开始，重复部分靠 upsert 幂等 |
-| `target.on_exists` | 默认 `error`（撞表就停），`recreate` 需要二次确认 + 备份提示 |
+| `target.on_exists` | 默认 `error`（撞表就停），`recreate` 会清空目标表、需要二次确认 + 备份提示（语义见 §1.1） |
 | `content.schema_follow` | `whitelist` 只跟随四类 DDL（加列、放宽长度、加索引、可选删列），其余拦截并暂停该表 |
 | `guard.on_exceed` | `pause` 最保守；`invalidate` 只在 PG 13+（有 `max_slot_wal_keep_size`）；`advance` 会跳过变更，必须显式确认 |
+
+### 1.1 重搬与 `on_exists: recreate` 的语义（已知限制）
+
+`on_exists: recreate` 会在重搬时**清空目标表**。若你在建任务之后往目标表手工写入过数据，**请先自行备份**——那部分数据会被一并清掉。B1 将加入「建表时行数/校验和」的比对，自动识别这种外部写入。
+
+为什么现在只能靠提示、不能自动判断（免得读者以为我们在瞎谨慎）：
+
+- 「这张表是不是本任务建的」靠目标端 `_jl_object` 里的 `table:<schema>.<table>` 记录判断；
+- **块标记（`_jl_chunk`）证明不了所有权**——`BulkApply` 对 `append` 复用的表同样会写块标记，所以「有块标记」不等于「表是我们建的」；
+- 于是存在唯一一个仍会删数据的组合：**记录在（表确实是我们建的）+ 用户事后往该表补写过行**。这种情况下重搬会连同补写的行一起清掉，目前只有 `recreate` 的二次确认能兜住；B1 的「建表时刻 vs 现在」行数/校验和比对才能把这一格也堵上。
+
+`on_exists: append` 没有这个问题（不清表），但它有自己的代价：**源端删掉的行会在目标端残留**，因为 append 不负责删除。这是语义选择，不是缺陷——要消除残留就选 `recreate`，代价是上面那条。
 
 ## 2. 命令面
 

@@ -72,11 +72,15 @@ type batcher struct {
 	batchRows int
 	delay     time.Duration
 
-	mu       sync.Mutex
-	cur      []source.Event // 当前源事务（还没 COMMIT），首元素是 EvBegin
-	txRows   int
-	txBytes  int64
-	inTx     bool
+	mu      sync.Mutex
+	cur     []source.Event // 当前源事务（还没 COMMIT），首元素是 EvBegin
+	txRows  int
+	txBytes int64
+	inTx    bool
+	// curTxID / lastTxID 是「续段伪装成新事务开头」的拦网：ValidateBatch 只能
+	// 看本批内的配对，看不出「这条数据属于上一批那个已提交的事务」。
+	curTxID  string
+	lastTxID string
 	pending  []source.Event // 已提交、还没落库的源事务
 	pendRows int
 	pendPos  pgsource.Position
@@ -140,7 +144,12 @@ func (b *batcher) Add(ctx context.Context, ev source.Event) error {
 
 	switch ev.Kind {
 	case source.EvBegin:
+		if b.inTx {
+			// 事务不能嵌套；正常 pgoutput 不会这样，真出现就是解码错乱。
+			return fmt.Errorf("又来一个 EvBegin（TxID %s），上一个事务还没提交", ev.TxID)
+		}
 		b.inTx = true
+		b.curTxID = ev.TxID
 		b.cur = b.cur[:0]
 		b.cur = append(b.cur, ev) // 事务边界要传给 sink：EvCommit 是唯一提交信号
 		return nil
@@ -150,6 +159,12 @@ func (b *batcher) Add(ctx context.Context, ev source.Event) error {
 			b.pending = append(b.pending, b.cur...)
 			b.pendRows += b.txRows
 		}
+		if ev.TxID != "" {
+			b.lastTxID = ev.TxID
+		} else {
+			b.lastTxID = b.curTxID
+		}
+		b.curTxID = ""
 		b.cur = b.cur[:0]
 		b.txRows = 0
 		b.inTx = false
@@ -165,8 +180,17 @@ func (b *batcher) Add(ctx context.Context, ev source.Event) error {
 		return nil
 	case source.EvInsert, source.EvUpdate, source.EvDelete, source.EvTruncate:
 		if !b.inTx {
+			// 契约（ValidateBatch 注释）明说：续段的首条数据事件单看本批认不出来，
+			// 靠 TxID 由引擎拦——就是这里。
+			if ev.TxID != "" && ev.TxID == b.lastTxID {
+				return &continuationError{txID: ev.TxID}
+			}
 			// pgoutput 不会在事务外发数据；真出现就是解码错乱，宁可停下。
 			return fmt.Errorf("收到事务外的事件（kind=%d）：这是解码器的问题", ev.Kind)
+		}
+		if ev.TxID != "" && b.curTxID != "" && ev.TxID != b.curTxID {
+			return fmt.Errorf("数据事件的事务（%s）和当前事务（%s）不是同一个：解码串流了",
+				ev.TxID, b.curTxID)
 		}
 		b.cur = append(b.cur, ev)
 		b.txRows++
@@ -192,6 +216,15 @@ func estimateSize(ev source.Event) int64 {
 		n += perCell + int64(len(v.S)+len(v.B))
 	}
 	return n
+}
+
+// continuationError 是「切开的大事务续段被当成新事务开头」：这种事件如果放过去，
+// 事务会被劈成两半提交，一半数据在上一批、一半在这一批，崩溃重放就不再是原子的。
+type continuationError struct{ txID string }
+
+func (e *continuationError) Error() string {
+	return fmt.Sprintf("事务 %s 的后半段又来了，但没有新的 EvBegin：切开的大事务续段不能当成新事务开头"+
+		"（数据会只落一半）。看到这个说明上游把事务边界弄丢了", e.txID)
 }
 
 // txTooLargeError is E1011: the source transaction does not fit in the buffer.
