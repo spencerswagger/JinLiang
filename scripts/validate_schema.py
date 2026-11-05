@@ -23,14 +23,25 @@ def main(paths: list[str]) -> int:
         return 2
     rc = 0
     for p in paths:
-        doc = yaml.safe_load(pathlib.Path(p).read_text(encoding="utf-8"))
-        try:
-            jsonschema.validate(doc, SCHEMA)
-        except jsonschema.ValidationError as e:
-            print(f"{p}: INVALID -> {e.message} (at {list(e.path)})", file=sys.stderr)
+        # `jinliang export --all` 用 `---` 分隔多个任务；只 safe_load 会报
+        # "expected a single document"。这里逐个文档校验，空文档跳过。
+        docs = [d for d in yaml.safe_load_all(pathlib.Path(p).read_text(encoding="utf-8")) if d is not None]
+        if not docs:
+            print(f"{p}: INVALID -> 空文档", file=sys.stderr)
             rc = 1
-        else:
-            print(f"{p}: ok")
+            continue
+        bad = False
+        for i, doc in enumerate(docs):
+            where = f"{p}#doc{i + 1}" if len(docs) > 1 else p
+            try:
+                jsonschema.validate(doc, SCHEMA)
+            except jsonschema.ValidationError as e:
+                print(f"{where}: INVALID -> {e.message} (at {list(e.path)})", file=sys.stderr)
+                rc = 1
+                bad = True
+                break
+        if not bad:
+            print(f"{p}: ok" + (f"（{len(docs)} 份）" if len(docs) > 1 else ""))
     return rc
 
 

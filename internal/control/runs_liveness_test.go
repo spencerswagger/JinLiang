@@ -148,7 +148,12 @@ func TestRecoverStaleRuns(t *testing.T) {
 
 // A2 回归：心跳必须独立于阶段推进——暂停 10 分钟的活 run 不能在下一次
 // RecoverStaleRuns 里被判死（那会静默放开活跃槽，还能起第二个 run）。
-func TestHeartbeatContinuesWhilePaused(t *testing.T) {
+// 心跳把「正在跑」与「进程已死」区分开：只要心跳新鲜，RecoverStaleRuns 就不许
+// 判死它（否则活跃槽会被静默放开，还能再起第二个 run）。
+//
+// B0 的桩 runner 已从生产路径移除（UI 改走真引擎），所以这里直接用控制库的
+// StartRun/TouchRun 模拟「一条活着的 run」，只测心跳与判死这一层。
+func TestHeartbeatKeepsLiveRunFromBeingReaped(t *testing.T) {
 	s, err := Open(Options{DataDir: t.TempDir(), Autogen: true, Heartbeat: time.Second})
 	if err != nil {
 		t.Fatal(err)
@@ -160,25 +165,27 @@ func TestHeartbeatContinuesWhilePaused(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	run, err := s.Runner().Start(ctx, job.ID, ActorAPI)
+	run, err := s.StartRun(ctx, job.ID, state.Preflight, RunKindSync)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Runner().Pause(ctx, job.ID); err != nil {
-		t.Fatalf("pause: %v", err)
+	if err := s.TouchRun(ctx, run.ID); err != nil {
+		t.Fatal(err)
 	}
-	// 等两个心跳周期：暂停期间也必须有心跳。
-	time.Sleep(2500 * time.Millisecond)
+	time.Sleep(1100 * time.Millisecond)
+	if err := s.TouchRun(ctx, run.ID); err != nil {
+		t.Fatal(err)
+	}
 
 	got, err := s.GetRun(ctx, run.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got.EndedAt != "" {
-		t.Fatalf("暂停中的 run 不该结束: %+v", got)
+		t.Fatalf("活着的 run 不该结束: %+v", got)
 	}
 	if got.HeartbeatAt == run.HeartbeatAt {
-		t.Fatalf("暂停期间心跳没有更新（Started=%s HeartbeatAt=%s）", run.HeartbeatAt, got.HeartbeatAt)
+		t.Fatalf("心跳没有更新（Started=%s HeartbeatAt=%s）", run.HeartbeatAt, got.HeartbeatAt)
 	}
 
 	// 阈值 3×1s：刚心跳过，绝不能被判死。
@@ -187,16 +194,11 @@ func TestHeartbeatContinuesWhilePaused(t *testing.T) {
 		t.Fatal(err)
 	}
 	if n != 0 {
-		t.Fatalf("暂停中的活 run 被误判为中断（%d 条），活跃槽会被错误放开", n)
+		t.Fatalf("心跳新鲜的活 run 被误判为中断（%d 条），活跃槽会被错误放开", n)
 	}
 
-	if err := s.Runner().Stop(ctx, job.ID); err != nil {
-		t.Fatalf("stop: %v", err)
-	}
-	if err := s.Runner().Wait(ctx, job.ID); err != nil {
-		t.Fatal(err)
-	}
-	final, err := s.GetRun(ctx, run.ID)
+	// 手动停止的语义：finish_reason=stopped，且不能伪装成 completed。
+	final, err := s.FinishRun(ctx, run.ID, state.Done, "", 130, FinishStopped)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -205,8 +207,6 @@ func TestHeartbeatContinuesWhilePaused(t *testing.T) {
 	}
 }
 
-// B4 回归：有运行历史的任务不许静默换身份（换连接/改表范围会换掉 job_key，
-// 目标端按 job_key 存的同步状态会变成孤儿）。
 func TestUpdateJobCannotChangeIdentityWithHistory(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
