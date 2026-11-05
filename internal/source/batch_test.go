@@ -28,6 +28,12 @@ func TestValidateBatch(t *testing.T) {
 		{"未收尾的事务", []Event{begin, ins}, false},
 		{"以 EvBegin 结尾", []Event{ins, commit, begin}, false},
 		{"事务嵌套", []Event{begin, begin, ins, commit}, false},
+		// 规则 4：提交完之后又凭空冒出一条数据事件（Owl 在 #7 复核时发现的洞）
+		{"提交后裸数据事件", []Event{ins, commit, ins}, false},
+		{"只有提交再裸数据事件", []Event{commit, ins}, false},
+		{"提交后开新事务再写", []Event{ins, commit, begin, ins, commit}, true},
+		{"两个事务之间夹心跳再开新事务", []Event{begin, ins, commit, beat, begin, ins, commit}, true},
+		{"提交后只有 DDL（事务外合法）", []Event{begin, ins, commit, ddl}, true},
 	}
 	for _, c := range cases {
 		err := ValidateBatch(c.evs)

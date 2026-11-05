@@ -18,6 +18,7 @@ func TestMap(t *testing.T) {
 		{"pg numeric keeps scale", Postgres, MySQL, "numeric(12, 2)", "decimal(12, 2)", Lossless, true},
 		{"pg timestamptz needs confirm", Postgres, MySQL, "timestamptz", "datetime(6)", NeedsConfirm, true},
 		{"pg array -> json", Postgres, MySQL, "text[]", "json", NeedsConfirm, true},
+		{"pg json -> mysql", Postgres, MySQL, "json", "json", Lossy, true},
 		{"pg uuid", Postgres, MySQL, "uuid", "char(36)", Lossless, true},
 		{"mysql tinyint(1) needs confirm", MySQL, Postgres, "tinyint(1)", "boolean", NeedsConfirm, true},
 		{"mysql bigint unsigned", MySQL, Postgres, "bigint unsigned", "numeric(20,0)", NeedsConfirm, true},
