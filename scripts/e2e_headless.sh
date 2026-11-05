@@ -154,6 +154,49 @@ for c in checks:
 print("  can_start=%s" % d.get("can_start"))
 PY
 
+say "5b. 预检要么放行，要么给出可执行的下一步（不假装能跑）"
+CAN_START=$(json '["can_start"]' <"${WORK}/preflight.json")
+if [ "${CAN_START}" = "True" ]; then
+  echo "  can_start=True：源库与目标端都满足 continuous+initial"
+else
+  echo "  can_start=False：预检拦住了。按设计这不等于拒绝——它必须同时给出下一步："
+  python3 - "${WORK}/preflight.json" <<'PYCHECK'
+import json, sys
+d = json.load(open(sys.argv[1]))
+blocked = [c for c in d["checks"] if c["status"] == "blocked"]
+assert blocked, "can_start=False 时必须至少有一项 blocked 说明原因"
+for c in blocked:
+    assert c.get("code"), "blocked 项必须挂错误码（UI 靠它渲染四段式）: %r" % c
+    print("  卡点 [%s] %s -> %s" % (c["code"], c["title"], c["detail"]))
+    if c.get("sql"):
+        print("  可复制执行：%s" % c["sql"])
+PYCHECK
+  # 按预检给出的替代方案改成定时增量，再预检一次：应该就能开跑了
+  INTERVAL_BODY=$(python3 - "${CONN_ID}" "${MY_ID}" "${TABLE}" <<'PYBODY'
+import json, sys
+conn, my, table = sys.argv[1], sys.argv[2], sys.argv[3]
+print(json.dumps({
+    "name": "e2e-orders",
+    "source_id": conn,
+    "target_id": my,
+    "enabled": False,
+    "spec": {
+        "source": {"scope": {"schema": "public", "include": [table]}},
+        "target": {"schema": "report", "on_exists": "append", "create_indexes": "defer"},
+        "mode": {"frequency": "interval", "interval": "5m", "incremental_column": "updated_at"},
+        "content": {"tables": {table: {}}},
+    },
+}))
+PYBODY
+)
+  api PUT "/api/jobs/${JOB_ID}" "${INTERVAL_BODY}" >/dev/null
+  curl -fsS -X POST "${BASE}/api/jobs/${JOB_ID}/preflight" -H "Authorization: Bearer ${TOKEN}" \
+    >"${WORK}/preflight2.json"
+  json '["can_start"]' <"${WORK}/preflight2.json" | grep -qx 'True' \
+    || fail "按预检建议改成定时增量后仍然跑不了"
+  echo "  改成定时增量（watermark=updated_at）后 can_start=True：替代方案真的能走通"
+fi
+
 say "6. run（桩：只推进阶段，不搬数据）"
 api POST "/api/jobs/${JOB_ID}/run" >"${WORK}/run.json"
 json '["stub"]' <"${WORK}/run.json" | grep -qi true || fail "run 必须明确返回 stub=true"
