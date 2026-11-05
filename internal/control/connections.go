@@ -101,7 +101,30 @@ func (in *ConnectionInput) Validate() error {
 	if in.Username == "" {
 		return fmt.Errorf("用户名不能为空")
 	}
+	// params 是自由键值（sslmode/charset/...），但口令类参数绝不能落控制库：
+	// params_json 是明文，列表接口还会原样回传——`{"params":{"sslpassword":"..."}}`
+	// 或 DSN 里 `?sslpassword=` 会让口令绕过 AES-GCM 直接躺在 db/-wal 里。
+	// 口令只有一个入口：password 字段（加密存储）。
+	for k := range in.Params {
+		if isSecretParamKey(k) {
+			return fmt.Errorf("%w: 参数 %q 是口令类，不能放进 params（它会明文存进控制库并被接口回传）。请用 password 字段，或从环境变量导入 DSN", ErrInvalid, k)
+		}
+	}
 	return nil
+}
+
+// secretParamKeys 是「一看就是口令」的参数名（大小写、- 与 _ 都不敏感）。
+// 宁严勿松：多拦一个不常用的参数，比让口令明文落盘好。
+var secretParamKeys = []string{"password", "sslpassword", "sslkey", "passphrase"}
+
+func isSecretParamKey(k string) bool {
+	norm := strings.ToLower(strings.NewReplacer("-", "", "_", "").Replace(strings.TrimSpace(k)))
+	for _, bad := range secretParamKeys {
+		if norm == bad {
+			return true
+		}
+	}
+	return false
 }
 
 // CreateConnection stores a connection, encrypting the password.
@@ -198,7 +221,7 @@ func (s *Store) UpdateConnection(ctx context.Context, id string, in ConnectionIn
 			return Connection{}, err
 		}
 		if n > 0 {
-			return Connection{}, fmt.Errorf("%w：有 %d 个任务把它当身份的一部分（改地址请新建一个连接，再把任务切过去）", ErrIdentityLocked, n)
+			return Connection{}, fmt.Errorf("%w：有 %d 个任务把它当身份的一部分（要换地址：新建连接 + 新建任务，然后把旧任务停用；有运行历史的任务不能再改源与目标）", ErrIdentityLocked, n)
 		}
 	}
 	if _, err := tx.ExecContext(ctx,

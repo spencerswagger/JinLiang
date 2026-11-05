@@ -24,6 +24,18 @@ jobs:
       - name: 单二进制体积守门（<25 MB）
         run: scripts/check_binary_size.sh
 
+  race:
+    # 并发安全单独一档：SSE 的订阅/发布、心跳 ticker、暂停/停止/取消路径，
+    # 只有 -race 能稳定暴露问题（PR #5 里那颗 send-on-closed-channel 就是这么找出来的）。
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.x"
+      - name: go test -race
+        run: CGO_ENABLED=1 go test -race ./...
+
   testmatrix:
     # 每个连接器必须带可测性清单，否则视为未完成
     runs-on: ubuntu-latest

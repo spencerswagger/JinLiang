@@ -400,14 +400,29 @@ func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, http.StatusBadRequest, plainError("%v", err))
 		return
 	}
-	job, err := s.store.ImportYAML(r.Context(), raw, control.ImportOptions{Actor: actorOf(r)})
-	if err != nil {
+	report, err := s.store.ImportYAMLDocs(r.Context(), raw, control.ImportOptions{Actor: actorOf(r)})
+	// 有跳过时仍然把成功的部分报出来，但状态码不是 201：调用方必须知道「不是全都进了」。
+	if err != nil && report.Total == 0 {
 		s.fail(w, r, err)
 		return
 	}
-	_ = s.store.Audit(r.Context(), actorOf(r), control.ActionJobImport, map[string]any{"job_id": job.ID})
-	sum, _ := s.store.GetJobSummary(r.Context(), job.ID)
-	writeJSON(w, http.StatusCreated, sum)
+	ids := make([]string, 0, len(report.Imported))
+	for _, job := range report.Imported {
+		ids = append(ids, job.ID)
+	}
+	_ = s.store.Audit(r.Context(), actorOf(r), control.ActionJobImport, map[string]any{
+		"job_ids": ids, "imported": report.ImportedCount(), "skipped": len(report.Skipped),
+	})
+	status := http.StatusCreated
+	switch {
+	case report.ImportedCount() == 0 && len(report.Skipped) > 0:
+		// 一份都没进：这不是「部分成功」，是失败。207 属于 2xx，`curl -f` 会当成功，
+		// 与 §4B「不能看起来像成功」直接冲突 → 422 + 完整 report。
+		status = http.StatusUnprocessableEntity
+	case len(report.Skipped) > 0:
+		status = http.StatusMultiStatus // 207：部分成功（至少一份真的写进去了）
+	}
+	writeJSON(w, status, report)
 }
 
 // readYAMLBody accepts either a raw yaml body or {"yaml": "..."} JSON.
@@ -542,7 +557,7 @@ func (s *Server) doctor(ctx context.Context) map[string]any {
 	if ierr != nil || integrity != "ok" {
 		problems = append(problems, "控制库完整性检查没通过："+integrity)
 	}
-	if s.listen != "" && !isLoopback(s.listen) {
+	if s.listen != "" && !netcheck.IsLoopbackListen(s.listen) {
 		problems = append(problems, "监听地址不是本机（"+s.listen+"）：同网络的人可以访问控制台，请确认这是你要的")
 	}
 	if !configured {
@@ -586,7 +601,7 @@ func (s *Server) fail(w http.ResponseWriter, r *http.Request, err error) {
 			Why: "任务的指纹＝源＋目标＋表范围（docs/IDENTITY.md §2），改坐标会让已有任务和指纹脱节，" +
 				"同一份同步就变成两个任务、两条写入流打同一张目标表",
 			Next: []string{
-				"要换地址/库：新建一个连接，再把任务切过去（任务页可以改源与目标）",
+				"要换地址/库：新建一个连接 + 新建一个任务，然后把旧任务停用（有运行历史的任务不能再改源与目标，否则目标库里的同步状态会变成孤儿）",
 				"只是换名字、换口令、加参数：这些不属于身份，随便改",
 			},
 			Risk: "无：这条只是拒绝改坐标，不会动现有连接与任务",
@@ -645,5 +660,9 @@ func safeFilename(s string) string {
 	}
 	return out
 }
+
+// 注意：这里**没有**第二份 loopback 判定。原来那份把空 host（":8080" = 绑全网卡）
+// 判成 loopback，于是 --listen :8080 时 doctor 报 healthy，与 serve 刚打印的
+// 暴露警告自相矛盾。统一用 internal/netcheck（与首启守卫同一份实现）。
 
 func isLoopback(listen string) bool { return netcheck.IsLoopbackListen(listen) }

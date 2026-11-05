@@ -35,18 +35,24 @@ type Options struct {
 	Autogen bool
 	// Now is a test seam; nil means time.Now.
 	Now func() time.Time
+	// Heartbeat is how often a running job refreshes runs.heartbeat_at.
+	// Zero means DefaultHeartbeatInterval (30s). 过期阈值固定取 3×它
+	// （StaleAfter），B1 的长事务靠这个独立 ticker 而不是阶段推进来续命。
+	Heartbeat time.Duration
 }
 
 // Store is the control database plus the cipher that protects connection
 // secrets. All writes go through it; nothing else opens the SQLite file.
 type Store struct {
-	db     *sql.DB
-	dir    string
-	path   string
-	cipher *Cipher
-	now    func() time.Time
-	bus    *Bus
-	runner *Runner
+	db         *sql.DB
+	dir        string
+	path       string
+	cipher     *Cipher
+	now        func() time.Time
+	bus        *Bus
+	runner     *Runner
+	instanceID string // settings.instance_id：审计、租约、run 的 owner 都用它
+	heartbeat  time.Duration
 }
 
 // DefaultDataDir returns ~/.config/jinliang (or $XDG_CONFIG_HOME/jinliang).
@@ -108,9 +114,12 @@ func Open(opts Options) (*Store, error) {
 		return nil, fmt.Errorf("连接控制库失败: %w", err)
 	}
 
-	s := &Store{db: db, dir: abs, path: path, cipher: cipher, now: opts.Now}
+	s := &Store{db: db, dir: abs, path: path, cipher: cipher, now: opts.Now, heartbeat: opts.Heartbeat}
 	if s.now == nil {
 		s.now = time.Now
+	}
+	if s.heartbeat <= 0 {
+		s.heartbeat = DefaultHeartbeatInterval
 	}
 	s.bus = NewBus(s.now)
 	if err := s.migrate(ctx); err != nil {
@@ -174,15 +183,17 @@ func ensurePrivateDir(dir string) error {
 // ensureInstance makes sure settings.instance_id exists. The instance id is the
 // third identity layer (docs/IDENTITY.md §4): audit, lease owner, object owner.
 func (s *Store) ensureInstance(ctx context.Context) error {
-	if _, ok, err := s.Setting(ctx, SettingInstanceID); err != nil {
+	if v, ok, err := s.Setting(ctx, SettingInstanceID); err != nil {
 		return err
 	} else if ok {
+		s.instanceID = v
 		return nil
 	}
 	id, err := newInstanceID()
 	if err != nil {
 		return err
 	}
+	s.instanceID = id
 	return s.SetSetting(ctx, SettingInstanceID, id)
 }
 

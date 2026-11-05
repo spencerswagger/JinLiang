@@ -2,9 +2,12 @@ package control
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/spencerswagger/jinliang/internal/core"
 )
@@ -20,6 +23,10 @@ type migration struct {
 	Version int
 	Name    string
 	Stmts   []string
+	// After 在同一事务里做「需要 Go 逻辑」的收尾（时间窗口比较、审计、索引兜底）。
+	// 放在事务里是故意的：迁移版本号与它带来的数据形态必须一起提交，
+	// 否则版本号已经前进、索引却没建上，下次启动再也不会补。
+	After func(ctx context.Context, tx *sql.Tx, s *Store) error
 }
 
 // migrations 是控制库的全部结构历史。字段名严格对齐 CONTROL-PLANE §3。
@@ -75,6 +82,69 @@ var migrations = []migration{
 			`CREATE INDEX IF NOT EXISTS idx_audit_at ON audit(at DESC)`,
 		},
 	},
+	{
+		Version: 2,
+		Name:    "runs-liveness",
+		Stmts: []string{
+			// 进程被杀后，原来那行会永远 ended_at IS NULL：历史页永久显示「在跑」，
+			// 而且还能再开第二个 run。三列 + 一条 partial unique index 把这件事关死。
+			`ALTER TABLE runs ADD COLUMN heartbeat_at TEXT`,
+			`ALTER TABLE runs ADD COLUMN owner_instance TEXT`,
+			// completed | failed | stopped | interrupted —— 「手动停止」不再伪装成 exit_code=0 的正常结束。
+			`ALTER TABLE runs ADD COLUMN finish_reason TEXT`,
+		},
+		After: closeOnlyStaleRunsThenIndex,
+	},
+}
+
+// closeOnlyStaleRunsThenIndex 是 v2 的收尾。
+//
+// 关键区别（Ark C-2）：**只收尾心跳过期的**，不无条件收尾所有 open run。
+// 一个只跑 200ms 的 `jinliang export` 也会打开同一个控制库；如果它把正在服务的
+// serve 手里那条活 run 标成 interrupted，活跃槽就白放开了（还能再起第二个 run）。
+// 心跳新鲜的留给人家的 RecoverStaleRuns（serve 启动时按同一阈值判断）。
+func closeOnlyStaleRunsThenIndex(ctx context.Context, tx *sql.Tx, s *Store) error {
+	cutoff := s.now().Add(-StaleAfter(s.heartbeat)).UTC().Format(time.RFC3339)
+	res, err := tx.ExecContext(ctx,
+		`UPDATE runs
+		    SET ended_at = ?, finish_reason = 'interrupted',
+		        phase = CASE WHEN phase IN ('done','failed') THEN phase ELSE 'failed' END,
+		        last_error = COALESCE(last_error, '升级时发现这是一条没有心跳的遗留运行；这一轮没有正常收尾')
+		  WHERE ended_at IS NULL
+		    AND COALESCE(heartbeat_at, started_at) < ?`, s.nowText(), cutoff)
+	if err != nil {
+		return fmt.Errorf("收尾遗留运行失败: %w", err)
+	}
+	closed, _ := res.RowsAffected()
+
+	// 兜底：同一任务若还残留多行「未结束」（v1 时代没有约束，理论上可能），
+	// 只保留最新一条，其余结掉——否则唯一索引建不起来，整个升级会卡死。
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE runs SET ended_at = started_at, finish_reason = COALESCE(finish_reason,'interrupted'),
+		        phase = CASE WHEN phase IN ('done','failed') THEN phase ELSE 'failed' END
+		  WHERE ended_at IS NULL
+		    AND id NOT IN (SELECT id FROM runs r2 WHERE r2.ended_at IS NULL
+		                   GROUP BY r2.job_id HAVING r2.id = MAX(r2.id))`); err != nil {
+		return fmt.Errorf("清理重复活跃运行失败: %w", err)
+	}
+
+	if _, err := tx.ExecContext(ctx,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_one_active
+		    ON runs(job_id) WHERE ended_at IS NULL`); err != nil {
+		return fmt.Errorf("创建「一任务一活跃运行」唯一索引失败: %w", err)
+	}
+
+	if closed > 0 {
+		id, _ := NewID()
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO audit (id, at, actor, action, detail_json) VALUES (?, ?, ?, ?, ?)`,
+			id, s.nowText(), ActorSystem, "migrate.recover_runs",
+			fmt.Sprintf(`{"closed":%d,"schema_version":2,"reason":"heartbeat stale during upgrade"}`, closed)); err != nil {
+			return fmt.Errorf("写迁移审计失败: %w", err)
+		}
+		fmt.Fprintf(os.Stderr, "迁移 2(runs-liveness)：%d 条心跳过期的运行已标记 interrupted\n", closed)
+	}
+	return nil
 }
 
 // migrate applies every migration newer than the recorded schema_version.
@@ -123,6 +193,11 @@ func (s *Store) applyMigration(ctx context.Context, m migration) error {
 		}
 		if _, err := tx.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("执行 %q 失败: %w", firstLine(stmt), err)
+		}
+	}
+	if m.After != nil {
+		if err := m.After(ctx, tx, s); err != nil {
+			return err
 		}
 	}
 	if _, err := tx.ExecContext(ctx,
