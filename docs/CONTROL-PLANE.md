@@ -121,11 +121,12 @@ CREATE TABLE audit (
 | POST | `/api/jobs/{id}/resume` | 从暂停恢复；没暂停则 400 | 需登录 | 需要 | 否 | 202 |
 | POST | `/api/jobs/{id}/stop` | 收尾后结束；没在跑则 409 | 需登录 | 需要 | 是（重复停止无副作用） | 202 |
 | GET | `/api/jobs/{id}/events` | **SSE**：阶段迁移、批次提交、延迟、错误（UI 实时刷新）；只认会话 cookie 或 `Authorization` 头，**不接受 query 里的 token** | 需登录 | 不需要（只读） | 是 | 200 |
-| GET | `/api/jobs/{id}/yaml` | 导出 yaml（与 `job.schema.json` 一致，完整 JobDoc）；会记一条审计 | 需登录 | 不需要 | 是（只读） | 200 |
+| GET | `/api/jobs/{id}/export` | **导出 yaml（规范路径）**：与 `job.schema.json` 一致的完整 JobDoc；会记一条审计 | 需登录 | 不需要 | 是（只读） | 200 |
+| GET | `/api/jobs/{id}/yaml` | **已弃用别名（deprecated，将在后续版本移除）**：与上一条完全等价，只为现有 e2e / UI / CLI 保留一个周期；新代码一律用 `/export` | 需登录 | 不需要 | 是（只读） | 200 |
 | POST | `/api/jobs/import` | 导入 yaml（先校验再落库）；同指纹是**更新**既有任务，不是报冲突 | 需登录 | 需要 | **是**（同坐标复用连接、同指纹更新任务） | 201（新建与更新都回 201，现状） |
 | GET | `/api/export` | 导出全部任务，每份之间用 `---` 分隔 | 需登录 | 不需要 | 是（只读） | 200 |
 
-> 命名待裁定：§4 旧稿的导出路径写的是 `/api/jobs/{id}/export`，实现（以及 `E1009` 的提示文案）用的是 `/yaml`；两者是否统一成一个名字，由设计裁定，本表按实现记录。
+> 导出路径以 `/api/jobs/{id}/export` 为规范；`/yaml` 是实现早期自行引入的名字，现降为别名，保留一个周期后移除（移除时同步改 `E1009` 的提示文案）。
 
 ### 4.4 运维
 
