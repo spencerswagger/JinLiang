@@ -3,6 +3,8 @@ package pgsource
 import (
 	"errors"
 	"testing"
+
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 func TestPositionRoundTrip(t *testing.T) {
@@ -134,5 +136,64 @@ func TestSafeAckPointNeedsStableKeepalives(t *testing.T) {
 	s.keepPrev.Store(900)
 	if _, ok := s.SafeAckPoint(); ok {
 		t.Fatal("位置在推进时不该给安全位点")
+	}
+}
+
+// 这条是守门用例（比正例重要）：通用短语不能把任何错误判成「位点不连续」。
+// 曾经 IsPositionGap 的匹配表里有裸的 "does not exist"，于是「schema 不存在」
+// 被当成进度不连续，把用户引去 --resync 重搬全量。
+func TestIsPositionGapOnlyMatchesPositionSignals(t *testing.T) {
+	notGap := []*pgconn.PgError{
+		{Code: "3F000", Message: `schema "report" does not exist`},
+		{Code: "42P01", Message: `relation "public.orders" does not exist`},
+		{Code: "42501", Message: `permission denied for schema public`},
+		{Code: "23505", Message: "duplicate key value violates unique constraint"},
+	}
+	for _, e := range notGap {
+		if IsPositionGap(e) {
+			t.Fatalf("%s %q 不该被判成位点不连续", e.Code, e.Message)
+		}
+	}
+
+	gap := []*pgconn.PgError{
+		{Code: "58P01", Message: "could not open file"},
+		{Code: "55000", Message: `replication slot "jl_abc" was invalidated`},
+		{Code: "55000", Message: `replication slot "jl_abc" does not exist`},
+		{Code: "55000", Message: `replication slot "jl_abc" was not found`},
+		{Code: "XX000", Message: "requested WAL segment 000000010000000000000002 has already been removed"},
+	}
+	for _, e := range gap {
+		if !IsPositionGap(e) {
+			t.Fatalf("%s %q 应该被判成位点不连续", e.Code, e.Message)
+		}
+	}
+}
+
+func TestWalLevelTooLowDetection(t *testing.T) {
+	low := &pgconn.PgError{Code: "55000", Message: "logical decoding requires wal_level >= logical"}
+	if !IsWalLevelTooLow(low) {
+		t.Fatal("wal_level 不够应该被识别（映射 E1001）")
+	}
+	for _, e := range []*pgconn.PgError{
+		{Code: "55000", Message: "object not in prerequisite state"},
+		{Code: "42501", Message: "wal_level insufficient"}, // 码不对不算
+	} {
+		if IsWalLevelTooLow(e) {
+			t.Fatalf("%s %q 不该被识别成 wal_level 问题", e.Code, e.Message)
+		}
+	}
+}
+
+func TestPrivilegeAndObjectMissingDetection(t *testing.T) {
+	if !IsNoPrivilege(&pgconn.PgError{Code: "42501", Message: "permission denied for schema public"}) {
+		t.Fatal("42501 应识别为权限问题")
+	}
+	for _, code := range []string{"3F000", "42P01", "42703"} {
+		if !IsObjectMissing(&pgconn.PgError{Code: code, Message: "missing"}) {
+			t.Fatalf("%s 应识别为对象不存在", code)
+		}
+	}
+	if IsObjectMissing(&pgconn.PgError{Code: "23505", Message: "duplicate"}) {
+		t.Fatal("23505 不是对象不存在")
 	}
 }

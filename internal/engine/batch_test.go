@@ -3,6 +3,10 @@ package engine
 import (
 	"context"
 	"errors"
+	"github.com/spencerswagger/jinliang/internal/core"
+
+	"github.com/jackc/pgx/v5/pgconn"
+
 	"reflect"
 	"strings"
 	"testing"
@@ -566,3 +570,44 @@ type fakePosition string
 
 func (f fakePosition) String() string { return string(f) + ":v1:x" }
 func (f fakePosition) Kind() string   { return string(f) }
+
+// 错误分类：兜底不许再落 E4002（「我们的 bug」），否则所有未分类错误都在指责自己。
+func TestClassifyErrorDoesNotDefaultToDecoderBug(t *testing.T) {
+	unknown := errors.New("some database error we have not seen")
+	code, classified := classifyError(unknown)
+	if classified {
+		t.Fatalf("未识别的错误不该被分类，得到 %s", code)
+	}
+	if code == core.CodeDecoderBug {
+		t.Fatal("兜底不许是 E4002：那会让用户去给我们提一个不存在的 issue")
+	}
+
+	// 运行期撞上 wal_level 不够 → E1001（与预检同一口径）
+	low := &pgconn.PgError{Code: "55000", Message: "logical decoding requires wal_level >= logical"}
+	if code, ok := classifyError(low); !ok || code != core.CodeWalLevel {
+		t.Fatalf("wal_level 不够应映射 E1001，得到 %s %v", code, ok)
+	}
+
+	// 位点不连续只认位点专属信号
+	gap := &pgconn.PgError{Code: "58P01", Message: "could not open file"}
+	if code, ok := classifyError(gap); !ok || code != core.CodePositionGap {
+		t.Fatalf("位点不连续应为 E3001，得到 %s %v", code, ok)
+	}
+
+	// schema 不存在：不能再被判成位点不连续（这条是本次修复的核心）
+	missing := &pgconn.PgError{Code: "3F000", Message: `schema "report" does not exist`}
+	if code, ok := classifyError(missing); ok {
+		t.Fatalf("schema 不存在不该有码（等 E1013 落地再挂），得到 %s", code)
+	}
+	why, next := hint(missing)
+	if !strings.Contains(why, "对象不存在") || len(next) == 0 {
+		t.Fatalf("未编号但已识别的错误要给方向，得到 why=%q next=%v", why, next)
+	}
+
+	// 权限不够同理
+	denied := &pgconn.PgError{Code: "42501", Message: "permission denied for schema public"}
+	why, next = hint(denied)
+	if !strings.Contains(why, "权限") || !strings.Contains(strings.Join(next, " "), "GRANT") {
+		t.Fatalf("权限错误应指向 GRANT，得到 why=%q next=%v", why, next)
+	}
+}
