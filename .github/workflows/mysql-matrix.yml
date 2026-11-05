@@ -3,6 +3,10 @@ name: mysql-matrix
 # MySQL 源（轨 B）的真库矩阵：5.7 / 8.0 / 8.4 各跑一遍
 # 全量（快照）/ 增量（binlog 取流）/ 崩溃恢复（按位点重放）。
 # 沙盒里没有 docker，所以这一层只能在 Actions 上跑。
+#
+# 为什么不用 services：5.7 的官方镜像默认 log_bin=OFF，而 services 没法给
+# 容器追加 mysqld 参数。这里直接用 docker run 把源库该开的开关写清楚——
+# 顺便当成「源库需要什么配置」的可执行文档。
 
 on:
   pull_request:
@@ -20,26 +24,11 @@ jobs:
       matrix:
         include:
           - mysql: "5.7"
-            note: "无 GTID 默认、无事务压缩、SHOW MASTER STATUS"
+            note: "log_bin 默认关闭、无 GTID 默认、无事务压缩、SHOW MASTER STATUS"
           - mysql: "8.0"
             note: "SHOW MASTER STATUS、8.0.20+ 事务压缩"
           - mysql: "8.4"
             note: "SHOW MASTER STATUS 已移除、mysql_native_password 默认关闭"
-    services:
-      mysql:
-        image: mysql:${{ matrix.mysql }}
-        env:
-          MYSQL_ROOT_PASSWORD: root
-          MYSQL_DATABASE: jinliang_src
-          MYSQL_USER: jinliang
-          MYSQL_PASSWORD: jinliang
-        ports:
-          - 3306:3306
-        options: >-
-          --health-cmd "mysqladmin ping -h 127.0.0.1 -ujinliang -pjinliang"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 40
     env:
       JINLIANG_TEST_MYSQL_SRC_DSN: mysql://jinliang:jinliang@127.0.0.1:3306/jinliang_src
     steps:
@@ -48,20 +37,36 @@ jobs:
         with:
           go-version: "1.27.x"
 
-      - name: 等 MySQL 就绪并补齐复制权限
+      - name: 起源库（${{ matrix.mysql }}：${{ matrix.note }}）
         run: |
           set -euo pipefail
-          for i in $(seq 1 60); do
-            if mysqladmin ping -h 127.0.0.1 -uroot -proot --silent; then break; fi
+          docker run -d --name mysql -p 3306:3306 \
+            -e MYSQL_ROOT_PASSWORD=root \
+            -e MYSQL_DATABASE=jinliang_src \
+            -e MYSQL_USER=jinliang \
+            -e MYSQL_PASSWORD=jinliang \
+            mysql:${{ matrix.mysql }} \
+            --server-id=1 \
+            --log-bin=mysql-bin \
+            --binlog-format=ROW \
+            --binlog-row-image=FULL
+          for i in $(seq 1 90); do
+            if mysqladmin ping -h 127.0.0.1 -uroot -proot --silent 2>/dev/null; then exit 0; fi
             sleep 2
           done
+          echo "MySQL 没起来，容器日志："
+          docker logs mysql
+          exit 1
+
+      - name: 补齐复制权限并确认源库配置
+        run: |
+          set -euo pipefail
           mysql -h 127.0.0.1 -uroot -proot -e "
             GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'jinliang'@'%';
             FLUSH PRIVILEGES;
-            SHOW VARIABLES LIKE 'log_bin';
-            SHOW VARIABLES LIKE 'binlog_format';
-            SHOW VARIABLES LIKE 'binlog_row_image';
-            SELECT VERSION();"
+            SELECT VERSION();
+            SHOW VARIABLES WHERE Variable_name IN
+              ('log_bin','binlog_format','binlog_row_image','gtid_mode','server_id');"
 
       - name: 连接器契约测试（全量 / 增量 / 崩溃恢复）
         run: go test -tags=integration ./internal/mysqlsource/ -v -timeout 10m
