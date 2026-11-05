@@ -273,7 +273,16 @@ Go 主干 · **MIT** · 对外开源 · 一期只做 MySQL 与 PostgreSQL（含�
 - [STATE-SCHEMA.md](STATE-SCHEMA.md)：`_ds_*` 表 DDL（PG / MySQL 两版）、位点与数据同事务的三种崩溃点分析、恢复时序、孤儿清理四判定。
 - [TYPE-MAPPING.md](TYPE-MAPPING.md)：类型映射字典与探测兜底。
 - [SNAPSHOT.md](SNAPSHOT.md)：初始化分块、一致性起点、断点与接缝。
+- [STREAMING.md](STREAMING.md)：增量流的事务组装、批提交、位点推进、背压与限速。
+- [CONFLICT.md](CONFLICT.md)：冲突策略、死信与人工处理。
+- [VERIFY.md](VERIFY.md)：三级一致性校验与订正。
+- [RUNTIME.md](RUNTIME.md)：生命周期状态机、暂停恢复、热更新、优雅退出。
+- [ARCHITECTURE.md](ARCHITECTURE.md)：分层、数据流、背压取舍、扩展点。
+- [SECURITY.md](SECURITY.md)：凭证与最小权限、TLS、日志脱敏、审计。
+- [BUILD.md](BUILD.md)：构建产物、部署、升级与状态表迁移。
 - [PLAN.md](PLAN.md)：`plan` 的输出与交互。
+- [ROADMAP.md](ROADMAP.md)：里程碑与验收判据。
+- [OPEN-QUESTIONS.md](OPEN-QUESTIONS.md)：未决清单。
 - 代码契约：[`internal/source/contract.go`](../internal/source/contract.go)、[`internal/sink/contract.go`](../internal/sink/contract.go) —— 已编译通过，CI 校验。
 
 ## 附：真机证据（仅校验设计假设，不作项目依赖）

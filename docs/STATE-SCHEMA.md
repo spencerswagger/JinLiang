@@ -13,13 +13,16 @@ CREATE TABLE IF NOT EXISTS public._ds_lease (
 );
 
 CREATE TABLE IF NOT EXISTS public._ds_meta (
-  job_id      text        PRIMARY KEY,
-  job_hash    text        NOT NULL,          -- job.yaml 的哈希；变了就要提示
-  phase       text        NOT NULL,          -- snapshot / catchup / streaming / paused / done
-  position    text,                          -- 各连接器自序列化（PG LSN / MySQL file:pos:gtid）
-  snapshot_id text,                          -- 初始化读数快照标识，结束后清空
-  started_at  timestamptz NOT NULL DEFAULT now(),
-  updated_at  timestamptz NOT NULL DEFAULT now()
+  job_id        text        PRIMARY KEY,
+  schema_version int        NOT NULL DEFAULT 1, -- 状态表结构版本，只向前迁移
+  job_hash      text        NOT NULL,          -- job.yaml 的哈希；变了就要提示
+  schema_hash   text,                          -- 源端表结构指纹，漂移时报警
+  phase         text        NOT NULL,          -- snapshot / catchup / streaming / paused / done
+  position      text,                          -- 各连接器自序列化（PG LSN / MySQL file:pos:gtid）
+  watermark     text,                          -- interval 模式的增量水位（水位列 + 主键复合）
+  snapshot_id   text,                          -- 初始化读数快照标识，结束后清空
+  started_at    timestamptz NOT NULL DEFAULT now(),
+  updated_at    timestamptz NOT NULL DEFAULT now()
 );
 
 CREATE TABLE IF NOT EXISTS public._ds_chunk (   -- 快照断点，块级续跑
@@ -52,6 +55,17 @@ CREATE TABLE IF NOT EXISTS public._ds_dead_letter (
   reason     text        NOT NULL,
   position   text,
   raw_row    jsonb       NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS public._ds_action (   -- 审计：系统为你做了什么（可选，也可只落本地 jsonl）
+  id         bigserial PRIMARY KEY,
+  job_id     text        NOT NULL,
+  action_id  text        NOT NULL,
+  what       text        NOT NULL,
+  sql        text,
+  undo       text,
+  actor      text        NOT NULL,          -- jinliang / you / dba
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
