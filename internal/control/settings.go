@@ -1,0 +1,126 @@
+package control
+
+import (
+	"context"
+	"fmt"
+	"strings"
+
+	"github.com/spencerswagger/jinliang/internal/state"
+)
+
+// settings 表的键。值一律是字符串（整数用 strconv），因为这张表要能被
+// `sqlite3 jinliang.db 'select * from settings'` 直接读懂。
+const (
+	SettingSchemaVersion = "schema_version"      // 迁移版本，migrate.go 维护
+	SettingInstanceID    = "instance_id"         // 实例身份（docs/IDENTITY.md §4）
+	SettingCreatedAt     = "created_at"          // 控制库创建时间
+	SettingAdminHash     = "admin_password_hash" // argon2id PHC 串，绝不存明文口令
+	SettingAdminSetAt    = "admin_password_set_at"
+	SettingDefaultBatch  = "default_batch_rows" // 新建向导的默认批次
+	SettingDefaultListen = "listen"             // 上次使用的监听地址（仅展示）
+)
+
+// Setting reads one settings row. The bool is false when the key is absent.
+func (s *Store) Setting(ctx context.Context, k string) (string, bool, error) {
+	var v string
+	err := s.db.QueryRowContext(ctx, `SELECT v FROM settings WHERE k = ?`, k).Scan(&v)
+	if isNoRows(err) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return v, true, nil
+}
+
+// SetSetting upserts one settings row.
+func (s *Store) SetSetting(ctx context.Context, k, v string) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO settings(k, v) VALUES(?, ?)
+		 ON CONFLICT(k) DO UPDATE SET v = excluded.v`, k, v)
+	return err
+}
+
+// Settings returns every non-secret setting, for the settings page.
+func (s *Store) Settings(ctx context.Context) (map[string]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT k, v FROM settings ORDER BY k`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]string{}
+	for rows.Next() {
+		var k, v string
+		if err := rows.Scan(&k, &v); err != nil {
+			return nil, err
+		}
+		if k == SettingAdminHash {
+			continue // 口令哈希不出控制层
+		}
+		out[k] = v
+	}
+	return out, rows.Err()
+}
+
+// InstanceID returns this deployment's instance identity.
+func (s *Store) InstanceID(ctx context.Context) (string, error) {
+	v, ok, err := s.Setting(ctx, SettingInstanceID)
+	if err != nil {
+		return "", err
+	}
+	if !ok || v == "" {
+		return "", fmt.Errorf("控制库缺少 instance_id（%s 可能被手工改过）", s.path)
+	}
+	return v, nil
+}
+
+// newInstanceID delegates to internal/state so CLI runs and the control plane
+// agree on the format (26-char base32, docs/IDENTITY.md §4).
+func newInstanceID() (string, error) { return state.NewInstanceID() }
+
+// AdminConfigured reports whether an administrator password exists. First start
+// uses this to decide between "建管理员" and "登录".
+func (s *Store) AdminConfigured(ctx context.Context) (bool, error) {
+	v, ok, err := s.Setting(ctx, SettingAdminHash)
+	if err != nil {
+		return false, err
+	}
+	return ok && strings.TrimSpace(v) != "", nil
+}
+
+// SetAdminPassword hashes and stores the administrator password (argon2id).
+func (s *Store) SetAdminPassword(ctx context.Context, password string) error {
+	hash, err := HashPassword(password)
+	if err != nil {
+		return err
+	}
+	if err := s.SetSetting(ctx, SettingAdminHash, hash); err != nil {
+		return err
+	}
+	return s.SetSetting(ctx, SettingAdminSetAt, s.nowText())
+}
+
+// VerifyAdminPassword checks a candidate password against the stored hash.
+// A missing hash is reported as "not configured", never as "wrong password".
+func (s *Store) VerifyAdminPassword(ctx context.Context, password string) (bool, error) {
+	hash, ok, err := s.Setting(ctx, SettingAdminHash)
+	if err != nil {
+		return false, err
+	}
+	if !ok || hash == "" {
+		return false, ErrAdminNotConfigured
+	}
+	return VerifyPassword(hash, password)
+}
+
+// ErrAdminNotConfigured means first start has not run yet.
+var ErrAdminNotConfigured = fmt.Errorf("还没有设置管理员口令")
+
+// SchemaVersionText is used by the settings page and doctor output.
+func (s *Store) SchemaVersionText(ctx context.Context) string {
+	v, err := s.SchemaVersion(ctx)
+	if err != nil {
+		return "?"
+	}
+	return fmt.Sprintf("%d/%d", v, LatestSchemaVersion())
+}

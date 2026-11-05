@@ -1,0 +1,39 @@
+{{define "layout"}}<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>{{.Title}} · 津梁</title>
+<link rel="stylesheet" href="/static/app.css">
+<script src="/static/htmx.min.js" defer></script>
+<script src="/static/app.js" defer></script>
+</head>
+<body data-csrf="{{.CSRF}}">
+<header class="top">
+  <a class="brand" href="/">津梁<span>控制台</span></a>
+  <nav class="main">
+    <a href="/" {{if eq .Nav "overview"}}class="on"{{end}}>总览</a>
+    <a href="/connections" {{if eq .Nav "connections"}}class="on"{{end}}>连接</a>
+    <a href="/jobs/new" {{if eq .Nav "jobs"}}class="on"{{end}}>新建任务</a>
+    <a href="/history" {{if eq .Nav "history"}}class="on"{{end}}>历史</a>
+    <a href="/diagnostics" {{if eq .Nav "diagnostics"}}class="on"{{end}}>诊断</a>
+    <a href="/settings" {{if eq .Nav "settings"}}class="on"{{end}}>设置</a>
+    {{if ne .Nav "login"}}{{if ne .Nav "setup"}}
+    <form class="inline" method="post" action="/logout">
+      <input type="hidden" name="csrf_token" value="{{.CSRF}}">
+      <button class="ghost" type="submit" title="退出登录">退出</button>
+    </form>
+    {{end}}{{end}}
+  </nav>
+</header>
+<main>
+{{if .Err}}{{template "error_card" .Err}}{{end}}
+{{template "content" .}}
+</main>
+<footer>
+  <div>津梁 {{.Version}} · 实例 <span class="mono">{{.Instance}}</span> · 监听 <span class="mono">{{.Listen}}</span></div>
+  <div>配置与凭证保存在本机控制库；位点永远在目标数据库。页面刷新时间 {{.Now}}</div>
+</footer>
+</body>
+</html>{{end}}

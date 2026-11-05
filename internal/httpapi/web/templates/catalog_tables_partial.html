@@ -1,0 +1,36 @@
+{{define "catalog_tables_partial"}}
+{{if .Error}}
+  <div class="err"><h3>列不出来</h3><p>{{.Error}}</p></div>
+{{else}}
+  {{if .Schemas}}
+  <div class="row">
+    <span class="meta">schema：</span>
+    {{$conn := .ConnectionID}}{{$side := .Side}}
+    {{range .Schemas}}
+      <a class="badge" href="#"
+         hx-get="/wizard/catalog?connection_id={{$conn}}&schema={{.}}&side={{$side}}"
+         hx-target="#tables" hx-swap="innerHTML">{{.}}</a>
+    {{end}}
+  </div>
+  {{end}}
+  <p class="hint">{{.Schema}} · {{len .Tables}} 张表（行数为估算值）· {{.Elapsed}} ms{{if .Warning}} · {{.Warning}}{{end}}</p>
+  {{if .Tables}}
+  <table>
+    <thead><tr><th>选</th><th>表</th><th>行数≈</th><th>主键</th></tr></thead>
+    <tbody>
+    {{range .Tables}}
+      <tr>
+        <td><input type="checkbox" name="tables" value="{{.Table}}"></td>
+        <td class="mono">{{.Table}}{{if .Partitioned}} <span class="badge">分区表</span>{{end}}</td>
+        <td class="num">{{.RowsEstimate}}</td>
+        <td>{{if .HasStablePK}}{{range $i, $c := .PrimaryKey}}{{if $i}}, {{end}}{{$c}}{{end}}{{else}}<span class="badge warn">无主键</span>{{end}}</td>
+      </tr>
+    {{end}}
+    </tbody>
+  </table>
+  {{else}}
+    <p class="hint">这个 schema 下没有表。</p>
+  {{end}}
+  {{if .Views}}<p class="hint">另有 {{len .Views}} 个视图（视图没有变更流水，只能走定时增量）。</p>{{end}}
+{{end}}
+{{end}}

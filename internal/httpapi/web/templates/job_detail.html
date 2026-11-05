@@ -1,0 +1,121 @@
+{{define "content"}}
+{{with .Data}}
+<div class="spread">
+  <div>
+    <h1>{{.Summary.Name}}</h1>
+    <p class="lead">
+      {{.Summary.SourceName}}（{{.Summary.SourceKind}}）→ {{.Summary.TargetName}}（{{.Summary.TargetKind}}）
+      · 指纹 <span class="mono">{{.Summary.JobKey}}</span>
+    </p>
+  </div>
+  <div class="row">
+    <a class="btn" href="/api/jobs/{{.Summary.ID}}/yaml">导出 yaml</a>
+  </div>
+</div>
+
+<div class="card">
+  <div class="row">
+    <span class="badge stub">B0 骨架</span>
+    <span class="meta">现在点「开始」只推进阶段、不搬数据；引擎在 B1 接上后才是真的同步。</span>
+  </div>
+</div>
+
+<h2>实时状态</h2>
+<div class="card">
+  <div class="live">
+    <span class="dot" id="live-dot"></span>
+    <strong id="live-phase">{{if .Active}}{{phaseLabel .Active.Phase}}{{else}}未在运行{{end}}</strong>
+  </div>
+  <p class="hint" id="live-hint">{{if .Active}}{{phaseHint .Active.Phase}}{{else}}点下面的「开始」会走：预检 → 准备 → 全量 → 追增量 → 实时 → 收尾{{end}}</p>
+
+  <div class="row">
+    <form class="inline" method="post" action="/jobs/{{.Summary.ID}}/run" data-once>
+      <input type="hidden" name="csrf_token" value="{{$.CSRF}}">
+      <button class="primary" type="submit">开始</button>
+    </form>
+    <form class="inline" method="post" action="/jobs/{{.Summary.ID}}/pause" data-once>
+      <input type="hidden" name="csrf_token" value="{{$.CSRF}}">
+      <button type="submit">暂停</button>
+    </form>
+    <form class="inline" method="post" action="/jobs/{{.Summary.ID}}/resume" data-once>
+      <input type="hidden" name="csrf_token" value="{{$.CSRF}}">
+      <button type="submit">恢复</button>
+    </form>
+    <form class="inline" method="post" action="/jobs/{{.Summary.ID}}/stop" data-once>
+      <input type="hidden" name="csrf_token" value="{{$.CSRF}}">
+      <button type="submit">停止</button>
+    </form>
+  </div>
+
+  <h3>事件流</h3>
+  <div id="eventlog"></div>
+  <div id="sse-source" data-url="/api/jobs/{{.Summary.ID}}/events"></div>
+</div>
+
+<h2>预检</h2>
+<div class="card">
+  <p class="hint">预检只读：连上两端、看能力、看表与主键、看目标端有没有同名表。blocked 的项会在下面给出可复制的 SQL。</p>
+  <button class="primary" hx-post="/jobs/{{.Summary.ID}}/preflight" hx-target="#preflight"
+          hx-swap="innerHTML" hx-headers='{"X-CSRF-Token": "{{$.CSRF}}"}'>跑预检</button>
+  <div id="preflight"></div>
+</div>
+
+<h2>阶段时间线</h2>
+<div class="card">
+  <ul class="timeline">
+    <li class="{{if .Active}}{{if eq (printf "%s" .Active.Phase) "preflight"}}current{{end}}{{end}}"><strong>预检</strong> <span class="meta">只读检查两端能力与表结构</span></li>
+    <li><strong>准备</strong> <span class="meta">目标端准备表与同步元数据</span></li>
+    <li><strong>全量</strong> <span class="meta">把历史数据整块搬过去，可暂停</span></li>
+    <li><strong>追增量</strong> <span class="meta">补上初始化期间的变更</span></li>
+    <li><strong>实时</strong> <span class="meta">之后每次变更秒级同步</span></li>
+    <li><strong>收尾</strong> <span class="meta">提交最后一批并释放占用</span></li>
+  </ul>
+</div>
+
+<h2>配置摘要</h2>
+<div class="card">
+  <table>
+    <tbody>
+      <tr><th>同步方式</th><td>{{.Doc.Mode.Frequency}}{{if .Doc.Mode.Interval}} · 每 {{.Doc.Mode.Interval}}{{end}}</td></tr>
+      {{if .Doc.Mode.IncrementalColumn}}<tr><th>水位列</th><td class="mono">{{.Doc.Mode.IncrementalColumn}}</td></tr>{{end}}
+      <tr><th>目标 schema</th><td>{{dash .Doc.Target.Schema}}</td></tr>
+      <tr><th>同名表</th><td>{{.Doc.Target.OnExists}}</td></tr>
+      <tr><th>索引进度</th><td>{{.Doc.Target.CreateIndexes}}</td></tr>
+      <tr><th>表</th><td>{{if .Tables}}{{range .Tables}}<span class="badge">{{.}}</span> {{end}}{{else}}—{{end}}</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h2>最近运行</h2>
+{{if .Runs}}
+<div class="card">
+  <table>
+    <thead><tr><th>开始</th><th>阶段</th><th>行数</th><th>结束</th><th>错误</th></tr></thead>
+    <tbody>
+    {{range .Runs}}
+      <tr>
+        <td class="mono">{{shortTime .StartedAt}}</td>
+        <td>{{phaseLabel .Phase}}{{if .Stub}} <span class="badge stub">桩</span>{{end}}</td>
+        <td class="num">{{.RowsDone}}</td>
+        <td class="mono">{{if .EndedAt}}{{shortTime .EndedAt}}{{else}}—{{end}}</td>
+        <td>{{dash .LastError}}</td>
+      </tr>
+    {{end}}
+    </tbody>
+  </table>
+</div>
+{{else}}
+<p class="hint">还没跑过。</p>
+{{end}}
+
+<h2>危险操作</h2>
+<div class="card">
+  <p class="hint">删除任务会连同它的运行历史一起删掉（连接与凭证不受影响）。</p>
+  <form method="post" action="/jobs/{{.Summary.ID}}/delete" data-once
+        onsubmit="return confirm('确定删除任务「{{.Summary.Name}}」？运行历史会一起消失。');">
+    <input type="hidden" name="csrf_token" value="{{$.CSRF}}">
+    <button class="danger" type="submit">删除这个任务</button>
+  </form>
+</div>
+{{end}}
+{{end}}

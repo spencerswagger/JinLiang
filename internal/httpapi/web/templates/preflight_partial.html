@@ -1,0 +1,44 @@
+{{define "preflight_partial"}}
+{{with .Report}}
+<div class="card">
+  <div class="spread">
+    <div class="row">
+      {{if .CanStart}}
+        <span class="badge ok">可以开跑</span>
+      {{else}}
+        <span class="badge bad">先处理 blocked 项</span>
+      {{end}}
+      <span class="meta">{{len .Checks}} 项检查</span>
+    </div>
+    <a class="meta" href="#" onclick="return false;">结果只读，不写你的数据库</a>
+  </div>
+</div>
+
+<ul class="checks">
+  {{$codes := $.Codes}}
+  {{range .Checks}}
+  <li>
+    <div class="spread">
+      <span class="t">{{.Title}}</span>
+      <span class="badge {{if eq .Status "ok"}}ok{{else if eq .Status "warn"}}warn{{else }}bad{{end}}">
+        {{if eq .Status "ok"}}已满足{{else if eq .Status "warn"}}风险{{else if eq .Status "autofixable"}}可代做{{else}}做不到{{end}}
+      </span>
+    </div>
+    <div class="d">{{.Detail}}</div>
+    {{if .Affected}}<div class="d">涉及：{{range $i, $a := .Affected}}{{if $i}}、{{end}}{{$a}}{{end}}</div>{{end}}
+    {{if .SQL}}<div class="sql">{{.SQL}}</div>{{end}}
+    {{if .Code}}
+      {{if index $codes .Code}}
+        {{with index $codes .Code}}
+        <div class="d">下一步：
+          <ol>{{range .Next}}<li>{{.}}</li>{{end}}</ol>
+          风险：{{.Risk}}
+        </div>
+        {{end}}
+      {{end}}
+    {{end}}
+  </li>
+  {{end}}
+</ul>
+{{end}}
+{{end}}

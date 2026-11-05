@@ -1,0 +1,66 @@
+{{define "content"}}
+{{with .Data}}
+<h1>设置</h1>
+<p class="lead">这些都是本机控制台的设置。危险的东西（监听地址、密钥）只能通过命令行改，改完会提示风险。</p>
+
+<h2>实例</h2>
+<div class="card">
+  <table>
+    <tbody>
+      <tr><th>实例 ID</th><td class="mono">{{.Instance}}</td></tr>
+      <tr><th>schema 版本</th><td class="mono">{{.Schema}}</td></tr>
+      <tr><th>数据目录</th><td class="mono">{{.DataDir}}</td></tr>
+      <tr><th>控制库</th><td class="mono">{{.DBPath}}</td></tr>
+      <tr><th>密钥来源</th><td>{{.KeySource}}{{if .KeyPath}} <span class="mono">{{.KeyPath}}</span>{{end}}</td></tr>
+      <tr><th>监听地址</th><td class="mono">{{.Listen}}</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<h2>管理员口令</h2>
+<div class="card">
+  <p class="hint">改口令需要先验证当前口令。改完旧会话不会立刻失效，24 小时后自然过期。</p>
+  <form method="post" action="/settings/admin" data-once>
+    <input type="hidden" name="csrf_token" value="{{$.CSRF}}">
+    <label for="current_password">当前口令</label>
+    <input id="current_password" name="current_password" type="password" autocomplete="current-password" required>
+    <div class="grid2">
+      <div>
+        <label for="new_password">新口令（至少 10 个字符）</label>
+        <input id="new_password" name="new_password" type="password" autocomplete="new-password" minlength="10" required>
+      </div>
+      <div>
+        <label for="new_password2">再输一次</label>
+        <input id="new_password2" name="new_password2" type="password" autocomplete="new-password" minlength="10" required>
+      </div>
+    </div>
+    <button class="primary" type="submit">改口令</button>
+  </form>
+</div>
+
+<h2>默认值</h2>
+<div class="card">
+  <table>
+    <thead><tr><th>键</th><th>值</th></tr></thead>
+    <tbody>
+    {{range $k, $v := .Settings}}
+      <tr><td class="mono">{{$k}}</td><td class="mono">{{$v}}</td></tr>
+    {{end}}
+    </tbody>
+  </table>
+  <p class="hint">默认批次等可以在 API 里改（PUT /api/settings），UI 后续补上可编辑入口。</p>
+</div>
+
+<h2>备份与迁移</h2>
+<div class="card">
+  <p class="hint">
+    备份整个数据目录（<span class="mono">{{.DataDir}}</span>）就是备份「配置 + 密文 + 密钥」。
+    换机器时把目录拷过去即可；只想搬任务定义就用导出：
+  </p>
+  <div class="row">
+    <a class="btn" href="/api/export">导出全部任务 yaml</a>
+    <a class="btn" href="/diagnostics">看体检结果</a>
+  </div>
+</div>
+{{end}}
+{{end}}
