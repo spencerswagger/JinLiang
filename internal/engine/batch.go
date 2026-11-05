@@ -24,7 +24,7 @@ import (
 // 提交时机：攒够 batch_rows，或距上次提交超过 batch_delay（先到者触发）。
 // 目标端慢的时候批会自然变大，快的时候批会变小 —— 这就是 group commit。
 // 单事务缓冲上限：与 docs/STREAMING.md §1 一致（128 MB / 100 万事件），
-// 超了报 E1011 而不是硬撑（spill 未实现）。
+// 超了报 E1011 停下——整段缓冲在内存里，超了就是 OOM，硬撑看不出原因。
 const (
 	defaultMaxTxBytes  = int64(128 << 20)
 	defaultMaxTxEvents = 1_000_000
@@ -203,9 +203,9 @@ type txTooLargeError struct {
 func (e *txTooLargeError) Error() string {
 	return fmt.Sprintf("源端有个事务太大：已经缓冲约 %d 行 / %s，超过单事务上限。"+
 		"你现在能做什么：1) 把它拆成几个小事务（批量 UPDATE/DELETE 改成分页做）；"+
-		"2) 调大上限 JINLIANG_TX_MAX_BYTES / JINLIANG_TX_MAX_EVENTS 后重跑。"+
-		"风险：调高会让峰值内存跟着涨，调得比机器内存还大就是 OOM（进程直接消失，看不出原因）；"+
-		"spill-to-disk 还没实现，所以现在只能报错停下，不会硬撑",
+		"2) 用 JINLIANG_TX_MAX_BYTES / JINLIANG_TX_MAX_EVENTS 调高上限后重跑。"+
+		"风险：整段缓冲都在内存里，调高上限等于把峰值内存一起抬高，调得比机器内存还大就是 OOM"+
+		"（进程直接消失，看不出原因）；调上限也等于改了这个任务的提交边界（一个源事务要么整段落库、要么整段不落）。",
 		e.rows, humanLag(e.bytes))
 }
 

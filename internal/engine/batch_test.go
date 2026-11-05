@@ -460,12 +460,23 @@ func TestBatcherStopsOversizedTransaction(t *testing.T) {
 	if !errors.As(err, &tooBig) {
 		t.Fatalf("应该是 txTooLargeError（E1011），得到 %T（%v）", err, err)
 	}
-	// 四段式的基本要素：发生了什么 + 能做什么 + 风险
+	// 四段式的基本要素：发生了什么 + 能做什么（两条真路）+ 风险
 	msg := err.Error()
-	for _, want := range []string{"事务太大", "拆成几个小事务", "JINLIANG_TX_MAX_BYTES", "风险"} {
+	for _, want := range []string{
+		"事务太大",
+		"拆成几个小事务",
+		"JINLIANG_TX_MAX_BYTES",
+		"JINLIANG_TX_MAX_EVENTS",
+		"风险",
+		"峰值内存",
+	} {
 		if !strings.Contains(msg, want) {
 			t.Fatalf("文案缺 %q：%s", want, msg)
 		}
+	}
+	// 不许暗示有兜底：spill 在代码里不存在（Ark 的 #14 已把文档改成不再提它）。
+	if strings.Contains(strings.ToLower(msg), "spill") {
+		t.Fatalf("文案不该提 spill（它没实现，会让人以为有兜底）：%s", msg)
 	}
 	if len(sink.batches) != 0 || len(src.acked) != 0 {
 		t.Fatal("报错之后不许落库、也不许推进位点")
