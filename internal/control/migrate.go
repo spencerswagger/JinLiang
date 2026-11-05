@@ -99,6 +99,9 @@ var migrations = []migration{
 		After: closeOnlyStaleRunsThenIndex,
 	},
 	{
+		// 版本号说明：PR #5（runs-liveness）占用了 2，本分支顺延一版。
+		// 撞版本号的后果不是「报错」而是「静默跳过」——库已经是 2 时两条 v2 都会被
+		// 跳过，kind 列永远不存在，runs 查询全线炸。见 migrate_versions_test.go。
 		Version: 3,
 		Name:    "runs-kind",
 		// hugo 裁决：runs 用 kind 表达「这一轮是什么运行」（sync | verify | stub），
