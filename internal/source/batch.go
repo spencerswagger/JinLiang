@@ -53,11 +53,14 @@ func clipPosition(s string) string {
 // before the engine hands it to a sink (docs/CONTROL-PLANE.md 之外的事务边界规则；
 // 见 sink.Sink.Apply 的注释)。
 //
-// 能被机械校验的三条：
+// 能被机械校验的四条：
 //  1. 事务不嵌套：一个 EvBegin 未收尾时不得再出现 EvBegin；
 //  2. 批次不得以未提交的事务结尾：开了事务就必须在本批内被 EvCommit 关掉；
 //  3. 以 EvBegin 开头的批次必须是完整事务（末尾必须是 EvCommit）——切开大事务的
-//     **续段**（前半段在上一批）不许伪造成一个新事务的开头。
+//     **续段**（前半段在上一批）不许伪造成一个新事务的开头；
+//  4. 见过 EvCommit 之后的数据事件必须属于一个**新的**事务：即它前面必须出现过
+//     EvBegin。`[ins, commit, ins]` 这种「提交完又凭空冒出一行」必须被拒——
+//     续段只可能出现在批次开头，中途出现的裸数据事件是装配器漏了事务头。
 //
 // 允许的形态：空批次（只推进位点）、纯心跳批次、事务外的 EvDDL、
 // 「续段 + EvCommit」（前半段在上一批、本批收尾）。
@@ -66,6 +69,7 @@ func clipPosition(s string) string {
 // 单看本批无法与「凭空出现的数据事件」区分——那要靠引擎按 TxID 自己拦（见 Event.TxID）。
 func ValidateBatch(evs []Event) error {
 	open := 0
+	sawCommit := false
 	for i, ev := range evs {
 		switch ev.Kind {
 		case EvBegin:
@@ -78,6 +82,13 @@ func ValidateBatch(evs []Event) error {
 				open--
 			}
 			// open == 0 且遇到 EvCommit：本批只承载「续段的收尾」，合法。
+			sawCommit = true
+		case EvInsert, EvUpdate, EvDelete, EvTruncate:
+			// 提交之后再出现数据事件，必须先开新事务（规则 4）。
+			// 批次开头（还没见过 EvCommit）的裸数据事件是**续段**，合法。
+			if sawCommit && open == 0 {
+				return fmt.Errorf("第 %d 个事件是「提交之后、没有 EvBegin」的数据事件：续段只能出现在批次开头，中途的裸数据事件说明事务头丢了", i)
+			}
 		case EvHeartbeat:
 			// 心跳不参与事务配对。
 		}

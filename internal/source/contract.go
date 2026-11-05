@@ -135,6 +135,20 @@ type Value struct {
 	T    time.Time
 }
 
+// KindJSON 的交付契约（2026-11-05 裁决；MySQL 的 json_binary 就是第一个用户）：
+//
+//   - **必须以文本形态交付**：Value.S 承载 UTF-8 的 JSON 文本（对象、数组、标量都按 JSON 文本写），
+//     Value.B 不使用。sink 只负责按目标方言落列（PG 的 json/jsonb 按文本写入），不做第二遍解码。
+//   - 源端负责解自己线缆上的二进制格式（例如 MySQL binlog 的 json_binary）：
+//     这是连接器的私有格式，不能指望下游认识。类型映射见 docs/TYPE-MAPPING.md §5。
+//   - **不得用 KindBytes 交付 JSON**：KindBytes 是二进制列（BYTEA/BLOB）的通道，
+//     sink 会原样写进去，结果是目标上一列"看起来像 JSON 的乱码"，而全链路都没有报错。
+//   - 解不出来就是数据或协议错误：返回 error 终止本批，**不降级为文本、不写半截**。
+//     源库的 json 列本身保证合法，解不出只可能是数据损坏或格式理解错；此时把碎片当文本写进目标，
+//     等于用"看起来成功"掩盖数据损坏——这比失败更难查。
+//   - 目标端的单值上限与方言差异（PG jsonb 拒绝 \u0000、MySQL 数字按 double 失真）归 sink 判定，
+//     超限一律明确失败并给下一步，不截断、不拆分。
+
 // Row is one table row in column order (column names come from the catalog).
 type Row struct {
 	Table  TableRef
