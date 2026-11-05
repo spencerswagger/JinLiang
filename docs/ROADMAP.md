@@ -43,6 +43,13 @@
 - 内容：L5 基线（吞吐/延迟/内存/冷启）、PR/nightly/release 三门禁、覆盖度报表。
 - 验收：单核 >=20k 行/s、p99 <100ms、空转 <80MB；release 覆盖 169 链路。
 
+## B1 前待办（已知债务，不阻塞 B0 合并）
+
+- **历史 `params` 明文清洗**：B0 之前的连接行里，`params_json` 可能已经存过
+  `sslpassword` / `sslkey` / `passphrase` 这类键（写入侧已在 PR #5 之后拒收，读取侧仍会原样回传）。
+  要做：一次性迁移把命中的键删除或改成 `***`，并在读取侧加同样的过滤；
+  附一个 `doctor --check-secrets` 报告命中行数。**B1 开始前完成**。
+
 ## M7 二期（不在本期承诺）
 
 同表双向、Web UI、Oracle/达梦/金仓、MQ sink、MariaDB。

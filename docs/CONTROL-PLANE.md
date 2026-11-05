@@ -73,6 +73,10 @@ CREATE TABLE runs (
   stub       INTEGER NOT NULL DEFAULT 0    -- 已弃用：保留一版兼容，B1 收口后删除（见下方）
 );
 
+-- 一个任务同时只能有一条未结束的运行（partial unique index，迁移 v2 已建）。
+-- 没有它：进程被杀后那行永远 ended_at IS NULL，历史页永久显示在跑、还能再开第二个。
+CREATE UNIQUE INDEX idx_runs_one_active ON runs(job_id) WHERE ended_at IS NULL;
+
 CREATE TABLE settings (k TEXT PRIMARY KEY, v TEXT NOT NULL);  -- instance_id / schema_version / 默认值
 CREATE TABLE audit (
   id TEXT PRIMARY KEY, at TEXT NOT NULL, actor TEXT NOT NULL,
@@ -165,7 +169,7 @@ UPDATE runs SET kind = 'stub' WHERE stub = 1;   -- 回填历史桩运行
 | GET | `/api/jobs/{id}/events` | **SSE**：阶段迁移、批次提交、延迟、错误（UI 实时刷新）；只认会话 cookie 或 `Authorization` 头，**不接受 query 里的 token** | 需登录 | 不需要（只读） | 是 | 200 |
 | GET | `/api/jobs/{id}/export` | **导出 yaml（规范路径）**：与 `job.schema.json` 一致的完整 JobDoc；会记一条审计 | 需登录 | 不需要 | 是（只读） | 200 |
 | GET | `/api/jobs/{id}/yaml` | **已弃用别名（deprecated，将在后续版本移除）**：与上一条完全等价，只为现有 e2e / UI / CLI 保留一个周期；新代码一律用 `/export` | 需登录 | 不需要 | 是（只读） | 200 |
-| POST | `/api/jobs/import` | 导入 yaml（先校验再落库）；同指纹是**更新**既有任务，不是报冲突 | 需登录 | 需要 | **是**（同坐标复用连接、同指纹更新任务） | 201（新建与更新都回 201，现状） |
+| POST | `/api/jobs/import` | 导入 yaml（逐份导入，先校验再落库）；同指纹是**更新**既有任务，不是报冲突 | 需登录 | 需要 | **是**（同坐标复用连接、同指纹更新任务） | 201 全成功 / 207 部分成功 / 422 零成功（body 带 `{total, imported[], skipped[]}`） |
 | GET | `/api/export` | 导出全部任务，每份之间用 `---` 分隔 | 需登录 | 不需要 | 是（只读） | 200 |
 
 > 导出路径以 `/api/jobs/{id}/export` 为规范；`/yaml` 是实现早期自行引入的名字，现降为别名，保留一个周期后移除（移除时同步改 `E1009` 的提示文案）。
