@@ -180,7 +180,7 @@ func TestOverviewBadgeColorFollowsFinishReason(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		run, err := store.StartRun(ctx, job.ID, state.Preflight)
+		run, err := store.StartRun(ctx, job.ID, state.Preflight, control.RunKindSync)
 		if err != nil {
 			t.Fatal(err)
 		}
