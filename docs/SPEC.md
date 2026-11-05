@@ -24,6 +24,7 @@
 | `target.on_exists` | 默认 `error`（撞表就停），`recreate` 会清空目标表、需要二次确认 + 备份提示（语义见 §1.1） |
 | `content.schema_follow` | `whitelist` 只跟随四类 DDL（加列、放宽长度、加索引、可选删列），其余拦截并暂停该表 |
 | `guard.on_exceed` | `pause` 最保守；`invalidate` 只在 PG 13+（有 `max_slot_wal_keep_size`）；`advance` 会跳过变更，必须显式确认 |
+| `reliability.tx_oversize` | 两种形状都收：字符串 `spill`（默认）/ `fail`（旧写法，**行为不变**），或对象 `{mode, bytes, events}`（`bytes` ≥1 MiB、`events` ≥1000，可只给其中一项）。取值顺序 **yaml 显式值 > 环境变量 `JINLIANG_TX_MAX_*` > 内置默认（128 MB / 100 万事件）**；`spill` 未实现，两种 `mode` 当前都表现为超限报 `E1011`（详见 STREAMING §1） |
 
 ### 1.1 重搬与 `on_exists: recreate` 的语义（已知限制）
 

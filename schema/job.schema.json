@@ -123,7 +123,21 @@
             "store_row": { "enum": ["full", "none"], "default": "full" }
           }
         },
-        "tx_oversize": { "enum": ["spill", "fail"], "default": "spill" }
+        "tx_oversize": {
+          "default": "spill",
+          "oneOf": [
+            { "enum": ["spill", "fail"] },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "mode":   { "enum": ["spill", "fail"] },
+                "bytes":  { "type": "integer", "minimum": 1048576 },
+                "events": { "type": "integer", "minimum": 1000 }
+              }
+            }
+          ]
+        }
       }
     },
     "guard": {
