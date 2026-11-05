@@ -457,12 +457,15 @@ func (r *runner) prepare(ctx context.Context) error {
 	}
 	r.sink = sink
 
-	ok, who, err := sink.AcquireLease(ctx, r.leaseTTL)
+	ok, why, err := sink.AcquireLease(ctx, r.leaseTTL)
 	if err != nil {
 		return fmt.Errorf("取任务租约失败: %w", err)
 	}
 	if !ok {
-		return fmt.Errorf("%w：%s", ErrHeldByOther, who)
+		return fmt.Errorf("%w：%s", ErrHeldByOther, why)
+	}
+	if why != "" {
+		r.note(ctx, why)
 	}
 	r.leaseOK = true
 	go r.renewLease(ctx)

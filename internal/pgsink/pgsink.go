@@ -11,6 +11,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -303,32 +304,64 @@ func (s *Sink) Position(ctx context.Context) (string, error) {
 // ── 租约（同一 job_key 只允许一个实例写） ─────────────────────────────
 
 // AcquireLease takes the job's lease, or reports who else holds it.
+//
+// 判断顺序在 leaseTakeover 里（纯函数，有单测）：过期可接管；别的实例不可；
+// 同一台机器上「pid 还活着」不可、「pid 已死」立刻接管（kill -9 后的重启
+// 不用等 30 秒）。抢租约用一条带条件的 UPDATE，命中 0 行说明被抢先了。
 func (s *Sink) AcquireLease(ctx context.Context, ttl time.Duration) (bool, string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	q := fmt.Sprintf(`INSERT INTO %s (job_key, instance_id, label, expires_at)
-		VALUES ($1,$2,$3, now() + $4::interval)
-		ON CONFLICT (job_key) DO UPDATE SET instance_id=EXCLUDED.instance_id,
-			label=EXCLUDED.label, expires_at=EXCLUDED.expires_at
-		WHERE %s.expires_at < now() OR %s.instance_id = EXCLUDED.instance_id
-		RETURNING instance_id`,
-		s.stateTable("_jl_lease"), s.stateTable("_jl_lease"), s.stateTable("_jl_lease"))
-	var owner string
-	err := s.conn.QueryRow(ctx, q, s.opt.JobKey, s.opt.InstanceID, s.opt.JobName, ttl).Scan(&owner)
-	if errors.Is(err, pgx.ErrNoRows) {
-		// 被别的实例占着：读回来告诉用户是谁
-		var who string
-		var until time.Time
-		_ = s.conn.QueryRow(ctx,
-			fmt.Sprintf(`SELECT instance_id, expires_at FROM %s WHERE job_key=$1`, s.stateTable("_jl_lease")),
-			s.opt.JobKey).Scan(&who, &until)
-		return false, fmt.Sprintf("%s（租约到 %s）", who, until.UTC().Format(time.RFC3339)), nil
-	}
+	label := leaseOwnerLabel(s.opt.JobName, os.Getpid())
+	now := time.Now()
+
+	cur, exists, err := s.readLeaseLocked(ctx)
 	if err != nil {
 		return false, "", err
 	}
-	return owner == s.opt.InstanceID, "", nil
+	ok, why := leaseTakeover(cur, exists, now, s.opt.InstanceID, os.Getpid(), processAlive)
+	if !ok {
+		return false, why, nil
+	}
+
+	if !exists {
+		q := fmt.Sprintf(`INSERT INTO %s (job_key, instance_id, label, expires_at)
+			VALUES ($1,$2,$3, now() + $4::interval)`, s.stateTable("_jl_lease"))
+		if _, err := s.conn.Exec(ctx, q, s.opt.JobKey, s.opt.InstanceID, label, ttl); err != nil {
+			if pgwire.SQLState(err) == "23505" { // unique_violation：被抢先
+				return false, "另一个进程刚刚抢先拿到了租约", nil
+			}
+			return false, "", err
+		}
+		return true, why, nil
+	}
+
+	q := fmt.Sprintf(`UPDATE %s SET instance_id=$1, label=$2, expires_at=now() + $3::interval
+		WHERE job_key=$4 AND (expires_at < now() OR instance_id=$1)`,
+		s.stateTable("_jl_lease"))
+	tag, err := s.conn.Exec(ctx, q, s.opt.InstanceID, label, ttl, s.opt.JobKey)
+	if err != nil {
+		return false, "", err
+	}
+	if tag.RowsAffected() == 0 {
+		return false, "另一个实例刚刚抢先拿到了租约", nil
+	}
+	return true, why, nil
+}
+
+// readLeaseLocked loads the current lease row (caller holds mu).
+func (s *Sink) readLeaseLocked(ctx context.Context) (leaseRow, bool, error) {
+	q := fmt.Sprintf(`SELECT instance_id, COALESCE(label,''), expires_at FROM %s WHERE job_key=$1`,
+		s.stateTable("_jl_lease"))
+	var row leaseRow
+	err := s.conn.QueryRow(ctx, q, s.opt.JobKey).Scan(&row.InstanceID, &row.Label, &row.Expires)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return leaseRow{}, false, nil
+	}
+	if err != nil {
+		return leaseRow{}, false, err
+	}
+	return row, true, nil
 }
 
 // RenewLease extends the lease; false means we lost it (someone took over).
