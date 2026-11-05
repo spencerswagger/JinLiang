@@ -159,6 +159,7 @@ func TestIsPositionGapOnlyMatchesPositionSignals(t *testing.T) {
 		{Code: "58P01", Message: "could not open file"},
 		{Code: "55000", Message: `replication slot "jl_abc" was invalidated`},
 		{Code: "55000", Message: `replication slot "jl_abc" does not exist`},
+		{Code: "55000", Message: `replication slot "jl_abc" was not found`},
 		{Code: "XX000", Message: "requested WAL segment 000000010000000000000002 has already been removed"},
 	}
 	for _, e := range gap {

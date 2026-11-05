@@ -940,6 +940,7 @@ func IsPositionGap(err error) bool {
 	pairs := [][2]string{
 		{"replication slot", "invalidated"},
 		{"replication slot", "does not exist"},
+		{"replication slot", "not found"},
 		{"replication slot", "has been dropped"},
 		{"requested wal segment", "has already been removed"},
 		{"could not find wal", ""},
