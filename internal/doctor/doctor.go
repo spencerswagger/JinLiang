@@ -42,7 +42,28 @@ type RunInfo struct {
 	JobID     string
 	Phase     string
 	StartedAt string
-	Stub      bool
+	// HeartbeatAt is the last liveness ping (runs.heartbeat_at). Empty on
+	// control databases that predate runs-liveness (PR #5); HeartbeatKnown
+	// then says "this column exists but is empty", so doctor can tell
+	// 「没有心跳列」 from 「心跳列存在但这行还没写过」.
+	HeartbeatAt    string
+	HeartbeatKnown bool
+	Stub           bool
+}
+
+// DefaultHeartbeatInterval mirrors control.DefaultHeartbeatInterval: a running
+// job refreshes runs.heartbeat_at every 30s. The stale window is 3× that.
+const DefaultHeartbeatInterval = 30 * time.Second
+
+// StaleAfter is the single stale window both control and doctor must use:
+// three missed heartbeats. Keeping one function here (and having the adapter
+// read the same heartbeat_at column) is how we avoid two different definitions
+// of "dead" — Owl's #10 review item 1.
+func StaleAfter(heartbeat time.Duration) time.Duration {
+	if heartbeat <= 0 {
+		heartbeat = DefaultHeartbeatInterval
+	}
+	return 3 * heartbeat
 }
 
 // ControlProbe is the slice of the control store doctor reads. Keeping it an
@@ -61,8 +82,10 @@ type Options struct {
 	Control ControlProbe // nil: skip control checks
 
 	LatestSchemaVersion int
-	GhostAfter          time.Duration // 默认 5 分钟；更老的未收尾运行算幽灵
-	Now                 func() time.Time
+	// HeartbeatInterval is how often a running job pings; the stale window is
+	// StaleAfter(HeartbeatInterval). Default 30s → 90s.
+	HeartbeatInterval time.Duration
+	Now               func() time.Time
 
 	Source *runtime.DB
 	Target *runtime.DB
@@ -96,8 +119,8 @@ func Run(ctx context.Context, opts Options) Report {
 	if opts.Now != nil {
 		now = opts.Now()
 	}
-	if opts.GhostAfter <= 0 {
-		opts.GhostAfter = 5 * time.Minute
+	if opts.HeartbeatInterval <= 0 {
+		opts.HeartbeatInterval = DefaultHeartbeatInterval
 	}
 	if opts.SlotLagWarnBytes <= 0 {
 		opts.SlotLagWarnBytes = 5 << 30
@@ -180,32 +203,54 @@ func controlChecks(ctx context.Context, opts Options, now time.Time, add func(Ch
 		add(Check{ID: "CTL-05", Area: "control", Title: "运行记录读不到", Status: StatusWarn, Detail: errText(err)})
 		return instance
 	}
+	staleAfter := StaleAfter(opts.HeartbeatInterval)
+	heartbeatKnown := false
+	for _, run := range runs {
+		if run.HeartbeatKnown {
+			heartbeatKnown = true
+			break
+		}
+	}
 	ghosts, open := 0, 0
 	var ghostIDs []string
 	for _, run := range runs {
-		started, perr := time.Parse(time.RFC3339, strings.TrimSpace(run.StartedAt))
+		// COALESCE(heartbeat_at, started_at)：心跳列存在但这一行还没写过时，
+		// 退回开始时间。绝不能只看 started_at —— 正常长跑会被误报成幽灵。
+		raw := strings.TrimSpace(run.HeartbeatAt)
+		if raw == "" {
+			raw = strings.TrimSpace(run.StartedAt)
+		}
+		lastSeen, perr := time.Parse(time.RFC3339, raw)
 		if perr != nil {
 			// 时间解析不了也按"未收尾"报告，别静默放过。
 			ghosts++
 			ghostIDs = append(ghostIDs, run.ID)
 			continue
 		}
-		if now.Sub(started) >= opts.GhostAfter {
+		if now.Sub(lastSeen) >= staleAfter {
 			ghosts++
 			ghostIDs = append(ghostIDs, fmt.Sprintf("%s(%s, %s)", run.ID, run.Phase, run.JobID))
 		} else {
 			open++
 		}
 	}
-	if ghosts > 0 {
+	switch {
+	case ghosts > 0 && heartbeatKnown:
 		sort.Strings(ghostIDs)
-		add(Check{ID: "CTL-05", Area: "control", Title: "发现幽灵运行（ended_at 为空）", Status: StatusProblem,
-			Detail: fmt.Sprintf("%d 条超过 %s 仍未收尾：%s", ghosts, opts.GhostAfter, strings.Join(ghostIDs, ", ")),
-			Hint:   "控制面会在下次启动时收尾这些行；若反复出现，说明上次进程被 kill -9 或容器没优雅退出。目标端位点是权威，重启后可续跑"})
-	} else if open > 0 {
+		add(Check{ID: "CTL-05", Area: "control", Title: "发现幽灵运行（心跳已过期）", Status: StatusProblem,
+			Detail: fmt.Sprintf("%d 条超过 %s 没有心跳：%s", ghosts, staleAfter, strings.Join(ghostIDs, ", ")),
+			Hint:   "控制面启动时会按同一阈值（3×30s）收尾；若反复出现，说明上次进程被 kill -9 或容器没优雅退出。目标端位点是权威，重启后可续跑"})
+	case ghosts > 0 && !heartbeatKnown:
+		// 旧控制库没有 heartbeat_at：只有 started_at，无法区分「长跑」与
+		// 「幽灵」。这里只提醒，不把健康系统自己判红（Owl #10 第 1 条）。
+		sort.Strings(ghostIDs)
+		add(Check{ID: "CTL-05", Area: "control", Title: "有未收尾运行，但控制库没有心跳列", Status: StatusWarn,
+			Detail: fmt.Sprintf("%d 条超过 %s 未收尾：%s；当前库没有 runs.heartbeat_at，无法判断是长跑还是幽灵", ghosts, staleAfter, strings.Join(ghostIDs, ", ")),
+			Hint:   "升级到含 runs-liveness 的控制面（心跳 30s，过期 90s）后此项才可靠；现在不要据此杀进程"})
+	case open > 0:
 		add(Check{ID: "CTL-05", Area: "control", Title: "有正在进行的运行", Status: StatusOK,
-			Detail: fmt.Sprintf("%d 条未收尾，但都在 %s 内（视为正常在跑）", open, opts.GhostAfter)})
-	} else {
+			Detail: fmt.Sprintf("%d 条未收尾，最近心跳都在 %s 内（视为正常在跑）", open, staleAfter)})
+	default:
 		add(Check{ID: "CTL-05", Area: "control", Title: "没有未收尾的运行", Status: StatusOK})
 	}
 	return instance

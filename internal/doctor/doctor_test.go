@@ -41,8 +41,12 @@ func TestGhostRunDetected(t *testing.T) {
 	ctl := &fakeControl{
 		instance: "inst1", integrity: "ok", schema: 3, admin: true,
 		runs: []RunInfo{
-			{ID: "old-1", JobID: "job1", Phase: "streaming", StartedAt: now.Add(-30 * time.Minute).Format(time.RFC3339)},
-			{ID: "new-1", JobID: "job2", Phase: "snapshot", StartedAt: now.Add(-30 * time.Second).Format(time.RFC3339)},
+			{ID: "old-1", JobID: "job1", Phase: "streaming", HeartbeatKnown: true,
+				StartedAt:   now.Add(-30 * time.Minute).Format(time.RFC3339),
+				HeartbeatAt: now.Add(-10 * time.Minute).Format(time.RFC3339)},
+			{ID: "new-1", JobID: "job2", Phase: "snapshot", HeartbeatKnown: true,
+				StartedAt:   now.Add(-30 * time.Second).Format(time.RFC3339),
+				HeartbeatAt: now.Add(-5 * time.Second).Format(time.RFC3339)},
 		},
 	}
 	rep := Run(context.Background(), Options{
@@ -64,7 +68,9 @@ func TestRecentOpenRunIsNotGhost(t *testing.T) {
 	now := fixedNow()
 	ctl := &fakeControl{
 		instance: "inst1", integrity: "ok", schema: 3, admin: true,
-		runs: []RunInfo{{ID: "new-1", JobID: "job2", Phase: "streaming", StartedAt: now.Add(-time.Second).Format(time.RFC3339)}},
+		runs: []RunInfo{{ID: "new-1", JobID: "job2", Phase: "streaming", HeartbeatKnown: true,
+			StartedAt:   now.Add(-time.Second).Format(time.RFC3339),
+			HeartbeatAt: now.Add(-time.Second).Format(time.RFC3339)}},
 	}
 	rep := Run(context.Background(), Options{Control: ctl, LatestSchemaVersion: 3, Now: func() time.Time { return now }})
 	if c := checkByID(rep, "CTL-05"); c.Status != StatusOK {
@@ -79,11 +85,54 @@ func TestUnparseableStartedAtCountsAsGhost(t *testing.T) {
 	now := fixedNow()
 	ctl := &fakeControl{
 		instance: "inst1", integrity: "ok", schema: 3, admin: true,
-		runs: []RunInfo{{ID: "bad", JobID: "job", Phase: "streaming", StartedAt: "not-a-time"}},
+		runs: []RunInfo{{ID: "bad", JobID: "job", Phase: "streaming", HeartbeatKnown: true,
+			StartedAt: "not-a-time", HeartbeatAt: "also-not-a-time"}},
 	}
 	rep := Run(context.Background(), Options{Control: ctl, LatestSchemaVersion: 3, Now: func() time.Time { return now }})
 	if c := checkByID(rep, "CTL-05"); c.Status != StatusProblem {
 		t.Fatalf("unparseable started_at must not be silently ignored: %+v", c)
+	}
+}
+
+// Regression for Owl #10 item 1: a normal long run with a fresh heartbeat must
+// stay green. Before the fix, every run older than 5 minutes was a "ghost".
+func TestLongRunWithFreshHeartbeatIsHealthy(t *testing.T) {
+	now := fixedNow()
+	ctl := &fakeControl{
+		instance: "inst1", integrity: "ok", schema: 3, admin: true,
+		runs: []RunInfo{{
+			ID: "long-1", JobID: "job1", Phase: "streaming", HeartbeatKnown: true,
+			StartedAt:   now.Add(-3 * time.Hour).Format(time.RFC3339),
+			HeartbeatAt: now.Add(-10 * time.Second).Format(time.RFC3339),
+		}},
+	}
+	rep := Run(context.Background(), Options{Control: ctl, LatestSchemaVersion: 3, Now: func() time.Time { return now }})
+	c := checkByID(rep, "CTL-05")
+	if c.Status != StatusOK {
+		t.Fatalf("long run with fresh heartbeat must be OK, got %+v", c)
+	}
+	if !rep.Healthy {
+		t.Fatalf("healthy system reported unhealthy: %+v", rep.Checks)
+	}
+}
+
+// 旧控制库没有 heartbeat_at：只能提醒，不能判红（否则升级前每个长跑都是故障）。
+func TestLongRunWithoutHeartbeatIsWarningNotProblem(t *testing.T) {
+	now := fixedNow()
+	ctl := &fakeControl{
+		instance: "inst1", integrity: "ok", schema: 3, admin: true,
+		runs: []RunInfo{{
+			ID: "long-1", JobID: "job1", Phase: "streaming",
+			StartedAt: now.Add(-3 * time.Hour).Format(time.RFC3339),
+		}},
+	}
+	rep := Run(context.Background(), Options{Control: ctl, LatestSchemaVersion: 3, Now: func() time.Time { return now }})
+	c := checkByID(rep, "CTL-05")
+	if c.Status != StatusWarn {
+		t.Fatalf("missing heartbeat column must be a warning, got %+v", c)
+	}
+	if !rep.Healthy || rep.Problems != 0 {
+		t.Fatalf("must not turn healthy into red: %+v", rep.Checks)
 	}
 }
 

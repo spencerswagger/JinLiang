@@ -294,7 +294,8 @@ func cmdDoctor(args []string) error {
 	target := fs.String("target", "", "目标端 DSN（可省略）")
 	jobKey := fs.String("job-key", "", "任务指纹（读目标端 _jl_meta / 死信 / 冲突）")
 	slotPrefix := fs.String("slot-prefix", "", "同步书签前缀（默认 jl_<job-key>）")
-	ghostAfter := fs.Duration("ghost-after", 5*time.Minute, "超过这个时间仍未收尾的运行算幽灵")
+	heartbeat := fs.Duration("heartbeat-interval", doctor.DefaultHeartbeatInterval,
+		"运行心跳间隔；过期阈值是 3×（默认 30s → 90s，与控制面 runs-liveness 一致）")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -308,7 +309,7 @@ func cmdDoctor(args []string) error {
 	opts := doctor.Options{
 		Control:             storeControl{s: store},
 		LatestSchemaVersion: control.LatestSchemaVersion(),
-		GhostAfter:          *ghostAfter,
+		HeartbeatInterval:   *heartbeat,
 		JobKey:              strings.TrimSpace(*jobKey),
 		SlotPrefix:          strings.TrimSpace(*slotPrefix),
 	}
