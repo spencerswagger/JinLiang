@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -454,4 +455,104 @@ func clip(s string, n int) string {
 		return s
 	}
 	return s[:n] + "…"
+}
+
+// TestUIFormsCreateConnectionAndJob 覆盖向导的表单路径：它和 JSON API 是两条
+// 独立代码路径（CSRF 走 form 字段而不是请求头），很容易单独坏掉。
+func TestUIFormsCreateConnectionAndJob(t *testing.T) {
+	ts, _ := newTestServer(t)
+	setupAdmin(t, ts)
+
+	jar, _ := cookiejar.New(nil)
+	client := &http.Client{Jar: jar, CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+	res, err := client.PostForm(ts.URL+"/login", map[string][]string{"password": {testPassword}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+
+	csrf := ""
+	for _, c := range jar.Cookies(mustURL(t, ts.URL)) {
+		if c.Name == csrfCookie {
+			csrf = c.Value
+		}
+	}
+	if csrf == "" {
+		t.Fatal("登录后没有拿到 CSRF cookie")
+	}
+
+	// 1) 新建连接（表单）
+	res, err = client.PostForm(ts.URL+"/connections", map[string][]string{
+		"csrf_token": {csrf},
+		"name":       {"表单连接"},
+		"kind":       {"postgres"},
+		"host":       {"127.0.0.1"},
+		"port":       {"1"},
+		"database":   {"nope"},
+		"username":   {"u"},
+		"password":   {"form-secret"},
+		"sslmode":    {"disable"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	if res.StatusCode != http.StatusSeeOther {
+		t.Fatalf("表单建连接 = %d，期望 303", res.StatusCode)
+	}
+	loc := res.Header.Get("Location")
+	if !strings.HasPrefix(loc, "/connections/") {
+		t.Fatalf("建完应跳到连接详情，实际 %q", loc)
+	}
+	connID := strings.TrimPrefix(loc, "/connections/")
+
+	// 2) 用向导建任务（表单：多值 tables + 频次）
+	res, err = client.PostForm(ts.URL+"/jobs", map[string][]string{
+		"csrf_token":    {csrf},
+		"name":          {"表单任务"},
+		"source_id":     {connID},
+		"target_id":     {connID},
+		"source_schema": {"public"},
+		"target_schema": {"report"},
+		"frequency":     {"once"},
+		"on_exists":     {"append"},
+		"batch_rows":    {"500"},
+		"conns":         {"4"},
+		"tables":        {"orders", "customers"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	if res.StatusCode != http.StatusSeeOther {
+		t.Fatalf("表单建任务 = %d，期望 303", res.StatusCode)
+	}
+	jobLoc := res.Header.Get("Location")
+	if !strings.HasPrefix(jobLoc, "/jobs/") {
+		t.Fatalf("建完应跳到任务详情，实际 %q", jobLoc)
+	}
+
+	// 3) 详情页能看到两张表
+	res, err = client.Get(ts.URL + jobLoc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(res.Body)
+	res.Body.Close()
+	for _, want := range []string{"orders", "customers", "表单任务"} {
+		if !strings.Contains(string(body), want) {
+			t.Fatalf("任务详情缺少 %q", want)
+		}
+	}
+}
+
+func mustURL(t *testing.T, raw string) *url.URL {
+	t.Helper()
+	u, err := url.Parse(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return u
 }
