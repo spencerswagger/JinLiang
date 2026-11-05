@@ -122,3 +122,32 @@ func TestPublishNeverBlocksOnSlowSubscriber(t *testing.T) {
 		t.Fatal("Publish 被不读事件的订阅者卡住了：发送必须是非阻塞的（select/default）")
 	}
 }
+
+// P2 回归：环形缓冲满 200 条后，早于缓冲起点的断档必须被承认（epochOK=false
+// → 走 reset），不能回放后半段却假装没漏。
+func TestReplayDetectsRingGap(t *testing.T) {
+	bus := NewBus(nil)
+	bus.SetEpoch("e1")
+	for i := 0; i < 250; i++ {
+		bus.Publish(Event{JobID: "j", Type: "progress"})
+	}
+	// 缓冲里现在是 51..250。
+	events, ok := bus.Replay("j", "e1", 10)
+	if ok {
+		t.Fatalf("10 号之后已经丢了 11..50，必须报补不齐（返回了 %d 条）", len(events))
+	}
+
+	// 起点在缓冲内：正常回放。
+	events, ok = bus.Replay("j", "e1", 200)
+	if !ok || len(events) != 50 {
+		t.Fatalf("200 之后应该能补 50 条，实际 %d 条 ok=%v", len(events), ok)
+	}
+	if events[0].Seq != 201 {
+		t.Fatalf("回放起点应为 201，实际 %d", events[0].Seq)
+	}
+
+	// 连续起点（正好是缓冲第一条的前一条）也算能补齐。
+	if _, ok := bus.Replay("j", "e1", 50); !ok {
+		t.Fatal("50 之后正好是 51 起，应该能补")
+	}
+}

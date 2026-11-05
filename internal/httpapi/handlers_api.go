@@ -557,7 +557,7 @@ func (s *Server) doctor(ctx context.Context) map[string]any {
 	if ierr != nil || integrity != "ok" {
 		problems = append(problems, "控制库完整性检查没通过："+integrity)
 	}
-	if s.listen != "" && !isLoopback(s.listen) {
+	if s.listen != "" && !netcheck.IsLoopbackListen(s.listen) {
 		problems = append(problems, "监听地址不是本机（"+s.listen+"）：同网络的人可以访问控制台，请确认这是你要的")
 	}
 	if !configured {
@@ -660,5 +660,9 @@ func safeFilename(s string) string {
 	}
 	return out
 }
+
+// 注意：这里**没有**第二份 loopback 判定。原来那份把空 host（":8080" = 绑全网卡）
+// 判成 loopback，于是 --listen :8080 时 doctor 报 healthy，与 serve 刚打印的
+// 暴露警告自相矛盾。统一用 internal/netcheck（与首启守卫同一份实现）。
 
 func isLoopback(listen string) bool { return netcheck.IsLoopbackListen(listen) }

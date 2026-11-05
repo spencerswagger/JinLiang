@@ -188,7 +188,14 @@ func (b *Bus) Replay(jobID, epoch string, afterSeq int64) (events []Event, epoch
 	if epoch != "" && epoch != b.epoch {
 		return nil, false
 	}
-	for _, ev := range b.ring[jobID] {
+	ring := b.ring[jobID]
+	// 环形缓冲只有最近 ringN 条：客户端要的起点如果比缓冲里第一条还早，
+	// 中间那段已经丢了，补不出来。这时必须承认「补不齐」并让调用方发 reset，
+	// 而不是回放 51..250 却假装 11..50 也送到了（§4A：绝不静默漏）。
+	if afterSeq > 0 && len(ring) > 0 && ring[0].Seq > afterSeq+1 {
+		return nil, false
+	}
+	for _, ev := range ring {
 		if ev.Seq > afterSeq {
 			events = append(events, ev)
 		}
