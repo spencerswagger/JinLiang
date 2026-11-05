@@ -144,7 +144,7 @@ jobs:
               sleep 1
             done
             if [ "$ok" != 1 ]; then echo "--- $c 没起来 ---"; docker logs "$c"; exit 1; fi
-            docker exec "$c" psql -U jinliang -tAc "select current_setting('wal_level')"
+            docker exec "$c" psql -U jinliang -d postgres -tAc "select current_setting('wal_level')"
           done
       - name: 引擎单元测试（位点 / 事务组装 / 阶段机 / DDL 生成）
         run: go test ./internal/engine/ ./internal/pgsink/ ./internal/pgsource/ ./internal/pgwire/
