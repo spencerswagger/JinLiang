@@ -15,6 +15,7 @@ package verify
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"sort"
@@ -447,64 +448,86 @@ func runConsistency(ctx context.Context, opts Options) LevelReport {
 	case srcPos == tgtPos:
 		lr.stat("verdict", "in_sync")
 	default:
-		comparePosition(&lr, srcPos, tgtPos, opts.MaxGapBytes)
+		comparePosition(&lr, srcPos, tgtPos, opts.MaxGapBytes, opts.Source.Kind())
 	}
 	lr.finish()
 	return lr
 }
 
-func comparePosition(lr *LevelReport, srcPos, tgtPos string, maxGap int64) {
-	// PostgreSQL: XX/XX LSN，可以直接算字节差。
-	if srcLSN, srcOK := runtime.ParseLSN(srcPos); srcOK {
-		if tgtLSN, tgtOK := runtime.ParseLSN(tgtPos); tgtOK {
-			switch {
-			case tgtLSN > srcLSN:
-				lr.add(SeverityError, "target_ahead", "", "",
-					"目标端位点超前源端 slot：两边不是同一份数据流（或 slot 被重建过）",
-					srcPos, tgtPos, "确认 job_key 与 slot 是否对应；不要继续跑")
-			case srcLSN-tgtLSN > uint64(maxGap):
-				lr.add(SeverityError, "position_gap", "", "",
-					fmt.Sprintf("目标端落后源端 %d 字节，超过容忍上限 %d", srcLSN-tgtLSN, maxGap),
-					srcPos, tgtPos, "确认同步是否卡住；正常追平后重跑 verify")
-			default:
-				lr.stat("gap_bytes", int64(srcLSN-tgtLSN))
-				lr.add(SeverityWarn, "position_behind", "", "",
-					fmt.Sprintf("目标端落后源端 %d 字节（在容忍范围内）", srcLSN-tgtLSN),
-					srcPos, tgtPos, "")
-			}
-			return
-		}
-	}
-	// MySQL: file:pos。
-	srcFile, srcOff, srcOK := runtime.BinlogPos(srcPos)
-	tgtFile, tgtOff, tgtOK := runtime.BinlogPos(tgtPos)
-	if srcOK && tgtOK {
-		switch {
-		case srcFile == tgtFile && tgtOff > srcOff:
-			lr.add(SeverityError, "target_ahead", "", "",
-				"目标端位点在同一 binlog 文件里超前源端", srcPos, tgtPos, "不要继续跑，先确认 slot/job 对应关系")
-		case srcFile == tgtFile:
-			if srcOff-tgtOff > maxGap {
-				lr.add(SeverityError, "position_gap", "", "",
-					fmt.Sprintf("目标端落后源端 %d 字节，超过容忍上限 %d", srcOff-tgtOff, maxGap),
-					srcPos, tgtPos, "确认同步是否卡住")
-			} else if srcOff > tgtOff {
-				lr.add(SeverityWarn, "position_behind", "", "",
-					fmt.Sprintf("目标端落后源端 %d 字节（在容忍范围内）", srcOff-tgtOff), srcPos, tgtPos, "")
-			}
-		case tgtFile > srcFile:
-			lr.add(SeverityError, "target_ahead", "", "",
-				"目标端位点指向更新的 binlog 文件", srcPos, tgtPos, "确认源端是否被替换过")
-		default:
-			lr.add(SeverityWarn, "position_behind", "", "",
-				"目标端位点停在更早的 binlog 文件", srcPos, tgtPos, "确认 binlog 是否被清理；必要时 --resync")
-		}
+// comparePosition picks the parser by the source connector's kind: the
+// position in `_jl_meta` is always written by the source side.
+func comparePosition(lr *LevelReport, srcPos, tgtPos string, maxGap int64, kind string) {
+	if kind == runtime.KindMySQL {
+		compareBinlog(lr, srcPos, tgtPos, maxGap)
 		return
 	}
-	// 格式不认识就明确说无法判定，绝不"字符串不等也算过"。
-	lr.add(SeverityError, "position_unparseable", "", "",
-		"两边位点格式不同或无法解析，不能判定", srcPos, tgtPos,
-		"把 --json 输出发给维护者；这属于连接器位点格式不一致")
+	// PostgreSQL: 裸 LSN 与版本化 postgres:v1:<lsn> 都要认（后者是引擎写的）。
+	srcLSN, srcErr := runtime.ParseLSN(srcPos)
+	tgtLSN, tgtErr := runtime.ParseLSN(tgtPos)
+	if srcErr != nil || tgtErr != nil {
+		if errors.Is(srcErr, runtime.ErrPositionKindMismatch) || errors.Is(tgtErr, runtime.ErrPositionKindMismatch) {
+			lr.add(SeverityError, "position_kind_mismatch", "", "",
+				"位点属于另一种数据库（E1010）：不是格式坏了，是目标库里的位点来自别的源类型",
+				srcPos, tgtPos, "确认 job_key 与源类型是否换过；不要用 --resync 掩盖")
+			return
+		}
+		lr.add(SeverityError, "position_unparseable", "", "",
+			"两边位点格式不同或无法解析，不能判定", srcPos, tgtPos,
+			"把 --json 输出发给维护者；这属于连接器位点格式不一致")
+		return
+	}
+	switch {
+	case tgtLSN > srcLSN:
+		lr.add(SeverityError, "target_ahead", "", "",
+			"目标端位点超前源端 slot：两边不是同一份数据流（或 slot 被重建过）",
+			srcPos, tgtPos, "确认 job_key 与 slot 是否对应；不要继续跑")
+	case srcLSN-tgtLSN > uint64(maxGap):
+		lr.add(SeverityError, "position_gap", "", "",
+			fmt.Sprintf("目标端落后源端 %d 字节，超过容忍上限 %d", srcLSN-tgtLSN, maxGap),
+			srcPos, tgtPos, "确认同步是否卡住；正常追平后重跑 verify")
+	default:
+		lr.stat("gap_bytes", int64(srcLSN-tgtLSN))
+		lr.add(SeverityWarn, "position_behind", "", "",
+			fmt.Sprintf("目标端落后源端 %d 字节（在容忍范围内）", srcLSN-tgtLSN),
+			srcPos, tgtPos, "")
+	}
+}
+
+func compareBinlog(lr *LevelReport, srcPos, tgtPos string, maxGap int64) {
+	srcFile, srcOff, srcErr := runtime.ParseBinlogPos(srcPos)
+	tgtFile, tgtOff, tgtErr := runtime.ParseBinlogPos(tgtPos)
+	if srcErr != nil || tgtErr != nil {
+		if errors.Is(srcErr, runtime.ErrPositionKindMismatch) || errors.Is(tgtErr, runtime.ErrPositionKindMismatch) {
+			lr.add(SeverityError, "position_kind_mismatch", "", "",
+				"位点属于另一种数据库（E1010）：目标库里的位点来自别的源类型",
+				srcPos, tgtPos, "确认 job_key 与源类型是否换过")
+			return
+		}
+		lr.add(SeverityError, "position_unparseable", "", "",
+			"两边位点格式不同或无法解析，不能判定", srcPos, tgtPos,
+			"把 --json 输出发给维护者；这属于连接器位点格式不一致")
+		return
+	}
+	switch {
+	case srcFile == tgtFile && tgtOff > srcOff:
+		lr.add(SeverityError, "target_ahead", "", "",
+			"目标端位点在同一 binlog 文件里超前源端", srcPos, tgtPos, "不要继续跑，先确认 slot/job 对应关系")
+	case srcFile == tgtFile:
+		if srcOff-tgtOff > maxGap {
+			lr.add(SeverityError, "position_gap", "", "",
+				fmt.Sprintf("目标端落后源端 %d 字节，超过容忍上限 %d", srcOff-tgtOff, maxGap),
+				srcPos, tgtPos, "确认同步是否卡住")
+		} else if srcOff > tgtOff {
+			lr.add(SeverityWarn, "position_behind", "", "",
+				fmt.Sprintf("目标端落后源端 %d 字节（在容忍范围内）", srcOff-tgtOff), srcPos, tgtPos, "")
+		}
+	case tgtFile > srcFile:
+		lr.add(SeverityError, "target_ahead", "", "",
+			"目标端位点指向更新的 binlog 文件", srcPos, tgtPos, "确认源端是否被替换过")
+	default:
+		lr.add(SeverityWarn, "position_behind", "", "",
+			"目标端位点停在更早的 binlog 文件", srcPos, tgtPos, "确认 binlog 是否被清理；必要时 --resync")
+	}
 }
 
 // ── helpers ────────────────────────────────────────────────────────────

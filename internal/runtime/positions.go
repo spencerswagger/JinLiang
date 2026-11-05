@@ -3,9 +3,12 @@ package runtime
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
+
+	"github.com/spencerswagger/jinliang/internal/source"
 )
 
 // Slot is one PostgreSQL replication slot (「同步书签」).
@@ -137,8 +140,45 @@ func (d *DB) MaxSlotWALKeepSize(ctx context.Context) string {
 	return v
 }
 
-// ParseLSN parses PostgreSQL's "HEX/HEX" LSN into one comparable integer.
-func ParseLSN(s string) (uint64, bool) {
+// Position parse errors. They must stay distinguishable: a position that
+// belongs to another database family is E1010 (换错了源), while a corrupted
+// string is E3001-ish 「无法判定」. Do not collapse them into one bool.
+var (
+	// ErrPositionKindMismatch means the versioned position belongs to another
+	// kind (e.g. a mysql position handed to the PostgreSQL checker).
+	ErrPositionKindMismatch = errors.New("位点属于另一种数据库类型（E1010）")
+	// ErrPositionMalformed means the string is not a position we can parse.
+	ErrPositionMalformed = errors.New("位点串格式不对")
+)
+
+// ParseLSN parses PostgreSQL's LSN into one comparable integer. It accepts
+// both the bare form ("0/16B6C50") and the versioned wire format that the
+// engine writes into `_jl_meta.position` ("postgres:v1:0/16B6C50").
+//
+// 版本化壳一律交给 source.SplitPosition（Ark 定的唯一入口），不要在这里
+// 再写一遍 split —— 上一次就是漏了这层，`postgres:v1:0/16B6C50` 被按
+// 「最后一个 / 之前都是十六进制」解析，整条一致性级必红。
+func ParseLSN(s string) (uint64, error) {
+	raw := strings.TrimSpace(s)
+	payload := raw
+	if kind, body, err := source.SplitPosition(raw); err == nil {
+		if kind != KindPostgres {
+			return 0, fmt.Errorf("%w：位点 kind=%s", ErrPositionKindMismatch, kind)
+		}
+		payload = body
+	} else if k := positionKind(raw); k != "" && k != KindPostgres {
+		// 非三段式但明显带别的连接器前缀（如 mysql:v1;file=…;pos=…）。
+		return 0, fmt.Errorf("%w：位点 kind=%s", ErrPositionKindMismatch, k)
+	}
+	lsn, ok := parseBareLSN(payload)
+	if !ok {
+		return 0, fmt.Errorf("%w：%q", ErrPositionMalformed, clipPosition(raw))
+	}
+	return lsn, nil
+}
+
+// parseBareLSN parses "HEX/HEX" (no version shell).
+func parseBareLSN(s string) (uint64, bool) {
 	s = strings.TrimSpace(s)
 	i := strings.IndexByte(s, '/')
 	if i <= 0 || i == len(s)-1 {
@@ -155,21 +195,46 @@ func ParseLSN(s string) (uint64, bool) {
 	return hi<<32 | lo, true
 }
 
-// CompareLSN returns -1/0/1 when both sides parse. ok=false means at least one
-// side is not an LSN — callers must report "无法判定", never silently pass.
-func CompareLSN(a, b string) (int, bool) {
-	x, ok1 := ParseLSN(a)
-	y, ok2 := ParseLSN(b)
-	if !ok1 || !ok2 {
-		return 0, false
+// positionKind returns the leading "<kind>:" when it names a database family
+// we know; "" otherwise (a bare LSN has no colon at all).
+func positionKind(raw string) string {
+	i := strings.IndexByte(raw, ':')
+	if i <= 0 {
+		return ""
+	}
+	switch k := raw[:i]; k {
+	case KindPostgres, KindMySQL:
+		return k
+	}
+	return ""
+}
+
+func clipPosition(s string) string {
+	const max = 48
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "…"
+}
+
+// CompareLSN returns -1/0/1. The error is one of ErrPositionKindMismatch /
+// ErrPositionMalformed — callers must report it, never silently pass.
+func CompareLSN(a, b string) (int, error) {
+	x, err := ParseLSN(a)
+	if err != nil {
+		return 0, err
+	}
+	y, err := ParseLSN(b)
+	if err != nil {
+		return 0, err
 	}
 	switch {
 	case x < y:
-		return -1, true
+		return -1, nil
 	case x > y:
-		return 1, true
+		return 1, nil
 	}
-	return 0, true
+	return 0, nil
 }
 
 // BinlogPos parses either a plain "mysql-bin.000003:1234" coordinate or the
@@ -181,37 +246,61 @@ func CompareLSN(a, b string) (int, bool) {
 // 两种格式都要认：B2/B3 一旦把带版本前缀的位点写进目标库，一致性级不能每条
 // 都报 position_unparseable。带 GTID 的位点（gtid:…）这里返回 ok=false，
 // 由上层明确报「无法判定」，不猜。
-func BinlogPos(s string) (string, int64, bool) {
-	s = strings.TrimSpace(s)
-	if i := strings.Index(s, "file="); i >= 0 {
-		file := s[i+len("file="):]
+// ParseBinlogPos parses a MySQL binlog coordinate, accepting:
+//
+//	mysql-bin.000003:1234
+//	mysql:v1:mysql-bin.000003:1234      (source.FormatPosition)
+//	mysql:v1;file=mysql-bin.000003;pos=1234
+//	v1;file=mysql-bin.000003;pos=1234
+//
+// 返回的错误区分「换了源」(ErrPositionKindMismatch/E1010) 与「格式坏了」
+// (ErrPositionMalformed)，上层不能把两者混成同一个 position_unparseable。
+func ParseBinlogPos(s string) (string, int64, error) {
+	raw := strings.TrimSpace(s)
+	if kind, body, err := source.SplitPosition(raw); err == nil {
+		if kind != KindMySQL {
+			return "", 0, fmt.Errorf("%w：位点 kind=%s", ErrPositionKindMismatch, kind)
+		}
+		raw = body
+	} else if k := positionKind(raw); k != "" && k != KindMySQL {
+		return "", 0, fmt.Errorf("%w：位点 kind=%s", ErrPositionKindMismatch, k)
+	}
+	if i := strings.Index(raw, "file="); i >= 0 {
+		file := raw[i+len("file="):]
 		if j := strings.IndexAny(file, ";,"); j >= 0 {
 			file = file[:j]
 		}
 		file = strings.TrimSpace(file)
-		posIdx := strings.Index(s, "pos=")
+		posIdx := strings.Index(raw, "pos=")
 		if file == "" || posIdx < 0 {
-			return "", 0, false
+			return "", 0, fmt.Errorf("%w：%q", ErrPositionMalformed, clipPosition(raw))
 		}
-		posStr := s[posIdx+len("pos="):]
+		posStr := raw[posIdx+len("pos="):]
 		if j := strings.IndexAny(posStr, ";,"); j >= 0 {
 			posStr = posStr[:j]
 		}
 		n, err := strconv.ParseInt(strings.TrimSpace(posStr), 10, 64)
 		if err != nil {
-			return "", 0, false
+			return "", 0, fmt.Errorf("%w：%q", ErrPositionMalformed, clipPosition(raw))
 		}
-		return file, n, true
+		return file, n, nil
 	}
-	i := strings.LastIndexByte(s, ':')
-	if i <= 0 || i == len(s)-1 {
-		return "", 0, false
+	i := strings.LastIndexByte(raw, ':')
+	if i <= 0 || i == len(raw)-1 {
+		return "", 0, fmt.Errorf("%w：%q", ErrPositionMalformed, clipPosition(raw))
 	}
-	n, err := strconv.ParseInt(s[i+1:], 10, 64)
+	n, err := strconv.ParseInt(raw[i+1:], 10, 64)
 	if err != nil {
-		return "", 0, false
+		return "", 0, fmt.Errorf("%w：%q", ErrPositionMalformed, clipPosition(raw))
 	}
-	return s[:i], n, true
+	return raw[:i], n, nil
+}
+
+// BinlogPos is the bool-compatible wrapper. Prefer ParseBinlogPos when the
+// caller can distinguish E1010 from a corrupted position.
+func BinlogPos(s string) (string, int64, bool) {
+	file, off, err := ParseBinlogPos(s)
+	return file, off, err == nil
 }
 
 func asString(v any) string {

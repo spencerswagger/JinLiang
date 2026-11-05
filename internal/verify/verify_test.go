@@ -303,6 +303,48 @@ func hasCode(rep Report, code string) bool {
 	return false
 }
 
+// 引擎把版本化位点写进 _jl_meta（postgres:v1:<lsn>）；一致性级必须认得，
+// 否则 #13 一合，PG 任务每条都红。
+func TestConsistencyAcceptsVersionedPositions(t *testing.T) {
+	src, tgt := newFake("postgres"), newFake("postgres")
+	src.add(ordersTable(), ordersRows()...)
+	tgt.add(ordersTable(), ordersRows()...)
+	opts := baseOptions(src, tgt)
+	opts.Level = LevelConsistency
+	opts.SourcePosition = func(context.Context) (string, error) { return "0/1000", nil }
+	opts.TargetPosition = func(context.Context) (string, error) { return "postgres:v1:0/1000", nil }
+	rep, err := Run(context.Background(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rep.OK {
+		t.Fatalf("versioned position must compare cleanly: %+v", rep.Levels[0])
+	}
+}
+
+// 别的连接器的位点是 E1010（换错了源），不能报成 position_unparseable。
+func TestConsistencyForeignKindIsE1010(t *testing.T) {
+	src, tgt := newFake("postgres"), newFake("postgres")
+	src.add(ordersTable(), ordersRows()...)
+	tgt.add(ordersTable(), ordersRows()...)
+	opts := baseOptions(src, tgt)
+	opts.Level = LevelConsistency
+	opts.SourcePosition = func(context.Context) (string, error) { return "0/1000", nil }
+	opts.TargetPosition = func(context.Context) (string, error) {
+		return "mysql:v1;file=mysql-bin.000003;pos=1234", nil
+	}
+	rep, err := Run(context.Background(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasCode(rep, "position_kind_mismatch") {
+		t.Fatalf("want position_kind_mismatch, got %+v", rep.Levels[0].Findings)
+	}
+	if hasCode(rep, "position_unparseable") {
+		t.Fatal("E1010 must not be reported as position_unparseable")
+	}
+}
+
 func TestCrossEngineTypeMapping(t *testing.T) {
 	src, tgt := newFake("mysql"), newFake("postgres")
 	src.add(source.Table{

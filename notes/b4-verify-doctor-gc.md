@@ -127,6 +127,24 @@ binary dist/jinliang: 19591328 bytes (18 MB), limit 25 MB → OK
 
 CI 集成步骤同步加上 `./internal/remedy`。
 
+## Owl 复审二（跨轨必改）：PG 版本化位点
+
+- `ParseLSN` 先用 `source.SplitPosition` 剥 `<kind>:v1:` 壳（Ark 定的唯一入口），
+  再解析裸 LSN；`postgres:v1:0/16B6C50` 与「两边都版本化」都能比较。
+- 外来 kind（`mysql:v1;file=…;pos=…` / `mysql:v1:…`）返回
+  `ErrPositionKindMismatch`，verify 报 `position_kind_mismatch`（E1010），
+  **不** 报 `position_unparseable`；载荷坏才是 `ErrPositionMalformed`。
+- MySQL 侧对称：`ParseBinlogPos` 同时认 `mysql:v1:<file:pos>` 与
+  `mysql:v1;file=…;pos=…`，PG 位点传给它会报 E1010。
+- 用例：`TestParseLSNBare`、`TestParseLSNVersioned`、`TestCompareLSNBothVersioned`、
+  `TestParseLSNVersionedBadPayload`、`TestParseLSNRejectsForeignKind`；
+  verify 层 `TestConsistencyAcceptsVersionedPositions`、`TestConsistencyForeignKindIsE1010`；
+  MySQL `TestBinlogPosFormats`、`TestParseBinlogPosForeignKind`。
+
+P3：main 已有 `race` job（`go test -race ./...`），合并 #5 后自动覆盖本分支的
+verify/gc/runtime/doctor/remedy 单测，不再另加。`-p 1` 仍是夹具权宜（PG
+`CREATE TABLE IF NOT EXISTS` 非并发安全）；更干净是每包独立 schema，记在这里。
+
 ## 共享契约与边界
 
 - 未改 `internal/source/contract.go`、`internal/sink/contract.go`；未动 `internal/engine`、`internal/mysqlsource`、`internal/control`、`internal/httpapi`。

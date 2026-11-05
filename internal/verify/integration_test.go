@@ -109,7 +109,11 @@ func TestPGVerifyIntegration(t *testing.T) {
 	setupPG(t, src, tgt, false)
 	var cur uint64
 	rows, _, _ = src.QueryRows(ctx, `SELECT pg_current_wal_lsn()::text`)
-	cur, _ = runtime.ParseLSN(fmt.Sprint(rows[0][0]))
+	var lsnErr error
+	cur, lsnErr = runtime.ParseLSN(fmt.Sprint(rows[0][0]))
+	if lsnErr != nil {
+		t.Fatalf("parse current LSN: %v", lsnErr)
+	}
 	ahead := fmt.Sprintf("%X/%X", cur>>32+1, cur&0xffffffff)
 	setPGPosition(t, tgt, ahead)
 	opts.Level = verify.LevelConsistency
