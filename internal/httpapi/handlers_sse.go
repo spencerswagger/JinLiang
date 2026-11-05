@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"strconv"
 	"time"
 
 	"github.com/spencerswagger/jinliang/internal/control"
@@ -14,6 +13,12 @@ import (
 //
 // 为什么要 SSE 而不是轮询：用户看的是"现在到哪了"。轮询要么慢要么费；
 // SSE 断线会自动重连，并且带 Last-Event-ID 补齐断档（events.go 的环形缓冲）。
+//
+// 两个容易写反的顺序（Ark 的 P1）：
+//  1. 必须**先 Subscribe 再回放**。反过来的话，两步之间发布的事件既不在回放里、
+//     也没进订阅通道，永久丢失；先订阅最多多收到重复事件，去重由 seq 兜住。
+//  2. id 是 "<boot_epoch>-<seq>"。进程重启后 seq 从 1 重来，客户端带着旧 epoch
+//     的 Last-Event-ID 回来时不能假装能补齐——发一条 reset 让它从头开始。
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	jobID := r.PathValue("id")
 	if _, err := s.store.GetJob(r.Context(), jobID); err != nil {
@@ -33,29 +38,45 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	h.Set("X-Accel-Buffering", "no") // 让反向代理别攒着
 	w.WriteHeader(http.StatusOK)
 
-	// 断线重连时客户端会带 Last-Event-ID（或 ?last_event_id=），先补历史。
-	lastID := int64(0)
+	// 断线重连时客户端会带 Last-Event-ID（或 ?last_event_id=）。
+	lastEpoch, lastSeq, haveLast := "", int64(0), false
 	if v := r.Header.Get("Last-Event-ID"); v != "" {
-		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
-			lastID = n
+		if epoch, seq, ok := control.ParseSSEID(v); ok {
+			lastEpoch, lastSeq, haveLast = epoch, seq, true
 		}
 	}
 	if v := r.URL.Query().Get("last_event_id"); v != "" {
-		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > lastID {
-			lastID = n
+		if epoch, seq, ok := control.ParseSSEID(v); ok && (!haveLast || seq > lastSeq) {
+			lastEpoch, lastSeq, haveLast = epoch, seq, true
 		}
 	}
 
-	fmt.Fprint(w, "retry: 3000\n\n")
-	for _, ev := range s.store.Bus().Since(jobID, lastID) {
-		if !writeSSE(w, ev) {
-			return
-		}
-	}
-	flusher.Flush()
-
+	// 先订阅，再回放（顺序不能反，见函数注释）。
 	ch, cancel := s.store.Bus().Subscribe(jobID)
 	defer cancel()
+
+	fmt.Fprint(w, "retry: 3000\n\n")
+
+	// lastEpoch == "" 有两种来源：老页面只会带裸数字 seq（升级前的服务端不发 epoch），
+	// 或者客户端自己拼了个数字。两种都属于「未知 epoch」——裸数字是上一辈子的进程
+	// 计数器，拿去跟当前 seq 比就是静默丢事件。所以一律先 reset 再从当前缓冲重发。
+	unknownEpoch := haveLast && lastEpoch == ""
+
+	if haveLast {
+		if events, epochOK := s.store.Bus().Replay(jobID, lastEpoch, lastSeq); epochOK && !unknownEpoch {
+			lastSeq = writeSSEList(w, events, lastSeq)
+		} else {
+			// 另一个进程生命周期（或无法识别）的事件流：旧 seq 与新的没有可比性。
+			// 明确告诉客户端「重置」，而不是让它拿着错位的序号继续。
+			writeSSEReset(w, s.store.Bus().Epoch(), unknownEpoch)
+			events, _ := s.store.Bus().Replay(jobID, "", 0)
+			lastSeq = writeSSEList(w, events, 0)
+		}
+	} else {
+		events, _ := s.store.Bus().Replay(jobID, "", 0)
+		lastSeq = writeSSEList(w, events, 0)
+	}
+	flusher.Flush()
 
 	heartbeat := time.NewTicker(15 * time.Second)
 	defer heartbeat.Stop()
@@ -68,6 +89,11 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				return
 			}
+			// 回放与订阅有重叠窗口：同一个 seq 只发一次。
+			if ev.Seq <= lastSeq {
+				continue
+			}
+			lastSeq = ev.Seq
 			if !writeSSE(w, ev) {
 				return
 			}
@@ -80,13 +106,52 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// writeSSE emits one event with its sequence number as the SSE id, so a
-// reconnecting client can ask for exactly what it missed.
+// writeSSEList emits a batch and returns the highest seq written.
+func writeSSEList(w http.ResponseWriter, events []control.Event, since int64) int64 {
+	for _, ev := range events {
+		if ev.Seq <= since {
+			continue
+		}
+		if !writeSSE(w, ev) {
+			return since
+		}
+		since = ev.Seq
+	}
+	return since
+}
+
+// writeSSEReset tells a reconnecting client that the ids it remembers belong to
+// a stream we cannot match: the process restarted, or the id carried no epoch at
+// all (an old page from before epochs existed).
+func writeSSEReset(w http.ResponseWriter, epoch string, noEpoch bool) {
+	reason := "控制面进程重启过，之前的事件序号已经失效；下面从这一轮的开头重新发送"
+	if noEpoch {
+		reason = "这个 Last-Event-ID 没有 epoch（升级前的客户端只会发序号），无法判断断档位置；下面从这一轮的开头重新发送"
+	}
+	payload, err := json.Marshal(map[string]string{
+		"epoch":  epoch,
+		"reason": reason,
+	})
+	if err != nil {
+		return
+	}
+	fmt.Fprintf(w, "event: reset\ndata: %s\n\n", payload)
+}
+
+// writeSSE emits one event. `event:` carries the type so the browser can use
+// addEventListener('phase', …) instead of guessing from the payload.
 func writeSSE(w http.ResponseWriter, ev control.Event) bool {
 	payload, err := json.Marshal(ev)
 	if err != nil {
 		return true // 跳过坏事件，别把流打断
 	}
-	_, err = fmt.Fprintf(w, "id: %d\ndata: %s\n\n", ev.Seq, payload)
+	// type 必须是浏览器订阅过的那几种（app.js 逐类型 addEventListener）。
+	// 将来的新 type 如果直接带 event: 行，浏览器会静默丢弃这条消息；
+	// 所以未知 type 退回「无名事件」，至少还能落到 onmessage 上被看见。
+	if !control.IsEventType(ev.Type) {
+		_, err = fmt.Fprintf(w, "id: %s\ndata: %s\n\n", ev.SSEID(), payload)
+		return err == nil
+	}
+	_, err = fmt.Fprintf(w, "id: %s\nevent: %s\ndata: %s\n\n", ev.SSEID(), ev.Type, payload)
 	return err == nil
 }

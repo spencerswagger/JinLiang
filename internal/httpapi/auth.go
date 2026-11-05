@@ -350,7 +350,7 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if configured {
-		// 已设过口令：这是幂等语义问题，先回答它，与来源无关
+		// 已设过口令：这是幂等语义问题，先回答它，与来源无关。
 		s.writeError(w, r, http.StatusConflict, apiError{
 			Class:   "user_action",
 			Message: "管理员口令已经设置过了",
@@ -360,8 +360,9 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	// A-1：还没设口令时，只有本机能定这个口令。
+	// A-1（从 #6 同批合入）：还没设口令时，只有本机能定这个口令。
 	// 顺序放在 CSRF 之前——先回答「你能不能做这件事」，再谈「这个请求是不是伪造的」。
+	// CSRF 挡不住直连：攻击者自己 GET 一次 /api/session 就能把 token 镜像进请求头。
 	if !netcheck.IsLoopbackRequest(r) {
 		s.writeError(w, r, http.StatusForbidden, setupLoopbackOnly())
 		return

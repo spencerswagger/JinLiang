@@ -11,10 +11,12 @@ import (
 // Audit entries: 我们替用户做了什么（docs/SECURITY.md §5）。
 // 控制面的每个写操作都记一条，这样"系统为什么动了"永远可回溯。
 const (
-	ActorUI          = "ui"
-	ActorAPI         = "api"
-	ActorCLI         = "cli"
-	ActorStub        = "runner"
+	ActorUI   = "ui"
+	ActorAPI  = "api"
+	ActorCLI  = "cli"
+	ActorStub = "runner"
+	// ActorSystem 是进程自己的动作（迁移收尾、启动恢复），不是某个用户点的按钮。
+	ActorSystem      = "system"
 	ActionConnCreate = "connection.create"
 	ActionConnUpdate = "connection.update"
 	ActionConnDelete = "connection.delete"
@@ -84,6 +86,25 @@ func (s *Store) ListAudit(ctx context.Context, limit int) ([]AuditEntry, error) 
 
 // PhaseLabel is the human word for a phase. The UI never shows raw phase codes
 // and never shows WAL/slot/LSN (docs/DESIGN.md: 用户不懂这些).
+// RunStateLabel is what the UI shows for one run. finish_reason wins over phase:
+// a run that ended with phase=done but reason=stopped is "已停止", not "已完成".
+func RunStateLabel(r Run) string {
+	switch r.FinishReason {
+	case FinishStopped:
+		return "已停止"
+	case FinishInterrupted:
+		return "已中断"
+	case FinishFailed:
+		return "失败"
+	case FinishCompleted:
+		return "已完成"
+	}
+	if r.EndedAt == "" {
+		return PhaseLabel(r.Phase)
+	}
+	return PhaseLabel(r.Phase)
+}
+
 func PhaseLabel(p state.Phase) string {
 	switch p {
 	case state.Idle:

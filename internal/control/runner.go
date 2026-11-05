@@ -160,6 +160,22 @@ func (r *Runner) loop(job Job, run Run, ctl *runControl) {
 		delete(r.active, ctl.jobID)
 		r.mu.Unlock()
 	}()
+	// 独立心跳：阶段推进可能几分钟不发生（长 streaming、暂停），只有阶段推进时打心跳
+	// 会让「活着但没动」的 run 被下一次 serve 判死（Ark P0-3）。暂停期间也照打。
+	hbCtx, hbCancel := context.WithCancel(context.Background())
+	defer hbCancel()
+	go r.heartbeat(hbCtx, ctl, run.ID)
+
+	// 这个 goroutine 是 go r.loop(...) 起的，没人接它的 panic：一次 panic 就是整个
+	// 控制台进程退出，用户正在看的页面直接断。兜住它，把这一轮标失败，进程继续活。
+	defer func() {
+		if rec := recover(); rec != nil {
+			msg := fmt.Sprintf("运行时内部错误（本轮已标记失败，进程继续运行）：%v", rec)
+			r.bus.Publish(Event{JobID: job.ID, RunID: run.ID, Type: "error",
+				Code: "E4002", Message: msg, Stub: true})
+			_, _ = r.store.FinishRun(context.Background(), run.ID, state.Failed, msg, 1, FinishFailed)
+		}
+	}()
 
 	ctx := context.Background()
 	cur := state.Preflight
@@ -176,6 +192,7 @@ func (r *Runner) loop(job Job, run Run, ctl *runControl) {
 			r.fail(job, run, "阶段推进失败："+err.Error())
 			return
 		}
+		_ = r.store.TouchRun(ctx, run.ID) // 心跳：让重启后的 serve 能区分「在跑」和「进程已死」
 		cur = step.phase
 		r.bus.Publish(Event{
 			JobID: job.ID, RunID: run.ID, Type: "phase", Phase: step.phase,
@@ -190,7 +207,7 @@ func (r *Runner) loop(job Job, run Run, ctl *runControl) {
 		r.finishStopped(job, run, cur)
 		return
 	}
-	final, err := r.store.FinishRun(ctx, run.ID, state.Done, "", 0)
+	final, err := r.store.FinishRun(ctx, run.ID, state.Done, "", 0, FinishCompleted)
 	if err != nil {
 		r.fail(job, run, "收尾失败："+err.Error())
 		return
@@ -201,6 +218,23 @@ func (r *Runner) loop(job Job, run Run, ctl *runControl) {
 		Stub:    true,
 	})
 	_ = r.store.Audit(ctx, ActorStub, ActionRunStub, map[string]any{"job_id": job.ID, "run_id": run.ID})
+}
+
+// heartbeat refreshes runs.heartbeat_at on its own ticker until the run ends.
+// 与阶段无关：暂停、长事务、卡在一次大 batch 里都不影响它。
+func (r *Runner) heartbeat(ctx context.Context, ctl *runControl, runID string) {
+	t := time.NewTicker(r.store.HeartbeatInterval())
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ctl.done:
+			return
+		case <-t.C:
+			_ = r.store.TouchRun(context.Background(), runID)
+		}
+	}
 }
 
 // gate blocks while the run is paused. It returns false when the run must stop.
@@ -270,7 +304,7 @@ func (r *Runner) fail(job Job, run Run, msg string) {
 	ev := ErrorEvent(job.ID, run.ID, "E4002", msg)
 	ev.Stub = true
 	r.bus.Publish(ev)
-	_, _ = r.store.FinishRun(context.Background(), run.ID, state.Failed, msg, 1)
+	_, _ = r.store.FinishRun(context.Background(), run.ID, state.Failed, msg, 1, FinishFailed)
 }
 
 func (r *Runner) finishStopped(job Job, run Run, cur state.Phase) {
@@ -281,7 +315,9 @@ func (r *Runner) finishStopped(job Job, run Run, cur state.Phase) {
 			return
 		}
 	}
-	final, err := r.store.FinishRun(ctx, run.ID, state.Done, "", 0)
+	// 手动停止是「停止」，不是「顺利完成」：B0 原来写 phase=done + exit_code=0，
+	// 历史页就会把它当成一次正常结束。finish_reason 让两者分得开。
+	final, err := r.store.FinishRun(ctx, run.ID, state.Done, "", 0, FinishStopped)
 	if err != nil {
 		r.fail(job, run, "停止时收尾失败："+err.Error())
 		return
