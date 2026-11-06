@@ -34,22 +34,22 @@ import (
 )
 
 type report struct {
-	Metric             string  `json:"metric"`
-	Rows               int     `json:"rows"`
-	BatchRows          int     `json:"batch_rows"`
-	Batches            int     `json:"batches"`
-	WarmupBatches      int     `json:"warmup_batches"`
-	RowsPerSec         float64 `json:"rows_per_sec"` // 增量 apply
-	SnapshotRowsPerSec float64 `json:"snapshot_rows_per_sec"`
-	P50MS              float64 `json:"p50_ms"`
-	P99MS              float64 `json:"p99_ms"`
-	MaxMS              float64 `json:"max_ms"`
-	ElapsedSec         float64 `json:"elapsed_sec"`
-	SetupMS            float64 `json:"setup_ms"`
-	NumCPU             int     `json:"num_cpu"`
-	GoVersion          string  `json:"go_version"`
-	CPUModel           string  `json:"cpu_model,omitempty"`
-	Note               string  `json:"note"`
+	Metric                   string  `json:"metric"`
+	Rows                     int     `json:"rows"`
+	BatchRows                int     `json:"batch_rows"`
+	Batches                  int     `json:"batches"`
+	WarmupBatches            int     `json:"warmup_batches"`
+	RowsPerSec               float64 `json:"rows_per_sec"` // 增量 apply
+	RawCopyCeilingRowsPerSec float64 `json:"raw_copy_ceiling_rows_per_sec"`
+	P50MS                    float64 `json:"p50_ms"`
+	P99MS                    float64 `json:"p99_ms"`
+	MaxMS                    float64 `json:"max_ms"`
+	ElapsedSec               float64 `json:"elapsed_sec"`
+	SetupMS                  float64 `json:"setup_ms"`
+	NumCPU                   int     `json:"num_cpu"`
+	GoVersion                string  `json:"go_version"`
+	CPUModel                 string  `json:"cpu_model,omitempty"`
+	Note                     string  `json:"note"`
 }
 
 type benchPosition string
@@ -62,7 +62,8 @@ func main() {
 	batch := flag.Int("batch", 500, "每批行数（= 每事务行数）")
 	warmup := flag.Int("warmup", 2, "预热批次数（不计入吞吐/延迟）")
 	jsonOut := flag.String("json-out", "", "把 JSON 报告写到这个文件（空 = 只打印）")
-	table := flag.String("table", "jl_bench_orders", "目标表名")
+	table := flag.String("table", "orders", "目标表名")
+	schema := flag.String("schema", "jl_bench_apply", "专用 schema（避免与其他集成测试抢 public._jl_*）")
 	flag.Parse()
 
 	raw := strings.TrimSpace(os.Getenv("JINLIANG_TEST_PG_DSN"))
@@ -82,7 +83,25 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
-	ref := source.TableRef{Schema: "public", Table: *table}
+	admin, err := pgx.Connect(ctx, ep.PostgresURL())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "benchapply: 连目标库失败: %v\n", err)
+		os.Exit(2)
+	}
+	if _, err := admin.Exec(ctx, `DROP SCHEMA IF EXISTS "`+*schema+`" CASCADE`); err != nil {
+		fmt.Fprintf(os.Stderr, "benchapply: 清理 schema 失败: %v\n", err)
+		os.Exit(2)
+	}
+	if _, err := admin.Exec(ctx, `CREATE SCHEMA "`+*schema+`"`); err != nil {
+		fmt.Fprintf(os.Stderr, "benchapply: 建 schema 失败: %v\n", err)
+		os.Exit(2)
+	}
+	defer func() {
+		_, _ = admin.Exec(context.Background(), `DROP SCHEMA IF EXISTS "`+*schema+`" CASCADE`)
+		_ = admin.Close(context.Background())
+	}()
+
+	ref := source.TableRef{Schema: *schema, Table: *table}
 	cat := source.Catalog{Tables: []source.Table{{
 		TableRef: ref,
 		Columns: []source.Column{
@@ -97,7 +116,7 @@ func main() {
 	setupStart := time.Now()
 	sink, err := pgsink.Open(ctx, pgsink.Options{
 		Target: ep, JobKey: "benchapply", JobName: "benchapply",
-		InstanceID: "bench", Schema: "public", OnExists: "recreate", Catalog: cat,
+		InstanceID: "bench", Schema: *schema, OnExists: "recreate", Catalog: cat,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "benchapply: 打开目标库失败: %v\n", err)
@@ -161,9 +180,9 @@ func main() {
 	rep := report{
 		Metric: "snapshot_copy+incremental_apply", Rows: measuredRows, BatchRows: *batch,
 		Batches: len(samples), WarmupBatches: *warmup,
-		RowsPerSec:         float64(measuredRows) / elapsed.Seconds(),
-		SnapshotRowsPerSec: snapshotRowsPerSec,
-		ElapsedSec:         elapsed.Seconds(), SetupMS: setupMS,
+		RowsPerSec:               float64(measuredRows) / elapsed.Seconds(),
+		RawCopyCeilingRowsPerSec: snapshotRowsPerSec,
+		ElapsedSec:               elapsed.Seconds(), SetupMS: setupMS,
 		NumCPU: runtime.NumCPU(), GoVersion: runtime.Version(),
 		CPUModel: cpuModel(),
 		Note: "快照=目标端 COPY；增量=单连接 apply（数据+位点同事务），均不含源端解码与网络；" +
@@ -177,7 +196,7 @@ func main() {
 			os.Exit(2)
 		}
 	}
-	fmt.Printf("snapshot COPY: %.0f rows/s (%d rows)\n", rep.SnapshotRowsPerSec, *rows)
+	fmt.Printf("raw COPY ceiling (非门禁): %.0f rows/s (%d rows)\n", rep.RawCopyCeilingRowsPerSec, *rows)
 	fmt.Printf("incremental apply: %.0f rows/s, p50 %.2f ms, p99 %.2f ms, max %.2f ms "+
 		"(%d rows, batch %d, %d batches, setup %.0f ms)\n",
 		rep.RowsPerSec, rep.P50MS, rep.P99MS, rep.MaxMS, rep.Rows, rep.BatchRows, rep.Batches, rep.SetupMS)

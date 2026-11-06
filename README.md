@@ -76,41 +76,48 @@ WAL / binlog / 复制槽 / 位点这些底层概念由工具负责探测、代�
 | `cmd/jinliang` | 0.3% | 单元 |
 | `internal/catalog` | 68.0% | 单元 |
 | `internal/connect` | 72.3% | 单元 |
-| `internal/control` | 65.4% | 单元 |
+| `internal/control` | 61.9% | 单元 |
 | `internal/core` | 84.6% | 单元 |
 | `internal/doctor` | 45.0% | 单元 |
 | `internal/dsn` | 87.7% | 单元 |
-| `internal/engine` | 14.4% | 单元 + 集成（nightly） |
+| `internal/engine` | 20.1% | 单元 + 集成（nightly） |
 | `internal/gc` | 68.8% | 单元 |
-| `internal/httpapi` | 68.0% | 单元 |
+| `internal/httpapi` | 69.8% | 单元 |
 | `internal/mysqlsource` | 51.2% | 单元 + 集成（nightly） |
 | `internal/netcheck` | 96.4% | 单元 |
 | `internal/pgsink` | 17.4% | 单元 + 集成（nightly） |
-| `internal/pgsource` | 8.8% | 单元 + 集成（nightly） |
+| `internal/pgsource` | 13.1% | 单元 + 集成（nightly） |
 | `internal/preflight` | 88.8% | 单元 |
 | `internal/runtime` | 11.6% | 单元 + 集成（nightly） |
 | `internal/source` | 96.8% | 单元 |
 | `internal/state` | 82.2% | 单元 |
 | `internal/verify` | 60.3% | 单元 |
 
-**总语句覆盖：44.1%**（单元测试；集成覆盖见 nightly 产物）
+**总语句覆盖：44.2%**（单元测试；集成覆盖见 nightly 产物）
 <!-- coverage:end -->
 
 ## 性能基线
 
-`scripts/bench.sh` 一次跑出五项：快照吞吐、增量 p99、空转内存、冷启、二进制体积。
-口径固定（10 万行 / 每批 500 / 2 批预热），报告写 `bench/latest.json`；当前基线在
-`bench/baseline.json`（release 用它做 >15% 回归对比；CPU 型号不同时只查绝对阈值）。
+`scripts/bench.sh` 一次跑出五项：**快照吞吐（产品路径 `pgsink.BulkApply`）**、
+增量 p99、空转内存、冷启、二进制体积。口径固定（10 万行 / 每批 500 / 2 批预热；
+快照每块 5000），报告写 `bench/latest.json`，基线在 `bench/baseline.json`
+（release 用它做 >15% 回归对比；CPU 型号不同时只查绝对阈值）。
 
 ```bash
 JINLIANG_TEST_PG_DSN=... scripts/bench.sh            # 报告模式
 JINLIANG_TEST_PG_DSN=... scripts/bench.sh --enforce  # 门禁：任一项不达标退出 1
 ```
 
-本机基线（AMD Ryzen 5 1500X / 8 vCPU / Linux 5.15）：快照 **167,965 行/s**、
-增量 apply 10,544 行/s、p99 **61.7 ms**、空转 **15.9 MB**、冷启 **27 ms**、二进制 **19.12 MB**。
-20k 行/s 的目标是**快照 COPY** 路径；增量 apply 当前逐行 Exec（500 次/事务），
-约 10k 行/s，这是已知差距——基线把它固定下来，避免以后悄悄变慢。
+本机基线（AMD Ryzen 5 1500X / 8 vCPU / Linux 5.15）：快照 **98,642 行/s**
+（`BulkApply`：临时落地区 → COPY → `INSERT…SELECT` → 块记账 + 位点同事务）、
+增量 apply 9,594 行/s、p99 **81.77 ms**、空转 **15.6 MB**、冷启 **27 ms**、二进制 **19.12 MB**。
+20k 行/s 的门禁量的是 **`BulkApply` 产品路径**；裸 `COPY`（约 176k 行/s）只是目标端
+上限参考，不进门禁——否则 `BulkApply` 慢 10 倍也能 PASS。
+
+口径三句（复现时别理解错）：p99 的样本数 = **批次数（200）**，不是单行延迟；
+空转内存 = `ps` 的 **RSS**，不是 Go heap；冷启 = 进程 exec → `/api/health` 返回 200。
+增量 apply 当前逐行 `Exec`（500 次/事务），约 10k 行/s，是已知差距——基线把它钉住，
+避免以后悄悄变慢。
 
 ## 自检
 

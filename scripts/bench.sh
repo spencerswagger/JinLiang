@@ -2,8 +2,10 @@
 # 性能基线：五项实测（吞吐 / p99 / 空转内存 / 冷启 / 二进制体积）。
 #
 # 口径固定，换机器要重测并记录 CPU：
-#   - 吞吐与 p99：单连接增量 apply，固定 10 万行、每批 500 行、2 批预热；
-#     走 pgsink.Apply 真实路径（数据 + 位点同事务），不含源端解码与网络。
+#   - 快照吞吐：走**产品路径** pgsink.BulkApply（临时落地区 → COPY → INSERT…SELECT
+#     → 块记账 + 位点同事务），固定 10 万行 / 每块 5000；裸 COPY 只作为上限参考。
+#   - 增量 p99：单连接 pgsink.Apply（数据 + 位点同事务），固定 10 万行 / 每批 500 /
+#     2 批预热；p99 的样本数 = 批次数（200），不是单行延迟。
 #   - 空转内存：serve 起来后、无任何请求时的 RSS（median of 3）。
 #   - 冷启：进程 exec 到 /api/health 返回 200 的墙钟（median of 3）。
 #   - 二进制：CGO_ENABLED=0 -trimpath -ldflags "-s -w" 的产物大小。
@@ -42,7 +44,8 @@ while [ $# -gt 0 ]; do
 done
 
 cd "$(dirname "$0")/.."
-export PATH="/.toolchain/go/bin:${PATH}"
+# 本机沙盒的 Go 在 /.toolchain；换机器时不要写死，否则会静默用系统 go。
+if [ -d "/.toolchain/go/bin" ]; then export PATH="/.toolchain/go/bin:${PATH}"; fi
 command -v curl >/dev/null || { echo "bench: 缺 curl" >&2; exit 2; }
 command -v python3 >/dev/null || { echo "bench: 缺 python3" >&2; exit 2; }
 if [ -z "${JINLIANG_TEST_PG_DSN:-}" ]; then
@@ -100,9 +103,41 @@ IDLE_MB=$(median "${idle_mb[@]}")
 
 # ── 3) 吞吐 + p99（真实 PG apply） ─────────────────────────────
 apply_json="$tmp/apply.json"
-go run ./scripts/benchapply --rows "$ROWS" --batch "$BATCH" --warmup "$WARMUP" \
-  --json-out "$apply_json" | tail -1
-SNAP_PER_SEC=$(python3 -c "import json;print(f'{json.load(open(\"$apply_json\"))[\"snapshot_rows_per_sec\"]:.0f}')")
+# 3 次取中位：共享机器/磁盘抖动会让单次 p99 出现 180ms 的假尖峰；门禁看中位数，
+# 原始三次数据仍在报告里（apply_runs）。
+for i in 1 2 3; do
+  go run ./scripts/benchapply --rows "$ROWS" --batch "$BATCH" --warmup "$WARMUP" \
+    --json-out "$tmp/apply-$i.json" >/dev/null
+done
+python3 - "$tmp/apply-1.json" "$tmp/apply-2.json" "$tmp/apply-3.json" "$apply_json" <<'PY'
+import json, statistics, sys
+runs = [json.load(open(p)) for p in sys.argv[1:4]]
+def med(k):
+    return statistics.median(float(r[k]) for r in runs)
+rep = dict(runs[0])
+rep["rows_per_sec"] = med("rows_per_sec")
+rep["p50_ms"] = med("p50_ms")
+rep["p99_ms"] = med("p99_ms")
+rep["raw_copy_ceiling_rows_per_sec"] = med("raw_copy_ceiling_rows_per_sec")
+rep["apply_runs"] = [
+    {k: r[k] for k in ("rows_per_sec", "p50_ms", "p99_ms", "raw_copy_ceiling_rows_per_sec")}
+    for r in runs
+]
+rep["note"] += "；吞吐/p99 为 3 次中位数（原始三次见 apply_runs）"
+open(sys.argv[4], "w").write(json.dumps(rep, ensure_ascii=False, indent=2) + "\n")
+PY
+
+# 快照：产品路径 BulkApply（不是裸 COPY）。同包集成用例里直接构造 tableInfo。
+bulk_json="$tmp/bulk.json"
+JINLIANG_BULK_BENCH_OUT="$bulk_json" JINLIANG_BULK_BENCH_ROWS="$ROWS" \
+  go test -count=1 -tags=integration -run '^TestBulkApplyThroughput$' ./internal/pgsink >"$tmp/bulk.log" 2>&1 || {
+    echo "bench: BulkApply 基线失败（这是产品路径，不能降级成裸 COPY 顶替）" >&2
+    cat "$tmp/bulk.log" >&2
+    exit 2
+  }
+SNAP_PER_SEC=$(python3 -c "import json;print(f'{json.load(open(\"$bulk_json\"))[\"rows_per_sec\"]:.0f}')")
+BULK_P99=$(python3 -c "import json;print(f'{json.load(open(\"$bulk_json\"))[\"p99_ms\"]:.2f}')")
+RAW_COPY=$(python3 -c "import json;print(f'{json.load(open(\"$apply_json\"))[\"raw_copy_ceiling_rows_per_sec\"]:.0f}')")
 ROWS_PER_SEC=$(python3 -c "import json;print(f'{json.load(open(\"$apply_json\"))[\"rows_per_sec\"]:.0f}')")
 P99_MS=$(python3 -c "import json;print(f'{json.load(open(\"$apply_json\"))[\"p99_ms\"]:.2f}')")
 P50_MS=$(python3 -c "import json;print(f'{json.load(open(\"$apply_json\"))[\"p50_ms\"]:.2f}')")
@@ -130,8 +165,9 @@ printf '%-14s %14s %14s  %s\n' "空转内存" "${IDLE_MB} MB" "≤ ${T_IDLE} MB"
 printf '%-14s %14s %14s  %s\n' "冷启" "${COLD_MS} ms" "≤ ${T_COLD} ms" "$V_COLD"
 printf '%-14s %14s %14s  %s\n' "二进制" "${SIZE_MB} MB" "< ${T_SIZE} MB" "$V_SIZE"
 echo
-echo "说明：增量 apply ${ROWS_PER_SEC} 行/s（p50 ${P50_MS} ms，数据+位点同事务）；"
-echo "      不含源端解码与网络；空转/冷启是 serve + 内嵌 SQLite 的真实启动路径。"
+echo "说明：快照=产品路径 pgsink.BulkApply（p99 ${BULK_P99} ms/块）；裸 COPY 上限 ${RAW_COPY} 行/s 仅参考；"
+echo "      增量 apply ${ROWS_PER_SEC} 行/s（p50 ${P50_MS} ms，数据+位点同事务，p99 样本=200 批）；"
+echo "      空转=ps 的 RSS（不是 Go heap）；冷启=exec→/api/health 返回 200；均不含源端解码与网络。"
 
 python3 - "$OUT" <<PY
 import json, os
@@ -141,7 +177,11 @@ rep = {
   "batch_rows": $BATCH,
   "warmup_batches": $WARMUP,
   "snapshot_rows_per_sec": float("$SNAP_PER_SEC"),
+  "bulk_apply_rows_per_sec": float("$SNAP_PER_SEC"),
+  "bulk_apply_p99_ms": float("$BULK_P99"),
+  "raw_copy_ceiling_rows_per_sec": float("$RAW_COPY"),
   "rows_per_sec": float("$ROWS_PER_SEC"),
+  "apply_runs": json.load(open("$apply_json")).get("apply_runs", []),
   "p50_ms": float("$P50_MS"),
   "p99_ms": float("$P99_MS"),
   "idle_mb": float("$IDLE_MB"),
@@ -155,7 +195,7 @@ rep = {
     "idle_mb_max": $T_IDLE, "cold_start_ms_max": $T_COLD, "binary_mb_max": $T_SIZE,
   },
   "verdict": {
-    "snapshot_rows_per_sec": "$V_ROWS", "p99_ms": "$V_P99", "idle_mb": "$V_IDLE",
+    "snapshot_rows_per_sec": "$V_ROWS", "bulk_apply_rows_per_sec": "$V_ROWS", "p99_ms": "$V_P99", "idle_mb": "$V_IDLE",
     "cold_start_ms": "$V_COLD", "binary_mb": "$V_SIZE",
   },
 }

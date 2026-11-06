@@ -6,20 +6,23 @@ README、`testmatrix.yaml`、集成测试夹具；未动 `internal/engine` / `in
 
 ## 1) 性能基线（可重复跑）
 
-`scripts/bench.sh` 固定规模：10 万行、每批 500、2 批预热；五项实测：
+`scripts/bench.sh` 固定规模：10 万行、每批 500、2 批预热；快照每块 5000。五项实测：
 
 ```
 指标                 实测         目标  结论
-吞吐(快照)   155809 行/s      ≥ 20000  PASS
-p99 延迟           65.99 ms     ≤ 100 ms  PASS
-空转内存          14.9 MB      ≤ 80 MB  PASS
-冷启                  26 ms     ≤ 200 ms  PASS
+吞吐(快照)    98642 行/s      ≥ 20000  PASS
+p99 延迟           81.77 ms     ≤ 100 ms  PASS
+空转内存          15.6 MB      ≤ 80 MB  PASS
+冷启                  27 ms     ≤ 200 ms  PASS
 二进制            19.12 MB        < 25 MB  PASS
 ```
 
-- 快照吞吐用目标端 `COPY`（与 pgsink 全量路径同一原语），不含源端 SELECT；
-- p99 是**增量批事务**（数据+位点同事务）延迟的最近秩，200 个样本；
-- 空转/冷启是 `serve` + 内嵌 SQLite 的真实启动路径，3 次取中位；
+- 快照吞吐走**产品路径 `pgsink.BulkApply`**（临时落地区 → COPY → `INSERT…SELECT`
+  → 块记账 + 位点同事务），不是裸 COPY；裸 COPY 只作为上限参考（~176k 行/s），
+  不进门禁——否则 BulkApply 慢 10 倍也能 PASS（Owl #28 必改）；
+- p99 是**增量批事务**（数据+位点同事务）延迟的最近秩，200 个样本，3 次取中位；
+- 空转 = `ps` 的 **RSS**（不是 Go heap）；冷启 = exec → `/api/health` 返回 200；
+  两者都是 `serve` + 内嵌 SQLite 的真实启动路径，3 次取中位；
 - `bench/baseline.json` 入库；`scripts/bench_compare.py` 做 >15% 回归对比
   （CPU 型号不同时只查绝对阈值，跨机器比吞吐没有意义）。
 - **已知差距**：增量 apply 约 10.5k 行/s（pgsink 每行一次 Exec，500 次/事务）。
