@@ -627,8 +627,11 @@ func (s *Sink) reconcileColumns(ctx context.Context, ti *tableInfo) error {
 		typ, ok := have[col]
 		if ok {
 			if !compatibleType(typ, ti.types[i]) {
-				return fmt.Errorf("%w: 目标表 %s 的列 %s 是 %s，源端是 %s",
-					ErrTypeMismatch, ti.ref.Table, col, typ, ti.types[i])
+				// **同一种失败、两种时机不能有两种行为**：跑起来时发现类型变了 → 暂停该表；
+				// prepare 时发现类型不一致却打死整任务，用户会当成两个 bug。
+				// 所以这里也走 TypeChangedError（同一个原因码），由第③步统一按表暂停。
+				return &TypeChangedError{TableName: ti.ref.Table,
+					Detail: fmt.Sprintf("%s: %s → %s", col, typ, ti.types[i])}
 			}
 			if want := ti.collation(i); want != "" && haveColl[col] != want {
 				// 排序规则不同 → 唯一索引判重与 ORDER BY 会不一致，而且是静默的。
@@ -1051,9 +1054,9 @@ func (s *Sink) alignRelationTx(ctx context.Context, tx pgx.Tx, ev source.Event) 
 		// 改类型：本版**不跟随**（改窄会截断、改宽会静默变更语义）。
 		// 第③步会把它降级成「只暂停这张表 + 明确原因码」，其它表继续跑；
 		// 在那之前先响亮拒绝，别让它安静写错。
-		return &TypeChangedError{Table: ev.Table.Table, Detail: typeDiff}
+		return &TypeChangedError{TableName: ev.Table.Table, Detail: typeDiff}
 	case !keptAll:
-		return &SchemaDriftError{Table: ev.Table.Table, Detail: nameDiff}
+		return &SchemaDriftError{TableName: ev.Table.Table, Detail: nameDiff}
 	}
 
 	var added []string
@@ -1170,60 +1173,50 @@ const (
 // TypeChangedError 表示源端改了列类型——本版不跟随（会截断或静默变更语义）。
 // 单独成类型，方便第③步把它降级成「只暂停这张表」而不是整个任务。
 type TypeChangedError struct {
-	Table  string
-	Detail string
+	TableName string
+	Detail    string
 }
 
 // Reason 实现 PausableError：第③步按它记 paused_tables 的原因码。
 func (e *TypeChangedError) Reason() string { return PauseReasonTypeChanged }
 
+// Table 实现 PausableError。
+func (e *TypeChangedError) Table() string { return e.TableName }
+
 // SchemaDriftError 表示列被改名或删掉（列数可能没变）。
 type SchemaDriftError struct {
-	Table  string
-	Detail string
+	TableName string
+	Detail    string
 }
 
 func (e *SchemaDriftError) Error() string {
 	return fmt.Sprintf("源端表 %s 的列发生变化（改名/删列），本版不跟随：%s。"+
 		"你能做什么：1) 手工把目标表的列改成与源端一致后重跑（位点不动）；"+
-		"2) 或把该表移出同步范围。风险：结构不一致时继续写会让数据与列错位", e.Table, e.Detail)
+		"2) 或把该表移出同步范围。风险：结构不一致时继续写会让数据与列错位", e.TableName, e.Detail)
 }
 
 // Reason 实现 PausableError。
 func (e *SchemaDriftError) Reason() string { return PauseReasonSchemaDrift }
 
+// Table 实现 PausableError。
+func (e *SchemaDriftError) Table() string { return e.TableName }
+
 // PausableError 是「这张表不能继续跟，但其它表可以继续」的错误。
 // 第③步用它把「一张表的 DDL」降级成「只暂停这张表」，而不是打死整个任务。
 type PausableError interface {
 	error
+	// Reason 是稳定原因码（机器判等，不是中文句子）。
 	Reason() string
+	// Table 是被暂停的那张表。放进接口是必须的：paused_tables 要存「表名 + 原因码 + 时间」，
+	// 若表名只藏在各个具体类型里，第③步就得对每个类型各写一次 errors.As——加第三个类型时必漏。
+	Table() string
 }
 
 func (e *TypeChangedError) Error() string {
 	return fmt.Sprintf("源端表 %s 的列类型发生变化，本版不跟随：%s。"+
 		"你能做什么：1) 确认目标端也要改成新类型后，手工执行 ALTER 再重跑（位点不动）；"+
 		"2) 或把该表移出同步范围。"+
-		"风险：类型不一致时继续写，要么被截断、要么报一个看起来像「数据问题」的编码错", e.Table, e.Detail)
-}
-
-func typeDiffText(ti *tableInfo, rel *source.Table) string {
-	var parts []string
-	for i, c := range rel.Columns {
-		if i < len(ti.types) && c.Type != ti.types[i] {
-			parts = append(parts, fmt.Sprintf("%s: %s → %s", c.Name, ti.types[i], c.Type))
-		}
-	}
-	return strings.Join(parts, "；")
-}
-
-func nameDiffText(ti *tableInfo, rel *source.Table) string {
-	var parts []string
-	for i, c := range rel.Columns {
-		if i < len(ti.cols) && c.Name != ti.cols[i] {
-			parts = append(parts, fmt.Sprintf("原 %s → 现 %s", ti.cols[i], c.Name))
-		}
-	}
-	return strings.Join(parts, "；")
+		"风险：类型不一致时继续写，要么被截断、要么报一个看起来像「数据问题」的编码错", e.TableName, e.Detail)
 }
 
 // applyDDLTx 在目标端执行源端的 DDL。
