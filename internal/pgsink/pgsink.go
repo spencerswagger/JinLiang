@@ -91,8 +91,6 @@ type Sink struct {
 	// ownerToken 让「同一个进程里的两个 Sink」也彼此可分（否则它们同 pid、
 	// 同 instance_id，第二个会把第一个的租约抢走）。
 	ownerToken string
-	// batchLimitOnce 让「批大小被参数上限钳制」只提示一次（每批都打会把日志刷满）。
-	batchLimitOnce sync.Once
 
 	// CountSource / FingerprintSource are injected by the engine so Verify can
 	// compare both sides without this package importing the source.
@@ -127,6 +125,9 @@ func Open(ctx context.Context, opt Options) (*Sink, error) {
 			}
 		}
 	}
+	if err := checkColumnBudget(opt.Catalog); err != nil {
+		return nil, err
+	}
 	tables, order := buildTables(opt.Catalog)
 	s := &Sink{opt: opt, tables: tables, order: order, ownerToken: newOwnerToken()}
 	conn, err := pgwire.Connect(ctx, opt.Target)
@@ -139,6 +140,24 @@ func Open(ctx context.Context, opt Options) (*Sink, error) {
 		return nil, err
 	}
 	return s, nil
+}
+
+// maxPGColumnsPerTable 是 PostgreSQL 单表列数上限（真实边界：建表会被拒）。
+const maxPGColumnsPerTable = 1600
+
+// checkColumnBudget 在建连之前拦「列太多」：这是**真实会撞**的边界（宽表 + 我们自动建表），
+// 提前拦比让它在写入时炸成一句驱动原始错误好。
+func checkColumnBudget(cat source.Catalog) error {
+	for _, t := range cat.Tables {
+		if len(t.Columns) <= maxPGColumnsPerTable {
+			continue
+		}
+		return fmt.Errorf("表 %s 有 %d 列，超过 PostgreSQL 单表 %d 列的上限。"+
+			"你能做的：① 把不需要同步的列写进 content.tables.%s.columns.exclude；"+
+			"② 拆分宽表后重新选表。风险：列数超限时建表/写入都会被数据库拒绝，且报错与数据无关",
+			t.Table, len(t.Columns), maxPGColumnsPerTable, t.Table)
+	}
+	return nil
 }
 
 // buildTables indexes the catalog by "schema.table" and keeps a stable order.
@@ -901,7 +920,7 @@ func (s *Sink) locateFailingRow(ctx context.Context, tx pgx.Tx, ti *tableInfo, e
 				return fmt.Errorf("写入 %s 失败（%d 行，%d 列；无法在事务内逐行定位：%v）: %w",
 					ti.ref.Table, len(evs), len(ti.cols), err, batchErr)
 			}
-			return fmt.Errorf("写入 %s 失败：第 %d/%d 行（主键 %s）写不进去：%s。"+
+			return fmt.Errorf("写入 %s 失败：第 %d/%d 行（同批去重后，主键 %s）写不进去：%s。"+
 				"你能做的：① 修源端这一行的数据（或按约束补默认值）后重跑；"+
 				"② 该列不再同步就加进 content.tables.<表>.columns.exclude；"+
 				"③ 目标端约束本身不对就改目标表。风险：跳过这一行意味着目标端会缺一条数据，语义上只能靠你确认。"+
@@ -937,7 +956,11 @@ func (s *Sink) pkOf(ti *tableInfo, ev source.Event) string {
 func describeSQLError(err error) string {
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {
-		return fmt.Sprintf("SQLSTATE %s（%s）：%s", pgErr.Code, pgErr.ConstraintName, pgErr.Message)
+		// 约束名经常为空（例如类型越界、权限）：渲染成「（）」比不写更让人困惑。
+		if pgErr.ConstraintName != "" {
+			return fmt.Sprintf("SQLSTATE %s（%s）：%s", pgErr.Code, pgErr.ConstraintName, pgErr.Message)
+		}
+		return fmt.Sprintf("SQLSTATE %s：%s", pgErr.Code, pgErr.Message)
 	}
 	return err.Error()
 }
@@ -1207,18 +1230,20 @@ func effectiveBatchRows(requested, cols int) int {
 	if cols <= 0 {
 		return limit
 	}
+	// 列数已经由 Open 校验过不超过 PG 的单表上限（1600），所以 max 最小是 40，恒 ≥1。
 	if max := maxBindParams / cols; limit > max {
-		if max < 1 {
-			max = 1 // 列数本身就超过上限：至少发一行，让错误指向「列太多」而不是「参数太多」
-		}
 		return max
 	}
 	return limit
 }
 
-// noteBatchLimit 把生效值打进日志（只在被钳制时打一次），让人一眼看出是配置问题。
+// batchLimitLogOnce 是**包级**的：interval 模式每轮都会新建 Sink，
+// 挂在实例上的 once 会变成「每分钟一打」，等于没做去重。
+var batchLimitLogOnce = &sync.Once{}
+
+// noteBatchLimit 把生效值打进日志（全进程只打一次），让人一眼看出是配置问题。
 func (s *Sink) noteBatchLimit(ti *tableInfo, limit int) {
-	s.batchLimitOnce.Do(func() {
+	batchLimitLogOnce.Do(func() {
 		asked := s.opt.ApplyBatchRows
 		if asked <= 0 {
 			asked = DefaultApplyBatchRows

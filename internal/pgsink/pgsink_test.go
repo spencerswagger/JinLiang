@@ -3,10 +3,14 @@ package pgsink
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"log"
 	"os"
 	"strings"
+	"sync"
 	"testing"
+
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/spencerswagger/jinliang/internal/source"
 )
@@ -182,20 +186,19 @@ func TestEffectiveBatchRowsClampedByParamLimit(t *testing.T) {
 	cases := []struct {
 		requested, cols, want int
 	}{
-		{0, 3, DefaultApplyBatchRows},      // 未配置 → 默认
-		{500, 3, 500},                      // 正常范围不动
-		{100000, 10, maxBindParams / 10},   // 10 列 → 6553
-		{100000, 200, maxBindParams / 200}, // 宽表 → 327
-		{100000, 70000, 1},                 // 列数比上限还大 → 至少 1 行也要能发
-		{100000, 0, 100000},                // 列数未知时不钳制（调用方会另行报错）
+		{0, 3, DefaultApplyBatchRows},        // 未配置 → 默认
+		{500, 3, 500},                        // 正常范围不动
+		{100000, 10, maxBindParams / 10},     // 10 列 → 6553
+		{100000, 200, maxBindParams / 200},   // 宽表 → 327
+		{100000, 1600, maxBindParams / 1600}, // PG 单表上限 1600 列（Open 已拦，这里验算术）
+		{100000, 0, 100000},                  // 列数未知时不钳制（调用方会另行报错）
 	}
 	for _, c := range cases {
 		got := effectiveBatchRows(c.requested, c.cols)
 		if got != c.want {
 			t.Fatalf("requested=%d cols=%d → %d，期望 %d", c.requested, c.cols, got, c.want)
 		}
-		// 列数本身就超过参数上限时无法靠减行解决，只断言「至少发 1 行」。
-		if c.cols > 0 && c.cols <= maxBindParams && got*c.cols > maxBindParams {
+		if c.cols > 0 && got*c.cols > maxBindParams {
 			t.Fatalf("钳制后参数总数 %d 仍超过 %d", got*c.cols, maxBindParams)
 		}
 	}
@@ -203,6 +206,11 @@ func TestEffectiveBatchRowsClampedByParamLimit(t *testing.T) {
 
 // 钳制必须留下日志：否则用户只看到「每批都失败」，看不出是自己把批大小配大了。
 func TestBatchLimitClampIsLogged(t *testing.T) {
+	// once 是包级的（interval 每轮新建 Sink 也不重复打），测试里重置一次才能观察输出。
+	prev := batchLimitLogOnce
+	batchLimitLogOnce = &sync.Once{}
+	t.Cleanup(func() { batchLimitLogOnce = prev })
+
 	var buf bytes.Buffer
 	log.SetOutput(&buf)
 	defer log.SetOutput(os.Stderr)
@@ -218,5 +226,44 @@ func TestBatchLimitClampIsLogged(t *testing.T) {
 	t.Logf("钳制日志: %s", strings.TrimSpace(got))
 	if !strings.Contains(got, "65535") || !strings.Contains(got, "配置问题") {
 		t.Fatalf("日志要说清是参数上限与配置问题: %q", got)
+	}
+}
+
+// 列太多是真实会撞的边界（PG 单表上限 1600）：在建连之前拦，并给出 exclude 的做法。
+func TestColumnBudgetRejectedBeforeConnecting(t *testing.T) {
+	cols := make([]source.Column, maxPGColumnsPerTable+1)
+	for i := range cols {
+		cols[i] = source.Column{Name: fmt.Sprintf("c%d", i), Type: "text"}
+	}
+	cat := source.Catalog{Tables: []source.Table{{
+		TableRef: source.TableRef{Schema: "public", Table: "wide"},
+		Columns:  cols,
+	}}}
+	err := checkColumnBudget(cat)
+	if err == nil {
+		t.Fatal("1601 列必须被拦住")
+	}
+	for _, want := range []string{"1600", "exclude", "风险"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("错误里应有 %q: %v", want, err)
+		}
+	}
+	// 正好 1600 列放行。
+	if err := checkColumnBudget(source.Catalog{Tables: []source.Table{{
+		TableRef: source.TableRef{Table: "wide"}, Columns: cols[:maxPGColumnsPerTable],
+	}}}); err != nil {
+		t.Fatalf("1600 列不该被拦: %v", err)
+	}
+}
+
+// 约束名为空时不能渲染成「SQLSTATE 23514（）：」那种空括号。
+func TestSQLErrorWithoutConstraintName(t *testing.T) {
+	e := &pgconn.PgError{Code: "23505", Message: "duplicate key"}
+	got := describeSQLError(e)
+	if strings.Contains(got, "（）") {
+		t.Fatalf("空约束名不该渲染空括号: %s", got)
+	}
+	if !strings.Contains(got, "23505") || !strings.Contains(got, "duplicate key") {
+		t.Fatalf("应保留码与消息: %s", got)
 	}
 }
