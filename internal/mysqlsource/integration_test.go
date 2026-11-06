@@ -402,3 +402,146 @@ func exec(t *testing.T, s *Source, query string, args ...any) {
 		t.Fatalf("执行 %q 失败: %v", query, err)
 	}
 }
+
+// 引擎侧要的只读能力：行数、指纹、块快照、水位、行数估算。
+// 这些是「MySQL 源接进引擎」的前置，必须真库验证（不是只看编译过）。
+func TestIntegrationReadOnlyCapabilities(t *testing.T) {
+	s := openSource(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	table := "jl_it_caps"
+	exec(t, s, "DROP TABLE IF EXISTS "+quoteIdent(table))
+	exec(t, s, "CREATE TABLE "+quoteIdent(table)+" (id INT PRIMARY KEY, note VARCHAR(32), seq INT)")
+	for i := 1; i <= 3; i++ {
+		exec(t, s, "INSERT INTO "+quoteIdent(table)+" (id, note, seq) VALUES (?, ?, ?)", i, "n", i*10)
+	}
+	defer exec(t, s, "DROP TABLE IF EXISTS "+quoteIdent(table))
+
+	ref := source.TableRef{Table: table}
+
+	// Count
+	if n, err := s.Count(ctx, ref); err != nil || n != 3 {
+		t.Fatalf("Count = (%d,%v)，期望 3", n, err)
+	}
+
+	// Fingerprint：同侧两次必须一致；改一行必须变。
+	fp1, err := s.Fingerprint(ctx, ref)
+	if err != nil {
+		t.Fatalf("Fingerprint: %v", err)
+	}
+	fp2, err := s.Fingerprint(ctx, ref)
+	if err != nil || fp1 != fp2 {
+		t.Fatalf("指纹应稳定: %q vs %q (err=%v)", fp1, fp2, err)
+	}
+	exec(t, s, "UPDATE "+quoteIdent(table)+" SET note='changed' WHERE id=2")
+	fp3, err := s.Fingerprint(ctx, ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fp3 == fp1 {
+		t.Fatal("改了内容指纹必须变")
+	}
+
+	// SnapshotChunks：块大小 2 → 3 行应切成 2 块，块边界可核对。
+	var chunks []Chunk
+	if _, err := s.SnapshotChunks(ctx, source.SnapshotOpt{ChunkRows: 2}, func(ctx context.Context, c Chunk) error {
+		if c.Table.Table == table {
+			chunks = append(chunks, c)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("SnapshotChunks: %v", err)
+	}
+	var rows int
+	for i, c := range chunks {
+		if i > 0 && c.No <= chunks[i-1].No {
+			t.Fatalf("块编号必须递增: %d 之后是 %d", chunks[i-1].No, c.No)
+		}
+		if i > 0 && c.From == "" {
+			t.Fatal("第二块起必须有 keyset 起点（块级续跑靠它）")
+		}
+		rows += len(c.Rows)
+	}
+	if len(chunks) != 2 || rows != 3 {
+		t.Fatalf("应 2 块共 3 行，实际 %d 块 %d 行", len(chunks), rows)
+	}
+
+	// 水位：MAX(seq) = 30
+	if v, err := s.MaxWatermark(ctx, ref, "seq"); err != nil || v != "30" {
+		t.Fatalf("MaxWatermark = (%q,%v)，期望 30", v, err)
+	}
+	// 水位分页：>10 应拿到 2 行，next=30
+	page, next, err := s.ReadWatermarkPage(ctx, ref, "seq", "10", 10)
+	if err != nil || len(page) != 2 || next != "30" {
+		t.Fatalf("ReadWatermarkPage = (%d 行, next=%q, err=%v)", len(page), next, err)
+	}
+
+	// 行数估算
+	if est, err := s.TableRowsEstimate(ctx, ref); err != nil || est < 0 {
+		t.Fatalf("TableRowsEstimate = (%d,%v)", est, err)
+	}
+}
+
+// 无主键表算不出稳定指纹：必须四段式报错，不能返回一个假的「一致」。
+func TestIntegrationFingerprintNeedsPrimaryKey(t *testing.T) {
+	s := openSource(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	table := "jl_it_caps_nopk"
+	exec(t, s, "DROP TABLE IF EXISTS "+quoteIdent(table))
+	exec(t, s, "CREATE TABLE "+quoteIdent(table)+" (a INT, b VARCHAR(8))")
+	exec(t, s, "INSERT INTO "+quoteIdent(table)+" (a,b) VALUES (1,'x')")
+	defer exec(t, s, "DROP TABLE IF EXISTS "+quoteIdent(table))
+
+	_, err := s.Fingerprint(ctx, source.TableRef{Table: table})
+	if err == nil {
+		t.Fatal("无主键表必须拒绝算指纹")
+	}
+	for _, want := range []string{"主键", "你能做的", "风险"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("错误里应有 %q（四段式），拿到: %v", want, err)
+		}
+	}
+}
+
+// 无主键表也必须分页：一次 SELECT * 把整表读进内存就是 OOM，且与「一页 = 一块」不符。
+func TestIntegrationNoPKChunksAreBounded(t *testing.T) {
+	s := openSource(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	table := "jl_it_nopkchunk"
+	exec(t, s, "DROP TABLE IF EXISTS "+quoteIdent(table))
+	exec(t, s, "CREATE TABLE "+quoteIdent(table)+" (a INT, b VARCHAR(8))")
+	for i := 0; i < 7; i++ {
+		exec(t, s, "INSERT INTO "+quoteIdent(table)+" (a,b) VALUES (?,?)", i, "x")
+	}
+	defer exec(t, s, "DROP TABLE IF EXISTS "+quoteIdent(table))
+
+	var chunks []Chunk
+	if _, err := s.SnapshotChunks(ctx, source.SnapshotOpt{ChunkRows: 3}, func(ctx context.Context, c Chunk) error {
+		if c.Table.Table == table {
+			chunks = append(chunks, c)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("SnapshotChunks: %v", err)
+	}
+	if len(chunks) < 2 {
+		t.Fatalf("7 行、每块 3 行应至少 2 块（无主键也要分页），实际 %d 块", len(chunks))
+	}
+	var total int
+	for i, c := range chunks {
+		if len(c.Rows) > 3 {
+			t.Fatalf("第 %d 块有 %d 行，超过每块上限 3（会把整表读进内存）", i+1, len(c.Rows))
+		}
+		total += len(c.Rows)
+		// 无主键块没有 keyset 边界，必须留空（引擎据此只做表级断点）。
+		if c.From != "" || c.To != "" {
+			t.Fatalf("无主键块不该有边界，拿到 From=%q To=%q", c.From, c.To)
+		}
+	}
+	if total != 7 {
+		t.Fatalf("分块后总数应仍为 7，实际 %d", total)
+	}
+}

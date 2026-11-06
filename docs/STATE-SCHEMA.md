@@ -182,7 +182,7 @@ COMMIT;
 1. 启动 → 尝试 INSERT _jl_lease(job_key, instance_id, now()+ttl)
    ├─ 冲突且未过期 → 另一个实例在跑：报 E1005，退出（绝不双写）
    └─ 冲突但已过期 → 接管（记一条 action："接管了超时租约"）
-2. 每 5s 续租（UPDATE expires_at）
+2. 每 `leaseTTL/3` 续租（UPDATE expires_at；默认 TTL 30s → **每 10s**）
 3. 读 _jl_meta：phase / position / snapshot_id
    ├─ phase=snapshot → 读 _jl_chunk 找未完成块，继续；快照 id 过期则整段重来
    ├─ phase=catchup/streaming → 从目标位点继续流
