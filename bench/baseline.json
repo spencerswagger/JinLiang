@@ -3,57 +3,57 @@
   "rows": 100000,
   "batch_rows": 500,
   "warmup_batches": 2,
-  "snapshot_rows_per_sec": 82501.0,
-  "bulk_apply_rows_per_sec": 82501.0,
-  "bulk_apply_p99_ms": 103.31,
+  "snapshot_rows_per_sec": 83052.0,
+  "bulk_apply_rows_per_sec": 83052.0,
+  "bulk_apply_p99_ms": 108.67,
   "reference": {
-    "raw_copy_ceiling_rows_per_sec": 150380.0,
+    "raw_copy_ceiling_rows_per_sec": 132259.0,
     "note": "仅目标端 COPY 上限参考，不进门禁；门禁量的是 BulkApply"
   },
-  "rows_per_sec": 10265.0,
+  "rows_per_sec": 56886.0,
   "apply_runs": [
     {
-      "rows_per_sec": 10418.64374757412,
-      "p50_ms": 45.38,
-      "p99_ms": 75.147,
-      "raw_copy_ceiling_rows_per_sec": 150494.69532686038
+      "rows_per_sec": 56040.569875658424,
+      "p50_ms": 7.271,
+      "p99_ms": 20.564,
+      "raw_copy_ceiling_rows_per_sec": 132258.5448492991
     },
     {
-      "rows_per_sec": 10053.938851088116,
-      "p50_ms": 46.353,
-      "p99_ms": 82.165,
-      "raw_copy_ceiling_rows_per_sec": 150379.98789799
+      "rows_per_sec": 56885.765695509894,
+      "p50_ms": 7.3,
+      "p99_ms": 16.988,
+      "raw_copy_ceiling_rows_per_sec": 174051.86603581544
     },
     {
-      "rows_per_sec": 10264.77036757862,
-      "p50_ms": 45.602,
-      "p99_ms": 71.913,
-      "raw_copy_ceiling_rows_per_sec": 132443.82120502662
+      "rows_per_sec": 59279.4597670766,
+      "p50_ms": 7.136,
+      "p99_ms": 15.924,
+      "raw_copy_ceiling_rows_per_sec": 117239.05188877218
     }
   ],
   "bulk_runs": [
     {
-      "rows_per_sec": 82500.54417152684,
-      "p50_ms": 49.655,
-      "p99_ms": 116.82
+      "rows_per_sec": 92203.63905413184,
+      "p50_ms": 45.37,
+      "p99_ms": 86.171
     },
     {
-      "rows_per_sec": 81029.53114456084,
-      "p50_ms": 52.973,
-      "p99_ms": 103.315
+      "rows_per_sec": 81947.10329560537,
+      "p50_ms": 53.288,
+      "p99_ms": 126.724
     },
     {
-      "rows_per_sec": 100394.60279338223,
-      "p50_ms": 45.461,
-      "p99_ms": 80.34
+      "rows_per_sec": 83051.6687893635,
+      "p50_ms": 56.215,
+      "p99_ms": 108.665
     }
   ],
-  "p50_ms": 45.6,
-  "p99_ms": 75.15,
-  "idle_mb": 15.4,
+  "p50_ms": 7.27,
+  "p99_ms": 16.99,
+  "idle_mb": 15.8,
   "cold_start_ms": 29,
-  "binary_mb": 19.13,
-  "binary_bytes": 20054176,
+  "binary_mb": 19.21,
+  "binary_bytes": 20144288,
   "cpu_model": "AMD Ryzen 5 1500X Quad-Core Processor",
   "num_cpu": 8,
   "thresholds": {

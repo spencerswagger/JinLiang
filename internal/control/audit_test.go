@@ -62,3 +62,73 @@ func TestListAuditByActionSurvivesBusyWindow(t *testing.T) {
 		t.Fatalf("取到的不是那条拒绝记录：%s", got[0].Detail)
 	}
 }
+
+// 计划必须走索引（Owl 用 EXPLAIN QUERY PLAN 实测过：没有这条索引时是
+// `SCAN audit` + `USE TEMP B-TREE FOR ORDER BY`，也就是每次开诊断页全表扫 + 全排序）。
+// 断言计划文本而不是耗时：耗时在不同机器上不稳定，计划是确定的。
+func TestListAuditByActionUsesIndex(t *testing.T) {
+	store, err := Open(Options{DataDir: t.TempDir(), Autogen: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	rows, err := store.DB().Query(`EXPLAIN QUERY PLAN
+		SELECT id, at, actor, action, COALESCE(detail_json,'') FROM audit
+		 WHERE action = ? ORDER BY at DESC, id DESC LIMIT ?`, ActionRunRejected, RejectedWindow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var plan strings.Builder
+	for rows.Next() {
+		var id, parent, notused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &notused, &detail); err != nil {
+			t.Fatal(err)
+		}
+		plan.WriteString(detail + "\n")
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	got := plan.String()
+	if !strings.Contains(got, "idx_audit_action_at_id") {
+		t.Fatalf("查询计划没走 idx_audit_action_at_id（会全表扫）：\n%s", got)
+	}
+	if strings.Contains(got, "TEMP B-TREE") {
+		t.Fatalf("仍需要临时 B 树排序——索引少了 id 这个键：\n%s", got)
+	}
+	if strings.Contains(got, "SCAN audit") {
+		t.Fatalf("仍是全表 SCAN：\n%s", got)
+	}
+}
+
+// limit 的钳制要按方向做：limit=500 应截到 100，而不是回落成默认的 10。
+func TestListAuditByActionClampsUpwards(t *testing.T) {
+	store, err := Open(Options{DataDir: t.TempDir(), Autogen: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	for i := 0; i < 120; i++ {
+		if err := store.Audit(ctx, "api", ActionRunRejected, map[string]any{"i": i}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := store.ListAuditByAction(ctx, ActionRunRejected, 500)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 100 {
+		t.Fatalf("limit=500 应被截到 100，实际 %d 条（回落成默认 10 就是那个 bug）", len(got))
+	}
+	zero, err := store.ListAuditByAction(ctx, ActionRunRejected, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(zero) != RejectedWindow {
+		t.Fatalf("limit=0 应回落默认 %d，实际 %d", RejectedWindow, len(zero))
+	}
+}

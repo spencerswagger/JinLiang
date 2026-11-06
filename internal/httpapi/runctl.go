@@ -161,10 +161,34 @@ func asOtherInstance(err error) *otherInstanceRunningError {
 	return nil
 }
 
-// errEngineUnsupported 是「引擎只做了 PG→PG」这条能力边界的四段式。
-// 放在 HTTP 入口同步判，是为了不在返回 202 之后什么也不发生——那正是我们一直
-// 在打的静默失败。（引擎里也有同样一条检查，见 internal/engine/engine.go:114。）
-func (s *Server) checkEngineSupported(ctx context.Context, job control.Job) error {
+// unsupportedDirectionError 携带**客观事实**（源 kind / 目标 kind）与码表条目。
+//
+// 注意它不带任何方向的中文描述：方向一旦被写进文案，就会出现「mysql→pg 写成
+// pg→mysql」这种反过来的错，而用户照着反的提示做只会更糟。界面只显示这两个
+// kind，解释交给码表 E1014。
+type unsupportedDirectionError struct {
+	SourceKind string
+	TargetKind string
+	Spec       core.Spec
+}
+
+func (e *unsupportedDirectionError) Error() string {
+	return string(e.Spec.Code) + " " + e.Spec.Message
+}
+
+// 注意：能力边界由**引擎构造期**判（newTargetSink 按连接类型选 sink）。
+// HTTP 入口只做一件引擎做不到的事：在**开跑之前**把「这个方向当前不支持」
+// 用 422 + 完整四段式告诉用户（引擎那边只会在 202 之后以事件形式出现，
+// 用户会看到「点了没反应」一样的一屏）。判断本身仍然只有一处：jobrun 的矩阵。
+//
+// 判断只该有一处——引擎的构造阶段（newTargetSink 按连接类型选 pgsink/mysqlsink，
+// 不认识的类型当场四段式）。HTTP 入口再判一次，两处迟早分叉：今晚已经因为
+// 「同一个判断散在多处」出过好几次（IsLoopbackListen vs IsLoopbackRequest、文档阈值
+// 与代码常量、E1013 的分类器与码表）。能力边界前移曾经是必要的（那时引擎会先 202
+// 然后什么都不发生），但那个洞现在由「引擎返回错误 → 补一条 error 事件 + audit」
+// 兜住了，所以入口不必再自己认一遍类型。
+func (s *Server) startJob(ctx context.Context, job control.Job, actor string) error {
+	// 方向支持：矩阵只有一处（jobrun.SupportedDirections），这里只是把它问出来。
 	src, err := s.store.GetConnection(ctx, job.SourceID)
 	if err != nil {
 		return err
@@ -173,17 +197,29 @@ func (s *Server) checkEngineSupported(ctx context.Context, job control.Job) erro
 	if err != nil {
 		return err
 	}
-	if src.Kind == "postgres" && tgt.Kind == "postgres" {
-		return nil
+	if !jobrun.DirectionSupported(src.Kind, tgt.Kind) {
+		// 用字面量取码表条目，而不是引用 core.CodeUnsupportedDirection 常量：
+		// 那条码在 #46（Ark）里落地，先合这条也不会编译不过；#46 合入后同一路径
+		// 自动带上 E1014（Lookup 按码查表，不关心常量名）。常量落地后可换成它。
+		spec, ok := core.Lookup(core.Code("E1014"))
+		if !ok {
+			// 码表还没有 E1014（Ark 的 #46 未合）时也要走同一条结构：**讲事实、
+			// 不带方向的自然语言描述**，code 留空而不是编造一个。等 #46 合入，
+			// 同一路径自动带上 E1014 的完整四段式。
+			spec = core.Spec{
+				Class:   core.UserAction,
+				Message: "当前版本不支持这个方向",
+				Why:     "支持范围由本版本的同步能力决定，方向本身不改数据",
+				Next: []string{
+					"换成已支持的方向（源用 PostgreSQL）",
+					"确实必须这个方向：先把源数据导出成目标端能直接吃的形式再另行导入",
+				},
+				Risk: "这条任务不会写入任何数据；别把它当成已在同步",
+			}
+		}
+		return &unsupportedDirectionError{SourceKind: src.Kind, TargetKind: tgt.Kind, Spec: spec}
 	}
-	return fmt.Errorf("引擎暂时只支持 PostgreSQL → PostgreSQL（当前 %s → %s）：MySQL 目标端在 B2；"+
-		"现在可以先建一个 PostgreSQL 目标连接来验证链路", src.Kind, tgt.Kind)
-}
 
-func (s *Server) startJob(ctx context.Context, job control.Job, actor string) error {
-	if err := s.checkEngineSupported(ctx, job); err != nil {
-		return err
-	}
 	if s.runs.active(job.ID) {
 		// 本进程里就有一条在跑：这是最常见的情况，文案不能说「控制库里有一条」——
 		// 那里可能什么都没有，按那句话去查会白忙。
@@ -246,6 +282,12 @@ func (s *Server) startJob(ctx context.Context, job control.Job, actor string) er
 			if spec, ok := core.Lookup(core.CodeJobRunningElsewhere); ok {
 				ev.Next = spec.Next
 			}
+		}
+		// 事件也要带「现在做什么」：只有 ErrConflict 会填 Next，而构造期拒绝
+		// （例如目标端类型不支持、增量未实现）同样需要下一步——否则这一帧又是
+		// 「有发生了什么，没有现在做什么」。
+		if len(ev.Next) == 0 {
+			ev.Next = fallbackNext
 		}
 		// 事件只活在环形缓冲里，进程重启就没了。用户回头问「它说已接受，为什么
 		// 什么都没发生」时，唯一能查的地方是控制库——所以这里必须落一条 audit。

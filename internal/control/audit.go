@@ -67,9 +67,21 @@ func (s *Store) Audit(ctx context.Context, actor, action string, detail any) err
 }
 
 // ListAudit returns the newest entries first.
+// 审计窗口大小抽成常量：诊断页的表格与「被拒绝的开始」区块各自写一个 50/10，
+// 哪天窗口改了，用例里那个写死的数字就会悄悄失去意义。
+const (
+	// AuditWindow 是诊断页「最近动作」表格的行数。
+	AuditWindow = 50
+	// RejectedWindow 是「被拒绝的『开始』」区块的行数。
+	RejectedWindow = 10
+)
+
 func (s *Store) ListAudit(ctx context.Context, limit int) ([]AuditEntry, error) {
-	if limit <= 0 || limit > 500 {
-		limit = 100
+	if limit <= 0 {
+		limit = AuditWindow
+	}
+	if limit > 500 {
+		limit = 500
 	}
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT id, at, actor, action, COALESCE(detail_json,'') FROM audit ORDER BY at DESC, id DESC LIMIT ?`, limit)
@@ -95,8 +107,13 @@ func (s *Store) ListAudit(ctx context.Context, limit int) ([]AuditEntry, error) 
 // 「没有被拒绝的记录」，而实际刚刚发生过。那和「没有痕迹」是同一个后果，
 // 所以过滤必须下推到 SQL。
 func (s *Store) ListAuditByAction(ctx context.Context, action string, limit int) ([]AuditEntry, error) {
-	if limit <= 0 || limit > 100 {
-		limit = 10
+	// 钳制要「按方向」做：非法下限回落默认，超上限截到上限。
+	// 早先写成 `<=0 || >100 → 10`，于是 limit=500 会静默拿到 10 条而不是 100 条。
+	if limit <= 0 {
+		limit = RejectedWindow
+	}
+	if limit > 100 {
+		limit = 100
 	}
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT id, at, actor, action, COALESCE(detail_json,'') FROM audit
