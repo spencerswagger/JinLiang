@@ -301,7 +301,9 @@ func cmdConflicts(args []string) error {
 		return printJSON(cs)
 	}
 	if len(cs) == 0 {
-		fmt.Println("没有冲突记录")
+		// 空表只能说「没人写过」，不能说「没有冲突」：本版引擎还没有产生冲突的路径。
+		fmt.Println("没有冲突记录（本版引擎还没有写入冲突的路径，这里为空不代表没发生过冲突；" +
+			"数据是否一致请看 verify）")
 		return nil
 	}
 	fmt.Printf("冲突 %d 条（unresolved 优先看）\n", len(cs))
@@ -367,7 +369,8 @@ func cmdDeadLetter(args []string) error {
 			return printJSON(dls)
 		}
 		if len(dls) == 0 {
-			fmt.Println("没有死信")
+			fmt.Println("没有死信（本版引擎还没有写入死信的路径，这里为空不代表数据干净；" +
+				"数据是否一致请看 verify）")
 			return nil
 		}
 		fmt.Printf("死信 %d 条\n", len(dls))

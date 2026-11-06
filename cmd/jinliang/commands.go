@@ -614,6 +614,8 @@ func cmdDoctor(args []string) error {
 			mark = "注意"
 		case doctor.StatusProblem:
 			mark = "问题"
+		case doctor.StatusSkipped:
+			mark = "跳过" // 「跑不了/没意义」不能显示成 OK
 		}
 		fmt.Printf("    [%s] %-7s %s\n", mark, c.Area, c.Title)
 		if c.Detail != "" {
@@ -624,9 +626,20 @@ func cmdDoctor(args []string) error {
 		}
 	}
 	if rep.Healthy {
-		fmt.Println("  结论      正常")
+		// 跳过不算不健康，但**必须在结论里说清有几项没做**：
+		// 逐行写 [跳过]、页脚说「正常」，人只读页脚就会以为全查过了。
+		if rep.Skipped > 0 {
+			fmt.Printf("  结论      正常（%d 项跳过，见上面的 [跳过]；那几项不代表通过）\n", rep.Skipped)
+		} else {
+			fmt.Println("  结论      正常")
+		}
 		return nil
 	}
-	fmt.Printf("  结论      有 %d 个问题、%d 个提醒\n", rep.Problems, rep.Warnings)
+	if rep.Skipped > 0 {
+		fmt.Printf("  结论      有 %d 个问题、%d 个提醒（另有 %d 项跳过，见上面的 [跳过]）\n",
+			rep.Problems, rep.Warnings, rep.Skipped)
+	} else {
+		fmt.Printf("  结论      有 %d 个问题、%d 个提醒\n", rep.Problems, rep.Warnings)
+	}
 	return errors.New("体检发现问题")
 }
