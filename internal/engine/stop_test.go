@@ -13,6 +13,7 @@ import (
 	"github.com/spencerswagger/jinliang/internal/control"
 	"github.com/spencerswagger/jinliang/internal/core"
 	"github.com/spencerswagger/jinliang/internal/dsn"
+	"github.com/spencerswagger/jinliang/internal/source"
 	"github.com/spencerswagger/jinliang/internal/state"
 )
 
@@ -552,5 +553,65 @@ func TestStopJobTimeoutIsNotSilent(t *testing.T) {
 	}
 	if !strings.Contains(serr.Error(), "没有退出") {
 		t.Fatalf("错误要写清「没有停干净」：%v", serr)
+	}
+}
+
+// 「我们自己判定出来的、原因明确的失败」不该落到「未分类」。
+// 表清单核对失败就是最常见的一种：选错表 / 改名 / 不在这个 schema 下——
+// 以前它抛的是普通 error 串（没有 SQLSTATE），classifyError 无从判断 → code 留空。
+func TestTableNotFoundCarriesE1013(t *testing.T) {
+	e := &TableNotFoundError{Table: "ghost_table_xyz", Schema: "public",
+		Available: []string{"ghost_table"}}
+	code, ok := classifyError(e)
+	if !ok || code != core.CodeObjectMissing {
+		t.Fatalf("表清单核对失败应挂 E1013，得到 %s %v", code, ok)
+	}
+	// typed error 只带**事实**：表名、schema、相近名。动作与风险由码表给（同一事实只留一处表达）。
+	msg := e.Error()
+	for _, want := range []string{"ghost_table_xyz", "schema public", "ghost_table"} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("错误里应包含事实 %q：%s", want, msg)
+		}
+	}
+	for _, unwanted := range []string{"你能做什么", "风险"} {
+		if strings.Contains(msg, unwanted) {
+			t.Fatalf("动作/风险应由码表提供，typed error 里不该再有 %q：%s", unwanted, msg)
+		}
+	}
+	// 不造伪 SQLSTATE：它必须不是 *pgconn.PgError
+	if isPgErrType(e) {
+		t.Fatal("这是我们自己的判定，不该伪装成驱动错误（伪 SQLSTATE 会污染分类器）")
+	}
+}
+
+// isPgErrType 判断错误是不是驱动层的 *pgconn.PgError（伪 SQLSTATE 的反例检查）。
+func isPgErrType(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr)
+}
+
+// 相近表名要「像」而不是「catalog 里先出现谁」：
+// 短名不做 contains（否则表名 `t` 会列出恰好含 t 的五张表 = 噪音），前缀优先于包含，同档按距离。
+func TestNearestNamesRanking(t *testing.T) {
+	tables := []source.Table{
+		{TableRef: source.TableRef{Table: "work_order_log"}},
+		{TableRef: source.TableRef{Table: "orders_archive"}},
+		{TableRef: source.TableRef{Table: "orders"}},
+		{TableRef: source.TableRef{Table: "unrelated"}},
+	}
+	got := nearestNames("ordrs", tables) // 少一个 e：应优先给 orders
+	if len(got) == 0 || got[0] != "orders" {
+		t.Fatalf("最像的应是 orders，得到 %v", got)
+	}
+	if strings.Contains(strings.Join(got, ","), "unrelated") {
+		t.Fatalf("不相关的表不该出现：%v", got)
+	}
+
+	// 短名不做 contains：`t` 不该把一堆含 t 的表列出来
+	short := nearestNames("t", tables)
+	for _, n := range short {
+		if n != "orders" && !strings.HasPrefix(strings.ToLower(n), "t") {
+			t.Fatalf("短名只允许前缀命中，得到 %v", short)
+		}
 	}
 }

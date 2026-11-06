@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"path"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1164,6 +1165,9 @@ func classifyError(err error) (code core.Code, classified bool) {
 		return core.CodePositionKindMismatch, true
 	case errors.As(err, &tooBig):
 		return core.CodeTxTooLarge, true
+	case errors.As(err, new(*TableNotFoundError)):
+		// 我们自己判定的配置错误：源端清单里没有这张表。文案以码表 E1013 为准。
+		return core.CodeObjectMissing, true
 	case pgsource.IsNoPrivilege(err):
 		// 42501：源端 SELECT 或目标端 DDL/DML 被拒——用户要做的事都是「去要授权」。
 		return core.CodeNoPrivilege, true
@@ -1548,6 +1552,138 @@ func scopeOf(doc control.JobDoc) source.Scope {
 	return sc
 }
 
+// TableNotFoundError 表示用户选中的表在源端清单里不存在。
+//
+// 单独成类型（而不是 fmt.Errorf）是为了让 classifyError 用 errors.As 挂码：
+// 这条失败从来不是「未识别的驱动错误」，而是**我们判定出来的配置错误**。
+type TableNotFoundError struct {
+	Table     string
+	Schema    string
+	Available []string // 最接近的几个表名（拼写错误时最有用的线索）
+}
+
+// Error 只陈述**事实**（表名 / schema / 相近名）。
+//
+// 动作与风险**交给码表**：`lastError` 的落盘格式是
+// `[E1013] <码表 Message>：<err.Error()> 下一步：<码表 Next>`，
+// 如果这里也写一遍「你能做什么…风险…」，用户在历史页会读到两段措辞不同的动作。
+// **同一事实只留一处表达**——这条今晚已经踩过好几次。
+func (e *TableNotFoundError) Error() string {
+	msg := fmt.Sprintf("源端找不到表 %s（schema %s）：可能表名写错、被改名，或不在这个 schema 下",
+		e.Table, orDash(e.Schema))
+	if len(e.Available) > 0 {
+		// 只列**源端表名**（不列列名、不列数据），信息暴露边界写在这里。
+		msg += "。源端相近的表名：" + strings.Join(e.Available, "、")
+	}
+	return msg
+}
+
+// nearestNames 给出与目标名最接近的几个表名，拼错时最有用。
+//
+// 排序按「像不像」而不是「catalog 里先出现谁」：
+//  1. 前缀命中优先于包含命中（`ord` → `orders` 比 `work_order_log` 更像）；
+//  2. 同档内按「长度差 + 编辑距离」升序。
+//
+// **短名（<3）不做 contains 匹配**：表名是 `t` 时，双向前缀/包含会把「恰好含字母 t 的前 5 张表」
+// 都列出来——那不是相近而是噪音，而这行提示一旦名不副实，用户就再也不信它了。
+//
+// 只是提示，**不做模糊匹配的自动替换**：选错表比报错更危险。
+func nearestNames(want string, tables []source.Table) []string {
+	lw := strings.ToLower(strings.TrimSpace(want))
+	if lw == "" {
+		return nil
+	}
+	type cand struct {
+		name  string
+		rank  int
+		score int
+	}
+	// 允许的编辑距离：短名严格（1），长名放宽到 1/3 长度——同时候选必须**真的像**，
+	// 宁可少列（用户还能自己看表清单），也不要列出噪音让人不再信这行提示。
+	maxDist := len([]rune(lw)) / 3
+	if maxDist < 1 {
+		maxDist = 1
+	}
+	var cands []cand
+	for _, t := range tables {
+		lt := strings.ToLower(t.Table)
+		d := editDistance(lt, lw)
+		score := abs(len(lt)-len(lw)) + d
+		switch {
+		case strings.HasPrefix(lt, lw) || strings.HasPrefix(lw, lt):
+			cands = append(cands, cand{name: t.Table, rank: 0, score: score})
+		case len(lw) >= 3 && len(lt) >= 3 && (strings.Contains(lt, lw) || strings.Contains(lw, lt)):
+			cands = append(cands, cand{name: t.Table, rank: 1, score: score})
+		case d <= maxDist:
+			cands = append(cands, cand{name: t.Table, rank: 2, score: score})
+		}
+	}
+	sort.Slice(cands, func(i, j int) bool {
+		if cands[i].rank != cands[j].rank {
+			return cands[i].rank < cands[j].rank
+		}
+		if cands[i].score != cands[j].score {
+			return cands[i].score < cands[j].score
+		}
+		return cands[i].name < cands[j].name
+	})
+	out := make([]string, 0, 5)
+	for _, c := range cands {
+		out = append(out, c.name)
+		if len(out) == 5 {
+			break
+		}
+	}
+	return out
+}
+
+func abs(n int) int {
+	if n < 0 {
+		return -n
+	}
+	return n
+}
+
+// editDistance 是 Levenshtein 距离（表名都很短，O(n²) 足够）。
+func editDistance(a, b string) int {
+	ra, rb := []rune(a), []rune(b)
+	prev := make([]int, len(rb)+1)
+	cur := make([]int, len(rb)+1)
+	for j := range prev {
+		prev[j] = j
+	}
+	for i := 1; i <= len(ra); i++ {
+		cur[0] = i
+		for j := 1; j <= len(rb); j++ {
+			cost := 1
+			if ra[i-1] == rb[j-1] {
+				cost = 0
+			}
+			cur[j] = min3(prev[j]+1, cur[j-1]+1, prev[j-1]+cost)
+		}
+		prev, cur = cur, prev
+	}
+	return prev[len(rb)]
+}
+
+func min3(a, b, c int) int {
+	m := a
+	if b < m {
+		m = b
+	}
+	if c < m {
+		m = c
+	}
+	return m
+}
+
+func orDash(s string) string {
+	if strings.TrimSpace(s) == "" {
+		return "（默认）"
+	}
+	return s
+}
+
 // selectTables resolves content.tables (explicit) or scope include/exclude
 // (patterns) against the source catalog.
 func (r *runner) selectTables() ([]source.TableRef, error) {
@@ -1563,7 +1699,15 @@ func (r *runner) selectTables() ([]source.TableRef, error) {
 		for name := range r.doc.Content.Tables {
 			t, ok := byName[name]
 			if !ok {
-				return nil, fmt.Errorf("源端找不到表 %s（可能改名了，或不在 %s 下）", name, scopeOf(r.doc).Schema)
+				// 这里是**我们自己判定出来**的失败（表清单里就是没有它），原因非常明确：
+				// 选错表 / 表改名 / 不在这个 schema 下。所以给它一个 typed error，
+				// 让 classifyError 挂上 E1013——否则用户看到的是「未分类」，
+				// 而这条恰恰是最常见的配置错误之一。
+				//
+				// 注意：**不造伪 SQLSTATE**。SQLSTATE 是协议的语义，塞假值会污染
+				// pgwire.SQLState 的判据，将来任何按 SQLSTATE 分类的地方都被带偏。
+				return nil, &TableNotFoundError{Table: name, Schema: scopeOf(r.doc).Schema,
+					Available: nearestNames(name, r.cat.Tables)}
 			}
 			out = append(out, t.TableRef)
 		}

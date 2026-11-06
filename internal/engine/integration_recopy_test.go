@@ -20,6 +20,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/spencerswagger/jinliang/internal/control"
+	"github.com/spencerswagger/jinliang/internal/core"
 	"github.com/spencerswagger/jinliang/internal/dsn"
 	"github.com/spencerswagger/jinliang/internal/engine"
 	"github.com/spencerswagger/jinliang/internal/pgsink"
@@ -809,6 +810,74 @@ func continuousJob(t *testing.T, srcDSN, dstDSN, name, table string) (*control.S
 			Source:  control.SourceDoc{Kind: "postgres", Scope: &control.ScopeDoc{Schema: "public"}},
 			Target:  control.TargetDoc{Kind: "postgres", Schema: "public", OnExists: "append"},
 			Mode:    control.ModeDoc{Frequency: "continuous+initial"},
+			Content: &control.ContentDoc{Tables: map[string]control.TableDoc{table: {}}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("建任务失败: %v", err)
+	}
+	return store, job.ID
+}
+
+// 端到端：选了一张不存在的表 → `runs.code` 必须是 E1013（不是空、不是「未分类」）。
+// 这条是 `runs.code` 那半件事的关键：列有了、写入点有了，如果最常见的配置错误
+// 产生不出码，等于只做了一半。
+func TestMissingTableRunGetsE1013(t *testing.T) {
+	srcDSN, dstDSN := dsns(t)
+	srcDB := mustConn(t, srcDSN)
+	ctx := context.Background()
+	exec(t, srcDB, "DROP TABLE IF EXISTS ghost_table_xyz")
+
+	store, jobID := tableJob(t, srcDSN, dstDSN, "ghost-job", "ghost_table_xyz")
+	res, err := engine.Run(ctx, engine.Options{Store: store, JobID: jobID, SnapshotOnly: true})
+	if err == nil {
+		t.Fatal("选不存在的表必须失败")
+	}
+	if res.ExitCode == 0 {
+		t.Fatal("失败时退出码不能是 0")
+	}
+	run, gerr := store.GetRun(ctx, res.RunID)
+	if gerr != nil {
+		t.Fatal(gerr)
+	}
+	if run.Code != string(core.CodeObjectMissing) {
+		t.Fatalf("runs.code 应为 %s（我们自己判定的配置错误），得到 %q；last_error=%s",
+			core.CodeObjectMissing, run.Code, run.LastError)
+	}
+	if !strings.Contains(run.LastError, "ghost_table_xyz") {
+		t.Fatalf("last_error 要点名那张表：%s", run.LastError)
+	}
+}
+
+// tableJob 建一条 mode=once、只选一张表（可能不存在）的任务。
+func tableJob(t *testing.T, srcDSN, dstDSN, name, table string) (*control.Store, string) {
+	t.Helper()
+	ctx := context.Background()
+	store, err := control.Open(control.Options{DataDir: t.TempDir(), Autogen: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
+	mk := func(nm string, port int, db, user, pass string) string {
+		c, err := store.CreateConnection(ctx, control.ConnectionInput{
+			Name: nm, Kind: "postgres", Host: "127.0.0.1", Port: port,
+			Database: db, Username: user, Password: pass,
+			Params: map[string]string{"sslmode": "disable"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c.ID
+	}
+	srcID := mk("src", portOf(t, srcDSN), dbOf(t, srcDSN), userOf(t, srcDSN), passOf(t, srcDSN))
+	dstID := mk("dst", portOf(t, dstDSN), dbOf(t, dstDSN), userOf(t, dstDSN), passOf(t, dstDSN))
+	job, err := store.CreateJob(ctx, control.JobInput{
+		Name: name, SourceID: srcID, TargetID: dstID,
+		Spec: control.JobDoc{
+			Version: 1, Job: name,
+			Source:  control.SourceDoc{Kind: "postgres", Scope: &control.ScopeDoc{Schema: "public"}},
+			Target:  control.TargetDoc{Kind: "postgres", Schema: "public", OnExists: "append"},
+			Mode:    control.ModeDoc{Frequency: "once"},
 			Content: &control.ContentDoc{Tables: map[string]control.TableDoc{table: {}}},
 		},
 	})
