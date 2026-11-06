@@ -51,6 +51,7 @@ func cmdVerify(args []string) error {
 	jobKey := fs.String("job-key", "", "任务指纹（一致性级需要：读 slot/binlog 与 _jl_meta.position）")
 	slotPrefix := fs.String("slot-prefix", "", "同步书签前缀（默认 jl_<job-key>）")
 	maxGap := fs.Int64("max-gap-bytes", 64<<20, "允许目标端落后的字节数")
+	aggOnly := fs.Bool("aggregate-only", false, "只跑 L1 聚合（SQL 下推，秒级；日常例检用）")
 	jsonOut := fs.Bool("json", false, "JSON 输出（给 CI / AI 助手）")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -74,6 +75,7 @@ func cmdVerify(args []string) error {
 		SourceSchema: *srcSchema, TargetSchema: *tgtSchema,
 		Tables: splitList(*tables), Level: verify.Level(strings.ToLower(*level)),
 		SampleRows: *sample, JobKey: strings.TrimSpace(*jobKey), MaxGapBytes: *maxGap,
+		AggregateOnly: *aggOnly,
 	}
 	if opts.SourceSchema == "" {
 		opts.SourceSchema = src.Schema()
@@ -135,11 +137,11 @@ func printVerify(rep verify.Report) {
 			fmt.Printf("  统计：%v\n", lr.Stats)
 		}
 	}
-	if rep.OK {
-		fmt.Println("\n结论：三级校验通过")
-	} else {
-		fmt.Println("\n结论：有级别未通过（详见上面的 code）")
+	conclusion := rep.Conclusion
+	if conclusion == "" {
+		conclusion = verify.Conclusion(rep)
 	}
+	fmt.Println("\n" + conclusion)
 }
 
 func firstOr(v, def string) string {
