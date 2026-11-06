@@ -367,7 +367,7 @@ func TestIntervalCopiesOnlyRowsAfterWatermark(t *testing.T) {
 			Source: control.SourceDoc{Kind: "postgres", Scope: &control.ScopeDoc{Schema: "public"}},
 			Target: control.TargetDoc{Kind: "postgres", Schema: "public", OnExists: "append"},
 			Mode: control.ModeDoc{Frequency: "interval", Interval: "1s",
-				IncrementalColumn: "updated_at", Lookback: "1m"},
+				IncrementalColumn: "updated_at", Lookback: "1s"},
 			Content: &control.ContentDoc{Tables: map[string]control.TableDoc{table: {}}},
 		},
 	})
@@ -400,8 +400,10 @@ func TestIntervalCopiesOnlyRowsAfterWatermark(t *testing.T) {
 	if res.RowsStream < 4 {
 		t.Fatalf("第二轮应至少搬 4 行（3 新增 + 1 更新），实际 %d", res.RowsStream)
 	}
-	if res.RowsStream > 200 {
-		t.Fatalf("第二轮搬了 %d 行，说明水位没生效（整表 1000 行又被扫了一遍）", res.RowsStream)
+	// 上界收到 20：回看窗口正常时合法重读就是这 4 行（测试数据确定性很强），
+	// 留 200 会连「回退窗口被误设成 10 分钟」这种形态都发现不了。
+	if res.RowsStream > 20 {
+		t.Fatalf("第二轮搬了 %d 行（合法应只有 4 行左右），说明回退窗口设错了或水位没生效", res.RowsStream)
 	}
 	var touched int
 	if err := dstDB.QueryRow(ctx, "SELECT count(*) FROM "+table+" WHERE payload='touched'").Scan(&touched); err != nil {

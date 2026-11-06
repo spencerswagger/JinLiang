@@ -49,9 +49,25 @@ func (r *runner) runIntervalRound(ctx context.Context) error {
 			continue
 		}
 		if !r.tableHasColumn(ref, wmCol) {
-			// 没有水位列 → 每轮整表重搬。小表没问题，大表就是「每分钟一次全表 COPY」，
-			// 这个代价必须由用户显式承担，不能悄悄跑。**按体量直接拦**（预检级别）。
-			if est := r.rowEstimate(ref); est > maxFullCopyRowsWithoutWatermark {
+			// 没有水位列 → 只能每轮整表重搬。这个代价必须由用户显式承担，不能替他猜。
+			//
+			// **判据必须 fail-closed**：`reltuples = -1`（从没 ANALYZE 过）以前被控制面
+			// 折成 0，于是「1000 万行的新表」估成 0 → 放行 → 每轮全表 COPY——正好放过
+			// 最该拦的那类表。所以这里：「未知」一律拦，「已知且过大」也拦。
+			est, known, err := r.src.TableRowsEstimate(ctx, ref)
+			if err != nil {
+				return fmt.Errorf("读 %s 的行数估算失败: %w", ref.Table, err)
+			}
+			switch {
+			case !known:
+				return &notImplementedError{fmt.Sprintf(
+					"表 %s 没有水位列 %s，而且源库还没有它的统计信息（从没 ANALYZE 过），"+
+						"我无法判断体量，所以不敢放行「每轮整表重搬」（大表等于每分钟一次全表拷贝）。"+
+						"你现在能做什么：1) 在源库执行 ANALYZE %s 后重跑；"+
+						"2) 给它加一个更新时间列（推荐，之后就会走增量）；"+
+						"3) 把 mode.frequency 改成 full_interval，明确接受整表周期重跑",
+					ref.Table, wmCol, ref.Table)}
+			case est > maxFullCopyRowsWithoutWatermark:
 				return &notImplementedError{fmt.Sprintf(
 					"表 %s 没有水位列 %s，而它约 %d 行：定时增量只能每轮整表重搬，"+
 						"这对大表等于每分钟一次全表拷贝。要么给它加一个更新时间列（推荐），"+
@@ -186,16 +202,6 @@ func (r *runner) copyOneTable(ctx context.Context, ref source.TableRef) (int64, 
 // 超过就拦下来，让用户显式选：加水位列（推荐），或改用 full_interval 承认整表周期重跑。
 const maxFullCopyRowsWithoutWatermark = 100_000
 
-// rowEstimate 用 catalog 的估算行数（`reltuples`），拿不到就当 0（不拦）。
-func (r *runner) rowEstimate(ref source.TableRef) int64 {
-	for _, t := range r.cat.Tables {
-		if t.Schema == ref.Schema && t.Table == ref.Table {
-			return t.RowsEstimate
-		}
-	}
-	return 0
-}
-
 // ── 这段代码的判据：**宁重不漏** ───────────────────────────────
 //
 // 定时增量允许重复（重读靠目标端 upsert 吸收，代价是多一次写），但**绝不允许漏读**
@@ -203,6 +209,11 @@ func (r *runner) rowEstimate(ref source.TableRef) int64 {
 //   - 本轮第一页永远从「水位 − lookback」开始（宁可重读一窗，也不漏一条晚提交的）；
 //   - 首次对齐水位要用**搬快照之前**的表尾（宁可从更早的位置再读一遍）；
 //   - 拿不准的时候，选「多读一次」而不是「少读一次」。
+//
+// 关于「先取表尾」会不会变成每轮重扫（用户看到第二轮搬了几万行时最容易误会）：
+// **不会**。水位 W0 = 搬快照**之前**的表尾，下一轮从 `W0 − lookback` 读，只重读
+// 「快照期间新增的行 + 一窗回看」，而且**只发生一次**——那一轮结束 `saveWatermark(next)`
+// 就把水位推到位了。
 func (r *runner) tableHasColumn(ref source.TableRef, col string) bool {
 	for _, t := range r.cat.Tables {
 		if t.Schema == ref.Schema && t.Table == ref.Table {

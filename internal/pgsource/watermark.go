@@ -177,3 +177,23 @@ func splitWatermarkPK(s string) []string {
 	}
 	return strings.Split(s, "\x1f")
 }
+
+// TableRowsEstimate 读源端表的行数估算，**并明确区分「未知」与「0 行」**。
+//
+// `pg_class.reltuples = -1` 表示「从没 ANALYZE 过」——新导入的大表长期就是 -1。
+// 控制面 Catalog 把它折成 0（`CASE WHEN reltuples < 0 THEN 0`），于是下游会把
+// 「不知道」当成「很小」，恰好放行最危险的表。这里保留 -1 作为 known=false，
+// 让调用方能 fail-closed。
+func (s *Source) TableRowsEstimate(ctx context.Context, ref source.TableRef) (rows int64, known bool, err error) {
+	q := `SELECT c.reltuples::bigint FROM pg_class c
+	      JOIN pg_namespace n ON n.oid = c.relnamespace
+	      WHERE n.nspname = $1 AND c.relname = $2`
+	var est int64
+	if err := s.conn.QueryRow(ctx, q, ref.Schema, ref.Table).Scan(&est); err != nil {
+		return 0, false, err
+	}
+	if est < 0 {
+		return 0, false, nil // 未知：调用方必须按 fail-closed 处理
+	}
+	return est, true, nil
+}

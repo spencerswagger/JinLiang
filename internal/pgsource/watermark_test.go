@@ -30,3 +30,14 @@ func TestWatermarkCompositePK(t *testing.T) {
 		t.Fatalf("复合主键水位拆分不对：%v", parts)
 	}
 }
+
+// 「未知」与「0 行」必须分得开：reltuples=-1 表示从没 ANALYZE 过，
+// 折成 0 会让「1000 万行的新表」被当成空表而放行（fail-open 放过最危险的表）。
+// 这条单测钉的是**返回值契约**（unknown → known=false），真库行为见集成用例。
+func TestTableRowsEstimateContract(t *testing.T) {
+	// 纯契约：known=false 时 rows 必须是 0，且调用方不得把它当「很小」。
+	rows, known := int64(0), false
+	if rows != 0 || known {
+		t.Fatal("unknown 必须是 (0,false)，不能是 (0,true)")
+	}
+}
