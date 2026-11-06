@@ -31,6 +31,15 @@ type runningJob struct {
 	done   chan struct{}
 }
 
+// fallbackNext 是「没有错误码」时的下一步：不编造原因，只给能自己动手的三条。
+// 为什么需要它：只有 ErrConflict 那条会填 Event.Next，而最常见的失败恰好没有码
+// （权限、schema 写错、连不上）——审计里留个 null 的 next 等于把问题丢回给用户。
+var fallbackNext = []string{
+	"看这次运行的原始报错：打开任务页 →「最近一次运行」，或 GET /api/runs?job_id=<id>",
+	"按报错里的关键词自查最常见三处：连接能否连通、源端表/schema 名是否写对、账号有没有 SELECT 与建表权限",
+	"仍解决不了：把错误摘要（含 SQLSTATE）与任务 id 发给维护者",
+}
+
 func newRunRegistry() *runRegistry {
 	return &runRegistry{by: map[string]*runningJob{}}
 }
@@ -178,12 +187,19 @@ func (s *Server) startJob(ctx context.Context, job control.Job, actor string) er
 		}
 		// 事件只活在环形缓冲里，进程重启就没了。用户回头问「它说已接受，为什么
 		// 什么都没发生」时，唯一能查的地方是控制库——所以这里必须落一条 audit。
+		// 「现在能做什么」必须每条都有。只有 ErrConflict 那条会填 ev.Next，
+		// 而最常见的恰恰是没码的那些（权限、schema 写错、连不上）——只写
+		// 「发生了什么」而留个 null 的 next，等于把问题原样丢回给用户。
+		next := ev.Next
+		if len(next) == 0 {
+			next = fallbackNext
+		}
 		detail := map[string]any{
 			"job_id":  job.ID,
 			"actor":   actor,
 			"code":    ev.Code,
 			"message": ev.Message,
-			"next":    ev.Next,
+			"next":    next,
 			"note":    "HTTP 已回 202，但引擎返回了错误；这里留一条不随进程重启消失的痕迹",
 		}
 		// 引擎若已经建出 run 行（失败发生在开跑之后），把那条 run 也指出来，
@@ -196,7 +212,9 @@ func (s *Server) startJob(ctx context.Context, job control.Job, actor string) er
 				detail["run_last_error"] = last.LastError
 			}
 		}
-		if aerr := s.store.Audit(context.Background(), control.ActorStub, control.ActionRunRejected, detail); aerr != nil {
+		// 审计行的「谁」用真实发起者：同一次 startJob 里 job.run 记的就是它，
+		// 写成 runner 会导致「按 actor 过滤时看得到发起、看不到被拒绝」。
+		if aerr := s.store.Audit(context.Background(), actor, control.ActionRunRejected, detail); aerr != nil {
 			s.logf("job %s 的拒绝痕迹写入失败（audit）: %v", job.ID, aerr)
 		}
 		s.store.Bus().Publish(ev)
