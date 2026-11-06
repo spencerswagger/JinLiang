@@ -35,6 +35,7 @@ const (
 	CodeNoPrivilege          Code = "E1012" // 账号没有做这件事的权限（SQLSTATE 42501）
 	CodeObjectMissing        Code = "E1013" // 缺这个 schema 或表（SQLSTATE 3F000 / 42P01）
 	CodeUnsupportedDirection Code = "E1014" // 当前版本不支持这个同步方向（源×目标组合）
+	CodeSchemaMismatch       Code = "E1015" // 表结构不一致（DDL 跟随发现的那类，可降级为只暂停该表）
 	CodeTargetReset          Code = "E2001" // 目标连接被重置
 	CodeSourceTimeout        Code = "E2002" // 源库连接超时
 	CodeLockTimeout          Code = "E2003" // 目标库锁等待超时
@@ -169,15 +170,27 @@ var specs = []Spec{
 		Risk: "授权是持久变更：建议用专用账号并按 schema 限定，别直接给超级用户",
 	},
 	{
+		// E1013 同时承担四种情形，所以 Next **必须按情形分层**：
+		//   ① 缺 schema（3F000）→ 目标端建 schema / 改 target.schema
+		//   ② 缺表（42P01）与 ③「任务里表名写错」→ 动作相同：别去建 schema，对名字
+		//   ④ 缺列（42703）→ 源端表结构变过，回任务页重跑预检
+		// 第一版把 3F000 顶在最前面，于是「表名拼错」的人会先去建一个已存在的 schema —
+		// 方向正好相反。把「最常见的名字写错」和 42P01 放同一条，是因为它们要做的事一样。
 		Code: CodeObjectMissing, Class: UserAction,
-		Message: "缺这个 schema、表或列",
-		Why:     "数据库说这个对象不存在（SQLSTATE 3F000 缺 schema / 42P01 缺表 / 42703 缺列）：目标端 target.schema 没建、源端选中的表被删过，或源端表结构变过（水位列改名/删掉）",
+		Message: "缺这个 schema、表或列（或名字写错）",
+		Why: "数据库说这个对象不存在（SQLSTATE 3F000 缺 schema / 42P01 缺表 / 42703 缺列）；" +
+			"也可能是任务里引用的表名或列名写错了（大小写、schema 前缀、拼写）——" +
+			"数据库只认完全一致的标识符，写错时会当成「不存在」。这类错误发生在配置与结构层面，" +
+			"位点没有推进，已同步的数据不会重搬",
 		Next: []string{
-			"3F000（缺 schema）建 schema 或改 target.schema；42P01（缺表）别建 schema，确认表名大小写/前缀或回源端重选表",
-			"42703（缺列）：源端表结构变过——回任务页重跑预检；水位列改名/删掉也会报这个",
-			"改完再跑一次 run：位点不动，不需要重搬历史",
+			"SQLSTATE 3F000（目标端缺 schema）：建 schema（CREATE SCHEMA <名字>;）或把 target.schema 改成已有的",
+			"SQLSTATE 42P01（缺表）或任务里表名写错：**别去建 schema**——对一下任务页里选中的表名（大小写、schema 前缀），或回源端重选表范围",
+			"SQLSTATE 42703（缺列）：源端表结构变过（水位列改名/删掉也会这样）——回任务页重跑预检，确认列还在",
 		},
-		Risk: "换 schema 等于换一套目标表：旧 schema 里的数据不会自动搬过去",
+		// Risk 只放「真风险 + 缓解」；「位点不动、不会重搬」是陈述事实（已挪进 Why），
+		// 不是风险——把让人安心的话放进 Risk，会让「风险」这个词贬值。
+		Risk: "改错方向不会损坏数据，但会继续失败；若确实要换 target.schema（那是另一套目标表），" +
+			"旧 schema 里的数据不会自动搬过去",
 	},
 	// E1014 只允许在**构造期 / 开跑前**抛出：它的 Risk 写着「不会写入任何数据」，
 	// 这句话只在「还没开始写」时成立。若将来有路径在跑中才判方向，必须同时改 Risk，
@@ -197,6 +210,19 @@ var specs = []Spec{
 			"关注后续版本：" + PendingDirectionsText() + " 在路线图上，但没有承诺日期",
 		},
 		Risk: "这条任务不会写入任何数据；最危险的是「以为它已经同步了」——请确认任务状态是「未开始」，别把它当成在跑",
+	},
+	{
+		Code: CodeSchemaMismatch, Class: UserAction,
+		Message: "表结构不一致",
+		Why: "目标表与源端的结构对不上：prepare 补列时发现目标列类型不一致（type_changed），" +
+			"或跑起来后源端改类型 / 改名 / 删列（schema_drift）。两种情况含义相同——这张表没法继续跟。" +
+			"具体是哪一种、哪张表哪一列，last_error 里会写明；该表会被暂停（若当前版本已支持按表暂停），其它表继续跑",
+		Next: []string{
+			"看 last_error 里点名的表与列：新旧类型或新旧列名都在里面",
+			"在目标端把结构对齐后重跑：位点没推进，不会重复搬已同步的数据",
+			"暂时不处理也行：该表会被暂停、其它表继续（若当前版本已支持按表暂停）",
+		},
+		Risk: "该表后续变更不会被写入，其它表不受影响；最常见误判是把它当成整体失败，于是去重搬全量",
 	},
 	{
 		Code: CodeControlDBBroken, Class: Fatal,
