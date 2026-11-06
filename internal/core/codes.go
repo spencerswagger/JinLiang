@@ -35,6 +35,7 @@ const (
 	CodeNoPrivilege          Code = "E1012" // 账号没有做这件事的权限（SQLSTATE 42501）
 	CodeObjectMissing        Code = "E1013" // 缺这个 schema 或表（SQLSTATE 3F000 / 42P01）
 	CodeUnsupportedDirection Code = "E1014" // 当前版本不支持这个同步方向（源×目标组合）
+	CodeSchemaMismatch       Code = "E1015" // 表结构不一致（DDL 跟随发现的那类，可降级为只暂停该表）
 	CodeTargetReset          Code = "E2001" // 目标连接被重置
 	CodeSourceTimeout        Code = "E2002" // 源库连接超时
 	CodeLockTimeout          Code = "E2003" // 目标库锁等待超时
@@ -197,6 +198,19 @@ var specs = []Spec{
 			"关注后续版本：" + PendingDirectionsText() + " 在路线图上，但没有承诺日期",
 		},
 		Risk: "这条任务不会写入任何数据；最危险的是「以为它已经同步了」——请确认任务状态是「未开始」，别把它当成在跑",
+	},
+	{
+		Code: CodeSchemaMismatch, Class: UserAction,
+		Message: "表结构不一致",
+		Why: "目标表与源端的结构对不上：prepare 补列时发现目标列类型不一致（type_changed），" +
+			"或跑起来后源端改类型 / 改名 / 删列（schema_drift）。两种情况含义相同——这张表没法继续跟。" +
+			"具体是哪一种、哪张表哪一列，last_error 里会写明；该表会被暂停（若当前版本已支持按表暂停），其它表继续跑",
+		Next: []string{
+			"看 last_error 里点名的表与列：新旧类型或新旧列名都在里面",
+			"在目标端把结构对齐后重跑：位点没推进，不会重复搬已同步的数据",
+			"暂时不处理也行：该表会被暂停、其它表继续（若当前版本已支持按表暂停）",
+		},
+		Risk: "该表后续变更不会被写入，其它表不受影响；最常见误判是把它当成整体失败，于是去重搬全量",
 	},
 	{
 		Code: CodeControlDBBroken, Class: Fatal,
