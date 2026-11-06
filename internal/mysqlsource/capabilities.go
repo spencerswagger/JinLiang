@@ -2,14 +2,13 @@ package mysqlsource
 
 import (
 	"context"
-	"crypto/sha256"
 	"database/sql"
-	"encoding/hex"
 	"fmt"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/spencerswagger/jinliang/internal/mysqlcanon"
 	"github.com/spencerswagger/jinliang/internal/source"
 )
 
@@ -30,6 +29,16 @@ func (s *Source) Ack(pos source.Position) {}
 
 // SafeAckPoint 返回「可以安全确认的位置」＝最后一次**已交付给下游**的事务位点。
 // ok=false 表示还没有交付过任何事务（此时不该推进任何书签）。
+//
+// **全部安全性的依据（写死，改 ack 顺序前先读这段）**：
+//
+//	`Apply(nil)` ⇔ 目标端 `_jl_meta.position` 已等于该事务的提交位点
+//
+// 换句话说：只有「下游返回 nil」才允许把 ack 点推进到这个位置。
+// 反过来，任何「Apply 还没返回/返回了错误」的时刻，ack 都必须停在上一个已确认点——
+// 否则源端会清掉还能重放的变更流水，目标端一回滚就永久缺数据。
+// MySQL 目标端是 `staged_phases`（含 DDL 的批次有三个提交点），所以那边多一道
+// `PositionDurable` 校验；PG 目标端是 `same_tx`，Apply 返回即成立。
 func (s *Source) SafeAckPoint() (source.Position, bool) {
 	p, ok := s.lastCommit.Load().(Position)
 	if !ok || p.IsZero() {
@@ -162,14 +171,26 @@ func (s *Source) eachChunk(ctx context.Context, conn *sql.Conn, t source.Table, 
 	}
 
 	if len(pk) == 0 {
-		rows, err := s.scanRowsAny(ctx, conn, fmt.Sprintf("SELECT %s FROM %s", selectList, table), nil, t)
-		if err != nil {
-			return err
+		// 无主键表：没有 keyset 边界，但**必须分页**——一次 `SELECT *` 把 1000 万行
+		// 读进内存就是 OOM，而且与「一页 = 一块」的自述不符。
+		// 用 LIMIT/OFFSET 分页：一致性快照内数据不漂，OFFSET 的代价在无主键表上可接受
+		// （本来也只能单连接顺序扫）；块边界留空表示「无序块」。
+		for offset := 0; ; offset += int(chunk) {
+			q := fmt.Sprintf("SELECT %s FROM %s LIMIT %d OFFSET %d", selectList, table, chunk, offset)
+			rows, err := s.scanRowsAny(ctx, conn, q, nil, t)
+			if err != nil {
+				return err
+			}
+			if len(rows) == 0 {
+				return nil
+			}
+			if err := fn(Chunk{Table: t.TableRef, Rows: rows, From: "", To: ""}); err != nil {
+				return err
+			}
+			if int64(len(rows)) < chunk {
+				return nil
+			}
 		}
-		if len(rows) == 0 {
-			return nil
-		}
-		return fn(Chunk{Table: t.TableRef, Rows: rows, From: "", To: ""})
 	}
 
 	var lastKey []source.Value
@@ -348,73 +369,17 @@ func (s *Source) Count(ctx context.Context, ref source.TableRef) (int64, error) 
 	return n, nil
 }
 
-// Fingerprint 是全表内容的稳定指纹：按主键顺序流式哈希。
+// FingerprintScope 标识本连接器指纹的可比范围（"mysql-canon-v1"）。
 //
-// 口径与 pgsink/pgsource 的「行数 + 内容哈希」一致（不要求算法相同，只要求同侧重算
-// 结果稳定、且能跨源/目标比对——比对时两侧都走各自的 Fingerprint）。
-// 无主键表明确报错：没有稳定顺序就没有可复现的指纹。
-func (s *Source) Fingerprint(ctx context.Context, ref source.TableRef) (string, error) {
-	pk, err := s.primaryKey(ctx, ref)
-	if err != nil {
-		return "", err
-	}
-	if len(pk) == 0 {
-		return "", capabilityError("这张表没有主键",
-			"没有主键就没有稳定顺序，同一份数据每次算出的指纹会不一样",
-			"给表加主键/唯一键，或改用 Count + 逐块抽样核对",
-			"无主键表的指纹不可比对，强行比对会给出假的「不一致」")
-	}
-	order := make([]string, len(pk))
-	for i, c := range pk {
-		order[i] = quoteIdent(c)
-	}
-	q := fmt.Sprintf("SELECT * FROM %s ORDER BY %s", s.qualifiedOn(ref), strings.Join(order, ", "))
-	rows, err := s.db.QueryContext(ctx, q)
-	if err != nil {
-		return "", fmt.Errorf("读 %s 失败: %w", ref.Table, err)
-	}
-	defer rows.Close()
-	names, err := rows.Columns()
-	if err != nil {
-		return "", err
-	}
-	h := sha256.New()
-	var n int64
-	for rows.Next() {
-		row, err := scanRow(rows, names, ref2table(ref))
-		if err != nil {
-			return "", err
-		}
-		for _, v := range row.Values {
-			fmt.Fprintf(h, "%d:%v\x00", v.Kind, driverValue(v))
-		}
-		h.Write([]byte{0x1e})
-		n++
-	}
-	if err := rows.Err(); err != nil {
-		return "", err
-	}
-	return fmt.Sprintf("%d:%s", n, hex.EncodeToString(h.Sum(nil))), nil
-}
+// **只在 MySQL↔MySQL 之间可比**：PG 侧是服务端 `sum(hashtextextended(...))`，
+// 与这里的客户端 sha256 永远不可能相等。跨引擎比对必须走 `internal/verify` 的
+// 逐行/分块比对，别拿指纹跨端比——那会每条都假红（今晚「假红」家族第三次）。
+func (s *Source) FingerprintScope() string { return mysqlcanon.Scope }
 
-func (s *Source) primaryKey(ctx context.Context, ref source.TableRef) ([]string, error) {
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE
-		WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND CONSTRAINT_NAME = 'PRIMARY'
-		ORDER BY ORDINAL_POSITION`, s.schemaOf(ref), ref.Table)
-	if err != nil {
-		return nil, fmt.Errorf("读 %s 的主键失败: %w", ref.Table, err)
-	}
-	defer rows.Close()
-	var out []string
-	for rows.Next() {
-		var c string
-		if err := rows.Scan(&c); err != nil {
-			return nil, err
-		}
-		out = append(out, c)
-	}
-	return out, rows.Err()
+// Fingerprint 返回「行数:内容哈希」，与 mysqlsink 用同一套规范编码（可自比）。
+// 列按**列名排序**参与哈希，所以源/目标建表顺序不同不会假红；无主键明确拒绝。
+func (s *Source) Fingerprint(ctx context.Context, ref source.TableRef) (string, error) {
+	return mysqlcanon.Fingerprint(ctx, s.db, s.schemaOf(ref), ref.Table)
 }
 
 // capabilityError 统一四段式：发生了什么 / 为什么 / 你能做什么 / 风险。

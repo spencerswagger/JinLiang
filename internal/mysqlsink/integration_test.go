@@ -7,6 +7,7 @@ package mysqlsink
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -14,8 +15,20 @@ import (
 
 	"github.com/spencerswagger/jinliang/internal/catalog"
 	"github.com/spencerswagger/jinliang/internal/dsn"
+	"github.com/spencerswagger/jinliang/internal/mysqlsource"
 	"github.com/spencerswagger/jinliang/internal/source"
 )
+
+func openSourceForTest(t *testing.T) (*mysqlsource.Source, error) {
+	t.Helper()
+	// 用**同一个库**：这个用例只验「同一份数据两侧指纹相等」，跨库比对会变成
+	// 「表不存在」而不是算法问题。
+	raw := strings.TrimSpace(os.Getenv("JINLIANG_TEST_MYSQL_DSN"))
+	if raw == "" {
+		return nil, fmt.Errorf("缺少 JINLIANG_TEST_MYSQL_DSN")
+	}
+	return mysqlsource.Open(context.Background(), raw)
+}
 
 func openSink(t *testing.T, mutate func(*Options)) *Sink {
 	t.Helper()
@@ -680,9 +693,9 @@ func TestIntegrationPositionDurableGatesAck(t *testing.T) {
 	if s.PositionDurability() != "staged_phases" {
 		t.Fatalf("MySQL 目标端必须是 staged_phases，拿到 %q", s.PositionDurability())
 	}
-	// 还没写过任何位点：ack 必须被拒。
-	if ok, err := s.PositionDurable(ctx, "postgres:v1:0/AAA"); err != nil || ok {
-		t.Fatalf("没有位点时应 false: ok=%v err=%v", ok, err)
+	// 还没写过任何位点：不是 durable（behind：再等等；不是 different：不用停）。
+	if st, err := s.PositionDurable(ctx, "mysql:v1:file=b.000001;pos=1;coord=mysql_file_pos"); err != nil || st != PositionBehind {
+		t.Fatalf("没有位点时应 behind，拿到 %v err=%v", st, err)
 	}
 
 	// 造一张表并写入一批，位点随数据落盘 → 该位点 durable。
@@ -706,12 +719,12 @@ func TestIntegrationPositionDurableGatesAck(t *testing.T) {
 	if err := s.Apply(ctx, batch, posOf(t, want)); err != nil {
 		t.Fatalf("写入: %v", err)
 	}
-	if ok, err := s.PositionDurable(ctx, want); err != nil || !ok {
-		t.Fatalf("位点应已落盘: ok=%v err=%v", ok, err)
+	if st, err := s.PositionDurable(ctx, want); err != nil || st != PositionDurable {
+		t.Fatalf("位点应已落盘: %v err=%v", st, err)
 	}
-	// 期望一个「更晚但没落盘」的位点 → 必须 false（引擎据此不 ack）。
-	if ok, _ := s.PositionDurable(ctx, "mysql:v1:file=binlog.000009;pos=9999;coord=mysql_file_pos"); ok {
-		t.Fatal("没落盘的位点不能报告为 durable")
+	// 期望一个「不是库里的值」→ different（位点被改过/回退，必须停）。
+	if st, _ := s.PositionDurable(ctx, "mysql:v1:file=binlog.000009;pos=9999;coord=mysql_file_pos"); st != PositionDifferent {
+		t.Fatalf("不同的位点应报 different，拿到 %v", st)
 	}
 }
 
@@ -746,10 +759,59 @@ func TestIntegrationDDLBatchKeepsAckAtOldPosition(t *testing.T) {
 	if err := s.Apply(ctx, batch, posOf(t, newPos)); err == nil {
 		t.Fatal("DROP TABLE 不在白名单，必须报错")
 	}
-	if ok, _ := s.PositionDurable(ctx, newPos); ok {
+	if st, _ := s.PositionDurable(ctx, newPos); st == PositionDurable {
 		t.Fatal("DDL 失败时新位点不能是 durable（否则引擎会 ack，源端随后清掉流水）")
 	}
-	if ok, err := s.PositionDurable(ctx, old); err != nil || !ok {
-		t.Fatalf("旧位点仍应 durable（aeck 只能停在这里）: ok=%v err=%v", ok, err)
+	if st, err := s.PositionDurable(ctx, old); err != nil || st != PositionDurable {
+		t.Fatalf("旧位点仍应 durable（ack 只能停在这里）: %v err=%v", st, err)
+	}
+}
+
+// 指纹必须**同端可比**：同一份数据，MySQL 源的指纹与 MySQL 目标的指纹要相等
+// （共用 internal/mysqlcanon）。跨引擎则不可比——用 Scope 判定，绝不硬比。
+func TestIntegrationFingerprintComparableWithinMySQL(t *testing.T) {
+	ctx := context.Background()
+	sink := openSink(t, func(o *Options) { o.JobKey = "itfp000001" })
+	table := "jl_fp_same"
+	dropTable(t, sink, table)
+	cat := source.Catalog{Tables: []source.Table{{
+		TableRef: source.TableRef{Table: table},
+		Columns: []source.Column{
+			{Name: "id", Type: "int", Nullable: false},
+			{Name: "note", Type: "varchar(32)", Nullable: true},
+		},
+		PrimaryKey:  []string{"id"},
+		HasStablePK: true,
+	}}}
+	if _, err := sink.EnsureSchema(ctx, cat); err != nil {
+		t.Fatalf("建表: %v", err)
+	}
+	defer dropTable(t, sink, table)
+	if err := sink.Apply(ctx, insertBatch(table, [][]any{{int64(1), "a"}, {int64(2), "b"}},
+		"mysql:v1:file=b.000001;pos=10;coord=mysql_file_pos"), posOf(t, "mysql:v1:file=b.000001;pos=10;coord=mysql_file_pos")); err != nil {
+		t.Fatalf("写入: %v", err)
+	}
+	dstFP, err := sink.Fingerprint(ctx, source.TableRef{Table: table})
+	if err != nil {
+		t.Fatalf("目标端指纹: %v", err)
+	}
+	if sink.FingerprintScope() != "mysql-canon-v1" {
+		t.Fatalf("目标端 Scope = %q", sink.FingerprintScope())
+	}
+
+	// 源端：同一个库（同一个 MySQL 实例）上算同一张表的指纹，必须与目标端相等。
+	src, err := openSourceForTest(t)
+	if err != nil {
+		t.Skipf("没有源端 DSN，跳过跨端比对: %v", err)
+	}
+	srcFP, err := src.Fingerprint(ctx, source.TableRef{Table: table})
+	if err != nil {
+		t.Fatalf("源端指纹: %v", err)
+	}
+	if srcFP != dstFP {
+		t.Fatalf("同一份数据的源/目标指纹必须相等（同一套规范编码）:\n 源 %s\n 目标 %s", srcFP, dstFP)
+	}
+	if src.FingerprintScope() != sink.FingerprintScope() {
+		t.Fatalf("Scope 不一致就不能比: %q vs %q", src.FingerprintScope(), sink.FingerprintScope())
 	}
 }

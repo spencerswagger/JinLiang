@@ -504,3 +504,44 @@ func TestIntegrationFingerprintNeedsPrimaryKey(t *testing.T) {
 		}
 	}
 }
+
+// 无主键表也必须分页：一次 SELECT * 把整表读进内存就是 OOM，且与「一页 = 一块」不符。
+func TestIntegrationNoPKChunksAreBounded(t *testing.T) {
+	s := openSource(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	table := "jl_it_nopkchunk"
+	exec(t, s, "DROP TABLE IF EXISTS "+quoteIdent(table))
+	exec(t, s, "CREATE TABLE "+quoteIdent(table)+" (a INT, b VARCHAR(8))")
+	for i := 0; i < 7; i++ {
+		exec(t, s, "INSERT INTO "+quoteIdent(table)+" (a,b) VALUES (?,?)", i, "x")
+	}
+	defer exec(t, s, "DROP TABLE IF EXISTS "+quoteIdent(table))
+
+	var chunks []Chunk
+	if _, err := s.SnapshotChunks(ctx, source.SnapshotOpt{ChunkRows: 3}, func(ctx context.Context, c Chunk) error {
+		if c.Table.Table == table {
+			chunks = append(chunks, c)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("SnapshotChunks: %v", err)
+	}
+	if len(chunks) < 2 {
+		t.Fatalf("7 行、每块 3 行应至少 2 块（无主键也要分页），实际 %d 块", len(chunks))
+	}
+	var total int
+	for i, c := range chunks {
+		if len(c.Rows) > 3 {
+			t.Fatalf("第 %d 块有 %d 行，超过每块上限 3（会把整表读进内存）", i+1, len(c.Rows))
+		}
+		total += len(c.Rows)
+		// 无主键块没有 keyset 边界，必须留空（引擎据此只做表级断点）。
+		if c.From != "" || c.To != "" {
+			t.Fatalf("无主键块不该有边界，拿到 From=%q To=%q", c.From, c.To)
+		}
+	}
+	if total != 7 {
+		t.Fatalf("分块后总数应仍为 7，实际 %d", total)
+	}
+}
