@@ -79,3 +79,19 @@ python scripts/check_testmatrix.py
 scripts/coverage.sh --check --min 40
 JINLIANG_TEST_PG_DSN=... scripts/bench.sh --enforce
 ```
+
+## Owl #28 复审整改
+
+- **快照门禁改量产品路径**：新增 `internal/pgsink/bench_integration_test.go`
+  （`-tags=integration`，同包直接构造 `tableInfo`），跑 `BulkApply`
+  （临时落地区 → COPY → `INSERT…SELECT` → 块记账 + 位点同事务）。
+  `scripts/bench.sh` 的快照吞吐改读该用例；裸 COPY 改名
+  `raw_copy_ceiling_rows_per_sec`，仅作上限参考、不进门禁。
+- **新基线**：`BulkApply` **98,642 行/s**（p99 74 ms/块）；裸 COPY 176k 仅参考；
+  增量 apply 9.6k 行/s（p99 81.77 ms，3 次中位）。
+- **README 口径三句**：p99 样本数 = 批次数（200）；空转 = `ps` 的 RSS（不是 Go heap）；
+  冷启 = exec → `/api/health` 返回 200。
+- **bench.sh 可移植**：`/.toolchain/go/bin` 存在才加入 PATH，否则用系统 `go`，
+  报告已打印 `go version`。
+- 增量 apply 3 次取中位（原始三次写进 `apply_runs`），避免共享机器/磁盘抖动
+  造成的 p99 假尖峰。
