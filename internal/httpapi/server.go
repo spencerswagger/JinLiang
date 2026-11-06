@@ -6,6 +6,7 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,6 +18,8 @@ import (
 
 	"github.com/spencerswagger/jinliang/internal/control"
 	"github.com/spencerswagger/jinliang/internal/core"
+	"github.com/spencerswagger/jinliang/internal/engine"
+	"github.com/spencerswagger/jinliang/internal/jobrun"
 )
 
 // Options configures the server.
@@ -38,6 +41,10 @@ type Server struct {
 	apiToken string
 	sessions *sessionStore
 	limiter  *loginLimiter
+	runs     *runRegistry
+	// runFn 是「真正跑一个任务」的函数。生产里就是 jobrun.Run；
+	// 测试注入桩，才能在没有真库的情况下断言「跑完会释放占位」「并发被挡住」。
+	runFn    func(context.Context, *control.Store, control.Job, jobrun.Options) (engine.Result, error)
 	pages    map[string]*pageTemplate
 	partials *pageTemplate
 	static   fs.FS
@@ -64,6 +71,8 @@ func New(opts Options) (*Server, error) {
 		apiToken: opts.APIToken,
 		sessions: newSessionStore(now, 24*time.Hour),
 		limiter:  newLoginLimiter(now, 5, time.Minute),
+		runs:     newRunRegistry(),
+		runFn:    jobrun.Run,
 		version:  opts.Version,
 		started:  now(),
 		now:      now,
@@ -146,6 +155,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/settings", s.wrap(s.handleGetSettings, roleUser))
 	s.mux.HandleFunc("PUT /api/settings", s.wrap(s.handlePutSettings, roleUser))
 	s.mux.HandleFunc("GET /api/doctor", s.wrap(s.handleDoctor, roleUser))
+	s.mux.HandleFunc("GET /api/codes", s.wrap(s.handleCodes, roleUser))
 
 	// ── /api 兜底：不存在的接口必须说「不存在」，不能落到 WebUI 的 GET / 上 ──
 	//

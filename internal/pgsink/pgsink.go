@@ -219,7 +219,7 @@ func (s *Sink) ensureStateTables(ctx context.Context) error {
 	}
 	for _, stmt := range ddl {
 		if _, err := s.conn.Exec(ctx, stmt); err != nil {
-			return fmt.Errorf("建状态表失败（目标库账号需要建表权限）: %w", err)
+			return fmt.Errorf("建状态表失败（需要目标库的建表权限，且 target.schema 必须已存在）: %w", err)
 		}
 	}
 	return nil
