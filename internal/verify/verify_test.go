@@ -65,6 +65,23 @@ func (f *fakeSide) SamplePKs(_ context.Context, _, name string, pk []string, n i
 	return out, nil
 }
 
+func (f *fakeSide) ScanOrdered(_ context.Context, _, name string, columns, _ []string, fn func([]any) error) error {
+	ft, ok := f.tables[name]
+	if !ok {
+		return fmt.Errorf("no table %s", name)
+	}
+	for _, row := range ft.rows {
+		vals := make([]any, len(columns))
+		for i, c := range columns {
+			vals[i] = row[c]
+		}
+		if err := fn(vals); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (f *fakeSide) RowByPK(_ context.Context, _, name string, columns, pk []string, values []any) ([]any, bool, error) {
 	ft, ok := f.tables[name]
 	if !ok {
