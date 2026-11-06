@@ -93,14 +93,29 @@ func (t *TxOversizeDoc) UnmarshalYAML(node *yaml.Node) error {
 	}
 }
 
-// MarshalYAML 按用户原来的形态写回（legacy 优先）。
+// keepLegacyShape 判断能否按「旧字符串」写回。
+//
+// 只有**语义没被改过**时才保形：legacy 是个合法 mode，且没被另外设置 bytes/events、
+// Mode 也没被改成别的值。否则一律写对象——**要么保形、要么保语义，不能两头都要**：
+// 用户把 `fail` 改成「对象语义」后如果仍导出 `"fail"`，下一轮导入就丢了他刚改的东西。
+func (t TxOversizeDoc) keepLegacyShape() (string, bool) {
+	if t.legacy == "" || t.Bytes != nil || t.Events != nil {
+		return "", false
+	}
+	if t.Mode != "" && t.Mode != t.legacy {
+		return "", false
+	}
+	return t.legacy, true
+}
+
+// MarshalYAML 语义未变时按原形态写回，变过则写对象。
 func (t TxOversizeDoc) MarshalYAML() (any, error) {
-	if t.legacy != "" {
-		return t.legacy, nil
+	if s, ok := t.keepLegacyShape(); ok {
+		return s, nil
 	}
 	out := map[string]any{}
-	if t.Mode != "" {
-		out["mode"] = t.Mode
+	if mode := t.effectiveMode(); mode != "" {
+		out["mode"] = mode
 	}
 	if t.Bytes != nil {
 		out["bytes"] = *t.Bytes
@@ -109,6 +124,14 @@ func (t TxOversizeDoc) MarshalYAML() (any, error) {
 		out["events"] = *t.Events
 	}
 	return out, nil
+}
+
+// effectiveMode 是写对象时该带的 mode（legacy 里的值也要带上，否则丢语义）。
+func (t TxOversizeDoc) effectiveMode() string {
+	if t.Mode != "" {
+		return t.Mode
+	}
+	return t.legacy
 }
 
 // UnmarshalJSON 与 YAML 同构（spec_json 里也存这一份）。
@@ -148,12 +171,12 @@ func (t *TxOversizeDoc) UnmarshalJSON(b []byte) error {
 
 // MarshalJSON 与 MarshalYAML 同口径。
 func (t TxOversizeDoc) MarshalJSON() ([]byte, error) {
-	if t.legacy != "" {
-		return json.Marshal(t.legacy)
+	if s, ok := t.keepLegacyShape(); ok {
+		return json.Marshal(s)
 	}
 	out := map[string]any{}
-	if t.Mode != "" {
-		out["mode"] = t.Mode
+	if mode := t.effectiveMode(); mode != "" {
+		out["mode"] = mode
 	}
 	if t.Bytes != nil {
 		out["bytes"] = *t.Bytes
@@ -202,13 +225,21 @@ func (t *TxOversizeDoc) Limits(lookup func(string) (string, bool)) (maxBytes, ma
 	}
 	if t != nil {
 		if t.Bytes != nil && *t.Bytes > 0 {
-			maxBytes = int64(*t.Bytes)
+			maxBytes = clampMin(int64(*t.Bytes), MinTxMaxBytes)
 		}
 		if t.Events != nil && *t.Events > 0 {
-			maxEvents = int64(*t.Events)
+			maxEvents = clampMin(int64(*t.Events), MinTxMaxEvents)
 		}
 	}
-	return maxBytes, maxEvents
+	// 环境变量同样钳下限：`JINLIANG_TX_MAX_BYTES=100` 那种误配不该让所有事务都超限。
+	return clampMin(maxBytes, MinTxMaxBytes), clampMin(maxEvents, MinTxMaxEvents)
+}
+
+func clampMin(v, min int64) int64 {
+	if v < min {
+		return min
+	}
+	return v
 }
 
 func envPositiveInt(lookup func(string) (string, bool), name string) (int64, bool) {

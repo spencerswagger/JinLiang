@@ -256,3 +256,70 @@ func init() {
 	os.Unsetenv(envTxMaxBytes)
 	os.Unsetenv(envTxMaxEvents)
 }
+
+// P3-1：Limits() 也必须钳下限——只调 Limits（不先 Validate）的路径不能让
+// `bytes: 100` 真的生效，否则「上限 100 字节 → 所有事务都超限」。
+func TestTxOversizeLimitsClampsMinimum(t *testing.T) {
+	doc := parseDoc(t, strings.Replace(legacyJobYAML, "tx_oversize: fail",
+		"tx_oversize: {bytes: 100, events: 10}", 1))
+	// 先确认 Validate 会拒（两处口径一致）
+	if err := doc.Validate(); err == nil {
+		t.Fatal("bytes:100 / events:10 应当被 Validate 拒")
+	}
+	gotBytes, gotEvents := doc.Reliability.TxOversize.Limits(func(string) (string, bool) { return "", false })
+	if gotBytes != MinTxMaxBytes || gotEvents != MinTxMaxEvents {
+		t.Fatalf("Limits 应钳到下限 %d/%d，实际 %d/%d",
+			MinTxMaxBytes, MinTxMaxEvents, gotBytes, gotEvents)
+	}
+	// 环境变量误配同样钳下限
+	env := func(k string) (string, bool) {
+		switch k {
+		case envTxMaxBytes:
+			return "100", true
+		case envTxMaxEvents:
+			return "10", true
+		}
+		return "", false
+	}
+	var nilDoc *TxOversizeDoc
+	if b, e := nilDoc.Limits(env); b != MinTxMaxBytes || e != MinTxMaxEvents {
+		t.Fatalf("环境变量也应钳下限，实际 %d/%d", b, e)
+	}
+}
+
+// P3-2：语义被改过就不能再按旧形态导出（要么保形、要么保语义）。
+func TestTxOversizeMutationKeepsSemantics(t *testing.T) {
+	// 旧字符串 fail → 只加 bytes：导出必须是对象，且带 mode: fail（语义不能丢）
+	doc := parseDoc(t, legacyJobYAML)
+	doc.Reliability.TxOversize.Bytes = intPtr(134217728)
+	out, err := MarshalJobYAML(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(out), "tx_oversize: fail") {
+		t.Fatalf("语义改过后不能再写回纯字符串：\n%s", out)
+	}
+	if !strings.Contains(string(out), "mode: fail") || !strings.Contains(string(out), "bytes: 134217728") {
+		t.Fatalf("对象导出要保留 mode 与 bytes：\n%s", out)
+	}
+
+	// 旧字符串 fail → 把 Mode 改成 spill：导出必须是 spill，不能还是 fail
+	doc2 := parseDoc(t, legacyJobYAML)
+	doc2.Reliability.TxOversize.Mode = "spill"
+	out2, err := MarshalJobYAML(doc2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(out2), "tx_oversize: fail") || !strings.Contains(string(out2), "mode: spill") {
+		t.Fatalf("Mode 改了却还写旧值：\n%s", out2)
+	}
+
+	// 什么都没改 → 仍按旧形态导回（保形），这条与 9 号用例互补
+	doc3 := parseDoc(t, legacyJobYAML)
+	out3, _ := MarshalJobYAML(doc3)
+	if !strings.Contains(string(out3), "tx_oversize: fail") {
+		t.Fatalf("没改过就该保形：\n%s", out3)
+	}
+}
+
+func intPtr(v int) *int { return &v }
