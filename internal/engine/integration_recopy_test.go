@@ -10,6 +10,7 @@ package engine_test
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -512,7 +513,9 @@ func TestTinyTableWithoutStatsIsAllowed(t *testing.T) {
 	srcDSN, dstDSN := dsns(t)
 	srcDB := mustConn(t, srcDSN)
 	dstDB := mustConn(t, dstDSN)
-	table := "wm_tiny"
+	// 唯一表名：新建表一定是 reltuples=-1（从没 ANALYZE 过），前提可靠；
+	// 也避免上一次运行留下的表被别人 analyze 过。
+	table := fmt.Sprintf("wm_tiny_%d", time.Now().UnixNano()%1e9)
 	ctx := context.Background()
 
 	exec(t, srcDB, "DROP TABLE IF EXISTS "+table)
@@ -529,7 +532,9 @@ func TestTinyTableWithoutStatsIsAllowed(t *testing.T) {
 		t.Fatal(err)
 	}
 	if est >= 0 {
-		t.Skipf("这张表已经有统计信息（reltuples=%d），构造不出「未知」前提", est)
+		// 不 Skip：一条会静默跳过的守护用例等于没有（今晚已经栽过「没跑到却报绿」）。
+		t.Fatalf("构造不出「统计信息未知」前提：新建表 %s 的 reltuples=%d。"+
+			"要么这台机器的 autovacuum 提前 analyze 了它，要么表名复用了旧表——请查清后再跑", table, est)
 	}
 
 	store, jobID := intervalJob(t, srcDSN, dstDSN, "wm-tiny", table, "1m")

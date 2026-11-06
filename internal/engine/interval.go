@@ -65,25 +65,18 @@ func (r *runner) runIntervalRound(ctx context.Context) error {
 			if err != nil {
 				return fmt.Errorf("读 %s 的行数估算失败: %w", ref.Table, err)
 			}
-			size, serr := r.src.TablePhysicalSize(ctx, ref)
-			if serr != nil {
-				return fmt.Errorf("读 %s 的物理大小失败（判断不了体量就不敢放行整表重搬）: %w", ref.Table, serr)
+			// 物理大小只在「统计信息未知」时才查：每轮每表少一次往返
+			// （大表上 pg_total_relation_size 也不是免费的）。
+			var size int64
+			if !known {
+				s, serr := r.src.TablePhysicalSize(ctx, ref)
+				if serr != nil {
+					return fmt.Errorf("读 %s 的物理大小失败（判断不了体量就不敢放行整表重搬）: %w", ref.Table, serr)
+				}
+				size = s
 			}
-			switch {
-			case known && est > maxFullCopyRowsWithoutWatermark:
-				return &notImplementedError{fmt.Sprintf(
-					"表 %s 没有水位列 %s，而它约 %d 行：定时增量只能每轮整表重搬，"+
-						"这对大表等于每分钟一次全表拷贝。要么给它加一个更新时间列（推荐），"+
-						"要么把 mode.frequency 改成 full_interval 明确接受整表周期重跑",
-					ref.Table, wmCol, est)}
-			case !known && size >= maxFullCopyBytesWithoutWatermark:
-				return &notImplementedError{fmt.Sprintf(
-					"表 %s 没有水位列 %s，源库里也没有它的统计信息（从没 ANALYZE 过），"+
-						"而它在磁盘上已经占 %s：判断不了行数就不敢放行「每轮整表重搬」。"+
-						"你现在能做什么：1) 在源库执行 ANALYZE %s 后重跑；"+
-						"2) 给它加一个更新时间列（推荐，之后就走增量）；"+
-						"3) 把 mode.frequency 改成 full_interval，明确接受整表周期重跑",
-					ref.Table, wmCol, humanLag(size), ref.Table)}
+			if allow, why := fullRecopyDecision(known, est, size); !allow {
+				return &notImplementedError{fmt.Sprintf("表 %s 没有水位列 %s：%s", ref.Table, wmCol, why)}
 			}
 			r.note(ctx, fmt.Sprintf("%s 没有水位列 %s：本轮整表重搬（行数多的话建议给它加一个更新时间列）",
 				ref.Table, wmCol))
@@ -207,6 +200,30 @@ func (r *runner) copyOneTable(ctx context.Context, ref source.TableRef) (int64, 
 			return nil
 		})
 	return total, err
+}
+
+// fullRecopyDecision 判断「没有水位列的表能不能每轮整表重搬」。
+//
+// **纯函数**，把判据从 SQL/往返里拿出来：好测、好评审，也保证两条腿的先后关系固定——
+// 先看已知行数（可靠且语义直接），未知才退到物理大小（可靠但只能表达「大概多大」）。
+// 返回 (false, why) 时 why 是给用户看的一句话（调用方补上表名与水位列名）。
+func fullRecopyDecision(known bool, rows, size int64) (allow bool, why string) {
+	if known {
+		if rows > maxFullCopyRowsWithoutWatermark {
+			return false, fmt.Sprintf("它约 %d 行，定时增量只能每轮整表重搬，"+
+				"这对大表等于每分钟一次全表拷贝。要么给它加一个更新时间列（推荐），"+
+				"要么把 mode.frequency 改成 full_interval 明确接受整表周期重跑", rows)
+		}
+		return true, ""
+	}
+	if size >= maxFullCopyBytesWithoutWatermark {
+		return false, fmt.Sprintf("源库里也没有它的统计信息（从没 ANALYZE 过），而它在磁盘上已经占 %s："+
+			"判断不了行数就不敢放行「每轮整表重搬」。你现在能做什么："+
+			"1) 在源库执行 ANALYZE 这张表后重跑；2) 给它加一个更新时间列（推荐，之后就走增量）；"+
+			"3) 把 mode.frequency 改成 full_interval，明确接受整表周期重跑", humanLag(size))
+	}
+	// 未知但物理很小（典型：几行的小维表，永远到不了自动 analyze 的 50 行阈值）→ 放行。
+	return true, ""
 }
 
 // maxFullCopyBytesWithoutWatermark：统计信息未知时用**物理大小**兜底判断体量。

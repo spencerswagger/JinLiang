@@ -632,3 +632,32 @@ func TestDefaultLookbackAndParseInterval(t *testing.T) {
 		t.Fatal("interval 解析不对（cron 形式暂不支持，应返回 0）")
 	}
 }
+
+// 「没有水位列的表能不能每轮整表重搬」的判据矩阵。
+// 这是纯函数单测：它覆盖的正是「统计信息未知」那两条最容易走错的分支，
+// 不依赖真库、也不会因为某台机器 autovacuum 抢先 analyze 而静默不覆盖。
+func TestFullRecopyDecision(t *testing.T) {
+	cases := []struct {
+		name  string
+		known bool
+		rows  int64
+		size  int64
+		allow bool
+	}{
+		{"已知且小", true, 1_000, 0, true},
+		{"已知正好在阈值上", true, maxFullCopyRowsWithoutWatermark, 0, true},
+		{"已知且过大", true, maxFullCopyRowsWithoutWatermark + 1, 0, false},
+		{"未知但物理很小（几行维表）", false, 0, 32 << 10, true},
+		{"未知且物理正好 8MiB", false, 0, maxFullCopyBytesWithoutWatermark, false},
+		{"未知且物理很大", false, 0, 31 << 20, false},
+	}
+	for _, c := range cases {
+		allow, why := fullRecopyDecision(c.known, c.rows, c.size)
+		if allow != c.allow {
+			t.Fatalf("%s：期望 allow=%v，得到 %v（%s）", c.name, c.allow, allow, why)
+		}
+		if !allow && why == "" {
+			t.Fatalf("%s：拒绝时必须给一句话说明", c.name)
+		}
+	}
+}
