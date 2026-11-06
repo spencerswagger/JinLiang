@@ -3,6 +3,7 @@ package control
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"sort"
@@ -383,9 +384,31 @@ func (s *Store) ExportYAML(ctx context.Context, j Job) ([]byte, error) {
 
 // DeleteJob removes a job together with its run history.
 //
-// CONTROL-PLANE §4 只列了 GET/POST/PUT，没有 DELETE；但「任务 CRUD」是 B0 的
-// 明确要求，所以这里用 DELETE 同一路径，并在 PR 里把这条文档缺口报给 hugo。
+// **守卫：有未结束的 run 就拒删。** 没有这道守卫时，网页入口（`DELETE /api/jobs/{id}`）
+// 会「删掉记录、但引擎的 goroutine 还在写、目标端租约还在续期」→ 同目标新建任务
+// 一直撞 E1005，而用户没有任何办法让那个进程停下来。
+//
+// 这个判断放在**数据入口**而不是每个调用方：两个入口各写一遍迟早漏一个
+// （今晚 `schemaOf`/`targetSchema` 就是这么分叉的）。CLI 的删除路径先 StopJob
+// 再删，所以它能通过；网页在接上 StopJob 之前会拿到一句可执行的话。
+//
+// 归属：本守卫由 Core 代改，**后续 job 删除语义归 Panel**。
 func (s *Store) DeleteJob(ctx context.Context, id string) error {
+	active, err := s.ActiveRuns(ctx)
+	if err != nil {
+		return err
+	}
+	for _, run := range active {
+		if run.JobID != id {
+			continue
+		}
+		return fmt.Errorf("%w：这个任务还有一条没结束的运行（run %s，阶段 %s，心跳 %s）。"+
+			"删任务会留下「记录没了、引擎还在写」的状态，所以先停掉它。"+
+			"你能做什么：1) 跑一次 `jinliang delete --job %s`（会先停引擎再删）；"+
+			"2) 或在网页上先点「停止」再删。"+
+			"风险：没有（什么都没删）",
+			ErrRunActive, run.ID, run.Phase, orDash(run.HeartbeatAt), id)
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -403,6 +426,17 @@ func (s *Store) DeleteJob(ctx context.Context, id string) error {
 	}
 	return tx.Commit()
 }
+
+// orDash 让空值在文案里显示成「（无）」而不是空白。
+func orDash(s string) string {
+	if strings.TrimSpace(s) == "" {
+		return "（无）"
+	}
+	return s
+}
+
+// ErrRunActive 表示任务还有没结束的运行，删除被拒（E1005 同一族：先停再删）。
+var ErrRunActive = errors.New("任务还有没结束的运行")
 
 // ImportOptions controls yaml import.
 type ImportOptions struct {

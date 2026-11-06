@@ -155,3 +155,49 @@ func (h LeaseHolder) Abandoned(now time.Time, alive func(int) bool) bool {
 // ProcessAlive exposes the platform liveness probe for callers that need to
 // judge a lease holder (engine's crash recovery path).
 func ProcessAlive(pid int) bool { return processAlive(pid) }
+
+// ForceReleaseLease 删掉这个任务在目标端的租约行，**不管它现在被谁持有**。
+//
+// 只有一个调用场景：用户删任务。那时租约属于一个可能已经没人管的进程，
+// 而它还在续期、还在写——同目标新建任务会一直撞 E1005，用户没有办法。
+//
+// 安全性：租约行一消失，**正在跑的那个进程下一次续租就会失败两次 → loseLease →
+// cancelRun 自己停下来**（#30 的语义），所以这不是「从别的进程手里硬抢」，而是
+// 「通知它别再写了」。返回被删掉的那一行的持有者描述（空表示本来就没有）。
+// 返回值：(被删掉那一行的持有者 label, 该持有者的进程是否还活着, error)。
+// 「还活着」与「已经是尸体」对用户是两件事：前者是**强制踢掉一个正在写的进程**，
+// 后者只是清理一条过期记录。
+func ForceReleaseLease(ctx context.Context, ep dsn.Endpoint, schema, jobKey string) (string, bool, error) {
+	s, err := Open(ctx, Options{Target: ep, Schema: schema, JobKey: jobKey, JobName: jobKey,
+		InstanceID: "gc-force-release", OnExists: "append"})
+	if err != nil {
+		return "", false, err
+	}
+	defer s.Close()
+	var label string
+	// 用 CTE 先读 label 再删，避免「删完就查不到持有者」。
+	q := fmt.Sprintf(`WITH gone AS (DELETE FROM %s WHERE job_key=$1 RETURNING label)
+		SELECT label FROM gone`, s.stateTable("_jl_lease"))
+	err = s.conn.QueryRow(ctx, q, jobKey).Scan(&label)
+	if err != nil {
+		if strings.Contains(err.Error(), "no rows") {
+			return "", false, nil // 本来就没有
+		}
+		return "", false, err
+	}
+	return label, labelHolderAlive(label), nil
+}
+
+// labelHolderAlive 从租约 label（`<job>#<pid>#<token>`）里取 pid，判断那个进程还在不在。
+// 解析不出来就按「不确定」处理 → 当作还活着（宁可提示得严重一点，也不要让人以为可以立刻重建）。
+func labelHolderAlive(label string) bool {
+	parts := strings.Split(label, "#")
+	if len(parts) < 2 {
+		return true
+	}
+	pid, err := strconv.Atoi(parts[len(parts)-2])
+	if err != nil || pid <= 0 {
+		return true
+	}
+	return processAlive(pid)
+}

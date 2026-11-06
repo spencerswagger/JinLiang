@@ -437,3 +437,92 @@ func TestReclaimAbandonedRunKeepsFreshHeartbeat(t *testing.T) {
 		t.Fatal("心跳是新的（刚起不到 StaleAfter），不该把这条 run 收掉")
 	}
 }
+
+// 夜班必做：删任务时引擎必须真的停（不然目标端租约还在续期、同目标新建任务撞 E1005）。
+// 这里钉三件事：StopJob 能 cancel 到登记过的 run、等它退出、并且退出后登记表里没有它。
+func TestStopJobCancelsRegisteredRun(t *testing.T) {
+	store, jobID := newControlStore(t)
+	job, err := store.GetJob(context.Background(), jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runCtx, runCancel := context.WithCancel(ctx)
+	_, unregister := registerRun(job.ID, runCancel)
+
+	exited := make(chan struct{})
+	go func() {
+		defer unregister()
+		<-runCtx.Done() // 模拟引擎：ctx 被取消后退出（真实路径在退出时 ReleaseLease）
+		close(exited)
+	}()
+
+	if !RunningInThisProcess(job.ID) {
+		t.Fatal("登记后 RunningInThisProcess 应为 true")
+	}
+	canceled, stopped, serr := StopJob(context.Background(), store, job.ID, job.JobKey, 2*time.Second)
+	if serr != nil {
+		t.Fatalf("StopJob 不该报错：%v", serr)
+	}
+	if !canceled || !stopped {
+		t.Fatalf("应 cancel 到并等到退出，得到 canceled=%v stopped=%v", canceled, stopped)
+	}
+	select {
+	case <-exited:
+	default:
+		t.Fatal("run 还没退出，StopJob 就说 stopped 了")
+	}
+	if RunningInThisProcess(job.ID) {
+		t.Fatal("退出后登记表里不该还有它")
+	}
+}
+
+// 引擎卡住不退出时：StopJob 必须在等待超时后**留痕**并返回错误（不许静默略过）。
+func TestStopJobRecordsAuditWhenEngineHangs(t *testing.T) {
+	store, jobID := newControlStore(t)
+	job, err := store.GetJob(context.Background(), jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, unregister := registerRun(job.ID, func() {}) // cancel 是空操作 → 模拟卡死
+	defer unregister()
+
+	canceled, stopped, err := StopJob(context.Background(), store, job.ID, job.JobKey, 30*time.Millisecond)
+	if !canceled || stopped {
+		t.Fatalf("应 cancel 过但没等到退出，得到 canceled=%v stopped=%v", canceled, stopped)
+	}
+	if err == nil {
+		t.Fatal("等不到退出必须返回错误（用户要能看到为什么没停干净）")
+	}
+	entries, lerr := store.ListAudit(context.Background(), 20)
+	if lerr != nil {
+		t.Fatal(lerr)
+	}
+	found := false
+	for _, e := range entries {
+		if e.Action == "job.run.stop_timeout" {
+			found = true
+			if !strings.Contains(e.Detail, "没有退出") {
+				t.Fatalf("audit 要写清原因：%s", e.Detail)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("等不到退出必须留一条 audit（不许静默略过）")
+	}
+}
+
+// 本进程没有这个任务在跑时：不做任何事、不写 audit、返回 false 让调用方提示。
+func TestStopJobNoOpWhenNotRunningHere(t *testing.T) {
+	store, jobID := newControlStore(t)
+	job, err := store.GetJob(context.Background(), jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	canceled, stopped, err := StopJob(context.Background(), store, job.ID, job.JobKey, time.Second)
+	if err != nil || canceled || stopped {
+		t.Fatalf("本进程没在跑时应是 no-op，得到 %v %v %v", canceled, stopped, err)
+	}
+}
