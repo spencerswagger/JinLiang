@@ -252,6 +252,26 @@ func (s *Sink) ensureStateTables(ctx context.Context) error {
 			dropped_at  timestamptz
 		)`, s.stateTable("_jl_object")),
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+			id         bigserial PRIMARY KEY,
+			job_key    text NOT NULL,
+			table_name text NOT NULL,
+			pk         text NOT NULL,
+			policy     text NOT NULL,
+			source_row jsonb,
+			target_row jsonb,
+			resolved   boolean NOT NULL DEFAULT false,
+			created_at timestamptz NOT NULL DEFAULT now()
+		)`, s.stateTable("_jl_conflict")),
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+			id         bigserial PRIMARY KEY,
+			job_key    text NOT NULL,
+			table_name text NOT NULL,
+			reason     text NOT NULL,
+			position   text,
+			raw_row    jsonb,
+			created_at timestamptz NOT NULL DEFAULT now()
+		)`, s.stateTable("_jl_dead_letter")),
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
 			instance_id text PRIMARY KEY,
 			label       text,
 			host        text,

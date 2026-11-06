@@ -59,6 +59,8 @@ type Options struct {
 	Verify bool
 	// LeaseTTL defaults to 30s.
 	LeaseTTL time.Duration
+	// HeartbeatEvery 覆盖心跳间隔（测试用；默认 control.DefaultHeartbeatInterval/2）。
+	HeartbeatEvery time.Duration
 }
 
 // Result is what a caller reports to a human.
@@ -263,6 +265,16 @@ func (r *runner) execute(parent context.Context, res *Result) error {
 	ctx, cancel := context.WithCancel(parent)
 	r.cancelRun = cancel
 	defer cancel()
+
+	// ① 心跳：`runs.heartbeat_at` 不刷新的话，空闲 90 秒就会被 doctor 判成幽灵、
+	// 重启时把健康任务标成 interrupted（TouchRun 之前一个调用方都没有）。
+	// 间隔取 control.DefaultHeartbeatInterval 的一半，保证总有至少两个心跳落在
+	// StaleAfter(=3×) 窗口里 —— 口径与 control 包一致，不另写一套。
+	hbCtx, stopHB := context.WithCancel(ctx)
+	defer stopHB()
+	go r.heartbeatLoop(hbCtx, r.heartbeatEvery(), func(c context.Context) error {
+		return r.opt.Store.TouchRun(c, r.run.ID)
+	})
 
 	defer func() {
 		res.Phase = r.phase
@@ -1091,6 +1103,36 @@ func classifyError(err error) (code core.Code, classified bool) {
 		return core.CodePositionGap, true
 	}
 	return "", false
+}
+
+// heartbeatLoop 周期刷新本条 run 的存活心跳；只在 run 未结束时可写（TouchRun 自己带条件）。
+func (r *runner) heartbeatLoop(ctx context.Context, interval time.Duration, touch func(context.Context) error) {
+	if interval <= 0 {
+		interval = control.DefaultHeartbeatInterval / 2
+	}
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			// 心跳失败不该打断同步（它只影响 doctor 的判断），但也不能静默：
+			// 连不上控制库时用户需要知道「状态可能被误判成幽灵」。
+			if err := touch(ctx); err != nil && ctx.Err() == nil {
+				r.emit(ctx, control.Event{Type: "note",
+					Message: "刷新运行心跳失败（状态页可能把这一轮判成「已中断」）：" + err.Error()})
+			}
+		}
+	}
+}
+
+// heartbeatEvery 是心跳间隔：control 的 DefaultHeartbeatInterval 的一半。
+func (r *runner) heartbeatEvery() time.Duration {
+	if r.opt.HeartbeatEvery > 0 {
+		return r.opt.HeartbeatEvery
+	}
+	return control.DefaultHeartbeatInterval / 2
 }
 
 // isUserStop reports「这次失败其实是用户按了停止」。

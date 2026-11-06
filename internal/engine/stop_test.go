@@ -289,3 +289,58 @@ func TestMissingColumnUsesE1013WithUsableNextSteps(t *testing.T) {
 		t.Fatalf("last_error 应含 E1013 与缺列的动作，得到：%s", got.LastError)
 	}
 }
+
+// ① 心跳必须真的刷新：`runs.heartbeat_at` 不更新的后果是「空闲 90 秒被判幽灵、
+// 重启把健康任务标成 interrupted」。这条测的是心跳循环本身（注入 interval 与 touch，
+// 不等真同步跑两分钟），另有一条对比断言：不调 TouchRun 时 heartbeat_at 不变。
+func TestHeartbeatLoopRefreshesRunRow(t *testing.T) {
+	store, jobID := newControlStore(t)
+	run, err := store.StartRun(context.Background(), jobID, state.Streaming, control.RunKindSync)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := store.GetRun(context.Background(), run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.HeartbeatAt == "" {
+		t.Fatal("StartRun 应写入初始 heartbeat_at")
+	}
+
+	// 把心跳手动推到「很久以前」，再看循环能不能把它刷新回来
+	if _, err := store.DB().Exec(`UPDATE runs SET heartbeat_at = '2000-01-01T00:00:00Z' WHERE id = ?`, run.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	r := &runner{opt: Options{Store: store}, job: control.Job{ID: jobID}, run: run, phase: state.Streaming}
+	ctx, cancel := context.WithCancel(context.Background())
+	go r.heartbeatLoop(ctx, 10*time.Millisecond, func(c context.Context) error {
+		return store.TouchRun(c, run.ID)
+	})
+	time.Sleep(80 * time.Millisecond)
+	cancel()
+
+	got, err := store.GetRun(context.Background(), run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.HeartbeatAt == "2000-01-01T00:00:00Z" {
+		t.Fatal("心跳没有被刷新（runs.heartbeat_at 还是旧值）——doctor 会把这轮判成幽灵")
+	}
+}
+
+// 心跳失败不能打断同步，但要 emit 一条 note（状态页可能误判，用户得知道）。
+func TestHeartbeatLoopReportsFailureButKeepsRunning(t *testing.T) {
+	r := &runner{opt: Options{}, job: control.Job{}, run: control.Run{ID: "x"}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	calls := 0
+	go r.heartbeatLoop(ctx, 5*time.Millisecond, func(context.Context) error {
+		calls++
+		return errors.New("控制库暂时不可写")
+	})
+	time.Sleep(60 * time.Millisecond)
+	if calls < 2 {
+		t.Fatalf("心跳失败后应继续尝试，实际只调了 %d 次", calls)
+	}
+}
