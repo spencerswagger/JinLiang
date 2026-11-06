@@ -554,3 +554,32 @@ func TestStopJobTimeoutIsNotSilent(t *testing.T) {
 		t.Fatalf("错误要写清「没有停干净」：%v", serr)
 	}
 }
+
+// 「我们自己判定出来的、原因明确的失败」不该落到「未分类」。
+// 表清单核对失败就是最常见的一种：选错表 / 改名 / 不在这个 schema 下——
+// 以前它抛的是普通 error 串（没有 SQLSTATE），classifyError 无从判断 → code 留空。
+func TestTableNotFoundCarriesE1013(t *testing.T) {
+	e := &TableNotFoundError{Table: "ghost_table_xyz", Schema: "public",
+		Available: []string{"ghost_table"}}
+	code, ok := classifyError(e)
+	if !ok || code != core.CodeObjectMissing {
+		t.Fatalf("表清单核对失败应挂 E1013，得到 %s %v", code, ok)
+	}
+	// 文案要能直接照着做：点名表、给相近表名、给两条出路、写风险
+	msg := e.Error()
+	for _, want := range []string{"ghost_table_xyz", "ghost_table", "重选表范围", "风险"} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("错误里应包含 %q：%s", want, msg)
+		}
+	}
+	// 不造伪 SQLSTATE：它必须不是 *pgconn.PgError
+	if isPgErrType(e) {
+		t.Fatal("这是我们自己的判定，不该伪装成驱动错误（伪 SQLSTATE 会污染分类器）")
+	}
+}
+
+// isPgErrType 判断错误是不是驱动层的 *pgconn.PgError（伪 SQLSTATE 的反例检查）。
+func isPgErrType(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr)
+}
