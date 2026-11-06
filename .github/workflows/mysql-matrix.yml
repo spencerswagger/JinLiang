@@ -33,6 +33,8 @@ jobs:
             note: "改名/删变量最多：SHOW BINARY LOG STATUS、authentication_policy、native 插件彻底移除、REPLICATION REPLICA"
     env:
       JINLIANG_TEST_MYSQL_SRC_DSN: mysql://jinliang:jinliang@127.0.0.1:3306/jinliang_src
+      # 目标端（B3 mysqlsink）用自己的库，避免和源端用例抢表
+      JINLIANG_TEST_MYSQL_DSN: mysql://jinliang:jinliang@127.0.0.1:3306/jinliang_target
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -76,4 +78,14 @@ jobs:
         # 排查版本差异时可临时加 JINLIANG_DEBUG_EVENTS=1 看事件流水。
 
       - name: 单元测试（不依赖数据库）
-        run: go test ./internal/mysqlsource/
+        run: go test ./internal/mysqlsource/ ./internal/mysqlsink/
+
+      - name: 建目标端库
+        run: |
+          mysql -h 127.0.0.1 -uroot -proot -e "
+            CREATE DATABASE IF NOT EXISTS jinliang_target CHARACTER SET utf8mb4;
+            GRANT ALL PRIVILEGES ON jinliang_target.* TO 'jinliang'@'%';
+            FLUSH PRIVILEGES;"
+
+      - name: 目标端 sink 契约测试（upsert / on_exists / DDL 白名单 / utf8mb4 行宽预检）
+        run: go test -tags=integration ./internal/mysqlsink/ -v -timeout 10m
