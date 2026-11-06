@@ -331,8 +331,10 @@ func TestIntervalCopiesOnlyRowsAfterWatermark(t *testing.T) {
 
 	exec(t, srcDB, "DROP TABLE IF EXISTS "+table)
 	exec(t, srcDB, "CREATE TABLE "+table+" (id bigint PRIMARY KEY, payload text, updated_at timestamptz)")
+	// 时间戳**逐行递增**（跨 2 小时），否则「同一时刻的行全在水位窗口内」，
+	// 回看窗口会合理地重读整表，断言「只搬 N 行」就没有意义了。
 	exec(t, srcDB, "INSERT INTO "+table+
-		" SELECT g, 'row-'||g, now() - interval '1 hour' FROM generate_series(1,1000) g")
+		" SELECT g, 'row-'||g, now() - interval '2 hours' + (g||' seconds')::interval FROM generate_series(1,1000) g")
 	exec(t, dstDB, "DROP TABLE IF EXISTS "+table)
 	exec(t, dstDB, "DROP TABLE IF EXISTS _jl_meta, _jl_chunk, _jl_lease, _jl_object, _jl_instance")
 
@@ -393,9 +395,13 @@ func TestIntervalCopiesOnlyRowsAfterWatermark(t *testing.T) {
 	if err != nil {
 		t.Fatalf("第二轮失败: %v", err)
 	}
-	if res.RowsStream != 4 {
-		t.Fatalf("第二轮应只搬 4 行（3 新增 + 1 更新），实际 %d 行（说明水位没生效，整表又扫了一遍）",
-			res.RowsStream)
+	// 回看窗口（1m）会重读水位附近的一小段，这是「宁重不漏」的设计代价；
+	// 断言的是「没重扫整表」+「新增/更新都到了」，而不是精确 4 行。
+	if res.RowsStream < 4 {
+		t.Fatalf("第二轮应至少搬 4 行（3 新增 + 1 更新），实际 %d", res.RowsStream)
+	}
+	if res.RowsStream > 200 {
+		t.Fatalf("第二轮搬了 %d 行，说明水位没生效（整表 1000 行又被扫了一遍）", res.RowsStream)
 	}
 	var touched int
 	if err := dstDB.QueryRow(ctx, "SELECT count(*) FROM "+table+" WHERE payload='touched'").Scan(&touched); err != nil {
@@ -404,4 +410,95 @@ func TestIntervalCopiesOnlyRowsAfterWatermark(t *testing.T) {
 	if touched != 1 {
 		t.Fatalf("更新应被搬过去，得到 %d 行", touched)
 	}
+}
+
+// Owl 要的那条：**lookback 必须真的生效**。
+//
+// 场景模拟「长事务 / 复制延迟」：一行在事务里很早就写好了（updated_at 很早），
+// 但它在本轮水位推进之后才可见。若回退窗口没生效（曾经 cursor 没清空 PK，
+// lookback 一次都用不上），这条行会永久读不到——漏读是重跑也补不回来的错误。
+func TestIntervalLookbackCatchesLateCommittedRows(t *testing.T) {
+	srcDSN, dstDSN := dsns(t)
+	srcDB := mustConn(t, srcDSN)
+	dstDB := mustConn(t, dstDSN)
+	table := "wm_late"
+	ctx := context.Background()
+
+	exec(t, srcDB, "DROP TABLE IF EXISTS "+table)
+	exec(t, srcDB, "CREATE TABLE "+table+" (id bigint PRIMARY KEY, payload text, updated_at timestamptz)")
+	exec(t, srcDB, "INSERT INTO "+table+
+		" SELECT g, 'row-'||g, now() - interval '2 hours' FROM generate_series(1,10) g")
+	exec(t, dstDB, "DROP TABLE IF EXISTS "+table)
+	exec(t, dstDB, "DROP TABLE IF EXISTS _jl_meta, _jl_chunk, _jl_lease, _jl_object, _jl_instance")
+
+	store, jobID := intervalJob(t, srcDSN, dstDSN, "wm-late", table, "1h")
+	if _, err := engine.Run(ctx, engine.Options{Store: store, JobID: jobID}); err != nil {
+		t.Fatalf("第一轮失败: %v", err)
+	}
+	var wm string
+	if err := dstDB.QueryRow(ctx, "SELECT COALESCE(watermark,'') FROM _jl_meta").Scan(&wm); err != nil {
+		t.Fatal(err)
+	}
+	if wm == "" {
+		t.Fatal("第一轮之后应有水位")
+	}
+
+	// 模拟长事务：这一行的 updated_at **比水位更早**（到达时水位已越过它），但此刻才可见。
+	// 只有「水位 − lookback」的回退窗口能读到它；没有回退就永久漏读。
+	exec(t, srcDB, "INSERT INTO "+table+
+		" VALUES (999,'late-commit', now() - interval '2 hours' - interval '30 seconds')")
+
+	res, err := engine.Run(ctx, engine.Options{Store: store, JobID: jobID})
+	if err != nil {
+		t.Fatalf("第二轮失败: %v", err)
+	}
+	if res.RowsStream == 0 {
+		t.Fatal("回退窗口内的晚提交行没被读到——lookback 没生效（正是 Owl 指出的漏读 bug）")
+	}
+	var got int
+	if err := dstDB.QueryRow(ctx, "SELECT count(*) FROM "+table+" WHERE id=999").Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got != 1 {
+		t.Fatal("晚提交的那一行必须出现在目标端")
+	}
+}
+
+// intervalJob 建一条 interval 任务（lookback 可指定），返回 store 与 job id。
+func intervalJob(t *testing.T, srcDSN, dstDSN, name, table, lookback string) (*control.Store, string) {
+	t.Helper()
+	ctx := context.Background()
+	store, err := control.Open(control.Options{DataDir: t.TempDir(), Autogen: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
+	mk := func(nm string, port int, db, user, pass string) string {
+		c, err := store.CreateConnection(ctx, control.ConnectionInput{
+			Name: nm, Kind: "postgres", Host: "127.0.0.1", Port: port,
+			Database: db, Username: user, Password: pass,
+			Params: map[string]string{"sslmode": "disable"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c.ID
+	}
+	srcID := mk("src", portOf(t, srcDSN), dbOf(t, srcDSN), userOf(t, srcDSN), passOf(t, srcDSN))
+	dstID := mk("dst", portOf(t, dstDSN), dbOf(t, dstDSN), userOf(t, dstDSN), passOf(t, dstDSN))
+	job, err := store.CreateJob(ctx, control.JobInput{
+		Name: name, SourceID: srcID, TargetID: dstID,
+		Spec: control.JobDoc{
+			Version: 1, Job: name,
+			Source: control.SourceDoc{Kind: "postgres", Scope: &control.ScopeDoc{Schema: "public"}},
+			Target: control.TargetDoc{Kind: "postgres", Schema: "public", OnExists: "append"},
+			Mode: control.ModeDoc{Frequency: "interval", Interval: "1s",
+				IncrementalColumn: "updated_at", Lookback: lookback},
+			Content: &control.ContentDoc{Tables: map[string]control.TableDoc{table: {}}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("建任务失败: %v", err)
+	}
+	return store, job.ID
 }
