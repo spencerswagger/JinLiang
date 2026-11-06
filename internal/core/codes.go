@@ -34,6 +34,7 @@ const (
 	CodeTxTooLarge           Code = "E1011" // 单个源事务超过整段缓冲的上限
 	CodeNoPrivilege          Code = "E1012" // 账号没有做这件事的权限（SQLSTATE 42501）
 	CodeObjectMissing        Code = "E1013" // 缺这个 schema 或表（SQLSTATE 3F000 / 42P01）
+	CodeUnsupportedDirection Code = "E1014" // 当前版本不支持这个同步方向（源×目标组合）
 	CodeTargetReset          Code = "E2001" // 目标连接被重置
 	CodeSourceTimeout        Code = "E2002" // 源库连接超时
 	CodeLockTimeout          Code = "E2003" // 目标库锁等待超时
@@ -177,6 +178,25 @@ var specs = []Spec{
 			"改完再跑一次 run：位点不动，不需要重搬历史",
 		},
 		Risk: "换 schema 等于换一套目标表：旧 schema 里的数据不会自动搬过去",
+	},
+	// E1014 只允许在**构造期 / 开跑前**抛出：它的 Risk 写着「不会写入任何数据」，
+	// 这句话只在「还没开始写」时成立。若将来有路径在跑中才判方向，必须同时改 Risk，
+	// 否则那句保证会变成谎话。
+	{
+		Code: CodeUnsupportedDirection, Class: UserAction,
+		Message: "当前版本不支持这个方向",
+		// Why 由方向矩阵生成（internal/core/direction.go），不手写方向名：
+		// 手写必然与代码分叉，而这个码存在的意义就是「让用户一眼看清自己在不在支持范围内」。
+		Why: "当前能跑的是：" + DirectionsText() + "；" + PendingDirectionsText() + " 还没接通",
+		Next: []string{
+			"换成已支持的方向：源用 " + name(supportedDirections[0].Source) + "，目标可以是 " +
+				name(supportedDirections[0].Target) + "（" + supportedDirections[0].Modes + "）或 " +
+				name(supportedDirections[1].Target) + "（" + supportedDirections[1].Modes + "）",
+			"确实必须这个方向：先把源数据导出成目标端能直接吃的形式（CSV / INSERT / 目标端原生 dump）再另行导入" +
+				"——这一步津梁不参与、不校验、也不负责类型转换，导入出问题不算同步本身的",
+			"关注后续版本：" + PendingDirectionsText() + " 在路线图上，但没有承诺日期",
+		},
+		Risk: "这条任务不会写入任何数据；最危险的是「以为它已经同步了」——请确认任务状态是「未开始」，别把它当成在跑",
 	},
 	{
 		Code: CodeControlDBBroken, Class: Fatal,
