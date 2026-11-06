@@ -37,3 +37,21 @@ notes: |
   MySQL 5.7 无 LOCK INSTANCE FOR BACKUP、无原子 DDL；
   8.4 起 SHOW MASTER STATUS 移除（用 SHOW BINARY LOG STATUS）、mysql_native_password 默认关闭；
   9.x 移除该插件。连接器一律运行时能力探测，不按版本号分支。
+
+# 组合分层：total_pairs = 4×4 = 16；required = 4 自洽 + 3 相邻 = 7。
+matrix:
+  total_pairs: 16
+  required:
+    - name: t1-self
+      pairs: "每版本 → 自身"
+      count: 4
+      scenarios: [snapshot, incremental_crud, type_boundary]
+    - name: t2-adjacent
+      pairs: "5.7→8.0→8.4→9.x"
+      count: 3
+      scenarios: [incremental_crud, ddl_whitelist]
+  nightly:
+    - name: t4-full
+      pairs: "全部 4×4"
+      count: 16
+      scenarios: [snapshot, incremental_crud, large_transaction, ddl_whitelist, crash_recovery, orphan_cleanup, type_boundary]

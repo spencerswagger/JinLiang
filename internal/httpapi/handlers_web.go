@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"strconv"
@@ -463,14 +464,18 @@ func (s *Server) pageJobRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.startJob(r.Context(), job, control.ActorUI); err != nil {
+		// 注意用 errors.As 而不是 errors.Is：这个错误**带字段**（是哪一台），
+		// 用哨兵指针比较永远不相等，会掉到下面「本进程在跑」那条去。
+		if oi := asOtherInstance(err); oi != nil {
+			s.renderPartial(w, "error_card", conflictOtherInstance(oi.OwnerInstance, oi.RunID, oi.HeartbeatAt))
+			return
+		}
+		if errors.Is(err, errStaleRunInControlDB) {
+			s.renderPartial(w, "error_card", conflictStaleRun())
+			return
+		}
 		if errors.Is(err, control.ErrRunInProgress) {
-			s.renderPartial(w, "error_card", apiError{
-				Class:   "user_action",
-				Message: "这个任务已经在跑了",
-				Why:     "同一任务同时跑两份会互相覆盖",
-				Next:    []string{"先看下面的实时事件；要停下按「停止」"},
-				Risk:    "无",
-			})
+			s.renderPartial(w, "error_card", conflictThisProcess())
 			return
 		}
 		s.renderPartial(w, "error_card", plainError("%v", err))
@@ -580,6 +585,19 @@ type diagnosticsData struct {
 	AdminConfigured bool
 	ActiveRuns      int
 	Audit           []control.AuditEntry
+	// Rejected：被拒绝的「开始」（HTTP 已回 202，但引擎没跑起来）。
+	// 单独抽出来渲染成人话，而不是让它埋在审计表的 JSON 里——这条正是
+	// 「它说已接受，然后什么都没发生」时用户唯一能查到的地方。
+	Rejected []rejectedRow
+}
+
+type rejectedRow struct {
+	At      string
+	JobID   string
+	Code    string
+	Message string
+	Next    []string
+	RunID   string
 }
 
 func (s *Server) pageDiagnostics(w http.ResponseWriter, r *http.Request) {
@@ -595,6 +613,27 @@ func (s *Server) pageDiagnostics(w http.ResponseWriter, r *http.Request) {
 		KeySource: str("key_source"), KeyPath: str("key_path"),
 		Listen: str("listen"), SchemaVersion: str("schema_version"),
 		DBBytes: num("db_bytes"), Audit: audit,
+	}
+	// 过滤下推到 SQL：窗口（最近 N 条）里筛，忙时会把拒绝记录筛没。
+	rejected, _ := s.store.ListAuditByAction(ctx, control.ActionRunRejected, 10)
+	for _, e := range rejected {
+		var det struct {
+			JobID   string   `json:"job_id"`
+			Code    string   `json:"code"`
+			Message string   `json:"message"`
+			Next    []string `json:"next"`
+			RunID   string   `json:"run_id"`
+		}
+		if err := json.Unmarshal([]byte(e.Detail), &det); err != nil {
+			continue // 旧版本写的痕迹（没有结构化详情）就只留在下面的审计表里
+		}
+		d.Rejected = append(d.Rejected, rejectedRow{
+			At: e.At, JobID: det.JobID, Code: det.Code,
+			Message: det.Message, Next: det.Next, RunID: det.RunID,
+		})
+		if len(d.Rejected) >= 10 {
+			break
+		}
 	}
 	d.Problems, _ = doc["problems"].([]string)
 	d.Counts, _ = doc["counts"].(map[string]int64)

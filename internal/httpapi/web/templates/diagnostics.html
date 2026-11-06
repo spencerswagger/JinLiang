@@ -39,6 +39,21 @@
   <p class="hint">备份 = 备份这个目录（含 key 文件）。没有 key 文件，密文解不开——这是特性，不是缺陷。</p>
 </div>
 
+{{if .Rejected}}
+<h2>被拒绝的「开始」</h2>
+<p class="hint">这些尝试<strong>接口已经答应</strong>（返回了「已开始」），但引擎没能跑起来。留在这里是因为事件流是易失的——重启后只有这里还查得到。</p>
+{{range .Rejected}}
+<div class="card">
+  <div class="row">
+    {{if .Code}}<span class="badge bad">{{.Code}}</span>{{else}}<span class="badge warn">未分类</span>{{end}}
+    <span class="meta">{{shortTime .At}} · 任务 {{clip .JobID 13}}{{if .RunID}} · 运行 {{clip .RunID 13}}{{end}}</span>
+  </div>
+  <p><strong>{{.Message}}</strong></p>
+  {{if .Next}}<p class="hint">下一步：</p><ol>{{range .Next}}<li>{{.}}</li>{{end}}</ol>{{end}}
+</div>
+{{end}}
+{{end}}
+
 <h2>最近动作（审计）</h2>
 {{if .Audit}}
 <div class="card">

@@ -84,13 +84,16 @@
 {{if .Runs}}
 <div class="card">
   <table>
-    <thead><tr><th>开始</th><th>阶段</th><th>行数</th><th>结束</th><th>错误</th></tr></thead>
+    <thead><tr><th>开始</th><th>阶段</th><th>行数</th><th>主机</th><th>结束</th><th>错误</th></tr></thead>
     <tbody>
     {{range .Runs}}
       <tr>
         <td class="mono">{{shortTime .StartedAt}}</td>
 <td>{{runState .}}{{if .Stub}} <span class="badge stub">桩</span>{{end}}{{if eq .Kind "verify"}} <span class="badge">校验</span>{{end}}</td>
         <td class="num">{{.RowsDone}}</td>
+        <!-- 多实例下「这条 run 是谁跑的」必须看得见：用户被建议「去那台机器上 stop」时，
+             这里就是他唯一能找到那台机器的地方 -->
+        <td class="mono">{{if .OwnerInstance}}{{clip .OwnerInstance 13}}{{else}}—{{end}}</td>
         <td class="mono">{{if .EndedAt}}{{shortTime .EndedAt}}{{else}}—{{end}}</td>
         <td>{{dash .LastError}}</td>
       </tr>

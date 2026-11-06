@@ -7,3 +7,7 @@
 
 # e2e 本地证据（不入库）
 .e2e-evidence/
+
+# B6：本地性能基线产物（基线本身 bench/baseline.json 要入库）
+/benchapply
+bench/latest.json
