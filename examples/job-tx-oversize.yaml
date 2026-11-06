@@ -1,0 +1,69 @@
+# 津梁任务定义 —— tx_oversize 的对象写法（与 job.yaml 的字符串写法等价、二选一）。
+# 校验：未知字段直接报错（strict），所有默认值由 `jinliang plan` 打印，无隐藏开关。
+version: 1
+
+job: orders-to-report-txobj            # 只是展示名；任务身份 = 「源+目标+范围」指纹（docs/IDENTITY.md）
+
+source:
+  kind: postgres                 # postgres | mysql
+  dsn: env:JINLIANG_SOURCE_DSN   # 只允许 env: 或 file:，不接受明文写在 yaml 里
+  scope:
+    schema: public
+    include: ["orders*", "customers"]
+    exclude: ["orders_archive_*", "customers_tmp"]
+  snapshot:
+    chunk_rows: 100000           # 分块大小；无主键表按 ctid 分块
+    conns: 4                     # 并发块数（预检会算给用户看压力）
+    max_read_qps: 200            # 每连接读限速
+
+target:
+  kind: mysql
+  dsn: env:JINLIANG_TARGET_DSN
+  schema: report
+  on_exists: error               # error（默认，绝不自作主张 drop）| append | recreate
+  create_indexes: defer          # defer（同步完再建，最快）| now | none
+
+mode:
+  frequency: continuous+initial   # once | continuous+initial | continuous | interval | full_interval
+  interval: 5m                    # interval / full_interval 用；支持 5m / 1h / cron:0 */2 * * *
+  incremental_column: updated_at   # interval 模式必填，普通模式可空
+  lookback: 5m                     # interval 的重叠回看窗口，防同值/时钟漂移漏数
+
+content:
+  tables:
+    orders:
+      columns: { exclude: [internal_note, cost_price] }
+      where: "region = 'cn'"                       # 受限表达式：列比较 + 常量，不支持子查询
+      transform:
+        - amount:  { from: amount_cents, scale: 0.01 }   # 分 → 元
+        - phone:   { mask: [3, 4] }                      # 脱敏
+        - status:  { enum: { "0": "pending", "1": "paid" } }
+    customers:
+      columns: { include: [id, name, city, updated_at] }
+  schema_follow: whitelist         # off | whitelist（只跟随加列/放宽长度/加索引/可选删列）
+
+conflict:
+  policy: manual                   # manual（默认，只记日志）| source_wins | target_wins | newest
+  log_table: _jl_conflict
+
+reliability:
+  lease_ttl: 30s                   # 目标库租约，防两个实例同跑
+  batch_rows: 500
+  batch_delay: 1ms                 # group commit 窗口：先到者触发
+  retry: { max: 3, backoff: [5s, 20s, 60s] }
+  tx_oversize:                     # 对象写法：mode 沿用 spill|fail，bytes/events 是单事务缓冲上限
+    mode: fail
+    bytes: 134217728               # 128 MB
+    events: 1000000                # 100 万事件
+  dead_letter:
+    max_rows: 100000               # 超上限暂停任务，不静默丢
+    on_error_ratio: 0.05
+
+guard:                             # 对源库的保护阀
+  slot_warn_lag: 5GB               # 同步书签落后阈值
+  slot_warn_seconds: 30m
+  on_exceed: pause                 # pause（默认）| invalidate（PG 13+）| advance（补偿：主动推进，需确认）
+
+observability:
+  metrics_addr: 127.0.0.1:9090
+  log_level: info
