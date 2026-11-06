@@ -40,6 +40,10 @@ type Run struct {
 	Kind string `json:"kind"`
 	// Stub 是 B0 的旧列，保留一版做兼容；新代码以 Kind 为准，两者应一致。
 	Stub bool `json:"stub"`
+	// Code 是这一轮结束时的错误码（E1xxx/E3xxx…），空表示没有错误。
+	// 有了它，列表页只显示「徽标 + 一句摘要」，全文留给详情页——
+	// 这比把 250–300 字的 last_error 截断更根治（#41 只是止血）。
+	Code string `json:"code,omitempty"`
 	// HeartbeatAt is the last liveness ping from the process that owns this run.
 	// A crashed process leaves ended_at NULL forever unless someone notices —
 	// that is exactly what this column and RecoverStaleRuns are for.
@@ -179,6 +183,30 @@ func (s *Store) FinishRun(ctx context.Context, runID string, to state.Phase, las
 	return s.GetRun(ctx, runID)
 }
 
+// FinishRunWithCode 与 FinishRun 相同，但把错误码一起写进 runs.code。
+//
+// 单独的入口而不是改 FinishRun 的签名：FinishRun 已被引擎多处调用，加参数会逼着
+// 每个调用点都改；引擎按需切到这个入口即可。errCode 为空时与 FinishRun 等价。
+func (s *Store) FinishRunWithCode(ctx context.Context, runID string, to state.Phase, lastError string, exitCode int, finishReason, errCode string) (Run, error) {
+	run, err := s.FinishRun(ctx, runID, to, lastError, exitCode, finishReason)
+	if err != nil {
+		return run, err
+	}
+	if errCode != "" {
+		if _, err := s.db.ExecContext(ctx, `UPDATE runs SET code = ? WHERE id = ?`, errCode, runID); err != nil {
+			return run, err
+		}
+		return s.GetRun(ctx, runID)
+	}
+	return run, nil
+}
+
+// SetRunCode 只补错误码（用于「先记错误、后确定分类」的场景）。
+func (s *Store) SetRunCode(ctx context.Context, runID, code string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE runs SET code = ? WHERE id = ?`, nullIfEmpty(code), runID)
+	return err
+}
+
 // SetRunProgress records rows moved and lag, for the number wall.
 func (s *Store) SetRunProgress(ctx context.Context, runID string, rows int64, lagBytes, lagMs *int64) error {
 	_, err := s.db.ExecContext(ctx,
@@ -195,7 +223,8 @@ func (s *Store) SetRunError(ctx context.Context, runID, msg string) error {
 
 const runCols = `id, job_id, phase, started_at, COALESCE(ended_at,''), rows_done,
 	lag_bytes, lag_ms, COALESCE(last_error,''), exit_code, stub,
-	COALESCE(heartbeat_at,''), COALESCE(owner_instance,''), COALESCE(finish_reason,''), kind`
+	COALESCE(heartbeat_at,''), COALESCE(owner_instance,''), COALESCE(finish_reason,''), kind,
+	COALESCE(code,'')`
 
 func scanRun(sc interface{ Scan(...any) error }) (Run, error) {
 	var r Run
@@ -205,7 +234,7 @@ func scanRun(sc interface{ Scan(...any) error }) (Run, error) {
 	var stub int
 	if err := sc.Scan(&r.ID, &r.JobID, &phase, &r.StartedAt, &r.EndedAt, &r.RowsDone,
 		&lagBytes, &lagMs, &r.LastError, &exit, &stub,
-		&r.HeartbeatAt, &r.OwnerInstance, &r.FinishReason, &r.Kind); err != nil {
+		&r.HeartbeatAt, &r.OwnerInstance, &r.FinishReason, &r.Kind, &r.Code); err != nil {
 		return Run{}, err
 	}
 	r.Phase = state.Phase(phase)

@@ -33,6 +33,7 @@ func main() {
   jinliang doctor   [--source DSN] [--target DSN] [--job-key KEY] [--json] [--data-dir DIR]
   jinliang verify   --source DSN --target DSN --tables a,b [--level all] [--job-key KEY] [--json]
   jinliang gc       --target DSN [--source DSN] [--apply] [--force-cross-instance] [--json]
+  jinliang audit-prune [--days 180] [--apply] [--json] [--data-dir DIR]   （默认 dry-run；登录/凭证/连接变更永久保留）
   jinliang conflicts list --target DSN [--job-key KEY]
   jinliang dead-letter list|retry --target DSN [--id N] [--dry-run]
   jinliang undo     （未实现，命令只给说明）
@@ -70,6 +71,8 @@ func main() {
 		err = cmdDoctor(args)
 	case "verify":
 		err = cmdVerify(args)
+	case "audit-prune":
+		err = cmdAuditPrune(args)
 	case "gc":
 		err = cmdGC(args)
 	case "conflicts":
