@@ -381,3 +381,18 @@ func TestFingerprintSameScopeComparable(t *testing.T) {
 		t.Fatalf("同 scope 不该报警：%+v", rep.Levels[0].Findings)
 	}
 }
+
+// 指纹不可比与「跑了几张表」无关：只跑聚合时也要在结论里说。
+func TestConclusionFingerprintNoteIndependentOfTables(t *testing.T) {
+	rep := Report{OK: true, Levels: []LevelReport{{
+		Level: LevelData, OK: true,
+		Stats: map[string]any{
+			"tables_full_scan": 0, "tables_aggregate_only": 2, "tables_no_pk": 0,
+			"fingerprint_comparable": false,
+		},
+	}}}
+	got := Conclusion(rep)
+	if !strings.Contains(got, "仅聚合") || !strings.Contains(got, "跨端指纹不可比") {
+		t.Fatalf("聚合级结论也必须带指纹不可比：%q", got)
+	}
+}

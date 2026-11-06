@@ -41,8 +41,9 @@ PG 是服务端 `sum(hashtextextended)`（`pg-hashtextextended-v1`），两个�
 块大小 1000 行，块级 checksum 用于定位。`--tables` 只校验指定表。
 抽样只作为 L1/L2 之后的补充确认（`--sample` 控制行数，默认 100），不参与判据。
 
-**成本与日常例检**：全表扫描 = 两端各一条 `SELECT 全列 … ORDER BY pk`，10M 行是
-分钟级（只读，比同步轻，但不适合每次同步都跑）。日常例检用
+**成本与日常例检**：全表扫描 = 两端各一条 `SELECT 全列 … ORDER BY pk` + 逐行规范化解码，
+10M 行是分钟级。**跨端（PG→MySQL / MySQL→PG）默认就是最贵的跑法**：两端全表扫 + 排序 +
+逐行解码，不能靠「只比指纹」省掉（指纹作用域不同，见上）。日常例检用
 `jinliang verify --level data --aggregate-only`：L1 下推成两端各一条
 `count/sum/min/max` 聚合查询（秒级）；全表行级比对留给发布前/周检。
 结论行按**实际执行的级**逐级枚举，例如「结构级 ✓ / 数据级 ✓（行级全表比对 3 表；

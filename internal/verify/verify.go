@@ -273,27 +273,32 @@ func Conclusion(rep Report) string {
 			full := statInt(lr, "tables_full_scan")
 			agg := statInt(lr, "tables_aggregate_only")
 			noPK := statInt(lr, "tables_no_pk")
+			note := ""
 			switch {
 			case full == 0 && agg > 0:
-				part += "（仅聚合，未做行级全表比对"
+				note = "仅聚合，未做行级全表比对"
 				if noPK > 0 {
-					part += "；无主键表只能聚合"
+					note += "；无主键表只能聚合"
 				}
-				part += "）"
 			case agg > 0:
-				part += fmt.Sprintf("（行级全表比对 %d 表；%d 表仅聚合", full, agg)
+				note = fmt.Sprintf("行级全表比对 %d 表；%d 表仅聚合", full, agg)
 				if noPK > 0 {
-					part += "（无主键）"
+					note += "（无主键）"
 				}
-				part += "）"
 			case full > 0:
-				part += fmt.Sprintf("（行级全表比对 %d 表", full)
-				if v, ok := lr.Stats["fingerprint_comparable"]; ok {
-					if b, ok := v.(bool); ok && !b {
-						part += "；跨端指纹不可比，已改用逐行比对"
+				note = fmt.Sprintf("行级全表比对 %d 表", full)
+			}
+			// 指纹不可比与「跑了几张表」无关：聚合级、混合级也要说。
+			if v, ok := lr.Stats["fingerprint_comparable"]; ok {
+				if b, ok := v.(bool); ok && !b {
+					if note != "" {
+						note += "；"
 					}
+					note += "跨端指纹不可比，已改用逐行比对"
 				}
-				part += "）"
+			}
+			if note != "" {
+				part += "（" + note + "）"
 			}
 		}
 		parts = append(parts, part)
