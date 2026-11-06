@@ -58,7 +58,7 @@
 <h2>最近一次失败</h2>
 <div class="card err">
   <div class="row">
-    <span class="badge bad">{{.LastError.Code}}</span>
+    {{if .LastError.Code}}<span class="badge bad">{{.LastError.Code}}</span>{{else}}<span class="badge warn">未分类</span>{{end}}
     <strong>{{.LastError.Message}}</strong>
   </div>
   <dl>

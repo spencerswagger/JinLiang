@@ -601,7 +601,11 @@ type lastErrorCard struct {
 
 func codeCardOf(code, raw string) *lastErrorCard {
 	if code == "" {
-		return nil
+		if raw == "" {
+			return nil
+		}
+		// 未分类：给一句实话，不编造码（与诊断页的「未分类」徽标同一口径）
+		return &lastErrorCard{Message: "这条错误还没分类", Raw: raw}
 	}
 	spec, ok := core.Lookup(core.Code(code))
 	if !ok {

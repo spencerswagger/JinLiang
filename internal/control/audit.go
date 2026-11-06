@@ -117,9 +117,12 @@ const AuditRetention = 180 * 24 * time.Hour
 func permanentAuditAction(action string) bool {
 	for _, p := range []string{
 		"connection.", // 连接的新增/修改/删除/测连：凭证与对端地址的变更史
-		"admin.",      // 管理员口令、身份相关
-		"login",       // 登录/登出
-		"auth.",       // 认证类（为将来留位）
+		"job.delete",  // 删任务**连同它的 runs 一起删**，和删连接一样不可逆：
+		//                三个月后问「谁删的那个任务」，只有这条记录能回答
+		//                （Owl：不对称比漏删更糟——删连接留、删任务不留，讲不通）
+		"admin.", // 管理员口令、身份相关
+		"login",  // 登录/登出
+		"auth.",  // 认证类（为将来留位）
 		"session.",
 		"key.",        // 密钥相关
 		"audit.prune", // 清理动作本身
@@ -137,9 +140,18 @@ type PruneResult struct {
 	Retention  string   `json:"retention"`
 	Apply      bool     `json:"apply"`
 	Deleted    int64    `json:"deleted"`
+	Batches    int      `json:"batches"`
 	Kept       int64    `json:"kept_permanent"`
 	Candidates []string `json:"candidates,omitempty"`
 }
+
+// pruneBatch 是一批删除的行数上限。
+//
+// 控制库单写锁：一条 `DELETE ... WHERE at < ?` 上几十万行就是长写事务，会把 15 秒
+// 一次的心跳（TouchRun）卡住——心跳一失败就触发「引擎没有退出」那条 note，严重时
+// doctor 会把活 run 判成幽灵。**一条会卡住心跳的清理命令比不清理更危险**，
+// 因为它的症状出现在别处。所以分批删、每批之间让出。
+const pruneBatch = 5000
 
 // PruneAudit 删除 before 之前的**非永久**审计记录。
 //
@@ -188,14 +200,29 @@ func (s *Store) PruneAudit(ctx context.Context, before time.Time, apply bool) (P
 		placeholders = append(placeholders, "?")
 		args = append(args, a)
 	}
-	q := `DELETE FROM audit WHERE at < ? AND action IN (` + strings.Join(placeholders, ",") + `)`
-	out, err := s.db.ExecContext(ctx, q, args...)
-	if err != nil {
-		return res, err
+	// 分批：每批最多 pruneBatch 行，批与批之间让出（sql.DB 每次 Exec 结束就放锁，
+	// 这里额外让一小会儿，保证心跳有机会插进来）。
+	deleteQ := `DELETE FROM audit WHERE rowid IN (
+		SELECT rowid FROM audit WHERE at < ? AND action IN (` + strings.Join(placeholders, ",") + `) LIMIT ?)`
+	var deleted int64
+	for batch := 0; ; batch++ {
+		out, derr := s.db.ExecContext(ctx, deleteQ, append(args, pruneBatch)...)
+		if derr != nil {
+			return res, derr
+		}
+		n, _ := out.RowsAffected()
+		deleted += n
+		res.Batches = batch + 1
+		if n == 0 || n < pruneBatch {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return res, ctx.Err()
+		case <-time.After(20 * time.Millisecond):
+		}
 	}
-	if n, _ := out.RowsAffected(); n != res.Deleted {
-		res.Deleted = n
-	}
+	res.Deleted = deleted
 	// 清理动作本身要留痕
 	if err := s.Audit(ctx, ActorSystem, ActionAuditPrune, map[string]any{
 		"deleted":   res.Deleted,
@@ -203,6 +230,7 @@ func (s *Store) PruneAudit(ctx context.Context, before time.Time, apply bool) (P
 		"cutoff":    res.Cutoff,
 		"retention": res.Retention,
 		"actions":   pruneActions,
+		"batches":   res.Batches,
 	}); err != nil {
 		return res, fmt.Errorf("清理已完成但写审计失败（这次清理没有留痕）: %w", err)
 	}

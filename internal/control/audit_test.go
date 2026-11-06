@@ -215,3 +215,30 @@ func TestPruneAuditKeepsPermanentActions(t *testing.T) {
 		t.Fatalf("清理动作没有留痕（或 detail 里没有删除条数）：%+v", entries)
 	}
 }
+
+// job.delete 与 connection.delete 同样不可逆（删任务会把它的 runs 一起删），
+// 必须永久保留；同时把「可清」的决定写下来作为断言——决定要落在代码里，
+// 而不是「没进前缀列表所以默认被清」。
+func TestPruneAuditPermanentActionsAreExplicit(t *testing.T) {
+	permanent := []string{
+		ActionConnCreate, ActionConnUpdate, ActionConnDelete, ActionConnTest,
+		ActionJobDelete, ActionAdminSet, ActionAuditPrune, "login.ok", "session.start",
+	}
+	for _, a := range permanent {
+		if !permanentAuditAction(a) {
+			t.Fatalf("%q 必须永久保留", a)
+		}
+	}
+	// 这些是「可以清」的**决定**（不是漏掉）：运行类记录的价值随时间衰减，
+	// 而任务/连接的变更史才是追责证据。
+	prunable := []string{
+		ActionJobRun, ActionRunStub, ActionRunRejected,
+		"job.run.lease_forced", "job.run.stop_timeout", "job.run.takeover",
+		ActionJobCreate, ActionJobUpdate, ActionJobExport,
+	}
+	for _, a := range prunable {
+		if permanentAuditAction(a) {
+			t.Fatalf("%q 被标成永久保留，但它应当可清（决定写在测试里，不是默认）", a)
+		}
+	}
+}
