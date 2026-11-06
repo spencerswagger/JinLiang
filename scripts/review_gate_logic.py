@@ -53,16 +53,16 @@ def decide_review(pr, pr2, reviews, compare=None, pr_files=None):
         if not compare or compare.get("status") != "ahead":
             return False, (
                 f"结论 {commit[:12]} 不是当前 head {head[:12]} 的祖先"
-                f"（status={(compare or {}).get('status', 'unknown')}；rebase/force push 后必须重审）"
-            ), "not_ancestor"
+                f"（head_mismatch；status={(compare or {}).get('status', 'unknown')}；rebase/force push 后必须重审）"
+            ), "head_mismatch"
         changed = {f.get("filename") for f in (compare.get("files") or []) if f.get("filename")}
         owned = {n for n in (pr_files or []) if n}
         touched = sorted(changed & owned)
         if touched:
             return False, (
-                f"结论早于本 PR 的新改动（review {commit[:12]} → head {head[:12]}）："
+                f"结论早于本 PR 的代码改动（stale_conclusion，review {commit[:12]} → head {head[:12]}）："
                 f"需要重审；涉及 {', '.join(touched[:5])}{'…' if len(touched) > 5 else ''}"
-            ), "pr_files_changed"
+            ), "stale_conclusion"
         anchor_note = "（head 前进仅来自 merge main / 别人已合的改动，未触及本 PR 文件）"
     if not APPROVE.search(body):
         return False, f"最新结论不是行首放行（reviewer={who}，state={state}）：{summary}", "not_approved"
@@ -115,9 +115,9 @@ def selftest():
         ("merge-main-only", {"body": "**可合并（必改 0）**", "state": "COMMENTED", "commit_id": old},
          {"status": "ahead", "files": [{"filename": "internal/other.go"}]}, ["cmd/x.go"], True, "pass"),
         ("pr-file-changed", {"body": "**可合并（必改 0）**", "state": "COMMENTED", "commit_id": old},
-         {"status": "ahead", "files": [{"filename": "cmd/x.go"}]}, ["cmd/x.go"], False, "pr_files_changed"),
+         {"status": "ahead", "files": [{"filename": "cmd/x.go"}]}, ["cmd/x.go"], False, "stale_conclusion"),
         ("rebase-not-ancestor", {"body": "**可合并（必改 0）**", "state": "COMMENTED", "commit_id": old},
-         {"status": "diverged", "files": []}, ["cmd/x.go"], False, "not_ancestor"),
+         {"status": "diverged", "files": []}, ["cmd/x.go"], False, "head_mismatch"),
         ("approval-conclusion", {"body": "结论：可合并", "state": "COMMENTED", "commit_id": head}, None, None, True, "pass"),
         ("history-in-tail", {"body": "**可合并（必改 0）**，按 head x\n\n…上轮必改 1 条已修…", "state": "COMMENTED", "commit_id": head}, None, None, True, "pass"),
     ]

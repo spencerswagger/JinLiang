@@ -112,7 +112,7 @@ advisory→required 顺序：job 名保持 `review-gate` / `admin-merge-audit` �
 2. `review..head` 的差异**不包含本 PR 改的文件**（只允许别人已合的改动/merge main 进来）。
 
 任何本 PR 的新改动（哪怕一行注释）仍然要求重审。失败信息分三种：
-「结论早于本 PR 的新改动」「结论不是放行/是否决词」「结论不是 head 祖先」。
+「结论早于本 PR 的代码改动（stale_conclusion）」「结论不是放行/是否决词」「结论不是 head 祖先（head_mismatch）」。
 
 真 PR 复测：
 
