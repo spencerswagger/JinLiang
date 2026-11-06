@@ -278,6 +278,16 @@ def validate(value, schema, root, path="$"):
     for sub in schema.get("allOf", []):
         errs += validate(value, sub, root, path)
 
+    # oneOf：恰好有一个分支成立（真实 jsonschema 的语义）。没有它的话，
+    # 靠 oneOf 表达的「旧值或新对象」在离线路径上会变成「什么都接受」——
+    # 这正是 schema 与校验器必须一起改的原因。
+    if "oneOf" in schema:
+        branches = schema["oneOf"]
+        matched = [i for i, sub in enumerate(branches) if not validate(value, sub, root, path)]
+        if len(matched) != 1:
+            what = "没有一个分支成立" if not matched else "同时有 %d 个分支成立" % len(matched)
+            errs.append("%s: oneOf 要求恰好命中一个分支，实际%s（值 %r）" % (path, what, value))
+
     if "if" in schema and "then" in schema:
         if not validate(value, schema["if"], root, path):
             errs += validate(value, schema["then"], root, path)
