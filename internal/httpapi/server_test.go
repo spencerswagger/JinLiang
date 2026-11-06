@@ -20,6 +20,7 @@ import (
 	"github.com/spencerswagger/jinliang/internal/core"
 	"github.com/spencerswagger/jinliang/internal/engine"
 	"github.com/spencerswagger/jinliang/internal/jobrun"
+	"github.com/spencerswagger/jinliang/internal/state"
 )
 
 const testPassword = "test-admin-password"
@@ -1300,6 +1301,177 @@ func TestCodesEndpointIsCacheable(t *testing.T) {
 	defer res.Body.Close()
 	if cc := res.Header.Get("Cache-Control"); cc != "private, max-age=300" {
 		t.Fatalf("Cache-Control = %q，期望 private, max-age=300", cc)
+	}
+}
+
+// 两种 409 必须分开说：本进程在跑（不要去控制库找 run 行），vs 控制库里确有
+// 一条上次没结束的 run（这才是能去查 run 的情形）。
+func TestRunConflictCopyDistinguishesCause(t *testing.T) {
+	store, err := control.Open(control.Options{DataDir: t.TempDir(), Autogen: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	srv, err := New(Options{Store: store, Version: "test", Listen: "127.0.0.1:0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	block := make(chan struct{})
+	srv.runFn = func(ctx context.Context, _ *control.Store, _ control.Job, _ jobrun.Options) (engine.Result, error) {
+		<-block
+		return engine.Result{}, nil
+	}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	token := setupAdmin(t, ts)
+	conn := createPGConn(t, ts, token, "src")
+	code, created := doJSON(t, http.MethodPost, ts.URL+"/api/jobs", token, map[string]any{
+		"name": "conflict-copy", "source_id": conn, "target_id": conn,
+		"spec": map[string]any{
+			"source":  map[string]any{"scope": map[string]any{"schema": "public", "include": []string{"orders"}}},
+			"target":  map[string]any{"schema": "report"},
+			"mode":    map[string]any{"frequency": "once"},
+			"content": map[string]any{"tables": map[string]any{"orders": map[string]any{}}},
+		},
+	})
+	if code != http.StatusCreated {
+		t.Fatalf("create job = %d %v", code, created)
+	}
+	jobID, _ := created["id"].(string)
+
+	if code, _ := doJSON(t, http.MethodPost, ts.URL+"/api/jobs/"+jobID+"/run", token, nil); code != http.StatusAccepted {
+		t.Fatalf("第一次 run 应为 202")
+	}
+	// 本进程在跑：文案要说「已经开始了」，且**不许**指向控制库里的 run
+	code, body := doJSON(t, http.MethodPost, ts.URL+"/api/jobs/"+jobID+"/run", token, nil)
+	if code != http.StatusConflict {
+		t.Fatalf("并发第二次 run = %d，期望 409", code)
+	}
+	errObj, _ := body["error"].(map[string]any)
+	msg, _ := errObj["message"].(string)
+	if !strings.Contains(msg, "已经开始在跑了") {
+		t.Fatalf("本进程在跑时文案应说「已经开始在跑了」，实际 %q", msg)
+	}
+	if strings.Contains(msg, "控制库里") {
+		t.Fatalf("本进程在跑时不该把人指向控制库的 run 行（那里可能是空的），实际 %q", msg)
+	}
+	close(block)
+}
+
+// 409 的两个「库里那条 run」方向都必须有用例钉住（Owl：#29 的哨兵只钉了一个方向，
+// 接反了照样绿）。这里直接造一条 ended_at IS NULL 的 run（不注入 runFn、不启动任何东西），
+// 再看 /run 报的是哪一种。
+//
+// 关键区别在**心跳**：新鲜 = 另一个实例正在写（不能建议重启 serve）；
+// 过期 = 上个进程被强杀留下的尸体（这时才谈「等收尾 / 重启」）。
+func TestRunConflictFromControlDBSplitsByHeartbeat(t *testing.T) {
+	cases := []struct {
+		name        string
+		heartbeat   time.Duration // 多久以前的心跳
+		wantMsg     string
+		mustNotHave string
+		wantNext    string
+		wantOwner   bool
+	}{
+		{
+			name:      "心跳新鲜：另一个实例正在跑",
+			heartbeat: 1 * time.Second, // 1 秒前还有心跳
+			wantMsg:   "另一个实例正在跑",
+			// 这条最重要：不能**建议**重启（文案里可以提醒「别在本机重启」，
+			// 但不能把「重启一次 serve」当解药），否则用户会把别人的同步打断
+			mustNotHave: "重启一次",
+			wantNext:    "POST /api/jobs/{id}/stop",
+			wantOwner:   true,
+		},
+		{
+			name:        "心跳过期：上次没结束的运行",
+			heartbeat:   10 * time.Minute, // 10 分钟前的心跳（> StaleAfter 90s）
+			wantMsg:     "控制库里还有一条上次没结束的运行",
+			mustNotHave: "已经在跑了",
+			wantNext:    "重启",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			store, err := control.Open(control.Options{DataDir: t.TempDir(), Autogen: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			srv, err := New(Options{Store: store, Version: "test"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			srv.runFn = func(context.Context, *control.Store, control.Job, jobrun.Options) (engine.Result, error) {
+				t.Fatal("这条路径不该真的开跑：库里已经有未结束的 run")
+				return engine.Result{}, nil
+			}
+			ts := httptest.NewServer(srv.Handler())
+			defer ts.Close()
+			token := setupAdmin(t, ts)
+			conn := createPGConn(t, ts, token, "src")
+			code, created := doJSON(t, http.MethodPost, ts.URL+"/api/jobs", token, map[string]any{
+				"name": "stale-job", "source_id": conn, "target_id": conn,
+				"spec": map[string]any{
+					"source":  map[string]any{"scope": map[string]any{"schema": "public", "include": []string{"orders"}}},
+					"target":  map[string]any{"schema": "report"},
+					"mode":    map[string]any{"frequency": "once"},
+					"content": map[string]any{"tables": map[string]any{"orders": map[string]any{}}},
+				},
+			})
+			if code != http.StatusCreated {
+				t.Fatalf("create job = %d %v", code, created)
+			}
+			jobID, _ := created["id"].(string)
+
+			// 直接造一条未结束的 sync run，并把心跳钉在指定时刻
+			run, err := store.StartRun(context.Background(), jobID, state.Preflight, control.RunKindSync)
+			if err != nil {
+				t.Fatal(err)
+			}
+			at := time.Now().Add(-c.heartbeat).UTC().Format(time.RFC3339)
+			if _, err := store.DB().Exec(`UPDATE runs SET heartbeat_at = ?, owner_instance = ? WHERE id = ?`,
+				at, run.OwnerInstance, run.ID); err != nil {
+				t.Fatalf("钉心跳失败: %v", err)
+			}
+
+			code, body := doJSON(t, http.MethodPost, ts.URL+"/api/jobs/"+jobID+"/run", token, nil)
+			if code != http.StatusConflict {
+				t.Fatalf("POST /run = %d，期望 409", code)
+			}
+			errObj, _ := body["error"].(map[string]any)
+			msg, _ := errObj["message"].(string)
+			why, _ := errObj["why"].(string)
+			var nextStr string
+			if list, ok := errObj["next"].([]any); ok {
+				for _, n := range list {
+					if s, ok := n.(string); ok {
+						nextStr += s + " "
+					}
+				}
+			}
+			if !strings.Contains(msg, c.wantMsg) {
+				t.Fatalf("message = %q，期望含 %q", msg, c.wantMsg)
+			}
+			all := msg + " " + why + " " + nextStr
+			if strings.Contains(all, c.mustNotHave) {
+				t.Fatalf("文案里不该出现 %q（整段：%s）", c.mustNotHave, all)
+			}
+			if !strings.Contains(nextStr, c.wantNext) {
+				t.Fatalf("next 应含 %q，实际 %q", c.wantNext, nextStr)
+			}
+			// 「到那台机器上 stop」必须可执行：界面上要有那台机器的标识。
+			// 跨实例那条要从结构化错误里取（errors.As），不许靠正则解析错误文本。
+			if c.wantOwner {
+				owner, _ := store.InstanceID(context.Background())
+				if owner == "" {
+					t.Fatal("测试环境拿不到 instance id")
+				}
+				if !strings.Contains(all, owner) {
+					t.Fatalf("文案里应出现实例标识 %q（用户要据此去那台机器 stop），实际：%s", owner, all)
+				}
+			}
+		})
 	}
 }
 

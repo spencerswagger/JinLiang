@@ -2,7 +2,7 @@
 
 > 津梁：渡口与桥。在异构数据库之间摆渡数据。
 
-**状态：设计阶段（2026-11-05 收口后按「WebUI 控制面」重排）。** 当前仓库只有骨架、连接器可测性清单与设计文档；实现从 M0.5 控制面开始。
+**状态：M1 实现中。** 控制面（内嵌 SQLite + WebUI）、PG→PG 引擎、MySQL 源、`verify`/`doctor`/`gc` 已落地；调度（B5）与性能优化进行中。
 
 ## 这是什么
 
@@ -33,7 +33,7 @@ WAL / binlog / 复制槽 / 位点这些底层概念由工具负责探测、代�
 
 ## 文档
 
-**设计（全部完成，代码尚未实现）**
+**设计（全部完成）与实现状态**
 
 | 文档 | 内容 |
 |---|---|
@@ -62,6 +62,66 @@ WAL / binlog / 复制槽 / 位点这些底层概念由工具负责探测、代�
 
 代码层契约已可编译、可测试：`internal/source/contract.go`、`internal/sink/contract.go`、
 `internal/catalog/typemap.go`（15 个用例）、`internal/state/phase.go`（状态机 17 个断言）。
+
+## 覆盖度报表
+
+口径：下表是 `go test ./...` 的**单元测试**语句覆盖；`engine` / `pgsource` /
+`pgsink` / `mysqlsource` / `runtime` / `remedy` 的真实覆盖来自
+`go test -tags=integration`（需要真库，nightly 跑），所以它们的单元数字偏低
+不代表没测。`sink` / `testkit` / `transform` 目前只有契约与文档，没有可执行测试。
+
+<!-- coverage:start -->
+| 包 | 语句覆盖 | 口径 |
+|---|---:|---|
+| `cmd/jinliang` | 0.3% | 单元 |
+| `internal/catalog` | 68.0% | 单元 |
+| `internal/connect` | 72.3% | 单元 |
+| `internal/control` | 64.3% | 单元 |
+| `internal/core` | 84.6% | 单元 |
+| `internal/doctor` | 45.0% | 单元 |
+| `internal/dsn` | 87.7% | 单元 |
+| `internal/engine` | 20.1% | 单元 + 集成（nightly） |
+| `internal/gc` | 68.8% | 单元 |
+| `internal/httpapi` | 69.8% | 单元 |
+| `internal/mysqlsink` | 26.4% | 单元 |
+| `internal/mysqlsource` | 51.2% | 单元 + 集成（nightly） |
+| `internal/netcheck` | 96.4% | 单元 |
+| `internal/pgsink` | 17.4% | 单元 + 集成（nightly） |
+| `internal/pgsource` | 13.1% | 单元 + 集成（nightly） |
+| `internal/preflight` | 88.8% | 单元 |
+| `internal/runtime` | 11.6% | 单元 + 集成（nightly） |
+| `internal/source` | 96.8% | 单元 |
+| `internal/state` | 82.2% | 单元 |
+| `internal/verify` | 60.3% | 单元 |
+
+**总语句覆盖：43.6%**（单元测试；集成覆盖见 nightly 产物）
+<!-- coverage:end -->
+
+## 性能基线
+
+`scripts/bench.sh` 一次跑出五项：**快照吞吐（产品路径 `pgsink.BulkApply`）**、
+增量 p99、空转内存、冷启、二进制体积。口径固定（10 万行 / 每批 500 / 2 批预热；
+快照每块 5000），报告写 `bench/latest.json`，基线在 `bench/baseline.json`
+（release 用它做回归对比，按指标分档：**吞吐与 p99 容差 30%**，其余（空转/冷启/体积）**15%**；
+阈值以 `scripts/bench_compare.py` 的 `TOLERANCE` 为准；CPU 型号不同时只查绝对阈值）。
+
+```bash
+JINLIANG_TEST_PG_DSN=... scripts/bench.sh            # 报告模式
+JINLIANG_TEST_PG_DSN=... scripts/bench.sh --enforce  # 门禁：任一项不达标退出 1
+```
+
+本机基线（AMD Ryzen 5 1500X / 8 vCPU / Linux 5.15）：快照 **82,501 行/s**
+（`BulkApply`：临时落地区 → COPY → `INSERT…SELECT` → 块记账 + 位点同事务）、
+增量 apply 10,265 行/s、p99 **75.15 ms**、空转 **15.4 MB**、冷启 **29 ms**、二进制 **19.13 MB**。
+20k 行/s 的门禁量的是 **`BulkApply` 产品路径**；裸 `COPY`（约 150k 行/s）只是目标端
+上限参考，不进门禁——否则 `BulkApply` 慢 10 倍也能 PASS。
+`bulk_apply_p99_ms`（本机 103 ms/块）**只记录、不门禁**：块级 p99 受块大小影响；
+门禁的 p99 是**增量批事务**的 p99。
+
+口径三句（复现时别理解错）：快照/增量的吞吐与 p99 都是 **3 次取中位**（原始三次在 JSON 的 `bulk_runs`/`apply_runs`）；p99 的样本数 = **批次数（200）**，不是单行延迟；
+空转内存 = `ps` 的 **RSS**，不是 Go heap；冷启 = 进程 exec → `/api/health` 返回 200。
+增量 apply 当前逐行 `Exec`（500 次/事务），约 10k 行/s，是已知差距——基线把它钉住，
+避免以后悄悄变慢。
 
 ## 自检
 

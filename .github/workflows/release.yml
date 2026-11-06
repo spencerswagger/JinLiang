@@ -1,0 +1,63 @@
+name: release
+
+# release 门禁（打 tag 时）：性能回归对比 + 二进制体积 + 覆盖度门槛。
+# 与 nightly 的区别：nightly 收集基线，release 用仓库里的 bench/baseline.json
+# 做回归对比（>15% 变差即红；CPU 型号不同时只查绝对阈值并警告）。
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.x"
+      - name: 覆盖度门槛（单元总覆盖 ≥ 40%）
+        run: scripts/coverage.sh --check --min 40
+
+  size:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.x"
+      - name: 单二进制 < 25 MB
+        run: scripts/check_binary_size.sh dist/jinliang
+
+  bench-regression:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: jinliang
+          POSTGRES_PASSWORD: jinliang
+          POSTGRES_DB: jinliang_src
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U jinliang"
+          --health-interval 5s --health-timeout 5s --health-retries 30
+    env:
+      JINLIANG_TEST_PG_DSN: "postgres://jinliang:jinliang@127.0.0.1:5432/jinliang_test?sslmode=disable"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.x"
+      - name: 第二套库
+        run: |
+          set -e
+          PGPASSWORD=jinliang psql -h 127.0.0.1 -U jinliang -d jinliang_src -c 'CREATE DATABASE jinliang_test'
+      - name: 性能基线（绝对阈值）
+        run: scripts/bench.sh --enforce --out bench/latest.json
+      - name: 与 bench/baseline.json 对比（>15% 回归即红）
+        run: scripts/bench_compare.py bench/baseline.json bench/latest.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-release-${{ github.ref_name }}
+          path: bench/latest.json
