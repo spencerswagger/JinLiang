@@ -526,3 +526,30 @@ func TestStopJobNoOpWhenNotRunningHere(t *testing.T) {
 		t.Fatalf("本进程没在跑时应是 no-op，得到 %v %v %v", canceled, stopped, err)
 	}
 }
+
+// 退出码必须与事实一致：等不到引擎退出时，delete 不能装作成功。
+// （原来 `serr != nil && stopped` 恒为 false —— stopped 恰恰是 false，
+// 于是超时错误被吞、退出码 0，用户看到「删除成功」而引擎其实没停。）
+func TestStopJobTimeoutIsNotSilent(t *testing.T) {
+	store, jobID := newControlStore(t)
+	job, err := store.GetJob(context.Background(), jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, unregister := registerRun(job.ID, func() {}) // cancel 空操作 = 卡住不退
+	defer unregister()
+
+	canceled, stopped, serr := StopJob(context.Background(), store, job.ID, job.JobKey, 20*time.Millisecond)
+	if !canceled {
+		t.Fatal("应发出过 cancel")
+	}
+	if stopped {
+		t.Fatal("卡住没退出时 stopped 必须是 false（否则调用方会当作停干净了）")
+	}
+	if serr == nil {
+		t.Fatal("超时必须返回错误——调用方靠它决定非 0 退出码")
+	}
+	if !strings.Contains(serr.Error(), "没有退出") {
+		t.Fatalf("错误要写清「没有停干净」：%v", serr)
+	}
+}
