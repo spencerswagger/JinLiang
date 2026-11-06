@@ -102,7 +102,8 @@ WAL / binlog / 复制槽 / 位点这些底层概念由工具负责探测、代�
 `scripts/bench.sh` 一次跑出五项：**快照吞吐（产品路径 `pgsink.BulkApply`）**、
 增量 p99、空转内存、冷启、二进制体积。口径固定（10 万行 / 每批 500 / 2 批预热；
 快照每块 5000），报告写 `bench/latest.json`，基线在 `bench/baseline.json`
-（release 用它做 >15% 回归对比；CPU 型号不同时只查绝对阈值）。
+（release 用它做回归对比，按指标分档：**吞吐与 p99 容差 30%**，其余（空转/冷启/体积）**15%**；
+阈值以 `scripts/bench_compare.py` 的 `TOLERANCE` 为准；CPU 型号不同时只查绝对阈值）。
 
 ```bash
 JINLIANG_TEST_PG_DSN=... scripts/bench.sh            # 报告模式
@@ -114,6 +115,8 @@ JINLIANG_TEST_PG_DSN=... scripts/bench.sh --enforce  # 门禁：任一项不达�
 增量 apply 10,265 行/s、p99 **75.15 ms**、空转 **15.4 MB**、冷启 **29 ms**、二进制 **19.13 MB**。
 20k 行/s 的门禁量的是 **`BulkApply` 产品路径**；裸 `COPY`（约 150k 行/s）只是目标端
 上限参考，不进门禁——否则 `BulkApply` 慢 10 倍也能 PASS。
+`bulk_apply_p99_ms`（本机 103 ms/块）**只记录、不门禁**：块级 p99 受块大小影响；
+门禁的 p99 是**增量批事务**的 p99。
 
 口径三句（复现时别理解错）：快照/增量的吞吐与 p99 都是 **3 次取中位**（原始三次在 JSON 的 `bulk_runs`/`apply_runs`）；p99 的样本数 = **批次数（200）**，不是单行延迟；
 空转内存 = `ps` 的 **RSS**，不是 Go heap；冷启 = 进程 exec → `/api/health` 返回 200。
