@@ -1321,16 +1321,16 @@ func (r *runner) fail(ctx context.Context, err error) error {
 		// 有码也要把方向写进 last_error：历史页在 code 为空时只有这条字符串。
 		// 不写的话，「该怎么处理」只活在事件流里（进程一重启就没了）。
 		if spec, ok := core.Lookup(code); ok {
-			// 「按表暂停」这一族要额外把**表名与原因码**写进去：用户必须看到
-			// 「哪种情况、哪张表」，否则 E1015 只是一句「表结构不一致」。
+			// 「按表暂停」这一族要额外把**表名与原因码**写进去，而且放在**开头**：
+			// 用户拿到这条错误，第一件要问的是「哪张表」，其次才是「怎么办」。
 			// 码表说类别，运行时说具体——这条边界由 Ark 给 E1015 时定下。
-			detail := err.Error()
+			head := spec.Message
 			var pe pgsink.PausableError
 			if errors.As(err, &pe) {
-				detail = fmt.Sprintf("%s（表 %s，原因码 %s）", detail, pe.Table(), pe.Reason())
+				head = fmt.Sprintf("%s（表 %s，原因码 %s）", head, pe.Table(), pe.Reason())
 			}
 			lastError = fmt.Sprintf("[%s] %s：%s 下一步：%s",
-				code, spec.Message, detail, strings.Join(spec.Next, "；"))
+				code, head, err.Error(), strings.Join(spec.Next, "；"))
 		} else {
 			lastError = fmt.Sprintf("[%s] %s", code, err.Error())
 		}
