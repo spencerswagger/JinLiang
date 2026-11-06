@@ -7,6 +7,7 @@ package mysqlsink
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -14,8 +15,20 @@ import (
 
 	"github.com/spencerswagger/jinliang/internal/catalog"
 	"github.com/spencerswagger/jinliang/internal/dsn"
+	"github.com/spencerswagger/jinliang/internal/mysqlsource"
 	"github.com/spencerswagger/jinliang/internal/source"
 )
+
+func openSourceForTest(t *testing.T) (*mysqlsource.Source, error) {
+	t.Helper()
+	// 用**同一个库**：这个用例只验「同一份数据两侧指纹相等」，跨库比对会变成
+	// 「表不存在」而不是算法问题。
+	raw := strings.TrimSpace(os.Getenv("JINLIANG_TEST_MYSQL_DSN"))
+	if raw == "" {
+		return nil, fmt.Errorf("缺少 JINLIANG_TEST_MYSQL_DSN")
+	}
+	return mysqlsource.Open(context.Background(), raw)
+}
 
 func openSink(t *testing.T, mutate func(*Options)) *Sink {
 	t.Helper()
@@ -665,5 +678,140 @@ func TestIntegrationReadLease(t *testing.T) {
 	h, err = ReadLease(ctx, s.ep, s.opt.JobKey)
 	if err != nil || !h.Exists || h.InstanceID != s.opt.InstanceID {
 		t.Fatalf("ReadLease = %+v err=%v", h, err)
+	}
+}
+
+// staged_phases 的 ack 前提：位点没落盘就不能 ack（否则源端会清掉还能重放的流水）。
+// 这条覆盖「含 DDL 的批次有三个提交点」里最危险的那种顺序。
+func TestIntegrationPositionDurableGatesAck(t *testing.T) {
+	ctx := context.Background()
+	s := openSink(t, func(o *Options) { o.JobKey = "itdur00001" })
+	t.Cleanup(func() {
+		_, _ = s.db.ExecContext(context.Background(), "DELETE FROM `_jl_meta` WHERE job_key = ?", s.opt.JobKey)
+	})
+
+	if s.PositionDurability() != "staged_phases" {
+		t.Fatalf("MySQL 目标端必须是 staged_phases，拿到 %q", s.PositionDurability())
+	}
+	// 还没写过任何位点：不是 durable（behind：再等等；不是 different：不用停）。
+	if st, err := s.PositionDurable(ctx, "mysql:v1:file=b.000001;pos=1;coord=mysql_file_pos"); err != nil || st != PositionBehind {
+		t.Fatalf("没有位点时应 behind，拿到 %v err=%v", st, err)
+	}
+
+	// 造一张表并写入一批，位点随数据落盘 → 该位点 durable。
+	cat := source.Catalog{Tables: []source.Table{{
+		TableRef: source.TableRef{Table: "jl_b3_orders"},
+		Columns: []source.Column{
+			{Name: "id", Type: "int", Nullable: false},
+			{Name: "note", Type: "varchar(64)", Nullable: true},
+		},
+		PrimaryKey:  []string{"id"},
+		HasStablePK: true,
+	}}}
+	dropTable(t, s, "jl_b3_orders")
+	if _, err := s.EnsureSchema(ctx, cat); err != nil {
+		t.Fatalf("建表: %v", err)
+	}
+	defer dropTable(t, s, "jl_b3_orders")
+
+	want := "mysql:v1:file=binlog.000009;pos=900;coord=mysql_file_pos"
+	batch := insertBatch("jl_b3_orders", [][]any{{int64(1), "x"}}, want)
+	if err := s.Apply(ctx, batch, posOf(t, want)); err != nil {
+		t.Fatalf("写入: %v", err)
+	}
+	if st, err := s.PositionDurable(ctx, want); err != nil || st != PositionDurable {
+		t.Fatalf("位点应已落盘: %v err=%v", st, err)
+	}
+	// 期望一个「不是库里的值」→ different（位点被改过/回退，必须停）。
+	if st, _ := s.PositionDurable(ctx, "mysql:v1:file=binlog.000009;pos=9999;coord=mysql_file_pos"); st != PositionDifferent {
+		t.Fatalf("不同的位点应报 different，拿到 %v", st)
+	}
+}
+
+// 含 DDL 的批次崩在「DDL 已执行、新位点未写」时：位点停在旧值 → ack 必须被拒。
+func TestIntegrationDDLBatchKeepsAckAtOldPosition(t *testing.T) {
+	ctx := context.Background()
+	s := openSink(t, func(o *Options) { o.JobKey = "itdur00002" })
+	t.Cleanup(func() {
+		_, _ = s.db.ExecContext(context.Background(), "DELETE FROM `_jl_meta` WHERE job_key = ?", s.opt.JobKey)
+	})
+	dropTable(t, s, "jl_b3_orders")
+	if _, err := s.EnsureSchema(ctx, ordersCatalog()); err != nil {
+		t.Fatalf("建表: %v", err)
+	}
+	defer dropTable(t, s, "jl_b3_orders")
+
+	old := "mysql:v1:file=binlog.000009;pos=100;coord=mysql_file_pos"
+	if err := s.Apply(ctx, insertBatch("jl_b3_orders", [][]any{{int64(1), "x"}}, old), posOf(t, old)); err != nil {
+		t.Fatalf("基线写入: %v", err)
+	}
+
+	// 含 DDL 且 DDL 被白名单拒绝 → 数据已落、DDL 没执行、新位点没写。
+	newPos := "mysql:v1:file=binlog.000009;pos=200;coord=mysql_file_pos"
+	batch := []source.Event{
+		{Kind: source.EvBegin, TxID: "t1"},
+		{Kind: source.EvInsert, TxID: "t1", Table: source.TableRef{Table: "jl_b3_orders"},
+			New:      source.Row{Table: source.TableRef{Table: "jl_b3_orders"}, Values: []source.Value{{Kind: source.KindInt, I: 2}, {Kind: source.KindString, S: "y"}}},
+			Relation: relationPtr("jl_b3_orders")},
+		{Kind: source.EvDDL, TxID: "t2", DDL: "DROP TABLE `jl_b3_orders`"},
+		{Kind: source.EvCommit, TxID: "t2"},
+	}
+	if err := s.Apply(ctx, batch, posOf(t, newPos)); err == nil {
+		t.Fatal("DROP TABLE 不在白名单，必须报错")
+	}
+	if st, _ := s.PositionDurable(ctx, newPos); st == PositionDurable {
+		t.Fatal("DDL 失败时新位点不能是 durable（否则引擎会 ack，源端随后清掉流水）")
+	}
+	if st, err := s.PositionDurable(ctx, old); err != nil || st != PositionDurable {
+		t.Fatalf("旧位点仍应 durable（ack 只能停在这里）: %v err=%v", st, err)
+	}
+}
+
+// 指纹必须**同端可比**：同一份数据，MySQL 源的指纹与 MySQL 目标的指纹要相等
+// （共用 internal/mysqlcanon）。跨引擎则不可比——用 Scope 判定，绝不硬比。
+func TestIntegrationFingerprintComparableWithinMySQL(t *testing.T) {
+	ctx := context.Background()
+	sink := openSink(t, func(o *Options) { o.JobKey = "itfp000001" })
+	table := "jl_fp_same"
+	dropTable(t, sink, table)
+	cat := source.Catalog{Tables: []source.Table{{
+		TableRef: source.TableRef{Table: table},
+		Columns: []source.Column{
+			{Name: "id", Type: "int", Nullable: false},
+			{Name: "note", Type: "varchar(32)", Nullable: true},
+		},
+		PrimaryKey:  []string{"id"},
+		HasStablePK: true,
+	}}}
+	if _, err := sink.EnsureSchema(ctx, cat); err != nil {
+		t.Fatalf("建表: %v", err)
+	}
+	defer dropTable(t, sink, table)
+	if err := sink.Apply(ctx, insertBatch(table, [][]any{{int64(1), "a"}, {int64(2), "b"}},
+		"mysql:v1:file=b.000001;pos=10;coord=mysql_file_pos"), posOf(t, "mysql:v1:file=b.000001;pos=10;coord=mysql_file_pos")); err != nil {
+		t.Fatalf("写入: %v", err)
+	}
+	dstFP, err := sink.Fingerprint(ctx, source.TableRef{Table: table})
+	if err != nil {
+		t.Fatalf("目标端指纹: %v", err)
+	}
+	if sink.FingerprintScope() != "mysql-canon-v1" {
+		t.Fatalf("目标端 Scope = %q", sink.FingerprintScope())
+	}
+
+	// 源端：同一个库（同一个 MySQL 实例）上算同一张表的指纹，必须与目标端相等。
+	src, err := openSourceForTest(t)
+	if err != nil {
+		t.Skipf("没有源端 DSN，跳过跨端比对: %v", err)
+	}
+	srcFP, err := src.Fingerprint(ctx, source.TableRef{Table: table})
+	if err != nil {
+		t.Fatalf("源端指纹: %v", err)
+	}
+	if srcFP != dstFP {
+		t.Fatalf("同一份数据的源/目标指纹必须相等（同一套规范编码）:\n 源 %s\n 目标 %s", srcFP, dstFP)
+	}
+	if src.FingerprintScope() != sink.FingerprintScope() {
+		t.Fatalf("Scope 不一致就不能比: %q vs %q", src.FingerprintScope(), sink.FingerprintScope())
 	}
 }

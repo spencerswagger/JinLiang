@@ -10,6 +10,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -55,6 +56,10 @@ type Source struct {
 	MaxTxEvents int
 
 	lastNote SnapshotNote
+
+	// lastCommit 是「下游已经成功处理完的最后一笔事务位点」——引擎的
+	// SafeAckPoint 语义（MySQL 没有服务端 ack，但这个值仍要能读到）。
+	lastCommit atomic.Value // Position
 }
 
 // Open builds a Source from a DSN (mysql://user:pass@host:3306/db or the
@@ -319,6 +324,8 @@ func (s *Source) Stream(ctx context.Context, from source.Position, handler sourc
 				return err
 			}
 		}
+		// 整笔事务都交付成功后才算「已提交」：这正是 ack 的安全点。
+		s.markCommitted(tx.Commit)
 		return nil
 	})
 	asm.Collations = s.loadCollations(ctx)
