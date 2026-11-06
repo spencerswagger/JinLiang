@@ -999,7 +999,15 @@ func TestDDLRenameIsReported(t *testing.T) {
 	if err == nil {
 		t.Fatal("列改名必须报错")
 	}
-	if !strings.Contains(err.Error(), "a → 现 b") && !strings.Contains(err.Error(), "→ 现 b") {
+	// 明细里必须有「原来那一列」的名字；同时新列也要出现（否则用户不知道改成了什么）
+	if !strings.Contains(err.Error(), "原 a 已不存在") || !strings.Contains(err.Error(), "新增 b") {
 		t.Fatalf("错误里要带上的新旧列名：%v", err)
+	}
+	var sd *pgsink.SchemaDriftError
+	if !errors.As(err, &sd) {
+		t.Fatalf("应返回 SchemaDriftError（第③步要按类型降级成只暂停该表），得到 %T", err)
+	}
+	if sd.Reason() != pgsink.PauseReasonSchemaDrift {
+		t.Fatalf("原因码应为 %q，得到 %q", pgsink.PauseReasonSchemaDrift, sd.Reason())
 	}
 }

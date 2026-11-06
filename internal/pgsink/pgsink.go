@@ -1043,7 +1043,9 @@ func (s *Sink) alignRelationTx(ctx context.Context, tx pgx.Tx, ev source.Event) 
 	case sameNames && sameTypes:
 		return nil // 真的没变
 	case keptAll && sameTypes:
-		// 原有列都还在、类型也没变——只可能是**追加了新列**：继续走对齐。
+		// 原有列都还在、类型也没变——可能是**追加了新列**，也可能是**列序变化**
+		//（后者 sameNames=false 但一列都不用加，只需按 Relation 顺序重建缓存）。
+		// 两种情况都走这里：对齐循环会跳过已存在的列，只补新列。
 		_ = nameDiff
 	case sameNames && !sameTypes:
 		// 改类型：本版**不跟随**（改窄会截断、改宽会静默变更语义）。
@@ -1051,27 +1053,33 @@ func (s *Sink) alignRelationTx(ctx context.Context, tx pgx.Tx, ev source.Event) 
 		// 在那之前先响亮拒绝，别让它安静写错。
 		return &TypeChangedError{Table: ev.Table.Table, Detail: typeDiff}
 	case !keptAll:
-		return fmt.Errorf("源端表 %s 的列发生变化（改名/删列），本版不跟随：%s。"+
-			"你能做什么：1) 手工把目标表的列改成与源端一致后重跑（位点不动）；"+
-			"2) 或把该表移出同步范围。风险：结构不一致时继续写会让数据与列错位", ev.Table.Table,
-			nameDiffText(ti, ev.Relation))
+		return &SchemaDriftError{Table: ev.Table.Table, Detail: nameDiff}
 	}
 
 	var added []string
+	if len(ev.Relation.Columns) > len(ti.cols) {
+		// lock_timeout 是**事务级**设置：设一次就够（原来写在每列循环里，幂等但看着像每列一个）。
+		// ADD COLUMN 在数据事务内部执行会拿 ACCESS EXCLUSIVE 并持有到提交：这一批期间
+		// 目标表对所有读写都不可见（verify 在读、别的任务在写都会被挡）。短超时让它
+		// **快速失败并说清**，而不是排队把后面批次一起堵住。这个代价只在「Relation 真的变列」时付。
+		if _, err := tx.Exec(ctx, "SET LOCAL lock_timeout = '3s'"); err != nil {
+			return fmt.Errorf("设置 lock_timeout 失败: %w", err)
+		}
+	}
 	for _, c := range ev.Relation.Columns {
 		if _, ok := ti.colIndex[c.Name]; ok {
 			continue
 		}
-		// ADD COLUMN 在**数据事务内部**执行会拿 ACCESS EXCLUSIVE 并持有到提交：
-		// 这一批对齐期间目标表对所有读写都不可见（verify 在读、别的任务在写都会被挡）。
-		// 设一个短的 lock_timeout：别人占着表时**快速失败并说清**，而不是排队把后面批次
-		// 一起堵住。这个代价只在「Relation 真的变列」的那一次付。
-		if _, err := tx.Exec(ctx, "SET LOCAL lock_timeout = '3s'"); err != nil {
-			return fmt.Errorf("设置 lock_timeout 失败: %w", err)
-		}
 		stmt := fmt.Sprintf("ALTER TABLE %s ADD COLUMN IF NOT EXISTS %s %s",
 			pgwire.Qualified(ev.Table.Schema, ev.Table.Table), pgwire.Quote(c.Name), c.Type)
 		if _, err := tx.Exec(ctx, stmt); err != nil {
+			var pgErr *pgconn.PgError
+			if errors.As(err, &pgErr) && pgErr.Code == "55P03" {
+				// 锁等不到 ≠ 数据有问题。值班最容易把它归到「数据坏了」。
+				return fmt.Errorf("目标表 %s 被别的会话占用，等锁超时（常见：verify 正在全表扫描）：%w。"+
+					"你能做什么：等那个操作结束再重跑（位点未推进，不会重复搬）。"+
+					"风险：没有（本次这一批没有写入）", ev.Table.Table, err)
+			}
 			return fmt.Errorf("源端新增了列 %s，但在目标表 %s 上补列失败: %w", c.Name, ev.Table.Table, err)
 		}
 		added = append(added, c.Name)
@@ -1140,11 +1148,10 @@ func relationMatches(ti *tableInfo, rel *source.Table) (sameNames, sameTypes, ke
 			nparts = append(nparts, fmt.Sprintf("第 %d 列 原 %s → 现 %s", i+1, name, rel.Columns[i].Name))
 		}
 	}
-	if len(rel.Columns) != len(ti.cols) {
-		for _, c := range rel.Columns {
-			if _, ok := ti.colIndex[c.Name]; !ok {
-				nparts = append(nparts, "新增 "+c.Name)
-			}
+	// 「新增」与列数是否变化无关：改名时也是「一个没了、一个多了」，两边都要说清。
+	for _, c := range rel.Columns {
+		if _, ok := ti.colIndex[c.Name]; !ok {
+			nparts = append(nparts, "新增 "+c.Name)
 		}
 	}
 	typeDiff = strings.Join(tparts, "；")
@@ -1152,11 +1159,44 @@ func relationMatches(ti *tableInfo, rel *source.Table) (sameNames, sameTypes, ke
 	return sameNames, sameTypes, keptAll, typeDiff, nameDiff
 }
 
+// 暂停原因码：**给机器判等用的稳定值**，不是给用户看的中文。
+// 第③步的 paused_tables、恢复入口与 doctor 都要按它判等；用 message 判断会在
+// 改一次文案之后全部失效（今晚已经因为「按字符串判断」返工过）。
+const (
+	PauseReasonTypeChanged = "type_changed" // 源端改了列类型
+	PauseReasonSchemaDrift = "schema_drift" // 改名 / 删列
+)
+
 // TypeChangedError 表示源端改了列类型——本版不跟随（会截断或静默变更语义）。
 // 单独成类型，方便第③步把它降级成「只暂停这张表」而不是整个任务。
 type TypeChangedError struct {
 	Table  string
 	Detail string
+}
+
+// Reason 实现 PausableError：第③步按它记 paused_tables 的原因码。
+func (e *TypeChangedError) Reason() string { return PauseReasonTypeChanged }
+
+// SchemaDriftError 表示列被改名或删掉（列数可能没变）。
+type SchemaDriftError struct {
+	Table  string
+	Detail string
+}
+
+func (e *SchemaDriftError) Error() string {
+	return fmt.Sprintf("源端表 %s 的列发生变化（改名/删列），本版不跟随：%s。"+
+		"你能做什么：1) 手工把目标表的列改成与源端一致后重跑（位点不动）；"+
+		"2) 或把该表移出同步范围。风险：结构不一致时继续写会让数据与列错位", e.Table, e.Detail)
+}
+
+// Reason 实现 PausableError。
+func (e *SchemaDriftError) Reason() string { return PauseReasonSchemaDrift }
+
+// PausableError 是「这张表不能继续跟，但其它表可以继续」的错误。
+// 第③步用它把「一张表的 DDL」降级成「只暂停这张表」，而不是打死整个任务。
+type PausableError interface {
+	error
+	Reason() string
 }
 
 func (e *TypeChangedError) Error() string {
