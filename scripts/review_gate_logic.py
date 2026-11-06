@@ -46,7 +46,7 @@ def compute_anchor(review, head, pr_files, cwd="."):
     """
     out = {"ancestor": False, "touched": [], "production_touched": [],
            "test_touched": [], "test_disallowed": [], "pr_files_missing": False,
-           "compare_files_missing": False, "error": ""}
+           "compare_files_missing": False, "compare_files_truncated": False, "error": ""}
     if not review or not head:
         out["error"] = "缺少 review 或 head"
         return out
@@ -76,6 +76,11 @@ def compute_anchor(review, head, pr_files, cwd="."):
         # git diff 成功但没有文件（空 merge 提交）：默认拒绝而不是猜「只 merge 了 main」。
         # /compare 300 上限截断也会表现成「文件清单为空」，同类风险一并堵。
         out["compare_files_missing"] = True
+        return out
+    if len(changed) >= 300:
+        # /compare 上限 300 且不分页；git diff 没有上限，但差异大到 300 时
+        # 仍按「可能被截断」拒绝，绝不把「交集为空」当「只 merge 了 main」。
+        out["compare_files_truncated"] = True
         return out
     touched = sorted(changed & owned)
     out["touched"] = touched
@@ -136,6 +141,11 @@ def decide_review(pr, pr2, reviews, anchor=None):
                 "review..head 的文件清单为空（可能是空 merge 提交，或文件清单被截断）；"
                 "默认拒绝而不是放行"
             ), "compare_files_missing"
+        if anchor.get("compare_files_truncated"):
+            return False, (
+                "review..head 的差异文件数 ≥300（/compare 上限且不分页，列表可能被截断）；"
+                "默认拒绝而不是放行"
+            ), "compare_files_truncated"
         if anchor.get("error"):
             return False, f"锚定计算失败：{anchor['error']}；按纪律拒绝", "anchor_error"
         if not anchor.get("ancestor"):
@@ -200,10 +210,10 @@ def selftest():
     pr = {"head": {"sha": head}}
     pr2 = {"head": {"sha": head}}
 
-    def anchor(production=None, test=None, disallowed=None, touched=None, missing=False, ancestor=True, no_changes=False):
+    def anchor(production=None, test=None, disallowed=None, touched=None, missing=False, ancestor=True, no_changes=False, truncated=False):
         return {
             "ancestor": ancestor, "pr_files_missing": missing,
-            "compare_files_missing": no_changes,
+            "compare_files_missing": no_changes, "compare_files_truncated": truncated,
             "production_touched": production or [], "test_touched": test or [],
             "test_disallowed": disallowed or [], "touched": touched or [],
         }
@@ -228,6 +238,8 @@ def selftest():
          anchor(ancestor=False), False, "head_mismatch"),
         ("missing-compare-files", {"body": "**可合并（必改 0）**", "state": "COMMENTED", "commit_id": old},
          anchor(no_changes=True), False, "compare_files_missing"),
+        ("compare-files-truncated", {"body": "**可合并（必改 0）**", "state": "COMMENTED", "commit_id": old},
+         anchor(truncated=True), False, "compare_files_truncated"),
         ("pr-files-missing", {"body": "**可合并（必改 0）**", "state": "COMMENTED", "commit_id": old},
          anchor(missing=True, ancestor=False), False, "pr_files_missing"),
         ("approval-conclusion", {"body": "结论：可合并", "state": "COMMENTED", "commit_id": head}, None, True, "pass"),
