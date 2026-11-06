@@ -1022,6 +1022,11 @@ func (s *Sink) applyDDLTx(ctx context.Context, tx pgx.Tx, ev source.Event) error
 	if stmt == "" {
 		return nil
 	}
+	// 纯注释（`-- …` 且没有换行、或只有注释）剥完是空的：没有 SQL 可执行，
+	// 别拿它去撞数据库（也不该因此判成破坏性语句）。
+	if strings.TrimSpace(stripLeadingComments(stmt)) == "" {
+		return nil
+	}
 	if err := checkDDLAllowed(stmt, ev.Table.Schema, s.opt.Schema); err != nil {
 		return err
 	}
@@ -1037,7 +1042,8 @@ func (s *Sink) applyDDLTx(ctx context.Context, tx pgx.Tx, ev source.Event) error
 	}
 	if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(stripLeadingComments(stmt))), "DROP INDEX") {
 		// 不删数据，但索引名是 **schema 级**的：可能删掉另一张表上（别的任务建的）同名索引。
-		log.Printf("执行 DROP INDEX（索引名是 schema 级的，可能影响别的表）：%s", stmt)
+		log.Printf("执行 DROP INDEX（索引名是 schema 级的，可能影响别的表；"+
+			"若这条索引由别的任务/人工维护，删掉后**不会自动重建**，后果通常要等查询变慢才暴露）：%s", stmt)
 		if s.opt.OnDDLSkipped != nil {
 			s.opt.OnDDLSkipped("DROP INDEX：" + stmt)
 		}
