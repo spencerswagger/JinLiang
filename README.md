@@ -110,18 +110,28 @@ JINLIANG_TEST_PG_DSN=... scripts/bench.sh            # 报告模式
 JINLIANG_TEST_PG_DSN=... scripts/bench.sh --enforce  # 门禁：任一项不达标退出 1
 ```
 
-本机基线（AMD Ryzen 5 1500X / 8 vCPU / Linux 5.15）：快照 **82,501 行/s**
+本机基线（AMD Ryzen 5 1500X / 8 vCPU / Linux 5.15）：快照 **83,052 行/s**
 （`BulkApply`：临时落地区 → COPY → `INSERT…SELECT` → 块记账 + 位点同事务）、
-增量 apply 10,265 行/s、p99 **75.15 ms**、空转 **15.4 MB**、冷启 **29 ms**、二进制 **19.13 MB**。
-20k 行/s 的门禁量的是 **`BulkApply` 产品路径**；裸 `COPY`（约 150k 行/s）只是目标端
+增量 apply **56,886 行/s**（多行批量 upsert）、p99 **16.99 ms**、空转 **15.8 MB**、
+冷启 **29 ms**、发布二进制 **19.21 MB**。
+20k 行/s 的门禁量的是 **`BulkApply` 产品路径**；裸 `COPY`（约 132k 行/s）只是目标端
 上限参考，不进门禁——否则 `BulkApply` 慢 10 倍也能 PASS。
-`bulk_apply_p99_ms`（本机 103 ms/块）**只记录、不门禁**：块级 p99 受块大小影响；
+`bulk_apply_p99_ms`（本机 108 ms/块）**只记录、不门禁**：块级 p99 受块大小影响；
 门禁的 p99 是**增量批事务**的 p99。
 
 口径三句（复现时别理解错）：快照/增量的吞吐与 p99 都是 **3 次取中位**（原始三次在 JSON 的 `bulk_runs`/`apply_runs`）；p99 的样本数 = **批次数（200）**，不是单行延迟；
 空转内存 = `ps` 的 **RSS**，不是 Go heap；冷启 = 进程 exec → `/api/health` 返回 200。
-增量 apply 当前逐行 `Exec`（500 次/事务），约 10k 行/s，是已知差距——基线把它钉住，
-避免以后悄悄变慢。
+
+### 二进制体积
+
+发布构建 **19–20 MB**（`CGO_ENABLED=0 go build -trimpath -ldflags "-s -w"`）；
+**debug 构建约 29.4 MB**——差的 ~9.3 MB 是 DWARF + 符号表，不是预算问题。
+`scripts/check_binary_size.sh` 现在会拒绝带符号表的产物（`--from-file` 可校验现成文件），
+避免把「构建方式不对」误判成「预算不够」。主要占用（`-w` 构建上 `go tool nm` 归因，
+含内联/符号别名误差）：`modernc.org/sqlite` ~6.8 MB、`pgx/pgtype` ~3 MB、
+`crypto/tls+x509` ~1.6 MB、std `runtime/net/http` ~2.5 MB、业务代码 ~1.5 MB、
+WebUI embed ~0.1 MB（htmx 50 KB + 模板/CSS 约 50 KB）。sqlite/pgx/TLS 都是必需项，
+`-s -w`/`-trimpath` 已用；`-tags osusergo,netgo` 实测体积不变。
 
 ## 自检
 
