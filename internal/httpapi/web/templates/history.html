@@ -13,7 +13,9 @@
         <td><a href="/jobs/{{.Run.JobID}}">{{.Job}}</a></td>
 <td>{{runState .Run}}{{if .Run.Stub}} <span class="badge stub">桩</span>{{end}}{{if eq .Run.Kind "verify"}} <span class="badge">校验</span>{{end}}</td>
         <td class="num">{{.Run.RowsDone}}</td>
-        <td>{{dash .Run.LastError}}</td>
+        <!-- last_error 现在带错误码与下一步（E1013 那条约 250–300 字符），全文直出会把行撑高；
+             正文截到 120 字，全文放 title（悬停可看全）。属性里的引号由 html/template 转义。 -->
+        <td title="{{dash .Run.LastError}}">{{clip (dash .Run.LastError) 120}}</td>
       </tr>
     {{end}}
     </tbody>

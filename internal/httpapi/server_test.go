@@ -1657,3 +1657,74 @@ func TestAppJSProgressNeverGoesBackwards(t *testing.T) {
 		t.Fatal("未知 finish_reason 必须原样显示（`: fr` 兜底），不能静默成「已完成」")
 	}
 }
+
+// last_error 现在带错误码与下一步（E1013 那条约 250–300 字符）。历史页与详情页的表格
+// 必须「正文截断 + 全文进 title」：全文直出会把行撑高，但只截不留全又会让人查不到原因。
+func TestLastErrorIsClippedWithFullTitle(t *testing.T) {
+	ts, store := newTestServer(t)
+	token := setupAdmin(t, ts)
+	conn := createPGConn(t, ts, token, "src")
+	code, created := doJSON(t, http.MethodPost, ts.URL+"/api/jobs", token, map[string]any{
+		"name": "clip-job", "source_id": conn, "target_id": conn,
+		"spec": map[string]any{
+			"source":  map[string]any{"scope": map[string]any{"schema": "public", "include": []string{"orders"}}},
+			"target":  map[string]any{"schema": "report"},
+			"mode":    map[string]any{"frequency": "once"},
+			"content": map[string]any{"tables": map[string]any{"orders": map[string]any{}}},
+		},
+	})
+	if code != http.StatusCreated {
+		t.Fatalf("create job = %d %v", code, created)
+	}
+	jobID, _ := created["id"].(string)
+
+	long := "[E1013] 缺这个 schema、表或列：relation \"x\" does not exist 下一步：" +
+		strings.Repeat("先在源端确认表名再回任务页重跑预检。", 12) // 远超 120 字，且含引号
+	run, err := store.StartRun(context.Background(), jobID, state.Preflight, control.RunKindSync)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.FinishRun(context.Background(), run.ID, state.Failed, long, 1, control.FinishFailed); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, page := range []string{"/jobs/" + jobID, "/history"} {
+		res, err := authorizedGet(t, ts.URL+page, token)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body := res
+		// ① 表格正文必须是截断后的样子（clip 会加省略号）——判据是「单元格文本」，
+		//    不是整页：全文出现在 title 属性里是允许且必要的。
+		if !strings.Contains(body, "…</td>") {
+			t.Fatalf("%s 的表格正文没有截断（应出现 clip 的省略号）", page)
+		}
+		// ② 全文必须在 title 里（悬停可看全），且 title 以错误码开头
+		if !strings.Contains(body, "先在源端确认表名再回任务页重跑预检。") {
+			t.Fatalf("%s 的 title 里没有全文：用户查不到原因", page)
+		}
+		if !strings.Contains(body, "title=\"[E1013]") {
+			t.Fatalf("%s 缺少以错误码开头的 title 属性", page)
+		}
+	}
+}
+
+// authorizedGet 用 Bearer token 取一个页面（页面也接受 Authorization 头）。
+func authorizedGet(t *testing.T, url, token string) (string, error) {
+	t.Helper()
+	req, _ := http.NewRequest(http.MethodGet, url, nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer res.Body.Close()
+	b, err := io.ReadAll(res.Body)
+	if err != nil {
+		return "", err
+	}
+	if res.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("%s = %d", url, res.StatusCode)
+	}
+	return string(b), nil
+}
