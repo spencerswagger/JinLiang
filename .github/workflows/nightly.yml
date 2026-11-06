@@ -131,7 +131,8 @@ jobs:
         run: |
           set -e
           go test -tags=integration ./internal/mysqlsource
-          go test -tags=integration ./internal/engine ./internal/verify ./internal/gc ./internal/doctor ./internal/remedy
+          go test -tags=integration ./internal/mysqlsink
+          go test -tags=integration ./internal/engine ./internal/pgsink ./internal/verify ./internal/gc ./internal/doctor ./internal/remedy
 
   bench:
     runs-on: ubuntu-latest
