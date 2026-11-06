@@ -22,6 +22,7 @@ import (
 	"github.com/spencerswagger/jinliang/internal/dsn"
 	"github.com/spencerswagger/jinliang/internal/engine"
 	"github.com/spencerswagger/jinliang/internal/pgsink"
+	"github.com/spencerswagger/jinliang/internal/source"
 )
 
 func dsns(t *testing.T) (src, dst string) {
@@ -547,5 +548,79 @@ func TestTinyTableWithoutStatsIsAllowed(t *testing.T) {
 	}
 	if n != 3 {
 		t.Fatalf("小表应整表搬过去，得到 %d 行", n)
+	}
+}
+
+// DDL 第①步：源端的 DDL 必须真的落到目标端（之前 `pgsink.Apply` 直接跳过 EvDDL，
+// 而引擎里也没有处理 DDL 的代码 → DDL 从来没搬过）。
+// 同时钉住幂等：同一条 DDL 再来一次（崩溃重放）不许失败。
+func TestDDLIsAppliedToTargetIdempotently(t *testing.T) {
+	srcDSN, dstDSN := dsns(t)
+	srcDB := mustConn(t, srcDSN)
+	dstDB := mustConn(t, dstDSN)
+	table := "ddl_follow"
+	ctx := context.Background()
+
+	exec(t, srcDB, "DROP TABLE IF EXISTS "+table)
+	exec(t, srcDB, "CREATE TABLE "+table+" (id bigint PRIMARY KEY, a text)")
+	exec(t, dstDB, "DROP TABLE IF EXISTS "+table)
+	exec(t, dstDB, "DROP TABLE IF EXISTS _jl_meta, _jl_chunk, _jl_lease, _jl_object, _jl_instance")
+
+	ep, err := dsn.Parse(dstDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rel := source.Table{
+		TableRef:   source.TableRef{Schema: "public", Table: table},
+		Columns:    []source.Column{{Name: "id", Type: "bigint"}, {Name: "a", Type: "text"}},
+		PrimaryKey: []string{"id"},
+	}
+	s, err := pgsink.Open(ctx, pgsink.Options{
+		Target: ep, JobKey: "ddlfollow", JobName: "ddl-follow", InstanceID: "it-ddl",
+		Schema: "public", OnExists: "append", Catalog: source.Catalog{Tables: []source.Table{rel}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if _, err := s.EnsureSchema(ctx, source.Catalog{Tables: []source.Table{rel}}); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+
+	ref := source.TableRef{Schema: "public", Table: table}
+	ddl := []source.Event{
+		{Kind: source.EvDDL, Table: ref, Relation: &rel,
+			DDL: "ALTER TABLE public." + table + " ADD COLUMN b text"},
+		{Kind: source.EvDDL, Table: ref, Relation: &rel,
+			DDL: "CREATE INDEX " + table + "_a_idx ON public." + table + " (a)"},
+		{Kind: source.EvCommit},
+	}
+	if err := s.Apply(ctx, ddl, nil); err != nil {
+		t.Fatalf("DDL 应被搬到目标端：%v", err)
+	}
+
+	// 1) 列 b 真的在
+	var hasCol bool
+	if err := dstDB.QueryRow(ctx, `SELECT EXISTS (
+		SELECT 1 FROM information_schema.columns
+		WHERE table_schema='public' AND table_name=$1 AND column_name='b')`, table).Scan(&hasCol); err != nil {
+		t.Fatal(err)
+	}
+	if !hasCol {
+		t.Fatal("源端加了列 b，目标端没有——DDL 没跟随")
+	}
+	// 2) 索引真的在（以前这种情况是**完全静默**）
+	var hasIdx bool
+	if err := dstDB.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname='public' AND indexname=$1)`,
+		table+"_a_idx").Scan(&hasIdx); err != nil {
+		t.Fatal(err)
+	}
+	if !hasIdx {
+		t.Fatal("源端建了索引，目标端没有——建索引仍然被静默忽略")
+	}
+	// 3) 幂等：同一条 DDL 再来一次（崩溃重放）不许失败
+	if err := s.Apply(ctx, ddl, nil); err != nil {
+		t.Fatalf("重放同一条 DDL 应幂等跳过（42701/42P07），得到：%v", err)
 	}
 }

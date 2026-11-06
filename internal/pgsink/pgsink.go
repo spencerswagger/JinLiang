@@ -899,8 +899,16 @@ func (s *Sink) Apply(ctx context.Context, evs []source.Event, pos source.Positio
 			if _, err := tx.Exec(ctx, "TRUNCATE TABLE "+pgwire.Qualified(ev.Table.Schema, ev.Table.Table)); err != nil {
 				return fmt.Errorf("截断目标表 %s 失败: %w", ev.Table.Table, err)
 			}
+		case source.EvDDL:
+			// **DDL 必须在这里执行**。之前这行注释写的是「由引擎处理」——而引擎里
+			// 根本没有 EvDDL 的处理代码（`grep EvDDL internal/engine` 为空），
+			// 于是源端 DDL 从来没搬到目标端：加列后整批行写失败、建索引完全静默、
+			// 改类型下次 EnsureSchema 撞 ErrTypeMismatch 把整个任务打死。
+			if err := s.applyDDLTx(ctx, tx, ev); err != nil {
+				return err
+			}
 		default:
-			// Begin/Commit/Heartbeat/DDL 由引擎处理，不落 SQL
+			// Begin/Commit/Heartbeat 由引擎处理，不落 SQL
 		}
 		i++
 	}
@@ -910,6 +918,48 @@ func (s *Sink) Apply(ctx context.Context, evs []source.Event, pos source.Positio
 		}
 	}
 	return tx.Commit(ctx)
+}
+
+// applyDDLTx 在目标端执行源端的 DDL（原样执行 + 幂等跳过）。
+//
+// **为什么原样执行**：DDL 的语义（加列、建索引、改类型、约束）只有源端那条语句说得清；
+// 我们不去猜「它想干什么」，只负责把它落到目标端——猜错比不执行更危险。
+//
+// **幂等**：崩溃重放时同一条 DDL 会再来一次，撞上「已经存在」的 SQLSTATE 视为成功：
+// 42701 duplicate_column / 42P07 duplicate_table / 42710 duplicate_object /
+// 42P16 invalid_table_definition / 42723 duplicate_function
+func (s *Sink) applyDDLTx(ctx context.Context, tx pgx.Tx, ev source.Event) error {
+	stmt := strings.TrimSpace(ev.DDL)
+	if stmt == "" {
+		return nil
+	}
+	// 用 SAVEPOINT 包住：PostgreSQL 里一条语句失败会让**整个事务**进入 aborted 状态
+	//（25P02），不回到保存点就没法「跳过这条、继续下一条」——而重放时恰恰会遇到
+	// 「这条 DDL 已经执行过」。
+	if _, err := tx.Exec(ctx, "SAVEPOINT jl_ddl"); err != nil {
+		return fmt.Errorf("为 DDL 建保存点失败: %w", err)
+	}
+	if _, err := tx.Exec(ctx, stmt); err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) {
+			switch pgErr.Code {
+			case "42701", "42P07", "42710", "42P16", "42723":
+				if _, rerr := tx.Exec(ctx, "ROLLBACK TO SAVEPOINT jl_ddl"); rerr != nil {
+					return fmt.Errorf("回滚 DDL 保存点失败: %w", rerr)
+				}
+				return nil // 已经存在：重放时的正常情形
+			}
+		}
+		return fmt.Errorf("在目标端执行源端 DDL 失败（%s）: %w。"+
+			"你能做什么：1) 在目标端手工执行这条语句后重跑（位点不动，不需要重搬历史）；"+
+			"2) 如果这条 DDL 不该跟随到目标端，把对应对象排除出同步范围。"+
+			"风险：DDL 没跟随时两端结构不一致，之后写这批表会持续失败", stmt, err)
+	}
+	if _, err := tx.Exec(ctx, "RELEASE SAVEPOINT jl_ddl"); err != nil {
+		return fmt.Errorf("释放 DDL 保存点失败: %w", err)
+	}
+	log.Printf("已在目标端执行源端 DDL：%s", stmt)
+	return nil
 }
 
 // endsWithCommit reports whether this batch closes on a committed transaction.
