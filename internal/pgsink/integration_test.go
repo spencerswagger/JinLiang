@@ -355,3 +355,54 @@ func TestDedupeByPKKKeepsLast(t *testing.T) {
 		t.Fatalf("去重后应保留 (2,b) 与 (1,c) 且保持顺序: %#v", got)
 	}
 }
+
+// 整批失败时必须能把坏行定位出来（主键 + SQLSTATE），否则毒丸行会让整批永久失败、
+// 位点不动，而用户只看到「写入 t 失败（5 行）」——既没主键也没原因。
+func TestIntegrationBatchFailureLocatesBadRow(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	table := "jl_batch_poison"
+	cat := batchCatalog(table)
+	s := openSinkFor(t, cat, nil)
+	_, _ = s.conn.Exec(ctx, "DROP TABLE IF EXISTS public."+table)
+	// 手工建表并加一条 CHECK：id 必须为正。第 3 行故意给 -3。
+	if _, err := s.conn.Exec(ctx, "CREATE TABLE public."+table+
+		" (id bigint PRIMARY KEY, payload text, CONSTRAINT jl_positive CHECK (id > 0))"); err != nil {
+		t.Fatalf("建表: %v", err)
+	}
+	defer func() { _, _ = s.conn.Exec(ctx, "DROP TABLE IF EXISTS public."+table) }()
+	if _, err := s.EnsureSchema(ctx, cat); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+
+	mk := func(id string) source.Event {
+		return source.Event{Kind: source.EvInsert, TxID: "tx", Table: source.TableRef{Schema: "public", Table: table},
+			New: source.Row{Table: source.TableRef{Schema: "public", Table: table}, Values: []source.Value{
+				{Kind: source.KindString, S: id}, {Kind: source.KindString, S: "x"},
+			}},
+			Relation: relationOf(table)}
+	}
+	batch := []source.Event{
+		{Kind: source.EvBegin, TxID: "tx"},
+		mk("1"), mk("2"), mk("-3"), mk("4"), mk("5"),
+		{Kind: source.EvCommit, TxID: "tx"},
+	}
+	err := s.Apply(ctx, batch, testPosition{"postgres:v1:0/EE"})
+	if err == nil {
+		t.Fatal("违反 CHECK 的批次必须失败")
+	}
+	msg := err.Error()
+	for _, want := range []string{"id=-3", "23514", "3/5", "content.tables"} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("错误里应有 %q（主键/SQLSTATE/第几行/下一步），实际: %s", want, msg)
+		}
+	}
+	// 整批回滚：一行都不该落库，位点不动。
+	if n, err := s.Count(ctx, source.TableRef{Schema: "public", Table: table}); err != nil || n != 0 {
+		t.Fatalf("整批回滚后应 0 行，实际 %d（err=%v）", n, err)
+	}
+	if p, _ := s.Position(ctx); strings.Contains(p, "0/EE") {
+		t.Fatalf("失败时位点不能前进: %q", p)
+	}
+}

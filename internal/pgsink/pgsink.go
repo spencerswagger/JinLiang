@@ -13,6 +13,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"strconv"
 	"strings"
@@ -21,6 +22,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/spencerswagger/jinliang/internal/catalog"
 	"github.com/spencerswagger/jinliang/internal/dsn"
@@ -89,6 +91,8 @@ type Sink struct {
 	// ownerToken 让「同一个进程里的两个 Sink」也彼此可分（否则它们同 pid、
 	// 同 instance_id，第二个会把第一个的租约抢走）。
 	ownerToken string
+	// batchLimitOnce 让「批大小被参数上限钳制」只提示一次（每批都打会把日志刷满）。
+	batchLimitOnce sync.Once
 
 	// CountSource / FingerprintSource are injected by the engine so Verify can
 	// compare both sides without this package importing the source.
@@ -817,10 +821,8 @@ func (s *Sink) upsertBatchTx(ctx context.Context, tx pgx.Tx, evs []source.Event)
 	if ti == nil {
 		return fmt.Errorf("收到未知表 %s 的变更（发布里多了表？）", evs[0].Table.Table)
 	}
-	limit := s.opt.ApplyBatchRows
-	if limit <= 0 {
-		limit = DefaultApplyBatchRows
-	}
+	limit := effectiveBatchRows(s.opt.ApplyBatchRows, len(ti.cols))
+	s.noteBatchLimit(ti, limit)
 	for start := 0; start < len(evs); start += limit {
 		end := start + limit
 		if end > len(evs) {
@@ -854,10 +856,90 @@ func (s *Sink) execUpsertChunk(ctx context.Context, tx pgx.Tx, ti *tableInfo, ev
 			params = append(params, valueOf(ev.New.Values[i]))
 		}
 	}
-	if _, err := tx.Exec(ctx, q, params...); err != nil {
-		return fmt.Errorf("写入 %s 失败（%d 行，%d 列）: %w", ti.ref.Table, len(evs), len(ti.cols), err)
+	// 用 SAVEPOINT 包住这条批量语句：失败后事务会进入 aborted 状态（后续语句全 25P02），
+	// 只有回滚到这个保存点才能继续在同一条事务里逐行定位坏行。
+	sp, err := tx.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("建保存点失败: %w", err)
 	}
-	return nil
+	if _, err := sp.Exec(ctx, q, params...); err == nil {
+		if err := sp.Commit(ctx); err != nil {
+			return fmt.Errorf("提交保存点失败: %w", err)
+		}
+		return nil
+	} else {
+		if rbErr := sp.Rollback(ctx); rbErr != nil {
+			return fmt.Errorf("回滚保存点失败（%v），原始错误: %w", rbErr, err)
+		}
+		// 整批失败时**降级逐行重试一遍**，把坏行定位出来：
+		// 毒丸行（类型越界/约束冲突）会让整批永远失败、每轮重放都失败、位点不动，
+		// 而「写入 t 失败（500 行）」这种信息既没主键也没批次范围，用户无从下手。
+		// 正常路径仍是 500 行一次往返——慢的这一遍只发生在已经失败的时候。
+		return s.locateFailingRow(ctx, tx, ti, evs, err)
+	}
+}
+
+// locateFailingRow 逐行重试以找出坏行，报告主键与原始 SQLSTATE。
+func (s *Sink) locateFailingRow(ctx context.Context, tx pgx.Tx, ti *tableInfo, evs []source.Event, batchErr error) error {
+	for i, ev := range evs {
+		cols := quoteList(ti.cols)
+		q := fmt.Sprintf("INSERT INTO %s (%s) VALUES %s",
+			pgwire.Qualified(ti.ref.Schema, ti.ref.Table), cols, castedHoldersFor(ti, 1))
+		q += conflictClause(ti)
+		params := make([]any, 0, len(ti.cols))
+		for c := range ti.cols {
+			params = append(params, valueOf(ev.New.Values[c]))
+		}
+		rowSP, spErr := tx.Begin(ctx)
+		if spErr != nil {
+			return fmt.Errorf("建保存点失败: %w", spErr)
+		}
+		if _, err := rowSP.Exec(ctx, q, params...); err != nil {
+			_ = rowSP.Rollback(ctx)
+			if strings.Contains(err.Error(), "25P02") {
+				// 事务仍处于 aborted：说明保存点没起作用，把原错误带回去，别掩盖真相。
+				return fmt.Errorf("写入 %s 失败（%d 行，%d 列；无法在事务内逐行定位：%v）: %w",
+					ti.ref.Table, len(evs), len(ti.cols), err, batchErr)
+			}
+			return fmt.Errorf("写入 %s 失败：第 %d/%d 行（主键 %s）写不进去：%s。"+
+				"你能做的：① 修源端这一行的数据（或按约束补默认值）后重跑；"+
+				"② 该列不再同步就加进 content.tables.<表>.columns.exclude；"+
+				"③ 目标端约束本身不对就改目标表。风险：跳过这一行意味着目标端会缺一条数据，语义上只能靠你确认。"+
+				"（整批失败原因：%v）",
+				ti.ref.Table, i+1, len(evs), s.pkOf(ti, ev), describeSQLError(err), batchErr)
+		}
+		if err := rowSP.Commit(ctx); err != nil {
+			return fmt.Errorf("提交保存点失败: %w", err)
+		}
+	}
+	// 逐行都能过？说明是批次层面的问题（例如参数上限/锁超时），把原错误带回去。
+	return fmt.Errorf("写入 %s 失败（%d 行，%d 列，逐行重试却都能过：多半是批大小或锁的问题）: %w",
+		ti.ref.Table, len(evs), len(ti.cols), batchErr)
+}
+
+// pkOf 渲染主键值，用于错误定位。
+func (s *Sink) pkOf(ti *tableInfo, ev source.Event) string {
+	if !ti.hasPK || len(ti.pkIdx) == 0 {
+		return "无（表没有主键）"
+	}
+	parts := make([]string, 0, len(ti.pkIdx))
+	for i, idx := range ti.pkIdx {
+		var v any
+		if idx < len(ev.New.Values) {
+			v = valueOf(ev.New.Values[idx])
+		}
+		parts = append(parts, fmt.Sprintf("%s=%v", ti.pk[i], v))
+	}
+	return strings.Join(parts, ",")
+}
+
+// describeSQLError 把 Postgres 错误压成「SQLSTATE + 消息」，便于用户搜索与反馈。
+func describeSQLError(err error) string {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return fmt.Sprintf("SQLSTATE %s（%s）：%s", pgErr.Code, pgErr.ConstraintName, pgErr.Message)
+	}
+	return err.Error()
 }
 
 func (s *Sink) deleteTx(ctx context.Context, tx pgx.Tx, ev source.Event) error {
@@ -1109,12 +1191,58 @@ func quoteList(names []string) string {
 // PostgreSQL through the column's own input function (bytea/array/json included).
 func castedHolders(ti *tableInfo) string { return castedHoldersFor(ti, 1) }
 
+// maxBindParams 是 PostgreSQL 扩展协议的参数上限（协议规定的 uint16）。
+const maxBindParams = 65535
+
+// effectiveBatchRows 把「每批行数」夹到「参数总数不超过 65535」的范围内。
+//
+// 多行 upsert 的参数数 = 行数 × 列数：10 列的宽表配上 100000 行/批 → 100 万参数，
+// **每批必败、位点永不推进、任务永久卡死**，而报错跟数据毫无关系，用户根本无从下手。
+// 所以这里按列数反算上限，宁可每批少几行。
+func effectiveBatchRows(requested, cols int) int {
+	limit := requested
+	if limit <= 0 {
+		limit = DefaultApplyBatchRows
+	}
+	if cols <= 0 {
+		return limit
+	}
+	if max := maxBindParams / cols; limit > max {
+		if max < 1 {
+			max = 1 // 列数本身就超过上限：至少发一行，让错误指向「列太多」而不是「参数太多」
+		}
+		return max
+	}
+	return limit
+}
+
+// noteBatchLimit 把生效值打进日志（只在被钳制时打一次），让人一眼看出是配置问题。
+func (s *Sink) noteBatchLimit(ti *tableInfo, limit int) {
+	s.batchLimitOnce.Do(func() {
+		asked := s.opt.ApplyBatchRows
+		if asked <= 0 {
+			asked = DefaultApplyBatchRows
+		}
+		if limit == asked {
+			return
+		}
+		log.Printf("每批行数从 %d 降到 %d：%d 列 × %d 行 = %d 个参数，超过 PostgreSQL 的 %d 上限；"+
+			"这是配置问题，不是数据问题（可调低 apply batch rows 或减少列数）",
+			asked, limit, len(ti.cols), limit, limit*len(ti.cols), maxBindParams)
+	})
+}
+
 // dedupeByPK 去掉同一批里**同一主键的较早版本**，只留最后一次。
 //
 // 为什么必须有：单行路径是逐条执行的，同一事务里两次改同一个主键 = 后写覆盖（合法）；
 // 拼成一条多行 INSERT 后，同一个主键在一次语句里出现两次会让 Postgres 报
 // "ON CONFLICT DO UPDATE command cannot affect row a second time" —— 整批失败、
 // 重放还是失败，就成了永久卡死。留最后一条正好等于「后写覆盖」的最终状态。
+//
+// 语义边界（写进文档，因为它在有触发器/审计表的环境里是**可见差异**）：
+// 去重后同一批内同一个主键只保留**最终版本**，所以目标端的 AFTER 触发器/审计只触发
+// **一次**；逐条执行则会触发两次（中间态也可见）。最终行状态两者相同。
+// 序列/自增列同理：只有存活的那一行消耗，表现为序列空洞数量的差别。
 //
 // 无主键表不参与（没有 ON CONFLICT，多行插入本身合法）。
 func dedupeByPK(ti *tableInfo, evs []source.Event) []source.Event {

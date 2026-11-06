@@ -1,7 +1,10 @@
 package pgsink
 
 import (
+	"bytes"
 	"context"
+	"log"
+	"os"
 	"strings"
 	"testing"
 
@@ -170,5 +173,50 @@ func TestApplyRejectsInvalidBatchBeforeTouchingTarget(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "事务边界") {
 		t.Fatalf("错误应说明是事务边界问题，得到 %v", err)
+	}
+}
+
+// 每批行数必须按「参数总数 ≤ 65535」钳制：否则 10 列宽表上 100000 行/批 = 100 万参数，
+// 每批必败、位点永不推进、任务永久卡死，而报错跟数据毫无关系。
+func TestEffectiveBatchRowsClampedByParamLimit(t *testing.T) {
+	cases := []struct {
+		requested, cols, want int
+	}{
+		{0, 3, DefaultApplyBatchRows},      // 未配置 → 默认
+		{500, 3, 500},                      // 正常范围不动
+		{100000, 10, maxBindParams / 10},   // 10 列 → 6553
+		{100000, 200, maxBindParams / 200}, // 宽表 → 327
+		{100000, 70000, 1},                 // 列数比上限还大 → 至少 1 行也要能发
+		{100000, 0, 100000},                // 列数未知时不钳制（调用方会另行报错）
+	}
+	for _, c := range cases {
+		got := effectiveBatchRows(c.requested, c.cols)
+		if got != c.want {
+			t.Fatalf("requested=%d cols=%d → %d，期望 %d", c.requested, c.cols, got, c.want)
+		}
+		// 列数本身就超过参数上限时无法靠减行解决，只断言「至少发 1 行」。
+		if c.cols > 0 && c.cols <= maxBindParams && got*c.cols > maxBindParams {
+			t.Fatalf("钳制后参数总数 %d 仍超过 %d", got*c.cols, maxBindParams)
+		}
+	}
+}
+
+// 钳制必须留下日志：否则用户只看到「每批都失败」，看不出是自己把批大小配大了。
+func TestBatchLimitClampIsLogged(t *testing.T) {
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+
+	s := &Sink{opt: Options{ApplyBatchRows: 100000}}
+	limit := effectiveBatchRows(s.opt.ApplyBatchRows, 10)
+	s.noteBatchLimit(&tableInfo{cols: make([]string, 10)}, limit)
+
+	got := buf.String()
+	if !strings.Contains(got, "6553") {
+		t.Fatalf("日志里应有生效行数 6553，实际: %q", got)
+	}
+	t.Logf("钳制日志: %s", strings.TrimSpace(got))
+	if !strings.Contains(got, "65535") || !strings.Contains(got, "配置问题") {
+		t.Fatalf("日志要说清是参数上限与配置问题: %q", got)
 	}
 }
