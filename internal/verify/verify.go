@@ -92,7 +92,10 @@ type Report struct {
 	// aggregate_only. The human conclusion must not say "三级通过" for a
 	// one-tier run (the exact "green says more than it did" bug).
 	Mode string `json:"mode,omitempty"`
-	OK   bool   `json:"ok"`
+	// Conclusion is the exact one-line human conclusion, also emitted in JSON
+	// so CI/AI consumers do not re-implement (and drift from) the CLI wording.
+	Conclusion string `json:"conclusion,omitempty"`
+	OK         bool   `json:"ok"`
 }
 
 // Side is the read-only view verify needs from one endpoint. *runtime.DB
@@ -199,16 +202,19 @@ func Run(ctx context.Context, opts Options) (Report, error) {
 	// 反例：--level structure --aggregate-only 根本没跑聚合，不能标 aggregate_only；
 	// --level all 遇到无主键表会降级成只聚合，不能只说「三级通过」。
 	rep.Mode = deriveMode(rep.Levels)
+	rep.Conclusion = Conclusion(rep)
 	return rep, nil
 }
 
+// 判据（比枚举更重要）：降级必须「要么推到 Stats 让结论跟着变、要么升成
+// SeverityError 让整行不通过」，**不许「跳过后仍算 OK」**。加新 level 或新降级
+// 路径时先问「结论会跟着变吗」——结论由**执行记录**推导，不由配置推导；
+// 一句概括永远会在某个分支上说多或说少。
+//
 // deriveMode records what actually ran. It is derived from the executed tiers
 // and their stats, never from the requested flags: a flag can be set while the
 // tier did nothing (structure + aggregate-only), and a tier can silently
 // degrade because of data shape (no-PK tables).
-//
-// 规矩：以后凡是加新的 level 或新的降级路径，先问「结论会跟着变吗」——
-// 结论由**执行记录**推导，不由配置推导；一句概括永远会在某个分支上说多或说少。
 func deriveMode(levels []LevelReport) string {
 	names := make([]string, 0, len(levels))
 	var data *LevelReport

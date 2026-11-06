@@ -93,3 +93,12 @@ numeric(12,4) 精度截断）。
   `TestConclusionNoPKAllShowsQualifier`（核心：无主键降级后不得再说「三级通过」）。
 - `deriveMode` 注释写明规矩：**结论由执行记录推导，不由配置推导；加 level/降级路径先问
   「结论会跟着变吗」**。
+
+## 终审（Owl 可合并）后的收尾
+
+- `deriveMode` 上方写死判据：**降级要么推到 `Stats` 让结论跟着变、要么升成
+  `SeverityError` 让整行不通过，不许「跳过后仍算 OK」**。
+- `--json` 顶层新增 `"conclusion"`（与 CLI 同一行，由 `Report.Conclusion` 输出），
+  CI/AI 不再自己拼措辞。
+- 六轮净结果：结论 = 执行记录；每条已知假话都有反面断言钉着
+  （最狠的是 `TestConclusionNoPKAllShowsQualifier` 显式断言不含「结论：三级校验通过」）。

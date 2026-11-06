@@ -137,7 +137,11 @@ func printVerify(rep verify.Report) {
 			fmt.Printf("  统计：%v\n", lr.Stats)
 		}
 	}
-	fmt.Println("\n" + verify.Conclusion(rep))
+	conclusion := rep.Conclusion
+	if conclusion == "" {
+		conclusion = verify.Conclusion(rep)
+	}
+	fmt.Println("\n" + conclusion)
 }
 
 func firstOr(v, def string) string {

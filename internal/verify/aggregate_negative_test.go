@@ -278,6 +278,9 @@ func TestConclusionAllNoDegradation(t *testing.T) {
 	if got != want {
 		t.Fatalf("conclusion=%q, want %q", got, want)
 	}
+	if rep.Conclusion != want {
+		t.Fatalf("JSON conclusion=%q, want %q", rep.Conclusion, want)
+	}
 }
 
 func TestLevelStructureAggregateOnlyMode(t *testing.T) {
