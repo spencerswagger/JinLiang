@@ -12,7 +12,16 @@
 import json
 import sys
 
-TOLERANCE = 0.15
+# 回归阈值按指标分开：吞吐/延迟的机器噪声远大于体积/内存。
+# 依据：本地三次原始值吞吐极差 29%、p99 极差 3.4 倍（见 apply_runs）；
+# 15% 比单次抖动还窄，会高频误红——一个会误红 1/3 的门禁迟早被 || true 掉。
+TOLERANCE = {
+    "snapshot_rows_per_sec": 0.30,
+    "p99_ms": 0.30,
+    "idle_mb": 0.15,
+    "cold_start_ms": 0.15,
+    "binary_mb": 0.15,
+}
 # (报告字段, 中文名, 方向)：max 表示越小越好，min 表示越大越好。
 METRICS = [
     ("snapshot_rows_per_sec", "快照吞吐", "min"),
@@ -52,7 +61,7 @@ def main():
         ok = val >= limit if mode == "min" else val <= limit
         print(f"  {name:<8} {val:>12.2f}  目标 {('≥' if mode == 'min' else '≤')} {limit:g}  {'PASS' if ok else 'FAIL'}")
         failed = failed or not ok
-    print("\n回归对比（>15% 变差即红）：")
+    print("\n回归对比（吞吐/延迟 >30%、体积/内存/冷启 >15% 即红）：")
     if not same_machine:
         print("  WARN: CPU 型号不同，跳过回归对比（跨机器比吞吐/延迟没有意义；仍会查绝对阈值）")
     else:
@@ -62,8 +71,9 @@ def main():
             if b <= 0:
                 continue
             worse = (b - c) / b if mode == "min" else (c - b) / b
-            ok = worse <= TOLERANCE
-            print(f"  {name:<8} 基线 {b:>10.2f} → 当前 {c:>10.2f}  变化 {worse*100:+.1f}%  {'PASS' if ok else 'FAIL'}")
+            tol = TOLERANCE.get(key, 0.15)
+            ok = worse <= tol
+            print(f"  {name:<8} 基线 {b:>10.2f} → 当前 {c:>10.2f}  变化 {worse*100:+.1f}%  容差 {tol*100:.0f}%  {'PASS' if ok else 'FAIL'}")
             failed = failed or not ok
 
     if failed:

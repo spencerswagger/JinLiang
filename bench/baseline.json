@@ -3,37 +3,57 @@
   "rows": 100000,
   "batch_rows": 500,
   "warmup_batches": 2,
-  "snapshot_rows_per_sec": 98642.0,
-  "bulk_apply_rows_per_sec": 98642.0,
-  "bulk_apply_p99_ms": 74.27,
-  "raw_copy_ceiling_rows_per_sec": 176515.0,
-  "rows_per_sec": 9594.0,
+  "snapshot_rows_per_sec": 82501.0,
+  "bulk_apply_rows_per_sec": 82501.0,
+  "bulk_apply_p99_ms": 103.31,
+  "reference": {
+    "raw_copy_ceiling_rows_per_sec": 150380.0,
+    "note": "仅目标端 COPY 上限参考，不进门禁；门禁量的是 BulkApply"
+  },
+  "rows_per_sec": 10265.0,
   "apply_runs": [
     {
-      "rows_per_sec": 8181.55954442404,
-      "p50_ms": 48.767,
-      "p99_ms": 203.866,
-      "raw_copy_ceiling_rows_per_sec": 176515.29395229582
+      "rows_per_sec": 10418.64374757412,
+      "p50_ms": 45.38,
+      "p99_ms": 75.147,
+      "raw_copy_ceiling_rows_per_sec": 150494.69532686038
     },
     {
-      "rows_per_sec": 9593.632307756232,
-      "p50_ms": 46.641,
-      "p99_ms": 81.769,
-      "raw_copy_ceiling_rows_per_sec": 158437.12875754663
+      "rows_per_sec": 10053.938851088116,
+      "p50_ms": 46.353,
+      "p99_ms": 82.165,
+      "raw_copy_ceiling_rows_per_sec": 150379.98789799
     },
     {
-      "rows_per_sec": 10551.244481776952,
-      "p50_ms": 45.63,
-      "p99_ms": 60.152,
-      "raw_copy_ceiling_rows_per_sec": 177965.87331040512
+      "rows_per_sec": 10264.77036757862,
+      "p50_ms": 45.602,
+      "p99_ms": 71.913,
+      "raw_copy_ceiling_rows_per_sec": 132443.82120502662
     }
   ],
-  "p50_ms": 46.64,
-  "p99_ms": 81.77,
-  "idle_mb": 15.6,
-  "cold_start_ms": 27,
-  "binary_mb": 19.12,
-  "binary_bytes": 20045984,
+  "bulk_runs": [
+    {
+      "rows_per_sec": 82500.54417152684,
+      "p50_ms": 49.655,
+      "p99_ms": 116.82
+    },
+    {
+      "rows_per_sec": 81029.53114456084,
+      "p50_ms": 52.973,
+      "p99_ms": 103.315
+    },
+    {
+      "rows_per_sec": 100394.60279338223,
+      "p50_ms": 45.461,
+      "p99_ms": 80.34
+    }
+  ],
+  "p50_ms": 45.6,
+  "p99_ms": 75.15,
+  "idle_mb": 15.4,
+  "cold_start_ms": 29,
+  "binary_mb": 19.13,
+  "binary_bytes": 20054176,
   "cpu_model": "AMD Ryzen 5 1500X Quad-Core Processor",
   "num_cpu": 8,
   "thresholds": {

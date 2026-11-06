@@ -76,13 +76,14 @@ WAL / binlog / 复制槽 / 位点这些底层概念由工具负责探测、代�
 | `cmd/jinliang` | 0.3% | 单元 |
 | `internal/catalog` | 68.0% | 单元 |
 | `internal/connect` | 72.3% | 单元 |
-| `internal/control` | 61.9% | 单元 |
+| `internal/control` | 64.3% | 单元 |
 | `internal/core` | 84.6% | 单元 |
 | `internal/doctor` | 45.0% | 单元 |
 | `internal/dsn` | 87.7% | 单元 |
 | `internal/engine` | 20.1% | 单元 + 集成（nightly） |
 | `internal/gc` | 68.8% | 单元 |
 | `internal/httpapi` | 69.8% | 单元 |
+| `internal/mysqlsink` | 26.4% | 单元 |
 | `internal/mysqlsource` | 51.2% | 单元 + 集成（nightly） |
 | `internal/netcheck` | 96.4% | 单元 |
 | `internal/pgsink` | 17.4% | 单元 + 集成（nightly） |
@@ -93,7 +94,7 @@ WAL / binlog / 复制槽 / 位点这些底层概念由工具负责探测、代�
 | `internal/state` | 82.2% | 单元 |
 | `internal/verify` | 60.3% | 单元 |
 
-**总语句覆盖：44.2%**（单元测试；集成覆盖见 nightly 产物）
+**总语句覆盖：43.6%**（单元测试；集成覆盖见 nightly 产物）
 <!-- coverage:end -->
 
 ## 性能基线
@@ -108,13 +109,13 @@ JINLIANG_TEST_PG_DSN=... scripts/bench.sh            # 报告模式
 JINLIANG_TEST_PG_DSN=... scripts/bench.sh --enforce  # 门禁：任一项不达标退出 1
 ```
 
-本机基线（AMD Ryzen 5 1500X / 8 vCPU / Linux 5.15）：快照 **98,642 行/s**
+本机基线（AMD Ryzen 5 1500X / 8 vCPU / Linux 5.15）：快照 **82,501 行/s**
 （`BulkApply`：临时落地区 → COPY → `INSERT…SELECT` → 块记账 + 位点同事务）、
-增量 apply 9,594 行/s、p99 **81.77 ms**、空转 **15.6 MB**、冷启 **27 ms**、二进制 **19.12 MB**。
-20k 行/s 的门禁量的是 **`BulkApply` 产品路径**；裸 `COPY`（约 176k 行/s）只是目标端
+增量 apply 10,265 行/s、p99 **75.15 ms**、空转 **15.4 MB**、冷启 **29 ms**、二进制 **19.13 MB**。
+20k 行/s 的门禁量的是 **`BulkApply` 产品路径**；裸 `COPY`（约 150k 行/s）只是目标端
 上限参考，不进门禁——否则 `BulkApply` 慢 10 倍也能 PASS。
 
-口径三句（复现时别理解错）：p99 的样本数 = **批次数（200）**，不是单行延迟；
+口径三句（复现时别理解错）：快照/增量的吞吐与 p99 都是 **3 次取中位**（原始三次在 JSON 的 `bulk_runs`/`apply_runs`）；p99 的样本数 = **批次数（200）**，不是单行延迟；
 空转内存 = `ps` 的 **RSS**，不是 Go heap；冷启 = 进程 exec → `/api/health` 返回 200。
 增量 apply 当前逐行 `Exec`（500 次/事务），约 10k 行/s，是已知差距——基线把它钉住，
 避免以后悄悄变慢。

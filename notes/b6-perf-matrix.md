@@ -10,17 +10,17 @@ README、`testmatrix.yaml`、集成测试夹具；未动 `internal/engine` / `in
 
 ```
 指标                 实测         目标  结论
-吞吐(快照)    98642 行/s      ≥ 20000  PASS
-p99 延迟           81.77 ms     ≤ 100 ms  PASS
-空转内存          15.6 MB      ≤ 80 MB  PASS
-冷启                  27 ms     ≤ 200 ms  PASS
-二进制            19.12 MB        < 25 MB  PASS
+吞吐(快照)    82501 行/s      ≥ 20000  PASS
+p99 延迟           75.15 ms     ≤ 100 ms  PASS
+空转内存          15.4 MB      ≤ 80 MB  PASS
+冷启                  29 ms     ≤ 200 ms  PASS
+二进制            19.13 MB        < 25 MB  PASS
 ```
 
 - 快照吞吐走**产品路径 `pgsink.BulkApply`**（临时落地区 → COPY → `INSERT…SELECT`
-  → 块记账 + 位点同事务），不是裸 COPY；裸 COPY 只作为上限参考（~176k 行/s），
+  → 块记账 + 位点同事务），不是裸 COPY；裸 COPY 只作为上限参考（~150k 行/s），
   不进门禁——否则 BulkApply 慢 10 倍也能 PASS（Owl #28 必改）；
-- p99 是**增量批事务**（数据+位点同事务）延迟的最近秩，200 个样本，3 次取中位；
+- p99 是**增量批事务**（数据+位点同事务）延迟的最近秩，200 个样本；快照/增量均 3 次取中位（原始三次见 bulk_runs/apply_runs）；
 - 空转 = `ps` 的 **RSS**（不是 Go heap）；冷启 = exec → `/api/health` 返回 200；
   两者都是 `serve` + 内嵌 SQLite 的真实启动路径，3 次取中位；
 - `bench/baseline.json` 入库；`scripts/bench_compare.py` 做 >15% 回归对比
@@ -87,8 +87,11 @@ JINLIANG_TEST_PG_DSN=... scripts/bench.sh --enforce
   （临时落地区 → COPY → `INSERT…SELECT` → 块记账 + 位点同事务）。
   `scripts/bench.sh` 的快照吞吐改读该用例；裸 COPY 改名
   `raw_copy_ceiling_rows_per_sec`，仅作上限参考、不进门禁。
-- **新基线**：`BulkApply` **98,642 行/s**（p99 74 ms/块）；裸 COPY 176k 仅参考；
-  增量 apply 9.6k 行/s（p99 81.77 ms，3 次中位）。
+- **新基线**：`BulkApply` **82,501 行/s**（三次原始 82,501/81,030/100,395，p99 中位 75.15 ms）；
+  裸 COPY 150k 仅参考；增量 apply 10,265 行/s（p99 75.15 ms，3 次中位）。
+- **阈值按指标分开**：吞吐/p99 回归容差 **30%**（单次抖动实测可达 29%/3.4×），
+  二进制/冷启/空转保留 15%；绝对阈值不变（20k 对 82k 有 4 倍余量）。
+- `raw_copy_ceiling` 移入 `reference:{…}`，避免只读 JSON 的人把它当产品能力。
 - **README 口径三句**：p99 样本数 = 批次数（200）；空转 = `ps` 的 RSS（不是 Go heap）；
   冷启 = exec → `/api/health` 返回 200。
 - **bench.sh 可移植**：`/.toolchain/go/bin` 存在才加入 PATH，否则用系统 `go`，

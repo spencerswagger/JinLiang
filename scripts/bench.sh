@@ -128,13 +128,31 @@ open(sys.argv[4], "w").write(json.dumps(rep, ensure_ascii=False, indent=2) + "\n
 PY
 
 # 快照：产品路径 BulkApply（不是裸 COPY）。同包集成用例里直接构造 tableInfo。
+# 与增量同口径：3 次取中位，原始三次写进 bulk_runs（Owl #28 必改：单跑一次会被抖动骗）。
 bulk_json="$tmp/bulk.json"
-JINLIANG_BULK_BENCH_OUT="$bulk_json" JINLIANG_BULK_BENCH_ROWS="$ROWS" \
-  go test -count=1 -tags=integration -run '^TestBulkApplyThroughput$' ./internal/pgsink >"$tmp/bulk.log" 2>&1 || {
-    echo "bench: BulkApply 基线失败（这是产品路径，不能降级成裸 COPY 顶替）" >&2
-    cat "$tmp/bulk.log" >&2
-    exit 2
-  }
+for i in 1 2 3; do
+  JINLIANG_BULK_BENCH_OUT="$tmp/bulk-$i.json" JINLIANG_BULK_BENCH_ROWS="$ROWS" \
+    go test -count=1 -tags=integration -run '^TestBulkApplyThroughput$' ./internal/pgsink >"$tmp/bulk-$i.log" 2>&1 || {
+      echo "bench: BulkApply 基线失败（这是产品路径，不能降级成裸 COPY 顶替）" >&2
+      cat "$tmp/bulk-$i.log" >&2
+      exit 2
+    }
+done
+python3 - "$tmp/bulk-1.json" "$tmp/bulk-2.json" "$tmp/bulk-3.json" "$bulk_json" <<'PY'
+import json, statistics, sys
+runs = [json.load(open(p)) for p in sys.argv[1:4]]
+def med(k):
+    return statistics.median(float(r[k]) for r in runs)
+rep = dict(runs[0])
+rep["rows_per_sec"] = med("rows_per_sec")
+rep["p50_ms"] = med("p50_ms")
+rep["p99_ms"] = med("p99_ms")
+rep["bulk_runs"] = [
+    {k: r[k] for k in ("rows_per_sec", "p50_ms", "p99_ms")} for r in runs
+]
+rep["note"] += "；吞吐/p99 为 3 次中位数（原始三次见 bulk_runs）"
+open(sys.argv[4], "w").write(json.dumps(rep, ensure_ascii=False, indent=2) + "\n")
+PY
 SNAP_PER_SEC=$(python3 -c "import json;print(f'{json.load(open(\"$bulk_json\"))[\"rows_per_sec\"]:.0f}')")
 BULK_P99=$(python3 -c "import json;print(f'{json.load(open(\"$bulk_json\"))[\"p99_ms\"]:.2f}')")
 RAW_COPY=$(python3 -c "import json;print(f'{json.load(open(\"$apply_json\"))[\"raw_copy_ceiling_rows_per_sec\"]:.0f}')")
@@ -179,9 +197,13 @@ rep = {
   "snapshot_rows_per_sec": float("$SNAP_PER_SEC"),
   "bulk_apply_rows_per_sec": float("$SNAP_PER_SEC"),
   "bulk_apply_p99_ms": float("$BULK_P99"),
-  "raw_copy_ceiling_rows_per_sec": float("$RAW_COPY"),
+  "reference": {
+    "raw_copy_ceiling_rows_per_sec": float("$RAW_COPY"),
+    "note": "仅目标端 COPY 上限参考，不进门禁；门禁量的是 BulkApply"
+  },
   "rows_per_sec": float("$ROWS_PER_SEC"),
   "apply_runs": json.load(open("$apply_json")).get("apply_runs", []),
+  "bulk_runs": json.load(open("$bulk_json")).get("bulk_runs", []),
   "p50_ms": float("$P50_MS"),
   "p99_ms": float("$P99_MS"),
   "idle_mb": float("$IDLE_MB"),
