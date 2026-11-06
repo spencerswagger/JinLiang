@@ -59,6 +59,8 @@ type Options struct {
 	Verify bool
 	// LeaseTTL defaults to 30s.
 	LeaseTTL time.Duration
+	// HeartbeatEvery 覆盖心跳间隔（测试用；默认 control.DefaultHeartbeatInterval/2）。
+	HeartbeatEvery time.Duration
 }
 
 // Result is what a caller reports to a human.
@@ -111,10 +113,16 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 	if err != nil {
 		return res, fmt.Errorf("解不开目标连接的口令（key 文件换过？）: %w", err)
 	}
-	if srcConn.Kind != dsn.KindPostgres || tgtConn.Kind != dsn.KindPostgres {
-		return res, fmt.Errorf("B1 只做了 PostgreSQL → PostgreSQL（当前 %s → %s）；"+
-			"MySQL 落在 B2，用 jinliang serve 里的任务页能看到进度说明",
-			srcConn.Kind, tgtConn.Kind)
+	// 源端目前只有 PG 的读实现；目标端允许 PG 与 MySQL，其它类型在构造阶段报清楚。
+	if srcConn.Kind != dsn.KindPostgres {
+		return res, fmt.Errorf("源端类型 %q 还没有读实现（现在支持 postgres 源）。"+
+			"你现在能做什么：把源连接换成 PostgreSQL；MySQL 源在下个版本。"+
+			"风险：没有（什么都没动）", srcConn.Kind)
+	}
+	if tgtConn.Kind != dsn.KindPostgres && tgtConn.Kind != dsn.KindMySQL {
+		return res, fmt.Errorf("目标端类型 %q 还不支持（现在支持 postgres / mysql）。"+
+			"你现在能做什么：把目标连接的 kind 改成 postgres 或 mysql。"+
+			"风险：没有（什么都没动）", tgtConn.Kind)
 	}
 	srcEP := endpointOf(srcConn, srcSecret)
 	tgtEP := endpointOf(tgtConn, tgtSecret)
@@ -176,12 +184,23 @@ func reclaimAbandonedRun(ctx context.Context, store *control.Store, job control.
 		if run.JobID != job.ID {
 			continue
 		}
-		holder, err := pgsink.ReadLease(ctx, ep, schema, job.JobKey)
-		if err != nil || !holder.Abandoned(time.Now(), pgsink.ProcessAlive) {
+		// 两条证据链，任一成立就算「上一次真死了」：
+		//   1. 目标端租约没人续期（pid 已不在 / expires_at 已过）；
+		//   2. 控制面心跳停了超过 StaleAfter（3×心跳间隔）。
+		// 只看第 1 条会漏掉「读不到租约表 / 目标端连不上」的情况——那时用户会陷入
+		// 「崩过一次就永远 E1005 等 serve 来救」，而 serve 可能根本没在跑。
+		why := ""
+		holder, lerr := pgsink.ReadLease(ctx, ep, schema, job.JobKey)
+		switch {
+		case lerr == nil && holder.Abandoned(time.Now(), pgsink.ProcessAlive):
+			why = "目标端租约已无人续期"
+		case heartbeatStale(run, time.Now()):
+			why = "控制面心跳已停超过 " + control.StaleAfter(control.DefaultHeartbeatInterval).String()
+		default:
 			return false, nil
 		}
 		_, err = store.FinishRun(ctx, run.ID, state.Failed,
-			"上一次运行随进程退出中断（kill -9 或断电）；进度以目标端 _jl_meta 为准，重启会从断点续跑",
+			"上一次运行随进程退出中断（kill -9 或断电；判据："+why+"）；进度以目标端 _jl_meta 为准，重启会从断点续跑",
 			ExitFailed, control.FinishInterrupted)
 		if err != nil {
 			return false, fmt.Errorf("收尾上一次被中断的运行失败: %w", err)
@@ -189,6 +208,19 @@ func reclaimAbandonedRun(ctx context.Context, store *control.Store, job control.
 		return true, nil
 	}
 	return false, nil
+}
+
+// heartbeatStale 判断一条活跃 run 的心跳是否已经停了超过 StaleAfter。
+// 心跳时间解析不出来时按「不可证明」处理（返回 false），不让它变成误杀的理由。
+func heartbeatStale(run control.Run, now time.Time) bool {
+	if run.HeartbeatAt == "" {
+		return false
+	}
+	hb, err := time.Parse(time.RFC3339, run.HeartbeatAt)
+	if err != nil {
+		return false
+	}
+	return now.Sub(hb) > control.StaleAfter(control.DefaultHeartbeatInterval)
 }
 
 // schemaOf is targetSchema as a free function (Run() needs it before the runner exists).
@@ -230,10 +262,15 @@ type runner struct {
 
 	leaseTTL time.Duration
 
-	src    *pgsource.Source
-	sink   *pgsink.Sink
+	src  *pgsource.Source
+	sink *pgsink.Sink
+	// gsink 是「按接口」的目标端：PG 用 pgsink（COPY 快路径），MySQL 用 mysqlsink
+	// （走契约的 Apply）。构造阶段确定，之后引擎只用接口。
+	gsink  targetSink
 	cat    source.Catalog
 	tables []source.TableRef
+	// emitHook 只在单测里用（数事件条数），生产路径为 nil。
+	emitHook func(control.Event)
 
 	phase   state.Phase
 	leaseOK bool
@@ -264,6 +301,16 @@ func (r *runner) execute(parent context.Context, res *Result) error {
 	r.cancelRun = cancel
 	defer cancel()
 
+	// ① 心跳：`runs.heartbeat_at` 不刷新的话，空闲 90 秒就会被 doctor 判成幽灵、
+	// 重启时把健康任务标成 interrupted（TouchRun 之前一个调用方都没有）。
+	// 间隔取 control.DefaultHeartbeatInterval 的一半，保证总有至少两个心跳落在
+	// StaleAfter(=3×) 窗口里 —— 口径与 control 包一致，不另写一套。
+	hbCtx, stopHB := context.WithCancel(ctx)
+	defer stopHB()
+	go r.heartbeatLoop(hbCtx, r.heartbeatEvery(), func(c context.Context) error {
+		return r.opt.Store.TouchRun(c, r.run.ID)
+	})
+
 	defer func() {
 		res.Phase = r.phase
 		res.RowsCopied = r.rowsCopied
@@ -275,6 +322,27 @@ func (r *runner) execute(parent context.Context, res *Result) error {
 	if err := r.preflight(ctx); err != nil {
 		return r.fail(ctx, err)
 	}
+	// 目标端不是 PG：走「只做全量」的通用路径（用契约里的 sink 接口，不按类型分支）。
+	if r.tgtEP.Kind != dsn.KindPostgres {
+		if err := r.prepareGeneric(ctx); err != nil {
+			return r.fail(ctx, err)
+		}
+		defer r.teardown()
+		if err := r.executeGenericFullCopy(ctx, res); err != nil {
+			if r.leaseLost.Load() {
+				return r.fail(ctx, r.leaseLostError())
+			}
+			if isUserStop(ctx, err) {
+				return r.fail(ctx, err)
+			}
+			if errors.As(err, new(*reachedDone)) {
+				return nil // 通用路径自己收尾到 done
+			}
+			return r.fail(ctx, err)
+		}
+		return nil
+	}
+
 	if err := r.prepare(ctx); err != nil {
 		return r.fail(ctx, err)
 	}
@@ -549,6 +617,9 @@ func (r *runner) preflight(ctx context.Context) error {
 		return err
 	}
 	r.tables = tables
+	// 类型映射的判定**只有一处**：`preflight` 的 TYPE-01（数组 → blocked）/ TYPE-02（其它有损 → warn），
+	// 由 report.CanStart 决定能不能开跑。引擎不再自己另写一份判断——两份判断迟早分叉。
+
 	in.Tables = tableNames(tables)
 	for _, t := range tables {
 		for _, c := range r.cat.Tables {
@@ -757,8 +828,9 @@ func (r *runner) teardown() {
 		if r.leaseOK {
 			_ = r.sink.ReleaseLease(ctx)
 		}
-		r.sink.Close()
+		_ = r.sink.Close()
 	}
+	closeTarget(r.gsink)
 	if r.src != nil {
 		r.src.Close()
 	}
@@ -1093,6 +1165,45 @@ func classifyError(err error) (code core.Code, classified bool) {
 	return "", false
 }
 
+// heartbeatLoop 周期刷新本条 run 的存活心跳；只在 run 未结束时可写（TouchRun 自己带条件）。
+func (r *runner) heartbeatLoop(ctx context.Context, interval time.Duration, touch func(context.Context) error) {
+	// 间隔的默认值只在 heartbeatEvery() 里算一份；这里拿到的一定是有效值。
+	if interval <= 0 {
+		return
+	}
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	failing := false // 只在状态转换点发 note：15 秒一条会把 200 条环形缓冲铺满并挤掉真正的 progress/error
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			err := touch(ctx)
+			if ctx.Err() != nil {
+				return
+			}
+			switch {
+			case err != nil && !failing:
+				failing = true
+				r.emit(ctx, control.Event{Type: "note",
+					Message: "刷新运行心跳失败（状态页可能把这一轮判成「已中断」）：" + err.Error()})
+			case err == nil && failing:
+				failing = false
+				r.emit(ctx, control.Event{Type: "note", Message: "运行心跳已恢复"})
+			}
+		}
+	}
+}
+
+// heartbeatEvery 是心跳间隔：control 的 DefaultHeartbeatInterval 的一半。
+func (r *runner) heartbeatEvery() time.Duration {
+	if r.opt.HeartbeatEvery > 0 {
+		return r.opt.HeartbeatEvery
+	}
+	return control.DefaultHeartbeatInterval / 2
+}
+
 // isUserStop reports「这次失败其实是用户按了停止」。
 //
 // **要区分的是「谁 cancel 的」，不是「超时还是取消」**：`errors.Is(Canceled)` 与
@@ -1282,6 +1393,9 @@ func (r *runner) note(ctx context.Context, msg string) {
 }
 
 func (r *runner) emit(ctx context.Context, ev control.Event) {
+	if r.emitHook != nil { // 单测要数「发了几条」时挂这里（不在测的路径上留后门）
+		r.emitHook(ev)
+	}
 	if r.opt.Store == nil { // 单测里没有控制库：事件流不是被测对象
 		return
 	}

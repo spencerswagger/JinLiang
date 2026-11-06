@@ -28,6 +28,30 @@ var metaDDL = []string{
 		"started_at datetime(6) NOT NULL," +
 		"updated_at datetime(6) NOT NULL" +
 		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+	"CREATE TABLE IF NOT EXISTS `_jl_lease` (" +
+		"job_key char(10) NOT NULL PRIMARY KEY," +
+		"instance_id varchar(32) NOT NULL," +
+		"label varchar(96) NULL," +
+		"expires_at datetime(6) NOT NULL" +
+		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+	"CREATE TABLE IF NOT EXISTS `_jl_object` (" +
+		"object_name varchar(191) NOT NULL PRIMARY KEY," +
+		"object_kind varchar(32) NOT NULL," +
+		"job_key char(10) NOT NULL," +
+		"instance_id varchar(32) NOT NULL," +
+		"created_at datetime(6) NOT NULL," +
+		"dropped_at datetime(6) NULL" +
+		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+	"CREATE TABLE IF NOT EXISTS `_jl_chunk` (" +
+		"job_key char(10) NOT NULL," +
+		"table_name varchar(191) NOT NULL," +
+		"chunk_no int NOT NULL," +
+		"range_from text NULL," +
+		"range_to text NULL," +
+		"done tinyint(1) NOT NULL DEFAULT 0," +
+		"`rows` bigint NOT NULL DEFAULT 0," +
+		"PRIMARY KEY (job_key, table_name, chunk_no)" +
+		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
 	"CREATE TABLE IF NOT EXISTS `_jl_instance` (" +
 		"instance_id varchar(32) NOT NULL PRIMARY KEY," +
 		"label varchar(64) NULL," +
@@ -47,10 +71,8 @@ var metaDDL = []string{
 func (s *Sink) EnsureSchema(ctx context.Context, cat source.Catalog) ([]sink.Action, error) {
 	var actions []sink.Action
 
-	for _, ddl := range metaDDL {
-		if _, err := s.db.ExecContext(ctx, ddl); err != nil {
-			return actions, fmt.Errorf("建运行时表失败: %w", err)
-		}
+	if err := s.ensureStateTables(ctx); err != nil {
+		return actions, err
 	}
 
 	exists, err := s.tableExists(ctx, catScope(cat))
@@ -107,6 +129,18 @@ func (s *Sink) EnsureSchema(ctx context.Context, cat source.Catalog) ([]sink.Act
 		}
 	}
 	return actions, nil
+}
+
+// ensureStateTables 建运行时库（幂等）。放在 Open 里而不是只放在 EnsureSchema：
+// 引擎拿租约/读位点可能早于任何 EnsureSchema 调用（崩溃接管就是这种），
+// 那时表还不存在会让「有没有人在跑」这个问题直接报错。
+func (s *Sink) ensureStateTables(ctx context.Context) error {
+	for _, ddl := range metaDDL {
+		if _, err := s.db.ExecContext(ctx, ddl); err != nil {
+			return fmt.Errorf("建运行时表失败: %w", err)
+		}
+	}
+	return nil
 }
 
 func catScope(cat source.Catalog) source.TableRef {

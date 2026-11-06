@@ -3,6 +3,7 @@ package mysqlsink
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/spencerswagger/jinliang/internal/source"
 )
@@ -240,5 +241,63 @@ func TestExcludeKeepsOrder(t *testing.T) {
 	got := exclude([]string{"id", "b", "c"}, []string{"ID"})
 	if strings.Join(got, ",") != "b,c" {
 		t.Fatalf("排除主键后应保持原顺序: %v", got)
+	}
+}
+
+// 租约的接管判定是纯函数：把「同机重启会不会自己挡自己」这类分支一次说清。
+func TestLeaseTakeover(t *testing.T) {
+	now := time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC)
+	future := now.Add(20 * time.Second)
+	past := now.Add(-time.Second)
+	alive := func(pid int) bool { return pid == 4242 }
+	dead := func(pid int) bool { return false }
+
+	cases := []struct {
+		name    string
+		cur     leaseRow
+		exists  bool
+		inst    string
+		alive   func(int) bool
+		wantOK  bool
+		mustNot string // 拒绝时不该出现的方向
+	}{
+		{"没有租约", leaseRow{}, false, "me", alive, true, ""},
+		{"已过期", leaseRow{InstanceID: "other", Label: "job#1", Expires: past}, true, "me", alive, true, ""},
+		{"别的实例而且在有效期内", leaseRow{InstanceID: "other", Label: "job#1", Expires: future}, true, "me", alive, false, ""},
+		{"自己续租", leaseRow{InstanceID: "me", Label: "job#4242#tok", Expires: future}, true, "me", alive, true, ""},
+		{"同机同 pid 不带 token", leaseRow{InstanceID: "me", Label: "job#4242", Expires: future}, true, "me", alive, true, ""},
+		{"同机另一个活着的进程", leaseRow{InstanceID: "me", Label: "job#4242#a", Expires: future}, true, "me", alive, false, ""},
+		{"同机崩溃进程留下的", leaseRow{InstanceID: "me", Label: "job#4242#a", Expires: future}, true, "me", dead, true, ""},
+		{"老记录没有 pid", leaseRow{InstanceID: "me", Label: "job", Expires: future}, true, "me", alive, true, ""},
+	}
+	for _, c := range cases {
+		ok, why := leaseTakeover(c.cur, c.exists, now, c.inst, 4242, "tok", c.alive)
+		if ok != c.wantOK {
+			t.Fatalf("%s: 判定 %v，期望 %v（why=%q）", c.name, ok, c.wantOK, why)
+		}
+		if !ok && why == "" {
+			t.Fatalf("%s: 拒绝时必须说清谁在跑", c.name)
+		}
+	}
+}
+
+func TestLeaseLabelRoundTrip(t *testing.T) {
+	for _, c := range []struct {
+		label string
+		pid   int
+		token string
+	}{
+		{"job#123", 123, ""},
+		{"my#job#123", 123, ""},
+		{"job#123#abc", 123, "abc"},
+		{"my#job#123#abc", 123, "abc"},
+	} {
+		pid, token, ok := parseLeaseLabel(c.label)
+		if !ok || pid != c.pid || token != c.token {
+			t.Fatalf("%q 解析成 (%d,%q,%v)，期望 (%d,%q)", c.label, pid, token, ok, c.pid, c.token)
+		}
+	}
+	if _, _, ok := parseLeaseLabel("job"); ok {
+		t.Fatal("没有 pid 的 label 应返回 ok=false")
 	}
 }

@@ -478,6 +478,17 @@ func (s *Server) pageJobRun(w http.ResponseWriter, r *http.Request) {
 			s.renderPartial(w, "error_card", conflictThisProcess())
 			return
 		}
+		var ud *unsupportedDirectionError
+		if errors.As(err, &ud) {
+			e := apiError{
+				Code: string(ud.Spec.Code), Class: string(ud.Spec.Class),
+				Message: ud.Spec.Message, Why: ud.Spec.Why, Next: ud.Spec.Next, Risk: ud.Spec.Risk,
+			}
+			// 方向只作为客观事实出现在 why 的开头，不另写自然语言描述
+			e.Why = "当前这条任务是 " + ud.SourceKind + " → " + ud.TargetKind + "。" + e.Why
+			s.renderPartial(w, "error_card", e)
+			return
+		}
 		s.renderPartial(w, "error_card", plainError("%v", err))
 		return
 	}

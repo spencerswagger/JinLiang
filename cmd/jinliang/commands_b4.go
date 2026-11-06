@@ -51,6 +51,7 @@ func cmdVerify(args []string) error {
 	jobKey := fs.String("job-key", "", "任务指纹（一致性级需要：读 slot/binlog 与 _jl_meta.position）")
 	slotPrefix := fs.String("slot-prefix", "", "同步书签前缀（默认 jl_<job-key>）")
 	maxGap := fs.Int64("max-gap-bytes", 64<<20, "允许目标端落后的字节数")
+	aggOnly := fs.Bool("aggregate-only", false, "只跑 L1 聚合（SQL 下推，秒级；日常例检用）")
 	jsonOut := fs.Bool("json", false, "JSON 输出（给 CI / AI 助手）")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -74,6 +75,7 @@ func cmdVerify(args []string) error {
 		SourceSchema: *srcSchema, TargetSchema: *tgtSchema,
 		Tables: splitList(*tables), Level: verify.Level(strings.ToLower(*level)),
 		SampleRows: *sample, JobKey: strings.TrimSpace(*jobKey), MaxGapBytes: *maxGap,
+		AggregateOnly: *aggOnly,
 	}
 	if opts.SourceSchema == "" {
 		opts.SourceSchema = src.Schema()
@@ -135,11 +137,11 @@ func printVerify(rep verify.Report) {
 			fmt.Printf("  统计：%v\n", lr.Stats)
 		}
 	}
-	if rep.OK {
-		fmt.Println("\n结论：三级校验通过")
-	} else {
-		fmt.Println("\n结论：有级别未通过（详见上面的 code）")
+	conclusion := rep.Conclusion
+	if conclusion == "" {
+		conclusion = verify.Conclusion(rep)
 	}
+	fmt.Println("\n" + conclusion)
 }
 
 func firstOr(v, def string) string {
@@ -299,7 +301,9 @@ func cmdConflicts(args []string) error {
 		return printJSON(cs)
 	}
 	if len(cs) == 0 {
-		fmt.Println("没有冲突记录")
+		// 空表只能说「没人写过」，不能说「没有冲突」：本版引擎还没有产生冲突的路径。
+		fmt.Println("没有冲突记录（本版引擎还没有写入冲突的路径，这里为空不代表没发生过冲突；" +
+			"数据是否一致请看 verify）")
 		return nil
 	}
 	fmt.Printf("冲突 %d 条（unresolved 优先看）\n", len(cs))
@@ -365,7 +369,8 @@ func cmdDeadLetter(args []string) error {
 			return printJSON(dls)
 		}
 		if len(dls) == 0 {
-			fmt.Println("没有死信")
+			fmt.Println("没有死信（本版引擎还没有写入死信的路径，这里为空不代表数据干净；" +
+				"数据是否一致请看 verify）")
 			return nil
 		}
 		fmt.Printf("死信 %d 条\n", len(dls))
