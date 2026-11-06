@@ -603,7 +603,7 @@ type rejectedRow struct {
 func (s *Server) pageDiagnostics(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	doc := s.doctor(ctx)
-	audit, _ := s.store.ListAudit(ctx, 50)
+	audit, _ := s.store.ListAudit(ctx, control.AuditWindow)
 	str := func(k string) string { v, _ := doc[k].(string); return v }
 	num := func(k string) int64 { v, _ := doc[k].(int64); return v }
 	d := diagnosticsData{
@@ -615,7 +615,7 @@ func (s *Server) pageDiagnostics(w http.ResponseWriter, r *http.Request) {
 		DBBytes: num("db_bytes"), Audit: audit,
 	}
 	// 过滤下推到 SQL：窗口（最近 N 条）里筛，忙时会把拒绝记录筛没。
-	rejected, _ := s.store.ListAuditByAction(ctx, control.ActionRunRejected, 10)
+	rejected, _ := s.store.ListAuditByAction(ctx, control.ActionRunRejected, control.RejectedWindow)
 	for _, e := range rejected {
 		var det struct {
 			JobID   string   `json:"job_id"`

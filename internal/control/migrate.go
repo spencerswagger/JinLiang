@@ -109,6 +109,18 @@ var migrations = []migration{
 		// 兼容：stub 列保留一版（B1 收口后再删），历史行照旧可读。
 		Fn: migrateRunsKind,
 	},
+	{
+		Version: 4,
+		Name:    "audit-action-index",
+		Stmts: []string{
+			// 诊断页按 action 取最近 N 条（ListAuditByAction）。没有这条索引时
+			// EXPLAIN 是 `SCAN audit` + `USE TEMP B-TREE FOR ORDER BY`（全表扫 + 全排序），
+			// 而 audit 没有保留策略、无界增长——「出问题时才打开」的页面会随时间线性变慢。
+			//
+			// **两个键都要**：只建 (action, at DESC) 时仍要为同秒内的 id 建临时树。
+			`CREATE INDEX IF NOT EXISTS idx_audit_action_at_id ON audit(action, at DESC, id DESC)`,
+		},
+	},
 }
 
 // closeOnlyStaleRunsThenIndex 是 v2 的收尾。
