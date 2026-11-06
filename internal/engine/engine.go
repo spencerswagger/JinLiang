@@ -1164,6 +1164,9 @@ func classifyError(err error) (code core.Code, classified bool) {
 		return core.CodePositionKindMismatch, true
 	case errors.As(err, &tooBig):
 		return core.CodeTxTooLarge, true
+	case errors.As(err, new(*TableNotFoundError)):
+		// 我们自己判定的配置错误：源端清单里没有这张表。文案以码表 E1013 为准。
+		return core.CodeObjectMissing, true
 	case pgsource.IsNoPrivilege(err):
 		// 42501：源端 SELECT 或目标端 DDL/DML 被拒——用户要做的事都是「去要授权」。
 		return core.CodeNoPrivilege, true
@@ -1548,6 +1551,52 @@ func scopeOf(doc control.JobDoc) source.Scope {
 	return sc
 }
 
+// TableNotFoundError 表示用户选中的表在源端清单里不存在。
+//
+// 单独成类型（而不是 fmt.Errorf）是为了让 classifyError 用 errors.As 挂码：
+// 这条失败从来不是「未识别的驱动错误」，而是**我们判定出来的配置错误**。
+type TableNotFoundError struct {
+	Table     string
+	Schema    string
+	Available []string // 最接近的几个表名（拼写错误时最有用的线索）
+}
+
+func (e *TableNotFoundError) Error() string {
+	msg := fmt.Sprintf("源端找不到表 %s（schema %s）：可能表名写错、被改名，或不在这个 schema 下",
+		e.Table, orDash(e.Schema))
+	if len(e.Available) > 0 {
+		msg += "。源端相近的表名：" + strings.Join(e.Available, "、")
+	}
+	msg += "。你能做什么：1) 回任务页从源端重选表范围；2) 或把 content.tables 里的名字改成实际表名。" +
+		"风险：没有（本次没有写入任何数据）"
+	return msg
+}
+
+// nearestNames 给出与目标名最接近的几个表名（前缀/包含关系），拼错时最有用。
+// 只是提示，不做模糊匹配的自动替换——选错表比报错更危险。
+func nearestNames(want string, tables []source.Table) []string {
+	lw := strings.ToLower(want)
+	var out []string
+	for _, t := range tables {
+		lt := strings.ToLower(t.Table)
+		if strings.HasPrefix(lt, lw) || strings.HasPrefix(lw, lt) ||
+			strings.Contains(lt, lw) || strings.Contains(lw, lt) {
+			out = append(out, t.Table)
+			if len(out) == 5 {
+				break
+			}
+		}
+	}
+	return out
+}
+
+func orDash(s string) string {
+	if strings.TrimSpace(s) == "" {
+		return "（默认）"
+	}
+	return s
+}
+
 // selectTables resolves content.tables (explicit) or scope include/exclude
 // (patterns) against the source catalog.
 func (r *runner) selectTables() ([]source.TableRef, error) {
@@ -1563,7 +1612,15 @@ func (r *runner) selectTables() ([]source.TableRef, error) {
 		for name := range r.doc.Content.Tables {
 			t, ok := byName[name]
 			if !ok {
-				return nil, fmt.Errorf("源端找不到表 %s（可能改名了，或不在 %s 下）", name, scopeOf(r.doc).Schema)
+				// 这里是**我们自己判定出来**的失败（表清单里就是没有它），原因非常明确：
+				// 选错表 / 表改名 / 不在这个 schema 下。所以给它一个 typed error，
+				// 让 classifyError 挂上 E1013——否则用户看到的是「未分类」，
+				// 而这条恰恰是最常见的配置错误之一。
+				//
+				// 注意：**不造伪 SQLSTATE**。SQLSTATE 是协议的语义，塞假值会污染
+				// pgwire.SQLState 的判据，将来任何按 SQLSTATE 分类的地方都被带偏。
+				return nil, &TableNotFoundError{Table: name, Schema: scopeOf(r.doc).Schema,
+					Available: nearestNames(name, r.cat.Tables)}
 			}
 			out = append(out, t.TableRef)
 		}
