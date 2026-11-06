@@ -1728,3 +1728,171 @@ func authorizedGet(t *testing.T, url, token string) (string, error) {
 	}
 	return string(b), nil
 }
+
+// 能力边界不再由 HTTP 入口判断（判断只该有一处：引擎构造期）。
+// 入口要保证的是另一件事：引擎在**构造期**拒绝时，202 之后事件流上必须出现 error，
+// 而不是「点了没反应」。这里用一个「只支持 PG→PG」的假引擎错误模拟构造期拒绝。
+func TestEngineConstructionErrorSurfacesAsEvent(t *testing.T) {
+	store, err := control.Open(control.Options{DataDir: t.TempDir(), Autogen: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	srv, err := New(Options{Store: store, Version: "test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv.runFn = func(context.Context, *control.Store, control.Job, jobrun.Options) (engine.Result, error) {
+		return engine.Result{}, errors.New("目标端类型还不支持：mysql（本版只支持 PostgreSQL 目标端）")
+	}
+	ctx := context.Background()
+	mk := func(name string) control.Connection {
+		c, err := store.CreateConnection(ctx, control.ConnectionInput{
+			Name: name, Kind: "postgres", Host: "127.0.0.1", Port: 1,
+			Database: "nope", Username: "u", Params: map[string]string{"sslmode": "disable"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	src, tgt := mk("s"), mk("t")
+	job, err := store.CreateJob(ctx, control.JobInput{
+		Name: "gate-gone", SourceID: src.ID, TargetID: tgt.ID,
+		Spec: control.JobDoc{
+			Source: control.SourceDoc{Scope: &control.ScopeDoc{Schema: "public", Include: []string{"orders"}}},
+			Target: control.TargetDoc{Schema: "report"},
+			Mode:   control.ModeDoc{Frequency: "once"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, cancel := store.Bus().Subscribe(job.ID)
+	defer cancel()
+
+	// 入口不再自判类型：startJob 接受，202 由 handler 给
+	if err := srv.startJob(ctx, job, control.ActorAPI); err != nil {
+		t.Fatalf("startJob 不该在入口拒绝（能力边界交给引擎）：%v", err)
+	}
+	select {
+	case ev := <-ch:
+		if ev.Type != "error" {
+			t.Fatalf("应当是 error 事件，收到 %+v", ev)
+		}
+		if !strings.Contains(ev.Message, "只支持") {
+			t.Fatalf("事件应带上引擎的原话（用户要知道为什么），实际 %q", ev.Message)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("引擎构造期拒绝，但事件流上什么都没有——用户会以为「点了没反应」")
+	}
+	// 同时必须留下可查的痕迹（不随重启消失）
+	entries, err := store.ListAuditByAction(ctx, control.ActionRunRejected, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) == 0 {
+		t.Fatal("拒绝没有落 audit：重启后用户查不到这次尝试")
+	}
+}
+
+// 方向不支持时，422 的 body 必须是**完整四段式**（code 不为 null），
+// 而且方向只以客观事实出现（source_kind / target_kind），不进文案——
+// 「每个方向各写一份自然语言」正是「mysql→pg 写成 pg→mysql」的来源。
+func TestUnsupportedDirectionIsFourPartAndFactual(t *testing.T) {
+	ts, store := newTestServer(t)
+	token := setupAdmin(t, ts)
+
+	// 造一对当前不支持的组合：mysql 源 → postgres 目标
+	mk := func(name, kind string) control.Connection {
+		c, err := store.CreateConnection(context.Background(), control.ConnectionInput{
+			Name: name, Kind: kind, Host: "127.0.0.1", Port: 1,
+			Database: "nope", Username: "u", Params: map[string]string{"sslmode": "disable"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	src := mk("my-src", "mysql")
+	tgt := mk("pg-tgt", "postgres")
+	job, err := store.CreateJob(context.Background(), control.JobInput{
+		Name: "bad-direction", SourceID: src.ID, TargetID: tgt.ID,
+		Spec: control.JobDoc{
+			Source: control.SourceDoc{Scope: &control.ScopeDoc{Schema: "app", Include: []string{"orders"}}},
+			Target: control.TargetDoc{Schema: "public"},
+			Mode:   control.ModeDoc{Frequency: "once"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	code, body := doJSON(t, http.MethodPost, ts.URL+"/api/jobs/"+job.ID+"/run", token, nil)
+	if code != http.StatusUnprocessableEntity {
+		t.Fatalf("不支持的方向应回 422，实际 %d %v", code, body)
+	}
+	errObj, _ := body["error"].(map[string]any)
+	// code 有两条口径：#46（E1014）合入后必须是 E1014；合入前允许为空，
+	// 但那时也必须给完整四段式（下面几行），**不许是空壳**。
+	if _, ok := core.Lookup(core.Code("E1014")); ok {
+		if errObj["code"] != "E1014" {
+			t.Fatalf("E1014 已落地，code 必须是 E1014，实际 %v", errObj["code"])
+		}
+	} else if c, _ := errObj["code"].(string); c != "" {
+		t.Fatalf("码表里没有 E1014 时不该编造 code，实际 %q", c)
+	}
+	if errObj["why"] == nil || errObj["risk"] == nil || errObj["next"] == nil {
+		t.Fatalf("四段式不完整：%v", errObj)
+	}
+	// 方向以客观事实出现，且**方向正确**（源 mysql → 目标 postgres）
+	if body["source_kind"] != "mysql" || body["target_kind"] != "postgres" {
+		t.Fatalf("事实字段不对：source_kind=%v target_kind=%v", body["source_kind"], body["target_kind"])
+	}
+	// 文案里不写方向描述：message 里不该出现「PostgreSQL → MySQL」这类自然语言
+	msg, _ := errObj["message"].(string)
+	if strings.Contains(msg, "→") {
+		t.Fatalf("message 里不该描述方向（那是「写反」的来源）：%q", msg)
+	}
+	// 而且不该有 202/run 记录（没开跑）
+	runs, _ := store.ListRuns(context.Background(), job.ID, 5)
+	if len(runs) != 0 {
+		t.Fatalf("不支持的方向不该产生 run 行，实际 %d 条", len(runs))
+	}
+}
+
+// 支持的方向仍然 202（PG→MySQL 全量）。
+func TestSupportedDirectionIsAccepted(t *testing.T) {
+	if !jobrun.DirectionSupported("postgres", "mysql") {
+		t.Skip("当前矩阵不含 PG→MySQL")
+	}
+	ts, store := newTestServer(t)
+	token := setupAdmin(t, ts)
+	mk := func(name, kind string) control.Connection {
+		c, err := store.CreateConnection(context.Background(), control.ConnectionInput{
+			Name: name, Kind: kind, Host: "127.0.0.1", Port: 1,
+			Database: "nope", Username: "u", Params: map[string]string{"sslmode": "disable"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	src := mk("pg-src", "postgres")
+	tgt := mk("my-tgt", "mysql")
+	job, err := store.CreateJob(context.Background(), control.JobInput{
+		Name: "good-direction", SourceID: src.ID, TargetID: tgt.ID,
+		Spec: control.JobDoc{
+			Source: control.SourceDoc{Scope: &control.ScopeDoc{Schema: "public", Include: []string{"orders"}}},
+			Target: control.TargetDoc{Schema: "app"},
+			Mode:   control.ModeDoc{Frequency: "once"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	code, body := doJSON(t, http.MethodPost, ts.URL+"/api/jobs/"+job.ID+"/run", token, nil)
+	if code != http.StatusAccepted {
+		t.Fatalf("支持的方向应 202（引擎自己会报能不能跑），实际 %d %v", code, body)
+	}
+}

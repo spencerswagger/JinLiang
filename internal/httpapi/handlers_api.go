@@ -357,17 +357,31 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, r, http.StatusConflict, conflictThisProcess())
 			return
 		}
-		// 引擎能力边界（例如 MySQL 目标端）是「用户可修正」的问题：422 + 四段式，
-		// 而不是 202 之后什么都没发生。
-		s.writeError(w, r, http.StatusUnprocessableEntity, apiError{
+		// 方向不支持：422 + **完整四段式**（code/why/next/risk 全来自码表），
+		// 另带两个客观事实字段 source_kind / target_kind —— 方向本身不进文案，
+		// 因为「每个方向各写一份自然语言」正是「mysql→pg 写反」的来源。
+		var ud *unsupportedDirectionError
+		if errors.As(err, &ud) {
+			e := apiError{
+				Code: string(ud.Spec.Code), Class: string(ud.Spec.Class),
+				Message: ud.Spec.Message, Why: ud.Spec.Why, Next: ud.Spec.Next, Risk: ud.Spec.Risk,
+			}
+			// 方向只以客观事实出现（两个 kind），不进文案：每个方向各写一份自然语言
+			// 正是「mysql→pg 写成 pg→mysql」的来源。
+			s.writeErrorWithFacts(w, r, http.StatusUnprocessableEntity, e, map[string]string{
+				"source_kind": ud.SourceKind,
+				"target_kind": ud.TargetKind,
+			})
+			return
+		}
+		// 其它错误一律回 409/400 一类「可修正」的四段式：能力边界由引擎在构造期
+		// 判（它的 message 已经是人话），入口只负责别把它降级成 500。
+		s.writeError(w, r, http.StatusConflict, apiError{
 			Class:   "user_action",
-			Message: "引擎暂时跑不了这种组合",
+			Message: "这次没能开始运行",
 			Why:     err.Error(),
-			Next: []string{
-				"把目标端换成一个 PostgreSQL 连接（新建连接 → 任务页改目标）",
-				"MySQL 目标端在 B2；现在可以先只验证源端读取与 full copy",
-			},
-			Risk: "无：这条在开跑之前就挡住了，不会留下半截数据",
+			Next:    []string{"按上面这句提示改配置或环境后重试", "改不了就把这句原话连同任务 id 发给维护者"},
+			Risk:    "无：这条在开跑之前就挡住了，不会留下半截数据",
 		})
 		return
 	}
@@ -731,6 +745,21 @@ func (s *Server) handleCodes(w http.ResponseWriter, r *http.Request) {
 
 // 三个「这个任务起不来」的四段式都定义在这里，**HTTP 与表单两个入口共用**。
 // 今晚的教训：双入口各写一份文案，改一处漏一处（表单版曾漏掉端点与动词）。
+// writeErrorWithFacts 与 writeError 相同，但额外带几个**客观事实**字段
+// （当前用于 source_kind / target_kind）。事实与文案分开：事实永远准确，
+// 文案只在码表里有一份。
+func (s *Server) writeErrorWithFacts(w http.ResponseWriter, r *http.Request, status int, e apiError, facts map[string]string) {
+	if wantsHTML(r) {
+		s.renderPartial(w, "error_card", e)
+		return
+	}
+	body := map[string]any{"error": e}
+	for k, v := range facts {
+		body[k] = v
+	}
+	writeJSON(w, status, body)
+}
+
 func conflictThisProcess() apiError {
 	return apiError{
 		Class:   "user_action",
