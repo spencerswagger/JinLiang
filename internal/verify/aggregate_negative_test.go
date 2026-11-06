@@ -411,6 +411,7 @@ func TestConclusionAggregateOnlyFingerprintNoContradiction(t *testing.T) {
 		},
 	}}}
 	got := Conclusion(rep)
+	t.Logf("aggregate_only conclusion: %s", got)
 	if strings.Contains(got, "未做行级全表比对") && strings.Contains(got, "已改用逐行比对") {
 		t.Fatalf("同一句里既说没做行级又说改用行级：%q", got)
 	}
