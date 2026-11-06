@@ -193,10 +193,11 @@ func buildTables(cat source.Catalog) (map[string]*tableInfo, []string) {
 }
 
 // Close releases the connection.
-func (s *Sink) Close() {
+func (s *Sink) Close() error {
 	if s.conn != nil {
-		_ = s.conn.Close(context.Background())
+		return s.conn.Close(context.Background())
 	}
+	return nil
 }
 
 // Kind implements the sink contract.
