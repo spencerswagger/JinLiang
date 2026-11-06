@@ -172,8 +172,8 @@ var specs = []Spec{
 		Message: "缺这个 schema 或表",
 		Why:     "数据库说这个对象不存在（SQLSTATE 3F000 / 42P01）：可能是目标端 target.schema 还没建，也可能是源端选中的表被删过",
 		Next: []string{
-			"目标端：先建 schema（CREATE SCHEMA <名字>;）或把 target.schema 改成已有的",
-			"源端：选中的表被删过的话，回任务页重选表范围",
+			"SQLSTATE 3F000（缺 schema）：先建 schema（CREATE SCHEMA <名字>;），或把 target.schema 改成已有的",
+			"SQLSTATE 42P01（缺表）：别去建 schema——确认表名大小写/前缀，或回任务页从源端重选表范围",
 			"改完再跑一次 run：位点不动，不需要重搬历史",
 		},
 		Risk: "换 schema 等于换一套目标表：旧 schema 里的数据不会自动搬过去",
