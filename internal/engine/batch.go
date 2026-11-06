@@ -3,11 +3,10 @@ package engine
 import (
 	"context"
 	"fmt"
-	"os"
-	"strconv"
-	"strings"
 	"sync"
 	"time"
+
+	"github.com/spencerswagger/jinliang/internal/control"
 
 	"github.com/spencerswagger/jinliang/internal/pgsource"
 	"github.com/spencerswagger/jinliang/internal/source"
@@ -30,21 +29,17 @@ const (
 	defaultMaxTxEvents = 1_000_000
 )
 
-// txLimits reads the two knobs Data 的 #11 也认的同一组环境变量，
-// 保证两个连接器的口径一致（`reliability.tx_oversize` 的数值形状还没定）。
-func txLimits() (bytes int64, events int) {
-	bytes, events = defaultMaxTxBytes, defaultMaxTxEvents
-	if v := strings.TrimSpace(os.Getenv("JINLIANG_TX_MAX_BYTES")); v != "" {
-		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
-			bytes = n
-		}
+// txLimits 的单事务上限交给控制面的 TxOversizeDoc.Limits()：
+// **yaml 显式值 > 环境变量 > 内置默认**，并且它自己会钳下限（bytes 写 100 会取到 1 MiB）。
+// 这里不再自己解析环境变量——两边各写一套迟早分叉（schema 里 `reliability.tx_oversize`
+// 是同一个开关，一处认 yaml、一处认环境变量，用户会看到「文档说的和实际行为不一致」）。
+func txLimits(doc control.JobDoc) (bytes int64, events int) {
+	var txo *control.TxOversizeDoc
+	if doc.Reliability != nil {
+		txo = doc.Reliability.TxOversize
 	}
-	if v := strings.TrimSpace(os.Getenv("JINLIANG_TX_MAX_EVENTS")); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			events = n
-		}
-	}
-	return bytes, events
+	b, e := txo.Limits(nil)
+	return b, int(e)
 }
 
 // endsWithCommit reports whether the batch closes on a committed transaction.
@@ -99,7 +94,7 @@ type batcher struct {
 	onApplied func(rows int64, pos pgsource.Position)
 }
 
-func newBatcher(sink applier, src acker, batchRows int, delay time.Duration,
+func newBatcher(sink applier, src acker, doc control.JobDoc, batchRows int, delay time.Duration,
 	start pgsource.Position, onApplied func(rows int64, pos pgsource.Position)) *batcher {
 	if batchRows < 1 {
 		batchRows = 1
@@ -107,7 +102,7 @@ func newBatcher(sink applier, src acker, batchRows int, delay time.Duration,
 	if delay <= 0 {
 		delay = time.Millisecond
 	}
-	txBytes, txEvents := txLimits()
+	txBytes, txEvents := txLimits(doc)
 	return &batcher{sink: sink, src: src, batchRows: batchRows, delay: delay,
 		lastPos: start, pendPos: start, onApplied: onApplied, lastFlush: time.Now(),
 		maxTxBytes: txBytes, maxTxEvents: txEvents}
