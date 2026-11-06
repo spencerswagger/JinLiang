@@ -236,6 +236,8 @@ type runner struct {
 	sink   *pgsink.Sink
 	cat    source.Catalog
 	tables []source.TableRef
+	// emitHook 只在单测里用（数事件条数），生产路径为 nil。
+	emitHook func(control.Event)
 
 	phase   state.Phase
 	leaseOK bool
@@ -1107,21 +1109,30 @@ func classifyError(err error) (code core.Code, classified bool) {
 
 // heartbeatLoop 周期刷新本条 run 的存活心跳；只在 run 未结束时可写（TouchRun 自己带条件）。
 func (r *runner) heartbeatLoop(ctx context.Context, interval time.Duration, touch func(context.Context) error) {
+	// 间隔的默认值只在 heartbeatEvery() 里算一份；这里拿到的一定是有效值。
 	if interval <= 0 {
-		interval = control.DefaultHeartbeatInterval / 2
+		return
 	}
 	t := time.NewTicker(interval)
 	defer t.Stop()
+	failing := false // 只在状态转换点发 note：15 秒一条会把 200 条环形缓冲铺满并挤掉真正的 progress/error
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			// 心跳失败不该打断同步（它只影响 doctor 的判断），但也不能静默：
-			// 连不上控制库时用户需要知道「状态可能被误判成幽灵」。
-			if err := touch(ctx); err != nil && ctx.Err() == nil {
+			err := touch(ctx)
+			if ctx.Err() != nil {
+				return
+			}
+			switch {
+			case err != nil && !failing:
+				failing = true
 				r.emit(ctx, control.Event{Type: "note",
 					Message: "刷新运行心跳失败（状态页可能把这一轮判成「已中断」）：" + err.Error()})
+			case err == nil && failing:
+				failing = false
+				r.emit(ctx, control.Event{Type: "note", Message: "运行心跳已恢复"})
 			}
 		}
 	}
@@ -1324,6 +1335,9 @@ func (r *runner) note(ctx context.Context, msg string) {
 }
 
 func (r *runner) emit(ctx context.Context, ev control.Event) {
+	if r.emitHook != nil { // 单测要数「发了几条」时挂这里（不在测的路径上留后门）
+		r.emitHook(ev)
+	}
 	if r.opt.Store == nil { // 单测里没有控制库：事件流不是被测对象
 		return
 	}

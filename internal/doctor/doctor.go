@@ -21,7 +21,10 @@ type Status string
 
 // Check statuses. problem makes the report unhealthy (exit code 1).
 const (
-	StatusOK      Status = "ok"
+	StatusOK Status = "ok"
+	// StatusSkipped 表示「这项检查跑不了/没有意义」——**不能当 OK 报**。
+	// 典型：冲突表/死信表本版引擎还没有写入路径，读出来的「空」不代表数据干净。
+	StatusSkipped Status = "skipped"
 	StatusWarn    Status = "warn"
 	StatusProblem Status = "problem"
 )
@@ -424,7 +427,12 @@ func targetChecks(ctx context.Context, opts Options, now time.Time, add func(Che
 					Detail: fmt.Sprintf("%d 条变更没写进目标库", len(dls)),
 					Hint:   "jinliang dead-letter list --job-key " + opts.JobKey + "；修好根因后重放"})
 			} else {
-				add(Check{ID: "TGT-05", Area: "target", Title: "没有死信", Status: StatusOK})
+				// 表存在但**引擎还没有产生死信的路径**（仓库里没有任何 _jl_dead_letter 的
+				// INSERT）。空表只能说「没人写过」，不能说「没有死信」——绿会被相信，红才被告知。
+				add(Check{ID: "TGT-05", Area: "target", Title: "死信表可读，但本版没有写入路径",
+					Status: StatusSkipped,
+					Detail: "引擎还没把任何变更写进死信表，所以这里的「空」不代表数据干净",
+					Hint:   "暂时只能靠 verify 判断数据是否完整；死信路径在后续版本接入"})
 			}
 		}
 	}
@@ -441,7 +449,10 @@ func targetChecks(ctx context.Context, opts Options, now time.Time, add func(Che
 					Detail: fmt.Sprintf("%d 条冲突等人决定（default policy=manual）", open),
 					Hint:   "jinliang conflicts list --job-key " + opts.JobKey})
 			} else {
-				add(Check{ID: "TGT-06", Area: "target", Title: "没有未处理的冲突", Status: StatusOK})
+				add(Check{ID: "TGT-06", Area: "target", Title: "冲突表可读，但本版没有写入路径",
+					Status: StatusSkipped,
+					Detail: "引擎还没把任何冲突写进冲突表，所以这里的「空」不代表没有冲突发生过",
+					Hint:   "暂时只能靠 verify 判断两端是否一致；冲突记录在后续版本接入"})
 			}
 		}
 	}

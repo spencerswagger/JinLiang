@@ -614,6 +614,8 @@ func cmdDoctor(args []string) error {
 			mark = "注意"
 		case doctor.StatusProblem:
 			mark = "问题"
+		case doctor.StatusSkipped:
+			mark = "跳过" // 「跑不了/没意义」不能显示成 OK
 		}
 		fmt.Printf("    [%s] %-7s %s\n", mark, c.Area, c.Title)
 		if c.Detail != "" {

@@ -345,3 +345,32 @@ func TestHeartbeatLoopReportsFailureButKeepsRunning(t *testing.T) {
 		t.Fatalf("心跳失败后应继续尝试，实际只调了 %d 次", n)
 	}
 }
+
+// 心跳 note 只在状态转换点发：每 15 秒一条会把 200 条环形缓冲铺满、
+// 把真正的 progress/error 挤掉（13 分钟就能铺满）。
+// 断言的是「两次失败只发一条、恢复时再发一条」，不是「至少发了一条」。
+func TestHeartbeatNotesOnlyOnStateTransitions(t *testing.T) {
+	var notes atomic.Int32
+	r := &runner{opt: Options{}, job: control.Job{}, run: control.Run{ID: "x"}}
+	r.emitHook = func(control.Event) { notes.Add(1) }
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	bad := atomic.Bool{}
+	bad.Store(true)
+	go r.heartbeatLoop(ctx, 5*time.Millisecond, func(context.Context) error {
+		if bad.Load() {
+			return errors.New("控制库暂时不可写")
+		}
+		return nil
+	})
+	time.Sleep(60 * time.Millisecond) // 期间会有多次失败
+	if n := notes.Load(); n != 1 {
+		t.Fatalf("连续失败只应发一条 note，实际 %d 条", n)
+	}
+	bad.Store(false) // 恢复
+	time.Sleep(40 * time.Millisecond)
+	if n := notes.Load(); n != 2 {
+		t.Fatalf("恢复时应再发一条，实际累计 %d 条", n)
+	}
+}

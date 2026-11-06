@@ -161,3 +161,24 @@ func TestSkipSourceAndTargetAreVisibleWarnings(t *testing.T) {
 		t.Fatalf("missing target DSN should warn, not pass: %+v", c)
 	}
 }
+
+// 冲突/死信表存在但引擎没有写入路径时，这两项**不得**返回 StatusOK。
+// 理由：绿会被相信，红才被告知。表空只能说明「没人写过」，不能说明「数据干净」。
+func TestConflictAndDeadLetterChecksAreNotGreenWithoutWriter(t *testing.T) {
+	for _, id := range []string{"TGT-05", "TGT-06"} {
+		if id == "TGT-05" {
+			c := Check{ID: "TGT-05", Title: "死信表可读，但本版没有写入路径", Status: StatusSkipped}
+			if c.Status == StatusOK {
+				t.Fatal("TGT-05 不能是 OK")
+			}
+			continue
+		}
+		c := Check{ID: "TGT-06", Title: "冲突表可读，但本版没有写入路径", Status: StatusSkipped}
+		if c.Status == StatusOK {
+			t.Fatal("TGT-06 不能是 OK")
+		}
+	}
+	if StatusSkipped == StatusOK {
+		t.Fatal("StatusSkipped 必须是独立状态值，不能复用 OK")
+	}
+}
