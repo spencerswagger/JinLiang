@@ -85,6 +85,11 @@ import json, sys
 files = [l.rstrip("\n") for l in open(sys.argv[1], encoding="utf-8") if l.strip()]
 open(sys.argv[2], "w", encoding="utf-8").write(json.dumps(files))
 PY
+    # 双保险：空清单不能让逻辑层独自承担「拒绝」责任；PR 不可能真的零文件。
+    if [ ! -s "$tmp/prfiles.txt" ]; then
+      echo "review-gate: FAIL 读不到本 PR 的文件清单（为空），无法判定 review..head 是否只含 merge main；按纪律拒绝而不是放行" >&2
+      exit 1
+    fi
   else
     echo '{}' >"$tmp/compare.json"
     echo '[]' >"$tmp/prfiles.json"
