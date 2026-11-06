@@ -504,3 +504,43 @@ func intervalJob(t *testing.T, srcDSN, dstDSN, name, table, lookback string) (*c
 	}
 	return store, job.ID
 }
+
+// Owl 的坑：PG 默认 `autovacuum_analyze_threshold = 50` 行，**几行的小维表永远不会被自动
+// analyze**（reltuples 长期 -1）。若把「统计信息未知」一律拦死，这种表会让整条 interval
+// 任务起不来——用户得先去 ANALYZE 一张 3 行的表。物理大小 < 8 MiB 时必须放行。
+func TestTinyTableWithoutStatsIsAllowed(t *testing.T) {
+	srcDSN, dstDSN := dsns(t)
+	srcDB := mustConn(t, srcDSN)
+	dstDB := mustConn(t, dstDSN)
+	table := "wm_tiny"
+	ctx := context.Background()
+
+	exec(t, srcDB, "DROP TABLE IF EXISTS "+table)
+	exec(t, srcDB, "CREATE TABLE "+table+" (id bigint PRIMARY KEY, name text)")
+	exec(t, srcDB, "INSERT INTO "+table+" VALUES (1,'a'),(2,'b'),(3,'c')")
+	exec(t, dstDB, "DROP TABLE IF EXISTS "+table)
+	exec(t, dstDB, "DROP TABLE IF EXISTS _jl_meta, _jl_chunk, _jl_lease, _jl_object, _jl_instance")
+
+	// 关键前提：新表且只有 3 行 → reltuples = -1（不会被自动 analyze）
+	var est int64
+	if err := srcDB.QueryRow(ctx,
+		`SELECT c.reltuples::bigint FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+		 WHERE n.nspname='public' AND c.relname=$1`, table).Scan(&est); err != nil {
+		t.Fatal(err)
+	}
+	if est >= 0 {
+		t.Skipf("这张表已经有统计信息（reltuples=%d），构造不出「未知」前提", est)
+	}
+
+	store, jobID := intervalJob(t, srcDSN, dstDSN, "wm-tiny", table, "1m")
+	if _, err := engine.Run(ctx, engine.Options{Store: store, JobID: jobID}); err != nil {
+		t.Fatalf("3 行的小表不该被拦（统计信息未知但物理很小）：%v", err)
+	}
+	var n int
+	if err := dstDB.QueryRow(ctx, "SELECT count(*) FROM "+table).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 3 {
+		t.Fatalf("小表应整表搬过去，得到 %d 行", n)
+	}
+}

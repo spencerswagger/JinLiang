@@ -197,3 +197,23 @@ func (s *Source) TableRowsEstimate(ctx context.Context, ref source.TableRef) (ro
 	}
 	return est, true, nil
 }
+
+// TablePhysicalSize 返回表在磁盘上的实际大小（`pg_total_relation_size`，含索引与 TOAST）。
+//
+// 为什么需要它：`reltuples` 在「从没 ANALYZE 过」时是 -1，而 PG 的自动 analyze 阈值是
+// `autovacuum_analyze_threshold = 50` 行——**几行的小维表永远不会被自动 analyze**，
+// 于是「未知」会一直成立。若把「未知」一律拦死，小维表会把整条 interval 任务卡住。
+// 物理大小读的是文件，不需要统计信息，正好用来区分「未知但很小」与「未知且很大」。
+//
+// **不要用 `relpages`**：它和 `reltuples` 一样只在 VACUUM/ANALYZE 后更新，
+// 对新导入的大表同样是 0——用它放行会把最危险的表重新放回来。
+func (s *Source) TablePhysicalSize(ctx context.Context, ref source.TableRef) (int64, error) {
+	q := `SELECT pg_total_relation_size(c.oid) FROM pg_class c
+	      JOIN pg_namespace n ON n.oid = c.relnamespace
+	      WHERE n.nspname = $1 AND c.relname = $2`
+	var size int64
+	if err := s.conn.QueryRow(ctx, q, ref.Schema, ref.Table).Scan(&size); err != nil {
+		return 0, err
+	}
+	return size, nil
+}

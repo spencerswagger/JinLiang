@@ -51,28 +51,39 @@ func (r *runner) runIntervalRound(ctx context.Context) error {
 		if !r.tableHasColumn(ref, wmCol) {
 			// 没有水位列 → 只能每轮整表重搬。这个代价必须由用户显式承担，不能替他猜。
 			//
-			// **判据必须 fail-closed**：`reltuples = -1`（从没 ANALYZE 过）以前被控制面
-			// 折成 0，于是「1000 万行的新表」估成 0 → 放行 → 每轮全表 COPY——正好放过
-			// 最该拦的那类表。所以这里：「未知」一律拦，「已知且过大」也拦。
+			// 判据两条腿：
+			//   1. 行数估算（reltuples）——**未知不等于很小**，`-1` 要单独处理；
+			//   2. 物理大小（pg_total_relation_size）——不需要 ANALYZE，用来区分
+			//      「未知但很小」与「未知且很大」。
+			//
+			// 为什么需要第 2 条：PG 的自动 analyze 阈值是 `autovacuum_analyze_threshold = 50`
+			// 行，**几行的小维表永远不会被自动 analyze**，reltuples 长期是 -1；若把「未知」
+			// 一律拦死，这种表会让整条 interval 任务起不来。
+			// **不要用 relpages**：它和 reltuples 一样只在 VACUUM/ANALYZE 后更新，
+			// 对新导入的大表同样是 0，用它放行会把最危险的表重新放回来。
 			est, known, err := r.src.TableRowsEstimate(ctx, ref)
 			if err != nil {
 				return fmt.Errorf("读 %s 的行数估算失败: %w", ref.Table, err)
 			}
+			size, serr := r.src.TablePhysicalSize(ctx, ref)
+			if serr != nil {
+				return fmt.Errorf("读 %s 的物理大小失败（判断不了体量就不敢放行整表重搬）: %w", ref.Table, serr)
+			}
 			switch {
-			case !known:
-				return &notImplementedError{fmt.Sprintf(
-					"表 %s 没有水位列 %s，而且源库还没有它的统计信息（从没 ANALYZE 过），"+
-						"我无法判断体量，所以不敢放行「每轮整表重搬」（大表等于每分钟一次全表拷贝）。"+
-						"你现在能做什么：1) 在源库执行 ANALYZE %s 后重跑；"+
-						"2) 给它加一个更新时间列（推荐，之后就会走增量）；"+
-						"3) 把 mode.frequency 改成 full_interval，明确接受整表周期重跑",
-					ref.Table, wmCol, ref.Table)}
-			case est > maxFullCopyRowsWithoutWatermark:
+			case known && est > maxFullCopyRowsWithoutWatermark:
 				return &notImplementedError{fmt.Sprintf(
 					"表 %s 没有水位列 %s，而它约 %d 行：定时增量只能每轮整表重搬，"+
 						"这对大表等于每分钟一次全表拷贝。要么给它加一个更新时间列（推荐），"+
 						"要么把 mode.frequency 改成 full_interval 明确接受整表周期重跑",
 					ref.Table, wmCol, est)}
+			case !known && size >= maxFullCopyBytesWithoutWatermark:
+				return &notImplementedError{fmt.Sprintf(
+					"表 %s 没有水位列 %s，源库里也没有它的统计信息（从没 ANALYZE 过），"+
+						"而它在磁盘上已经占 %s：判断不了行数就不敢放行「每轮整表重搬」。"+
+						"你现在能做什么：1) 在源库执行 ANALYZE %s 后重跑；"+
+						"2) 给它加一个更新时间列（推荐，之后就走增量）；"+
+						"3) 把 mode.frequency 改成 full_interval，明确接受整表周期重跑",
+					ref.Table, wmCol, humanLag(size), ref.Table)}
 			}
 			r.note(ctx, fmt.Sprintf("%s 没有水位列 %s：本轮整表重搬（行数多的话建议给它加一个更新时间列）",
 				ref.Table, wmCol))
@@ -197,6 +208,10 @@ func (r *runner) copyOneTable(ctx context.Context, ref source.TableRef) (int64, 
 		})
 	return total, err
 }
+
+// maxFullCopyBytesWithoutWatermark：统计信息未知时用**物理大小**兜底判断体量。
+// 8 MiB 以下的表（典型是小维表）每轮整表重搬完全可接受；再大就必须让人显式决定。
+const maxFullCopyBytesWithoutWatermark = 8 << 20
 
 // maxFullCopyRowsWithoutWatermark 是「没有水位列也允许每轮整表重搬」的行数上限。
 // 超过就拦下来，让用户显式选：加水位列（推荐），或改用 full_interval 承认整表周期重跑。
