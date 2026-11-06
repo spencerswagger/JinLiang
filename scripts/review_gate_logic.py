@@ -51,6 +51,8 @@ def compute_anchor(review, head, pr_files, cwd="."):
         out["error"] = "缺少 review 或 head"
         return out
     owned = {p for p in (pr_files or []) if p}
+    # 早退时 ancestor 故意保持 false：decision 层先判 pr_files_missing，
+    # 否则真实路径会被误归因成「不是祖先，请 rebase」（selftest 用同样形状）。
     if not owned:
         out["pr_files_missing"] = True
         return out
@@ -240,6 +242,8 @@ def selftest():
          anchor(no_changes=True), False, "compare_files_missing"),
         ("compare-files-truncated", {"body": "**可合并（必改 0）**", "state": "COMMENTED", "commit_id": old},
          anchor(truncated=True), False, "compare_files_truncated"),
+        # 真实 compute_anchor 早退时 ancestor=False；用例必须喂这个形状，
+        # 否则测的是真实代码走不到的世界。
         ("pr-files-missing", {"body": "**可合并（必改 0）**", "state": "COMMENTED", "commit_id": old},
          anchor(missing=True, ancestor=False), False, "pr_files_missing"),
         ("approval-conclusion", {"body": "结论：可合并", "state": "COMMENTED", "commit_id": head}, None, True, "pass"),
