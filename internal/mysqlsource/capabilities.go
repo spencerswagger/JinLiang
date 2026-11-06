@@ -1,0 +1,450 @@
+package mysqlsource
+
+import (
+	"context"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/hex"
+	"fmt"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/spencerswagger/jinliang/internal/source"
+)
+
+// 引擎侧要的那几组能力，这里按「只读、不改行为」补齐。
+//
+// 为什么放在连接器而不是引擎：这些方法的签名里都有连接器的类型（位置、块边界、
+// 指纹口径），引擎只要按能力接口断言即可（照 #51 的 stateCapable 写法），
+// 契约（source.Source / sink.Sink）不用加方法。
+
+// —— 1. LSN / ack 组：MySQL 没有服务端 ack ——
+//
+// PG 的 ack 是「源端可以丢掉这段 WAL」的强承诺；MySQL 的 binlog 由源端按保留策略
+// 自己轮转，副本无话可说，所以这里只能是 no-op。用 no-op 而不是「假装成功」：
+// 调用方看 SafeAckPoint 就知道「没有需要 ack 的东西」。
+
+// Ack 是 no-op：MySQL 不需要向源端确认位点。
+func (s *Source) Ack(pos source.Position) {}
+
+// SafeAckPoint 返回「可以安全确认的位置」＝最后一次**已交付给下游**的事务位点。
+// ok=false 表示还没有交付过任何事务（此时不该推进任何书签）。
+func (s *Source) SafeAckPoint() (source.Position, bool) {
+	p, ok := s.lastCommit.Load().(Position)
+	if !ok || p.IsZero() {
+		return nil, false
+	}
+	return p, true
+}
+
+// LastCommit 与 SafeAckPoint 同值：MySQL 侧没有「已 ack 位置」与「已提交位置」之分。
+func (s *Source) LastCommit() source.Position {
+	p, ok := s.SafeAckPoint()
+	if !ok {
+		return nil
+	}
+	return p
+}
+
+// markCommitted 由 RunStream/Stream 在**下游成功处理完一笔事务**后调用。
+func (s *Source) markCommitted(p Position) { s.lastCommit.Store(p) }
+
+// —— 2. 分块快照组 ——
+
+// Chunk 是一个快照块（与 pgsource.Chunk 同形状，方便引擎共用一套块记账）。
+type Chunk struct {
+	Table source.TableRef
+	No    int
+	Rows  [][]any
+	From  string // 本块的 keyset 边界（供人核对 + 块进度标记）
+	To    string
+}
+
+// ChunkHandler 消费一个块；返回错误即中止快照。
+type ChunkHandler func(ctx context.Context, c Chunk) error
+
+// SnapshotChunks 把全量按「一个 keyset 页 = 一块」交出去，块边界可核对、可记账。
+//
+// 与 Snapshot 的差别只在交付粒度：Snapshot 逐行回调，这个逐块回调——引擎要写
+// `_jl_chunk`（块级续跑）就得知道块的边界，所以必须有这个形状。
+// 无主键表没有 keyset 边界，整表算一块（与 docs/SNAPSHOT.md 的「只有表级断点」一致）。
+func (s *Source) SnapshotChunks(ctx context.Context, opt source.SnapshotOpt, fn ChunkHandler) (Position, error) {
+	if opt.ChunkRows <= 0 {
+		opt.ChunkRows = 100_000
+	}
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return Position{}, err
+	}
+	defer conn.Close()
+
+	probe, err := NewProber(s.db).Probe(ctx)
+	if err != nil {
+		return Position{}, err
+	}
+	stmt := probe.StatusStatement
+	if stmt == "" {
+		return Position{}, capabilityError("缺「读位点」权限",
+			"读不到当前位点，全量搬完没法接上增量",
+			"按预检 MY-03 给账号补 REPLICATION CLIENT，然后重跑",
+			"没有位点就只能整表重搬，且增量接不上")
+	}
+
+	var pos Position
+	locked := false
+	if _, err := conn.ExecContext(ctx, "FLUSH TABLES WITH READ LOCK"); err == nil {
+		locked = true
+		pos, err = s.readStatusConn(ctx, conn, stmt)
+		if err != nil {
+			_, _ = conn.ExecContext(ctx, "UNLOCK TABLES")
+			return Position{}, err
+		}
+	}
+	if _, err := conn.ExecContext(ctx, "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ"); err != nil {
+		if locked {
+			_, _ = conn.ExecContext(ctx, "UNLOCK TABLES")
+		}
+		return Position{}, err
+	}
+	if _, err := conn.ExecContext(ctx, "START TRANSACTION WITH CONSISTENT SNAPSHOT"); err != nil {
+		if locked {
+			_, _ = conn.ExecContext(ctx, "UNLOCK TABLES")
+		}
+		return Position{}, fmt.Errorf("开一致性快照失败: %w", err)
+	}
+	if !locked {
+		pos, err = s.readStatusConn(ctx, conn, stmt)
+		if err != nil {
+			_, _ = conn.ExecContext(ctx, "ROLLBACK")
+			return Position{}, err
+		}
+	}
+	if locked {
+		if _, err := conn.ExecContext(ctx, "UNLOCK TABLES"); err != nil {
+			_, _ = conn.ExecContext(ctx, "ROLLBACK")
+			return Position{}, err
+		}
+	}
+	defer conn.ExecContext(context.WithoutCancel(ctx), "COMMIT")
+
+	cat, err := s.Catalog(ctx, source.Scope{})
+	if err != nil {
+		return Position{}, err
+	}
+	chunkNo := 0
+	for _, t := range cat.Tables {
+		if err := s.eachChunk(ctx, conn, t, opt.ChunkRows, func(c Chunk) error {
+			chunkNo++
+			c.No = chunkNo
+			return fn(ctx, c)
+		}); err != nil {
+			return Position{}, err
+		}
+	}
+	return pos, nil
+}
+
+// eachChunk 按 keyset 页切块（无主键表整表一块）。
+func (s *Source) eachChunk(ctx context.Context, conn *sql.Conn, t source.Table, chunk int64, fn func(Chunk) error) error {
+	cols := make([]string, 0, len(t.Columns))
+	for _, c := range t.Columns {
+		cols = append(cols, quoteIdent(c.Name))
+	}
+	if len(cols) == 0 {
+		return nil
+	}
+	selectList := strings.Join(cols, ", ")
+	table := quoteIdent(t.Schema) + "." + quoteIdent(t.Table)
+	pk := make([]string, 0, len(t.PrimaryKey))
+	for _, c := range t.PrimaryKey {
+		pk = append(pk, quoteIdent(c))
+	}
+
+	if len(pk) == 0 {
+		rows, err := s.scanRowsAny(ctx, conn, fmt.Sprintf("SELECT %s FROM %s", selectList, table), nil, t)
+		if err != nil {
+			return err
+		}
+		if len(rows) == 0 {
+			return nil
+		}
+		return fn(Chunk{Table: t.TableRef, Rows: rows, From: "", To: ""})
+	}
+
+	var lastKey []source.Value
+	for {
+		var (
+			q    string
+			args []any
+		)
+		if lastKey == nil {
+			q = fmt.Sprintf("SELECT %s FROM %s ORDER BY %s LIMIT %d", selectList, table, strings.Join(pk, ", "), chunk)
+		} else {
+			args = make([]any, len(lastKey))
+			for i, v := range lastKey {
+				args[i] = driverValue(v)
+			}
+			q = fmt.Sprintf("SELECT %s FROM %s WHERE (%s) > (%s) ORDER BY %s LIMIT %d",
+				selectList, table, strings.Join(pk, ", "), placeholders(len(pk)), strings.Join(pk, ", "), chunk)
+		}
+		rows, err := conn.QueryContext(ctx, q, args...)
+		if err != nil {
+			return fmt.Errorf("读 %s.%s 失败: %w", t.Schema, t.Table, err)
+		}
+		names, err := rows.Columns()
+		if err != nil {
+			rows.Close()
+			return err
+		}
+		pkIdx := pkIndexes(t, names)
+		var anyRows [][]any
+		n := 0
+		from := keyString(lastKey)
+		for rows.Next() {
+			row, err := scanRow(rows, names, t)
+			if err != nil {
+				rows.Close()
+				return err
+			}
+			anyRows = append(anyRows, toAnyRow(row))
+			if len(pkIdx) > 0 {
+				lastKey = make([]source.Value, len(pkIdx))
+				for i, idx := range pkIdx {
+					lastKey[i] = row.Values[idx]
+				}
+			}
+			n++
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return err
+		}
+		rows.Close()
+		if n == 0 {
+			return nil
+		}
+		if err := fn(Chunk{Table: t.TableRef, Rows: anyRows, From: from, To: keyString(lastKey)}); err != nil {
+			return err
+		}
+		if int64(n) < chunk {
+			return nil
+		}
+	}
+}
+
+func (s *Source) scanRowsAny(ctx context.Context, conn *sql.Conn, q string, args []any, t source.Table) ([][]any, error) {
+	rows, err := conn.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	names, err := rows.Columns()
+	if err != nil {
+		return nil, err
+	}
+	var out [][]any
+	for rows.Next() {
+		row, err := scanRow(rows, names, t)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, toAnyRow(row))
+	}
+	return out, rows.Err()
+}
+
+func keyString(keys []source.Value) string {
+	if len(keys) == 0 {
+		return ""
+	}
+	parts := make([]string, len(keys))
+	for i, k := range keys {
+		parts[i] = fmt.Sprintf("%v", driverValue(k))
+	}
+	return strings.Join(parts, ",")
+}
+
+// —— 3. 定时增量组 ——
+
+// MaxWatermark 读水位列的当前最大值（interval 模式的水位起点）。
+func (s *Source) MaxWatermark(ctx context.Context, ref source.TableRef, column string) (string, error) {
+	if strings.TrimSpace(column) == "" {
+		return "", capabilityError("没有配置水位列",
+			"定时增量靠水位列判断「这一轮从哪开始」，没配就没法算",
+			"在 job 里给这张表配 incremental_column，或把模式改成 continuous（需要打开变更流水）",
+			"不配水位列时该表只能整表重搬")
+	}
+	var v sql.NullString
+	q := fmt.Sprintf("SELECT MAX(%s) FROM %s", quoteIdent(column), s.qualifiedOn(ref))
+	if err := s.db.QueryRowContext(ctx, q).Scan(&v); err != nil {
+		return "", capabilityError("水位列读不出来（"+column+"）",
+			"这一列不存在，或类型不能比大小",
+			"确认列名（区分大小写按源库规则），或换一个单调递增的列",
+			"水位列不对时定时增量会漏数据或重复搬")
+	}
+	if !v.Valid {
+		return "", nil // 空表：没有水位
+	}
+	return v.String, nil
+}
+
+// ReadWatermarkPage 按水位列取一页（keyset，不用 OFFSET）。
+func (s *Source) ReadWatermarkPage(ctx context.Context, ref source.TableRef, column, after string, limit int) ([]source.Row, string, error) {
+	if limit <= 0 {
+		limit = 1000
+	}
+	if strings.TrimSpace(column) == "" {
+		return nil, "", capabilityError("没有配置水位列", "定时增量需要它算每轮起点", "配 incremental_column", "不配就只能整表重搬")
+	}
+	q := fmt.Sprintf("SELECT * FROM %s WHERE %s > ? ORDER BY %s LIMIT %d",
+		s.qualifiedOn(ref), quoteIdent(column), quoteIdent(column), limit)
+	rows, err := s.db.QueryContext(ctx, q, after)
+	if err != nil {
+		return nil, "", capabilityError("水位分页读不出来", "水位列不存在或不可比大小", "确认列名与类型", "分页失败会导致该轮同步不完整")
+	}
+	defer rows.Close()
+	names, err := rows.Columns()
+	if err != nil {
+		return nil, "", err
+	}
+	var out []source.Row
+	next := after
+	for rows.Next() {
+		row, err := scanRow(rows, names, ref2table(ref))
+		if err != nil {
+			return nil, "", err
+		}
+		out = append(out, row)
+		for i, n := range names {
+			if strings.EqualFold(n, column) {
+				next = fmt.Sprintf("%v", driverValue(row.Values[i]))
+			}
+		}
+	}
+	return out, next, rows.Err()
+}
+
+// TableRowsEstimate 给规划用的行数估算（information_schema，不锁表）。
+func (s *Source) TableRowsEstimate(ctx context.Context, ref source.TableRef) (int64, error) {
+	var n sql.NullInt64
+	err := s.db.QueryRowContext(ctx,
+		"SELECT TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
+		s.schemaOf(ref), ref.Table).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("读 %s 的行数估算失败: %w", ref.Table, err)
+	}
+	return n.Int64, nil
+}
+
+// —— 4. 校验组 ——
+
+// Count 目标端/源端的行数（对账用）。
+func (s *Source) Count(ctx context.Context, ref source.TableRef) (int64, error) {
+	var n int64
+	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+s.qualifiedOn(ref)).Scan(&n); err != nil {
+		return 0, fmt.Errorf("数 %s 行数失败: %w", ref.Table, err)
+	}
+	return n, nil
+}
+
+// Fingerprint 是全表内容的稳定指纹：按主键顺序流式哈希。
+//
+// 口径与 pgsink/pgsource 的「行数 + 内容哈希」一致（不要求算法相同，只要求同侧重算
+// 结果稳定、且能跨源/目标比对——比对时两侧都走各自的 Fingerprint）。
+// 无主键表明确报错：没有稳定顺序就没有可复现的指纹。
+func (s *Source) Fingerprint(ctx context.Context, ref source.TableRef) (string, error) {
+	pk, err := s.primaryKey(ctx, ref)
+	if err != nil {
+		return "", err
+	}
+	if len(pk) == 0 {
+		return "", capabilityError("这张表没有主键",
+			"没有主键就没有稳定顺序，同一份数据每次算出的指纹会不一样",
+			"给表加主键/唯一键，或改用 Count + 逐块抽样核对",
+			"无主键表的指纹不可比对，强行比对会给出假的「不一致」")
+	}
+	order := make([]string, len(pk))
+	for i, c := range pk {
+		order[i] = quoteIdent(c)
+	}
+	q := fmt.Sprintf("SELECT * FROM %s ORDER BY %s", s.qualifiedOn(ref), strings.Join(order, ", "))
+	rows, err := s.db.QueryContext(ctx, q)
+	if err != nil {
+		return "", fmt.Errorf("读 %s 失败: %w", ref.Table, err)
+	}
+	defer rows.Close()
+	names, err := rows.Columns()
+	if err != nil {
+		return "", err
+	}
+	h := sha256.New()
+	var n int64
+	for rows.Next() {
+		row, err := scanRow(rows, names, ref2table(ref))
+		if err != nil {
+			return "", err
+		}
+		for _, v := range row.Values {
+			fmt.Fprintf(h, "%d:%v\x00", v.Kind, driverValue(v))
+		}
+		h.Write([]byte{0x1e})
+		n++
+	}
+	if err := rows.Err(); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%d:%s", n, hex.EncodeToString(h.Sum(nil))), nil
+}
+
+func (s *Source) primaryKey(ctx context.Context, ref source.TableRef) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE
+		WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND CONSTRAINT_NAME = 'PRIMARY'
+		ORDER BY ORDINAL_POSITION`, s.schemaOf(ref), ref.Table)
+	if err != nil {
+		return nil, fmt.Errorf("读 %s 的主键失败: %w", ref.Table, err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var c string
+		if err := rows.Scan(&c); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// capabilityError 统一四段式：发生了什么 / 为什么 / 你能做什么 / 风险。
+// 缺能力时给这个，而不是 panic 或静默返回空值。
+func capabilityError(what, why, next, risk string) error {
+	return fmt.Errorf("%s：%s。你能做的：%s。风险：%s", what, why, next, risk)
+}
+
+func ref2table(ref source.TableRef) source.Table { return source.Table{TableRef: ref} }
+
+func toAnyRow(r source.Row) []any {
+	out := make([]any, len(r.Values))
+	for i, v := range r.Values {
+		out[i] = driverValue(v)
+	}
+	return out
+}
+
+var _ = time.Now
+var _ sync.Mutex
+
+// schemaOf / qualifiedOn 是给「只带表名」的 TableRef 补上连接库名的两个小工具
+// （MySQL 源没有 schema 层，scope.Schema 就是库名）。
+func (s *Source) schemaOf(ref source.TableRef) string {
+	if ref.Schema != "" {
+		return ref.Schema
+	}
+	return s.ep.Database
+}
+
+func (s *Source) qualifiedOn(ref source.TableRef) string {
+	return quoteIdent(s.schemaOf(ref)) + "." + quoteIdent(ref.Table)
+}

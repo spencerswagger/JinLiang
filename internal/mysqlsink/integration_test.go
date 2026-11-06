@@ -667,3 +667,89 @@ func TestIntegrationReadLease(t *testing.T) {
 		t.Fatalf("ReadLease = %+v err=%v", h, err)
 	}
 }
+
+// staged_phases 的 ack 前提：位点没落盘就不能 ack（否则源端会清掉还能重放的流水）。
+// 这条覆盖「含 DDL 的批次有三个提交点」里最危险的那种顺序。
+func TestIntegrationPositionDurableGatesAck(t *testing.T) {
+	ctx := context.Background()
+	s := openSink(t, func(o *Options) { o.JobKey = "itdur00001" })
+	t.Cleanup(func() {
+		_, _ = s.db.ExecContext(context.Background(), "DELETE FROM `_jl_meta` WHERE job_key = ?", s.opt.JobKey)
+	})
+
+	if s.PositionDurability() != "staged_phases" {
+		t.Fatalf("MySQL 目标端必须是 staged_phases，拿到 %q", s.PositionDurability())
+	}
+	// 还没写过任何位点：ack 必须被拒。
+	if ok, err := s.PositionDurable(ctx, "postgres:v1:0/AAA"); err != nil || ok {
+		t.Fatalf("没有位点时应 false: ok=%v err=%v", ok, err)
+	}
+
+	// 造一张表并写入一批，位点随数据落盘 → 该位点 durable。
+	cat := source.Catalog{Tables: []source.Table{{
+		TableRef: source.TableRef{Table: "jl_b3_orders"},
+		Columns: []source.Column{
+			{Name: "id", Type: "int", Nullable: false},
+			{Name: "note", Type: "varchar(64)", Nullable: true},
+		},
+		PrimaryKey:  []string{"id"},
+		HasStablePK: true,
+	}}}
+	dropTable(t, s, "jl_b3_orders")
+	if _, err := s.EnsureSchema(ctx, cat); err != nil {
+		t.Fatalf("建表: %v", err)
+	}
+	defer dropTable(t, s, "jl_b3_orders")
+
+	want := "mysql:v1:file=binlog.000009;pos=900;coord=mysql_file_pos"
+	batch := insertBatch("jl_b3_orders", [][]any{{int64(1), "x"}}, want)
+	if err := s.Apply(ctx, batch, posOf(t, want)); err != nil {
+		t.Fatalf("写入: %v", err)
+	}
+	if ok, err := s.PositionDurable(ctx, want); err != nil || !ok {
+		t.Fatalf("位点应已落盘: ok=%v err=%v", ok, err)
+	}
+	// 期望一个「更晚但没落盘」的位点 → 必须 false（引擎据此不 ack）。
+	if ok, _ := s.PositionDurable(ctx, "mysql:v1:file=binlog.000009;pos=9999;coord=mysql_file_pos"); ok {
+		t.Fatal("没落盘的位点不能报告为 durable")
+	}
+}
+
+// 含 DDL 的批次崩在「DDL 已执行、新位点未写」时：位点停在旧值 → ack 必须被拒。
+func TestIntegrationDDLBatchKeepsAckAtOldPosition(t *testing.T) {
+	ctx := context.Background()
+	s := openSink(t, func(o *Options) { o.JobKey = "itdur00002" })
+	t.Cleanup(func() {
+		_, _ = s.db.ExecContext(context.Background(), "DELETE FROM `_jl_meta` WHERE job_key = ?", s.opt.JobKey)
+	})
+	dropTable(t, s, "jl_b3_orders")
+	if _, err := s.EnsureSchema(ctx, ordersCatalog()); err != nil {
+		t.Fatalf("建表: %v", err)
+	}
+	defer dropTable(t, s, "jl_b3_orders")
+
+	old := "mysql:v1:file=binlog.000009;pos=100;coord=mysql_file_pos"
+	if err := s.Apply(ctx, insertBatch("jl_b3_orders", [][]any{{int64(1), "x"}}, old), posOf(t, old)); err != nil {
+		t.Fatalf("基线写入: %v", err)
+	}
+
+	// 含 DDL 且 DDL 被白名单拒绝 → 数据已落、DDL 没执行、新位点没写。
+	newPos := "mysql:v1:file=binlog.000009;pos=200;coord=mysql_file_pos"
+	batch := []source.Event{
+		{Kind: source.EvBegin, TxID: "t1"},
+		{Kind: source.EvInsert, TxID: "t1", Table: source.TableRef{Table: "jl_b3_orders"},
+			New:      source.Row{Table: source.TableRef{Table: "jl_b3_orders"}, Values: []source.Value{{Kind: source.KindInt, I: 2}, {Kind: source.KindString, S: "y"}}},
+			Relation: relationPtr("jl_b3_orders")},
+		{Kind: source.EvDDL, TxID: "t2", DDL: "DROP TABLE `jl_b3_orders`"},
+		{Kind: source.EvCommit, TxID: "t2"},
+	}
+	if err := s.Apply(ctx, batch, posOf(t, newPos)); err == nil {
+		t.Fatal("DROP TABLE 不在白名单，必须报错")
+	}
+	if ok, _ := s.PositionDurable(ctx, newPos); ok {
+		t.Fatal("DDL 失败时新位点不能是 durable（否则引擎会 ack，源端随后清掉流水）")
+	}
+	if ok, err := s.PositionDurable(ctx, old); err != nil || !ok {
+		t.Fatalf("旧位点仍应 durable（aeck 只能停在这里）: ok=%v err=%v", ok, err)
+	}
+}

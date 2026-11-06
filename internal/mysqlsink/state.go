@@ -332,6 +332,25 @@ func (s *Sink) tableObjectName(ref source.TableRef) string {
 	return s.schemaOf(ref) + "." + ref.Table + "#table"
 }
 
+// PositionDurability 告诉引擎「位点是怎么落盘的」，决定它能不能在 Apply 返回后立刻 ack。
+//
+// MySQL 的 DDL/TRUNCATE 会**隐式提交**，含它们的批次必须拆三段（数据+旧位点 → DDL →
+// 新位点），所以「一个 Apply = 一个事务」在这里不成立——ack 前必须确认新位点真的落盘。
+// pgsink 返回 "same_tx"（数据与位点同事务），引擎据此走原路径。
+func (s *Sink) PositionDurability() string { return "staged_phases" }
+
+// PositionDurable 报告「这个位点是否已经真的落库」。
+//
+// 引擎在 staged_phases 模式下 ack 之前必须调它：崩在「DDL 已执行、新位点未写」时
+// 这里返回 false，引擎就不该 ack（否则源端会清掉还能重放的变更流水）。
+func (s *Sink) PositionDurable(ctx context.Context, want string) (bool, error) {
+	got, err := s.MetaPosition(ctx)
+	if err != nil {
+		return false, err
+	}
+	return want != "" && got == want, nil
+}
+
 // Count 目标表行数（全量/增量对账用）。
 func (s *Sink) Count(ctx context.Context, ref source.TableRef) (int64, error) {
 	var n int64
