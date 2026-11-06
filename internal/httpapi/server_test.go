@@ -1728,3 +1728,70 @@ func authorizedGet(t *testing.T, url, token string) (string, error) {
 	}
 	return string(b), nil
 }
+
+// 能力边界不再由 HTTP 入口判断（判断只该有一处：引擎构造期）。
+// 入口要保证的是另一件事：引擎在**构造期**拒绝时，202 之后事件流上必须出现 error，
+// 而不是「点了没反应」。这里用一个「只支持 PG→PG」的假引擎错误模拟构造期拒绝。
+func TestEngineConstructionErrorSurfacesAsEvent(t *testing.T) {
+	store, err := control.Open(control.Options{DataDir: t.TempDir(), Autogen: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	srv, err := New(Options{Store: store, Version: "test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv.runFn = func(context.Context, *control.Store, control.Job, jobrun.Options) (engine.Result, error) {
+		return engine.Result{}, errors.New("目标端类型还不支持：mysql（本版只支持 PostgreSQL 目标端）")
+	}
+	ctx := context.Background()
+	mk := func(name string) control.Connection {
+		c, err := store.CreateConnection(ctx, control.ConnectionInput{
+			Name: name, Kind: "postgres", Host: "127.0.0.1", Port: 1,
+			Database: "nope", Username: "u", Params: map[string]string{"sslmode": "disable"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	src, tgt := mk("s"), mk("t")
+	job, err := store.CreateJob(ctx, control.JobInput{
+		Name: "gate-gone", SourceID: src.ID, TargetID: tgt.ID,
+		Spec: control.JobDoc{
+			Source: control.SourceDoc{Scope: &control.ScopeDoc{Schema: "public", Include: []string{"orders"}}},
+			Target: control.TargetDoc{Schema: "report"},
+			Mode:   control.ModeDoc{Frequency: "once"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, cancel := store.Bus().Subscribe(job.ID)
+	defer cancel()
+
+	// 入口不再自判类型：startJob 接受，202 由 handler 给
+	if err := srv.startJob(ctx, job, control.ActorAPI); err != nil {
+		t.Fatalf("startJob 不该在入口拒绝（能力边界交给引擎）：%v", err)
+	}
+	select {
+	case ev := <-ch:
+		if ev.Type != "error" {
+			t.Fatalf("应当是 error 事件，收到 %+v", ev)
+		}
+		if !strings.Contains(ev.Message, "只支持") {
+			t.Fatalf("事件应带上引擎的原话（用户要知道为什么），实际 %q", ev.Message)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("引擎构造期拒绝，但事件流上什么都没有——用户会以为「点了没反应」")
+	}
+	// 同时必须留下可查的痕迹（不随重启消失）
+	entries, err := store.ListAuditByAction(ctx, control.ActionRunRejected, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) == 0 {
+		t.Fatal("拒绝没有落 audit：重启后用户查不到这次尝试")
+	}
+}

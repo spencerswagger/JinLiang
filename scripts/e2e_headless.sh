@@ -300,20 +300,31 @@ PYBODY
   echo "  改成定时增量（watermark=updated_at）后 can_start=True：替代方案真的能走通"
 fi
 
-say "6. run 的能力边界：MySQL 目标端要明确拒绝（不能回 202 之后什么都不发生）"
+say "6. run 之后必须有可观察的结局（能力边界由引擎在构造期判，入口不再自己判类型）"
 BOUNDARY_CODE=$(curl -s -o "${WORK}/run-boundary.json" -w '%{http_code}' \
   -X POST "${BASE}/api/jobs/${JOB_ID}/run" -H "Authorization: Bearer ${TOKEN}")
+[ "${BOUNDARY_CODE}" = "202" ] || { cat "${WORK}/run-boundary.json"; fail "run 应异步接受（202），实际 ${BOUNDARY_CODE}"; }
 if [ "${TGT_LABEL}" = "postgres" ]; then
-  echo "  （本次目标端是 PostgreSQL，跳过边界检查）"
+  echo "  （目标端是 PostgreSQL：后面的 6b 会真跑一轮）"
 else
-  [ "${BOUNDARY_CODE}" = "422" ] || fail "MySQL 目标端应返回 422，实际 ${BOUNDARY_CODE}"
-  python3 - "${WORK}/run-boundary.json" <<'PYB'
-import json,sys
-e=json.load(open(sys.argv[1]))["error"]
-assert "PostgreSQL" in e["why"] or "只支持" in e["message"], e
-assert e.get("next"), "能力边界也要给下一步"
-print("  422 + 四段式：%s" % e["message"])
+  # 目标端不是 PG 时，引擎可能在**开跑之后**拒绝（例如只支持全量、或增量未实现）。
+  # 这正是要检的：202 之后事件流上必须出现 error 或 done，不能什么都没有。
+  curl -sN --max-time 25 -H "Authorization: Bearer ${TOKEN}" \
+    "${BASE}/api/jobs/${JOB_ID}/events" >"${WORK}/sse-boundary.txt" || true
+  if grep -q '"type":"done"' "${WORK}/sse-boundary.txt"; then
+    echo "  202 → done：引擎接受了这种组合并跑完"
+  else
+    python3 - "${WORK}/sse-boundary.txt" <<'PYB'
+import json, sys
+raw = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+errs = [json.loads(l[6:]) for l in raw.splitlines() if l.startswith("data: ") and '"type":"error"' in l]
+assert errs, "202 之后事件流上既没有 done 也没有 error —— 用户会以为「点了没反应」"
+e = errs[0]
+assert e.get("message"), e
+assert e.get("next"), "能力边界也要给下一步（四段式）"
+print("  202 → error（可观察的结局）：%s" % e["message"][:80])
 PYB
+  fi
 fi
 
 say "6b. 建一个 PostgreSQL → PostgreSQL 的任务，跑真引擎"
