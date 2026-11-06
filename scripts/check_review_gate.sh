@@ -55,7 +55,8 @@ if [ "$MODE" = "review" ]; then
     echo "review-gate: 复读 head 失败" >&2
     exit 1
   }
-  # 锚定判据：review commit 是 head 祖先，且 review..head 未触及本 PR 文件。
+  # 锚定判据（git 版）：review 是 head 祖先；review..head 不触及本 PR 生产代码；
+  # 测试文件允许改，但新增行必须全部来自 origin/main 同路径（解冲突放行）。
   HEAD_SHA="$(python3 - "$tmp/pr.json" <<'PY'
 import json, sys
 print((json.load(open(sys.argv[1])).get("head") or {}).get("sha") or "")
@@ -72,29 +73,27 @@ else:
 PY
 )"
   if [ -n "$REVIEW_SHA" ] && [ "$REVIEW_SHA" != "$HEAD_SHA" ]; then
-    gh api "repos/${GITHUB_REPOSITORY}/compare/${REVIEW_SHA}...${HEAD_SHA}" >"$tmp/compare.json" || {
-      echo "review-gate: 读不到 compare ${REVIEW_SHA:0:12}...${HEAD_SHA:0:12}" >&2
-      exit 1
-    }
     gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls/${PR}/files?per_page=100" --jq '.[].filename' >"$tmp/prfiles.txt" || {
       echo "review-gate: 读不到 PR #${PR} 的文件清单" >&2
       exit 1
     }
+    if [ ! -s "$tmp/prfiles.txt" ]; then
+      echo "review-gate: FAIL 读不到本 PR 的文件清单（为空），无法判定 review..head 是否只含 merge main；按纪律拒绝而不是放行" >&2
+      exit 1
+    fi
     python3 - "$tmp/prfiles.txt" "$tmp/prfiles.json" <<'PY'
 import json, sys
 files = [l.rstrip("\n") for l in open(sys.argv[1], encoding="utf-8") if l.strip()]
 open(sys.argv[2], "w", encoding="utf-8").write(json.dumps(files))
 PY
-    # 双保险：空清单不能让逻辑层独自承担「拒绝」责任；PR 不可能真的零文件。
-    if [ ! -s "$tmp/prfiles.txt" ]; then
-      echo "review-gate: FAIL 读不到本 PR 的文件清单（为空），无法判定 review..head 是否只含 merge main；按纪律拒绝而不是放行" >&2
+    python3 "$LOGIC" anchor "$tmp/anchor.json" "$REVIEW_SHA" "$HEAD_SHA" "$tmp/prfiles.json" || {
+      echo "review-gate: 计算锚定失败（git 历史不可用？检查 checkout fetch-depth）" >&2
       exit 1
-    fi
+    }
   else
-    echo '{}' >"$tmp/compare.json"
-    echo '[]' >"$tmp/prfiles.json"
+    echo '{}' >"$tmp/anchor.json"
   fi
-  python3 "$LOGIC" review "$tmp/pr.json" "$tmp/pr2.json" "$tmp/reviews.json" "$tmp/compare.json" "$tmp/prfiles.json"
+  python3 "$LOGIC" review "$tmp/pr.json" "$tmp/pr2.json" "$tmp/reviews.json" "$tmp/anchor.json"
   exit $?
 fi
 

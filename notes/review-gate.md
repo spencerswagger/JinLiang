@@ -138,3 +138,12 @@ if not owned: return False, "读不到本 PR 的文件清单…", "pr_files_miss
 
 selftest 新增 `missing-prfiles-empty`、`missing-prfiles-none` 两例；这是第三次
 「拿不到数据就放行」（前两次：B5 `reltuples=-1`、verify 抽样），判据必须倒向拒绝。
+
+
+## 解冲突放行（分层）
+
+- 生产代码（非 `_test.go`）在 `review..head` 里必须**零改动**；
+- 测试文件允许改，但**新增行逐行 membership**：每行都必须在 `origin/main` 同路径存在；
+- 只有新增不算通行证（`e2e` 14 增/3 删）；失败类别 `stale_conclusion`，通过时 note 写
+  「仅合并冲突解决：生产代码零改动，测试新增行均来自 origin/main」；
+- selftest 增加 `merge-conflict-test-only` PASS、`production-changed`/`test-hand-added` FAIL。

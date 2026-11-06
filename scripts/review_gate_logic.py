@@ -4,9 +4,17 @@
 COMMENTED 发结论），所以 COMMENTED 不能当「非放行」；能硬判的只有
 DISMISSED / CHANGES_REQUESTED。正文匹配必须「先否决词、再放行词，且放行词
 出现在行首结论行」——否则「不可合并」「上一轮必改 0，本轮必改 2 条」都会误放行。
+
+锚定不是「commit == head」（strict 下 merge main 必然死锁）：
+  1) review commit 是 head 祖先；
+  2) review..head 的差异不包含「本 PR 的生产代码」；测试文件允许改，但新增行
+     必须全部能在 origin/main 同路径找到（挡住「顺手加一条永不失败的用例」）。
+  3) 只有 merge main / 解冲突时才允许 head 前进；失败类别分 stale_conclusion
+     （本 PR 代码/测试新增行又变了）与 head_mismatch（不是祖先）。
 """
 import json
 import re
+import subprocess
 import sys
 
 DENY = re.compile(r"不可合并|不予放行|不通过|必须修|必改\s*[1-9]")
@@ -18,7 +26,72 @@ def _summary(body, n=80):
     return re.sub(r"\s+", " ", (body or "").strip())[:n] or "（无正文）"
 
 
-def decide_review(pr, pr2, reviews, compare=None, pr_files=None):
+def _git(*args, cwd="."):
+    return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
+
+
+def _main_lines(path, cwd="."):
+    """Return the set of lines of path in origin/main (empty if absent)."""
+    r = _git("show", f"origin/main:{path}", cwd=cwd)
+    if r.returncode != 0:
+        return set()
+    return set(r.stdout.splitlines())
+
+
+def compute_anchor(review, head, pr_files, cwd="."):
+    """Compute whether head only moved by merge main / conflict resolution.
+
+    Returns a dict consumed by decide_review. Missing/unreadable inputs are
+    represented explicitly so the decision layer can fail closed.
+    """
+    out = {"ancestor": False, "touched": [], "production_touched": [],
+           "test_touched": [], "test_disallowed": [], "pr_files_missing": False,
+           "error": ""}
+    if not review or not head:
+        out["error"] = "缺少 review 或 head"
+        return out
+    owned = {p for p in (pr_files or []) if p}
+    if not owned:
+        out["pr_files_missing"] = True
+        return out
+
+    # 确保两个 commit 与 origin/main 都在本地（Actions 用 fetch-depth: 0）。
+    for ref in (review, head):
+        if _git("rev-parse", "--verify", f"{ref}^{{commit}}", cwd=cwd).returncode != 0:
+            _git("fetch", "--no-tags", "origin", ref, cwd=cwd)
+    if _git("rev-parse", "--verify", "origin/main^{commit}", cwd=cwd).returncode != 0:
+        _git("fetch", "--no-tags", "origin", "main:refs/remotes/origin/main", cwd=cwd)
+
+    if _git("merge-base", "--is-ancestor", review, head, cwd=cwd).returncode != 0:
+        out["error"] = "review commit 不是 head 的祖先"
+        return out
+    out["ancestor"] = True
+
+    r = _git("diff", "--name-only", f"{review}..{head}", cwd=cwd)
+    if r.returncode != 0:
+        out["error"] = "git diff 失败: " + r.stderr.strip()
+        return out
+    changed = {ln for ln in r.stdout.splitlines() if ln}
+    touched = sorted(changed & owned)
+    out["touched"] = touched
+
+    for f in touched:
+        if not f.endswith("_test.go"):
+            out["production_touched"].append(f)
+            continue
+        out["test_touched"].append(f)
+        diff = _git("diff", "--unified=0", f"{review}..{head}", "--", f, cwd=cwd)
+        added = [ln[1:] for ln in diff.stdout.splitlines()
+                 if ln.startswith("+") and not ln.startswith("+++")]
+        if not added:
+            continue
+        main_lines = _main_lines(f, cwd=cwd)
+        if any(ln not in main_lines for ln in added):
+            out["test_disallowed"].append(f)
+    return out
+
+
+def decide_review(pr, pr2, reviews, anchor=None):
     head = (pr.get("head") or {}).get("sha") or ""
     head2 = (pr2.get("head") or {}).get("sha") or ""
     if not head:
@@ -37,40 +110,37 @@ def decide_review(pr, pr2, reviews, compare=None, pr_files=None):
 
     if state in ("DISMISSED", "CHANGES_REQUESTED"):
         return False, f"最新 review 是 {state}（{who}）：{summary}", "state_veto"
-    # 否决词先于 head：一个锚在旧 head 的「必改 2 条」应该以「必改 2」被拒，
-    # 而不是被 head 不匹配掩盖（两者都失败，但原因要指向真正的问题）。
-    # 否决词只看**首行结论**：多轮正文后面引用「上轮必改 1 条」不代表本轮否决
-    # （#31 就是首行可合并、末尾提到历史必改 1；全文匹配会误杀）。
+    # 否决词只看首行结论：多轮正文后面引用「上轮必改 1 条」不代表本轮否决。
     first_line = next((ln for ln in body.splitlines() if ln.strip()), "")
     if DENY.search(first_line):
         return False, f"首行结论含否决词（不可合并/不通过/必改 N 等）：{summary}", "deny_word"
-    # 锚定判据不再是「commit == head」（strict 下 merge main 必然死锁），而是：
-    #   1) review.commit 是 head 的祖先；
-    #   2) review..head 的差异不包含本 PR 改的文件（只允许别人已合的改动/merge main）。
-    # 任何本 PR 的新改动（哪怕一行注释）都要求重审。
+
     anchor_note = ""
     if commit != head:
-        if not compare or compare.get("status") != "ahead":
-            return False, (
-                f"结论 {commit[:12]} 不是当前 head {head[:12]} 的祖先"
-                f"（head_mismatch；status={(compare or {}).get('status', 'unknown')}；rebase/force push 后必须重审）"
-            ), "head_mismatch"
-        changed = {f.get("filename") for f in (compare.get("files") or []) if f.get("filename")}
-        owned = {n for n in (pr_files or []) if n}
-        # 输入缺失必须倒向拒绝：空清单时「未触及本 PR 文件」这句话是假的
-        # （今晚第三次「拿不到数据就放行」——B5 reltuples=-1、verify 抽样、这里）。
-        if not owned:
+        if not anchor or not anchor.get("ancestor"):
+            detail = (anchor or {}).get("error") or "不是当前 head 的祖先（rebase/force push 后必须重审）"
+            return False, f"结论 {commit[:12]} → head {head[:12]}：{detail}", "head_mismatch"
+        if anchor.get("pr_files_missing"):
             return False, (
                 "读不到本 PR 的文件清单（输入为空），无法判定 review..head 是否只含 merge main；"
                 "按纪律拒绝而不是放行"
             ), "pr_files_missing"
-        touched = sorted(changed & owned)
-        if touched:
+        if anchor.get("production_touched"):
+            files = ", ".join(anchor["production_touched"][:5])
             return False, (
-                f"结论早于本 PR 的代码改动（stale_conclusion，review {commit[:12]} → head {head[:12]}）："
-                f"需要重审；涉及 {', '.join(touched[:5])}{'…' if len(touched) > 5 else ''}"
+                f"结论早于本 PR 的代码改动（stale_conclusion）：生产代码有改动（{files}），必须重审"
             ), "stale_conclusion"
-        anchor_note = "（head 前进仅来自 merge main / 别人已合的改动，未触及本 PR 文件）"
+        if anchor.get("test_disallowed"):
+            files = ", ".join(anchor["test_disallowed"][:5])
+            return False, (
+                f"结论早于本 PR 的代码改动（stale_conclusion）：测试文件出现 origin/main 里不存在的新增行（{files}），"
+                "像「顺手加一条永不失败的用例」，必须重审"
+            ), "stale_conclusion"
+        if anchor.get("test_touched"):
+            anchor_note = "（仅合并冲突解决：生产代码零改动，测试新增行均来自 origin/main）"
+        else:
+            anchor_note = "（head 前进仅来自 merge main / 别人已合的改动，未触及本 PR 文件）"
+
     if not APPROVE.search(body):
         return False, f"最新结论不是行首放行（reviewer={who}，state={state}）：{summary}", "not_approved"
     return True, f"head={head[:12]} reviewer={who}：{summary}{anchor_note}", "pass"
@@ -87,7 +157,6 @@ def decide_admin(pr, commit, comments):
         return True, "合并提交没有 parent，无法判断是否 --admin", "unknown"
     if parents[0] == base:
         return True, f"正常合并（base 与合并 parent 一致，by={who}）", "normal"
-
     for c in comments:
         body = c.get("body") or ""
         if ADMIN_HINT.search(body):
@@ -109,37 +178,44 @@ def _load(path):
 
 def selftest():
     head = "a" * 40
+    old = "b" * 40
     pr = {"head": {"sha": head}}
     pr2 = {"head": {"sha": head}}
-    old = "b" * 40
+
+    def anchor(production=None, test=None, disallowed=None, touched=None, missing=False, ancestor=True):
+        return {
+            "ancestor": ancestor, "pr_files_missing": missing,
+            "production_touched": production or [], "test_touched": test or [],
+            "test_disallowed": disallowed or [], "touched": touched or [],
+        }
+
     cases = [
-        ("approval-bold", {"body": "**可合并（必改 0）**，head x", "state": "COMMENTED", "commit_id": head}, None, None, True, "pass"),
-        ("not-mergeable", {"body": "不可合并", "state": "COMMENTED", "commit_id": head}, None, None, False, "deny_word"),
-        ("not-released", {"body": "不予放行", "state": "COMMENTED", "commit_id": head}, None, None, False, "deny_word"),
-        ("history-zero", {"body": "上一轮必改 0，本轮必改 2 条", "state": "COMMENTED", "commit_id": head}, None, None, False, "deny_word"),
-        ("mustfix-2", {"body": "**必改 2 条**（都在地基上）", "state": "COMMENTED", "commit_id": head}, None, None, False, "deny_word"),
-        ("changes-requested", {"body": "**可合并（必改 0）**", "state": "CHANGES_REQUESTED", "commit_id": head}, None, None, False, "state_veto"),
-        ("merge-main-only", {"body": "**可合并（必改 0）**", "state": "COMMENTED", "commit_id": old},
-         {"status": "ahead", "files": [{"filename": "internal/other.go"}]}, ["cmd/x.go"], True, "pass"),
-        ("pr-file-changed", {"body": "**可合并（必改 0）**", "state": "COMMENTED", "commit_id": old},
-         {"status": "ahead", "files": [{"filename": "cmd/x.go"}]}, ["cmd/x.go"], False, "stale_conclusion"),
+        ("approval-bold", {"body": "**可合并（必改 0）**，head x", "state": "COMMENTED", "commit_id": head}, None, True, "pass"),
+        ("not-mergeable", {"body": "不可合并", "state": "COMMENTED", "commit_id": head}, None, False, "deny_word"),
+        ("not-released", {"body": "不予放行", "state": "COMMENTED", "commit_id": head}, None, False, "deny_word"),
+        ("history-zero", {"body": "上一轮必改 0，本轮必改 2 条", "state": "COMMENTED", "commit_id": head}, None, False, "deny_word"),
+        ("mustfix-2", {"body": "**必改 2 条**（都在地基上）", "state": "COMMENTED", "commit_id": head}, None, False, "deny_word"),
+        ("changes-requested", {"body": "**可合并（必改 0）**", "state": "CHANGES_REQUESTED", "commit_id": head}, None, False, "state_veto"),
+        ("merge-main-only", {"body": "**可合并（必改 0）**", "state": "COMMENTED", "commit_id": old}, anchor(), True, "pass"),
+        ("merge-conflict-test-only", {"body": "**可合并（必改 0）**", "state": "COMMENTED", "commit_id": old},
+         anchor(test=["internal/verify/x_test.go"]), True, "pass"),
+        ("production-changed", {"body": "**可合并（必改 0）**", "state": "COMMENTED", "commit_id": old},
+         anchor(production=["internal/engine/engine.go"]), False, "stale_conclusion"),
+        ("test-hand-added", {"body": "**可合并（必改 0）**", "state": "COMMENTED", "commit_id": old},
+         anchor(test=["internal/verify/x_test.go"], disallowed=["internal/verify/x_test.go"]), False, "stale_conclusion"),
         ("rebase-not-ancestor", {"body": "**可合并（必改 0）**", "state": "COMMENTED", "commit_id": old},
-         {"status": "diverged", "files": []}, ["cmd/x.go"], False, "head_mismatch"),
+         anchor(ancestor=False), False, "head_mismatch"),
         ("pr-files-missing", {"body": "**可合并（必改 0）**", "state": "COMMENTED", "commit_id": old},
-         {"status": "ahead", "files": [{"filename": "internal/other.go"}]}, [], False, "pr_files_missing"),
-        ("missing-prfiles-empty", {"body": "**可合并（必改 0）**", "state": "COMMENTED", "commit_id": old},
-         {"status": "ahead", "files": [{"filename": "internal/other.go"}]}, [], False, "pr_files_missing"),
-        ("missing-prfiles-none", {"body": "**可合并（必改 0）**", "state": "COMMENTED", "commit_id": old},
-         {"status": "ahead", "files": [{"filename": "internal/other.go"}]}, None, False, "pr_files_missing"),
-        ("approval-conclusion", {"body": "结论：可合并", "state": "COMMENTED", "commit_id": head}, None, None, True, "pass"),
-        ("history-in-tail", {"body": "**可合并（必改 0）**，按 head x\n\n…上轮必改 1 条已修…", "state": "COMMENTED", "commit_id": head}, None, None, True, "pass"),
+         anchor(missing=True), False, "pr_files_missing"),
+        ("approval-conclusion", {"body": "结论：可合并", "state": "COMMENTED", "commit_id": head}, None, True, "pass"),
+        ("history-in-tail", {"body": "**可合并（必改 0）**，按 head x\n\n…上轮必改 1 条已修…", "state": "COMMENTED", "commit_id": head}, None, True, "pass"),
     ]
     ok_all = True
-    for name, review, compare, prfiles, want_ok, want_cat in cases:
+    for name, review, anc, want_ok, want_cat in cases:
         review.setdefault("user", {"login": "probe"})
         review.setdefault("submitted_at", "2026-01-01T00:00:00Z")
         review.setdefault("id", 1)
-        ok, msg, cat = decide_review(pr, pr2, [review], compare, prfiles)
+        ok, msg, cat = decide_review(pr, pr2, [review], anc)
         good = ok == want_ok and cat == want_cat
         ok_all = ok_all and good
         print(f"{'PASS' if good else 'FAIL'} {name}: cat={cat} ok={ok} :: {msg}")
@@ -148,16 +224,22 @@ def selftest():
 
 def main():
     if len(sys.argv) < 2:
-        sys.exit("用法: review_gate_logic.py review|admin|selftest ...")
+        sys.exit("用法: review_gate_logic.py review|admin|anchor|selftest ...")
     mode = sys.argv[1]
     if mode == "selftest":
         sys.exit(selftest())
+    if mode == "anchor":
+        if len(sys.argv) != 6:
+            sys.exit("anchor 需要 out.json review head prfiles.json")
+        out = compute_anchor(sys.argv[3], sys.argv[4], _load(sys.argv[5]))
+        with open(sys.argv[2], "w", encoding="utf-8") as f:
+            json.dump(out, f)
+        sys.exit(0)
     if mode == "review":
-        if len(sys.argv) != 7:
-            sys.exit("review 需要 pr.json pr2.json reviews.json compare.json prfiles.json")
-        compare = _load(sys.argv[5]) if _load(sys.argv[5]) else {}
-        prfiles = _load(sys.argv[6]) if _load(sys.argv[6]) else []
-        ok, msg, cat = decide_review(_load(sys.argv[2]), _load(sys.argv[3]), _load(sys.argv[4]), compare, prfiles)
+        if len(sys.argv) != 6:
+            sys.exit("review 需要 pr.json pr2.json reviews.json anchor.json")
+        anchor = _load(sys.argv[5]) if _load(sys.argv[5]) else {}
+        ok, msg, cat = decide_review(_load(sys.argv[2]), _load(sys.argv[3]), _load(sys.argv[4]), anchor)
     elif mode == "admin":
         if len(sys.argv) != 5:
             sys.exit("admin 需要 pr.json commit.json comments.json")

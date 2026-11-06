@@ -30,6 +30,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # 锚定要跑 git merge-base/diff 与 origin/main 行集合
       - name: 判定逻辑自测（否决词/state/锚定）
         run: scripts/check_review_gate.sh selftest
       - name: 最新 review 是否针对当前 head 且放行
