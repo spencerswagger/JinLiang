@@ -23,6 +23,7 @@ import (
 	"github.com/spencerswagger/jinliang/internal/engine"
 	"github.com/spencerswagger/jinliang/internal/pgsink"
 	"github.com/spencerswagger/jinliang/internal/source"
+	"github.com/spencerswagger/jinliang/internal/state"
 )
 
 func dsns(t *testing.T) (src, dst string) {
@@ -623,4 +624,195 @@ func TestDDLIsAppliedToTargetIdempotently(t *testing.T) {
 	if err := s.Apply(ctx, ddl, nil); err != nil {
 		t.Fatalf("重放同一条 DDL 应幂等跳过（42701/42P07），得到：%v", err)
 	}
+}
+
+// 整条 P1 的**验收核心**：删除一个正在跑的任务 → 立刻重建同名任务 → 能跑起来（不是 E1005）。
+// 这条不测「函数被调了」，测的是用户实际做的那串操作在真库上的结果。
+func TestDeleteRunningJobThenRecreateRuns(t *testing.T) {
+	srcDSN, dstDSN := dsns(t)
+	srcDB := mustConn(t, srcDSN)
+	dstDB := mustConn(t, dstDSN)
+	table := "del_recreate"
+	ctx := context.Background()
+
+	exec(t, srcDB, "DROP TABLE IF EXISTS "+table)
+	exec(t, srcDB, "CREATE TABLE "+table+" (id bigint PRIMARY KEY, payload text)")
+	exec(t, srcDB, "INSERT INTO "+table+" SELECT g,'r'||g FROM generate_series(1,500) g")
+	exec(t, dstDB, "DROP TABLE IF EXISTS "+table)
+	exec(t, dstDB, "DROP TABLE IF EXISTS _jl_meta, _jl_chunk, _jl_lease, _jl_object, _jl_instance")
+
+	// 必须是**真的在跑**的任务：`interval` 会很快跑完（搬完就 done），
+	// 那样测不到「跑着删掉」。用 continuous+initial，它会停在 stream 阶段等变更。
+	store, jobID := continuousJob(t, srcDSN, dstDSN, "del-recreate", table)
+
+	// 起一个「一直在跑」的同步（continuous+initial），然后删任务
+	runCtx, stopRun := context.WithCancel(ctx)
+	doneRun := make(chan struct{})
+	go func() {
+		defer close(doneRun)
+		res, rerr := engine.Run(runCtx, engine.Options{Store: store, JobID: jobID})
+		if rerr != nil {
+			t.Logf("引擎提前结束：%v（阶段 %s，退出码 %d）", rerr, res.Phase, res.ExitCode)
+		}
+	}()
+	// 等它真的开始写（目标表出现）
+	waitFor(t, 10*time.Second, func() bool {
+		var n int
+		_ = dstDB.QueryRow(ctx, "SELECT count(*) FROM "+table).Scan(&n)
+		return n > 0
+	})
+
+	job, err := store.GetJob(ctx, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// ① 先确认租约**此刻真的被持有**（否则这条用例又是「跑得太快什么都没测到」）
+	var held int
+	if err := dstDB.QueryRow(ctx, "SELECT count(*) FROM _jl_lease WHERE job_key=$1", job.JobKey).Scan(&held); err != nil {
+		t.Fatal(err)
+	}
+	if held == 0 {
+		t.Fatalf("此刻目标端没有租约：说明任务没在跑，这条用例测不到「跑着删掉」")
+	}
+
+	// ② 跨进程那条路：删掉目标端租约行 → 那个正在跑的引擎续租失败 → 自己停下
+	h, alive, lerr := pgsink.ForceReleaseLease(ctx, mustEndpoint(t, dstDSN), "public", job.JobKey)
+	if lerr != nil {
+		t.Fatalf("清目标端租约失败：%v", lerr)
+	}
+	if h == "" {
+		t.Fatal("应删掉一条真实存在的租约（持有者描述不能为空）")
+	}
+	t.Logf("清掉的租约持有者=%q（进程还活着=%v）", h, alive)
+
+	// ③ 引擎必须**自己**发现租约没了并退出（这是 #30 的语义，不是我们强杀）
+	select {
+	case <-doneRun:
+	case <-time.After(25 * time.Second):
+		t.Fatal("租约被删掉后引擎没有自己退出（`loseLease` 没生效？）")
+	}
+	stopRun()
+
+	// ④ 等 run 行收尾 → 删任务（守卫会拦住未结束的 run）
+	if err := settleForTest(ctx, store, job.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeleteJob(ctx, job.ID); err != nil {
+		t.Fatalf("删除任务失败：%v", err)
+	}
+
+	// 目标端租约必须是空的（否则同名任务新建后会撞 E1005）
+	var leases int
+	if err := dstDB.QueryRow(ctx, "SELECT count(*) FROM _jl_lease").Scan(&leases); err != nil {
+		t.Fatal(err)
+	}
+	if leases != 0 {
+		t.Fatalf("删除后目标端还有 %d 条租约——同名任务会撞 E1005", leases)
+	}
+
+	// 立刻重建同名任务并跑：必须成功，且数据到齐
+	store2, jobID2 := intervalJob(t, srcDSN, dstDSN, "del-recreate2", table, "1m")
+	res, err := engine.Run(ctx, engine.Options{Store: store2, JobID: jobID2, SnapshotOnly: true})
+	if err != nil {
+		t.Fatalf("重建同名任务后应该能跑起来（而不是 E1005）：%v", err)
+	}
+	if res.ExitCode != 0 {
+		t.Fatalf("重建后的 run 应成功，退出码 %d", res.ExitCode)
+	}
+	var n int
+	if err := dstDB.QueryRow(ctx, "SELECT count(*) FROM "+table).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 500 {
+		t.Fatalf("目标端应有 500 行，得到 %d", n)
+	}
+}
+
+// waitFor 轮询直到条件成立或超时（集成用例等状态用）。
+func waitFor(t *testing.T, d time.Duration, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("等了 %s 条件仍未成立", d)
+}
+
+// mustEndpoint 把 DSN 解析成 endpoint（测试用）。
+func mustEndpoint(t *testing.T, raw string) dsn.Endpoint {
+	t.Helper()
+	ep, err := dsn.Parse(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ep
+}
+
+// settleForTest 等这个任务的 run 收尾；等不到就替它标 interrupted（与 CLI 同一套语义）。
+func settleForTest(ctx context.Context, store *control.Store, jobID string) error {
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		active, err := store.ActiveRuns(ctx)
+		if err != nil {
+			return err
+		}
+		var mine []control.Run
+		for _, r := range active {
+			if r.JobID == jobID {
+				mine = append(mine, r)
+			}
+		}
+		if len(mine) == 0 {
+			return nil
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	active, _ := store.ActiveRuns(ctx)
+	for _, r := range active {
+		if r.JobID == jobID {
+			_, _ = store.FinishRun(ctx, r.ID, state.Failed, "测试：删除任务时强制收尾", 1, control.FinishInterrupted)
+		}
+	}
+	return nil
+}
+
+// continuousJob 建一条 continuous+initial 的任务（会一直跑着，用来测「跑着删掉」）。
+func continuousJob(t *testing.T, srcDSN, dstDSN, name, table string) (*control.Store, string) {
+	t.Helper()
+	ctx := context.Background()
+	store, err := control.Open(control.Options{DataDir: t.TempDir(), Autogen: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
+	mk := func(nm string, port int, db, user, pass string) string {
+		c, err := store.CreateConnection(ctx, control.ConnectionInput{
+			Name: nm, Kind: "postgres", Host: "127.0.0.1", Port: port,
+			Database: db, Username: user, Password: pass,
+			Params: map[string]string{"sslmode": "disable"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c.ID
+	}
+	srcID := mk("src", portOf(t, srcDSN), dbOf(t, srcDSN), userOf(t, srcDSN), passOf(t, srcDSN))
+	dstID := mk("dst", portOf(t, dstDSN), dbOf(t, dstDSN), userOf(t, dstDSN), passOf(t, dstDSN))
+	job, err := store.CreateJob(ctx, control.JobInput{
+		Name: name, SourceID: srcID, TargetID: dstID,
+		Spec: control.JobDoc{
+			Version: 1, Job: name,
+			Source:  control.SourceDoc{Kind: "postgres", Scope: &control.ScopeDoc{Schema: "public"}},
+			Target:  control.TargetDoc{Kind: "postgres", Schema: "public", OnExists: "append"},
+			Mode:    control.ModeDoc{Frequency: "continuous+initial"},
+			Content: &control.ContentDoc{Tables: map[string]control.TableDoc{table: {}}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("建任务失败: %v", err)
+	}
+	return store, job.ID
 }
