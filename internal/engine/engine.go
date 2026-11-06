@@ -1313,7 +1313,7 @@ func (r *runner) fail(ctx context.Context, err error) error {
 	case classified:
 		ev = control.ErrorEvent(r.job.ID, r.run.ID, code, err.Error())
 		ev.Phase = r.phase
-		// 有码也要把方向写进 last_error：run 行**不存 code**，历史页只有这条字符串。
+		// 有码也要把方向写进 last_error：历史页在 code 为空时只有这条字符串。
 		// 不写的话，「该怎么处理」只活在事件流里（进程一重启就没了）。
 		if spec, ok := core.Lookup(code); ok {
 			lastError = fmt.Sprintf("[%s] %s：%s 下一步：%s",
@@ -1341,7 +1341,13 @@ func (r *runner) fail(ctx context.Context, err error) error {
 		reason = control.FinishInterrupted // 租约被接管 = 被中断，不是「这条同步本身错了」
 	}
 	if r.phase != state.Failed {
-		if _, ferr := r.opt.Store.FinishRun(dctx, r.run.ID, state.Failed, lastError, ExitFailed, reason); ferr != nil {
+		// 把分类结果写进 runs.code：列表页只显示「徽标 + 一句摘要」，全文留给详情页。
+		// classified=false 时 code 为空——不编造码（未分类就该显示「未分类」）。
+		codeStr := ""
+		if classified {
+			codeStr = string(code)
+		}
+		if _, ferr := r.opt.Store.FinishRunWithCode(dctx, r.run.ID, state.Failed, lastError, ExitFailed, reason, codeStr); ferr != nil {
 			return fmt.Errorf("%w（收尾也失败：%v）", err, ferr)
 		}
 		r.phase = state.Failed

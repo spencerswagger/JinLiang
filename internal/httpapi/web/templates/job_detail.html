@@ -54,6 +54,22 @@
   <div id="preflight"></div>
 </div>
 
+{{if .LastError}}
+<h2>最近一次失败</h2>
+<div class="card err">
+  <div class="row">
+    {{if .LastError.Code}}<span class="badge bad">{{.LastError.Code}}</span>{{else}}<span class="badge warn">未分类</span>{{end}}
+    <strong>{{.LastError.Message}}</strong>
+  </div>
+  <dl>
+    {{if .LastError.Why}}<dt>为什么</dt><dd>{{.LastError.Why}}</dd>{{end}}
+    {{if .LastError.Next}}<dt>你现在能做什么</dt><dd><ol>{{range .LastError.Next}}<li>{{.}}</li>{{end}}</ol></dd>{{end}}
+    {{if .LastError.Risk}}<dt>风险</dt><dd>{{.LastError.Risk}}</dd>{{end}}
+    {{if .LastError.Raw}}<dt>原始报错</dt><dd class="mono">{{.LastError.Raw}}</dd>{{end}}
+  </dl>
+</div>
+{{end}}
+
 <h2>阶段时间线</h2>
 <div class="card">
   <ul class="timeline">
@@ -95,7 +111,11 @@
              这里就是他唯一能找到那台机器的地方 -->
         <td class="mono">{{if .OwnerInstance}}{{clip .OwnerInstance 13}}{{else}}—{{end}}</td>
         <td class="mono">{{if .EndedAt}}{{shortTime .EndedAt}}{{else}}—{{end}}</td>
+        {{if .Code}}
+        <td><span class="badge bad">{{.Code}}</span> <span class="meta">{{clip (dash .LastError) 60}}</span></td>
+        {{else}}
         <td title="{{dash .LastError}}">{{clip (dash .LastError) 120}}</td>
+        {{end}}
       </tr>
     {{end}}
     </tbody>
