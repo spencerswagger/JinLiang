@@ -122,19 +122,27 @@ def decide_review(pr, pr2, reviews, anchor=None):
 
     anchor_note = ""
     if commit != head:
-        if not anchor or not anchor.get("ancestor"):
-            detail = (anchor or {}).get("error") or "不是当前 head 的祖先（rebase/force push 后必须重审）"
-            return False, f"结论 {commit[:12]} → head {head[:12]}：{detail}", "head_mismatch"
-        if anchor.get("compare_files_missing"):
-            return False, (
-                "review..head 的文件清单为空（可能是空 merge 提交，或 /compare 300 上限截断）；"
-                "默认拒绝而不是放行"
-            ), "compare_files_missing"
+        # 先判「输入缺失」再判祖先：真实早退路径会同时 ancestor=False，
+        # 若先判祖先会把「读不到 pr_files」误报成「请 rebase/force push」。
+        if not anchor:
+            return False, "没有锚定数据（git/API 读不到），无法判定 head 前进原因；按纪律拒绝", "anchor_error"
         if anchor.get("pr_files_missing"):
             return False, (
                 "读不到本 PR 的文件清单（输入为空），无法判定 review..head 是否只含 merge main；"
                 "按纪律拒绝而不是放行"
             ), "pr_files_missing"
+        if anchor.get("compare_files_missing"):
+            return False, (
+                "review..head 的文件清单为空（可能是空 merge 提交，或文件清单被截断）；"
+                "默认拒绝而不是放行"
+            ), "compare_files_missing"
+        if anchor.get("error"):
+            return False, f"锚定计算失败：{anchor['error']}；按纪律拒绝", "anchor_error"
+        if not anchor.get("ancestor"):
+            return False, (
+                f"结论 {commit[:12]} 不是当前 head {head[:12]} 的祖先"
+                f"（head_mismatch；rebase/force push 后必须重审）"
+            ), "head_mismatch"
         if anchor.get("production_touched"):
             files = ", ".join(anchor["production_touched"][:5])
             return False, (
@@ -208,6 +216,8 @@ def selftest():
         ("mustfix-2", {"body": "**必改 2 条**（都在地基上）", "state": "COMMENTED", "commit_id": head}, None, False, "deny_word"),
         ("changes-requested", {"body": "**可合并（必改 0）**", "state": "CHANGES_REQUESTED", "commit_id": head}, None, False, "state_veto"),
         ("merge-main-only", {"body": "**可合并（必改 0）**", "state": "COMMENTED", "commit_id": old}, anchor(), True, "pass"),
+        ("anchor-error", {"body": "**可合并（必改 0）**", "state": "COMMENTED", "commit_id": old},
+         {"ancestor": True, "error": "git diff 失败"}, False, "anchor_error"),
         ("merge-conflict-test-only", {"body": "**可合并（必改 0）**", "state": "COMMENTED", "commit_id": old},
          anchor(test=["internal/verify/x_test.go"]), True, "pass"),
         ("production-changed", {"body": "**可合并（必改 0）**", "state": "COMMENTED", "commit_id": old},
@@ -219,7 +229,7 @@ def selftest():
         ("missing-compare-files", {"body": "**可合并（必改 0）**", "state": "COMMENTED", "commit_id": old},
          anchor(no_changes=True), False, "compare_files_missing"),
         ("pr-files-missing", {"body": "**可合并（必改 0）**", "state": "COMMENTED", "commit_id": old},
-         anchor(missing=True), False, "pr_files_missing"),
+         anchor(missing=True, ancestor=False), False, "pr_files_missing"),
         ("approval-conclusion", {"body": "结论：可合并", "state": "COMMENTED", "commit_id": head}, None, True, "pass"),
         ("history-in-tail", {"body": "**可合并（必改 0）**，按 head x\n\n…上轮必改 1 条已修…", "state": "COMMENTED", "commit_id": head}, None, True, "pass"),
     ]
