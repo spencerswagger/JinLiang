@@ -29,6 +29,16 @@ func TestListAuditByActionSurvivesBusyWindow(t *testing.T) {
 		}
 	}
 
+	// 时间戳只有秒级精度，且 id 尾号是随机的 —— 光靠「插 60 条」在快机器上可能
+	// 把拒绝记录仍留在前 50 条里（CI 上就出现过）。把时间钉成确定值，测试才稳定：
+	// 拒绝记录放 2000 年，其余放 2030 年。
+	if _, err := store.DB().Exec(`UPDATE audit SET at = '2000-01-01T00:00:00Z' WHERE action = ?`, ActionRunRejected); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().Exec(`UPDATE audit SET at = '2030-01-01T00:00:00Z' WHERE action = ?`, ActionJobRun); err != nil {
+		t.Fatal(err)
+	}
+
 	// 先证明「取最近 50 条再筛」这条路确实已经看不到它（前提成立）
 	recent, err := store.ListAudit(ctx, 50)
 	if err != nil {
