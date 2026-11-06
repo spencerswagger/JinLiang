@@ -2,6 +2,7 @@ package core
 
 import (
 	"regexp"
+	"strings"
 	"testing"
 	"unicode/utf8"
 )
@@ -46,5 +47,23 @@ func TestSpecLookup(t *testing.T) {
 	}
 	if _, ok := Lookup("E9999"); ok {
 		t.Fatal("unknown code must not resolve")
+	}
+}
+
+// TestSchemaMismatchCoversBothReasons：E1015 的两条原因码（type_changed / schema_drift）
+// 与「哪张表哪一列看 last_error」这句都必须在用户可见文案里，
+// 否则用户只拿到一个码、不知道到底哪种情况。
+func TestSchemaMismatchCoversBothReasons(t *testing.T) {
+	spec, ok := Lookup(CodeSchemaMismatch)
+	if !ok {
+		t.Fatal("E1015 必须在码表里")
+	}
+	for _, want := range []string{"type_changed", "schema_drift", "last_error"} {
+		if !strings.Contains(spec.Why+strings.Join(spec.Next, " "), want) {
+			t.Errorf("E1015 的四段式里没提到 %q：%s / %v", want, spec.Why, spec.Next)
+		}
+	}
+	if strings.Contains(spec.Risk, "数据会不一致") {
+		t.Error("E1015 的 Risk 不该写「数据会不一致」——它是「这张表停止更新」，不是数据错了")
 	}
 }
