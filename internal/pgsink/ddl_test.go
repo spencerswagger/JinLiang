@@ -82,8 +82,8 @@ func TestStripLeadingComments(t *testing.T) {
 // 让 paused_tables / 恢复入口 / doctor 能判等，而不是去抠一句中文。
 func TestPausableErrorsCarryStableReasonCodes(t *testing.T) {
 	var errs = []PausableError{
-		&TypeChangedError{Table: "t", Detail: "v: bigint → text"},
-		&SchemaDriftError{Table: "t", Detail: "原 a 已不存在"},
+		&TypeChangedError{TableName: "t", Detail: "v: bigint → text"},
+		&SchemaDriftError{TableName: "t", Detail: "原 a 已不存在"},
 	}
 	want := []string{PauseReasonTypeChanged, PauseReasonSchemaDrift}
 	for i, e := range errs {
@@ -98,5 +98,26 @@ func TestPausableErrorsCarryStableReasonCodes(t *testing.T) {
 	// 两个原因码不能相同（否则暂停原因分不开）
 	if PauseReasonTypeChanged == PauseReasonSchemaDrift {
 		t.Fatal("改类型与改名/删列必须是不同原因码")
+	}
+}
+
+// 第③步的两个前置：PausableError 必须带 Table()，且**同一件事的两个时机**用同一个原因码。
+func TestPausableErrorCarriesTable(t *testing.T) {
+	var errs = []PausableError{
+		&TypeChangedError{TableName: "orders", Detail: "v: bigint → text"},
+		&SchemaDriftError{TableName: "orders", Detail: "原 a 已不存在"},
+	}
+	for _, e := range errs {
+		if e.Table() != "orders" {
+			t.Fatalf("%T.Table() 应为 orders，得到 %q", e, e.Table())
+		}
+		if e.Reason() == "" {
+			t.Fatalf("%T.Reason() 不能为空", e)
+		}
+	}
+	// 通过接口拿到表名与原因码（第③步就是这样写 paused_tables 的）
+	var pe PausableError = &TypeChangedError{TableName: "t2", Detail: "x"}
+	if pe.Table() != "t2" || pe.Reason() != PauseReasonTypeChanged {
+		t.Fatalf("接口取值不对：table=%q reason=%q", pe.Table(), pe.Reason())
 	}
 }

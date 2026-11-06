@@ -1011,3 +1011,52 @@ func TestDDLRenameIsReported(t *testing.T) {
 		t.Fatalf("原因码应为 %q，得到 %q", pgsink.PauseReasonSchemaDrift, sd.Reason())
 	}
 }
+
+// 同一件事的两个时机必须给同一个原因码：ensureSchema（prepare 时）发现目标列类型与源端
+// 不一致，和跑起来时发现类型变了，都是「这张表的类型对不上」。
+// 以前前者是裸哨兵 ErrTypeMismatch → 整任务死，后者是 TypeChangedError → 暂停该表，
+// 用户会当成两个 bug。
+func TestEnsureSchemaTypeMismatchIsPausable(t *testing.T) {
+	srcDSN, dstDSN := dsns(t)
+	srcDB := mustConn(t, srcDSN)
+	dstDB := mustConn(t, dstDSN)
+	table := "type_mismatch_prep"
+	ctx := context.Background()
+
+	exec(t, srcDB, "DROP TABLE IF EXISTS "+table)
+	exec(t, srcDB, "CREATE TABLE "+table+" (id bigint PRIMARY KEY, v bigint)")
+	// 目标端故意建一张「列名同、类型不同」的表
+	exec(t, dstDB, "DROP TABLE IF EXISTS "+table)
+	exec(t, dstDB, "CREATE TABLE "+table+" (id bigint PRIMARY KEY, v text)")
+	exec(t, dstDB, "DROP TABLE IF EXISTS _jl_meta, _jl_chunk, _jl_lease, _jl_object, _jl_instance")
+
+	ref := source.TableRef{Schema: "public", Table: table}
+	rel := source.Table{TableRef: ref,
+		Columns:    []source.Column{{Name: "id", Type: "bigint"}, {Name: "v", Type: "bigint"}},
+		PrimaryKey: []string{"id"}}
+	s, err := pgsink.Open(ctx, pgsink.Options{
+		Target: mustEndpoint(t, dstDSN), JobKey: "typemismatchprep", JobName: "tm",
+		InstanceID: "it-tm", Schema: "public", OnExists: "append",
+		Catalog: source.Catalog{Tables: []source.Table{rel}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	_, err = s.EnsureSchema(ctx, source.Catalog{Tables: []source.Table{rel}})
+	if err == nil {
+		t.Fatal("目标列类型与源端不一致时必须报错")
+	}
+	var pe pgsink.PausableError
+	if !errors.As(err, &pe) {
+		t.Fatalf("必须是 PausableError（第③步按表暂停），得到 %T: %v", err, err)
+	}
+	if pe.Table() != table {
+		t.Fatalf("要能直接拿到表名，得到 %q", pe.Table())
+	}
+	if pe.Reason() != pgsink.PauseReasonTypeChanged {
+		t.Fatalf("原因码应与「跑起来时发现类型变了」一致（%q），得到 %q",
+			pgsink.PauseReasonTypeChanged, pe.Reason())
+	}
+}
