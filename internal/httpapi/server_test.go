@@ -1499,7 +1499,7 @@ func TestRejectedRunLeavesDurableAuditTrace(t *testing.T) {
 			name:       "无码：源端表读不到（最常见的失败）",
 			runErr:     errors.New("没读到源端的表清单（权限不足或 schema 写错）"),
 			wantCode:   "",
-			wantNextIn: "/api/runs",
+			wantNextIn: "摘要", // 无码时兜底第一条要指向「摘要里的原始报错」，不是 /api/runs
 		},
 	}
 	for _, c := range cases {
@@ -1616,4 +1616,23 @@ func setupAdminExisting(t *testing.T, ts *httptest.Server) string {
 		t.Fatalf("login 没有返回 token: %v", body)
 	}
 	return token
+}
+
+// 兜底文案必须在这条路径上真的可用（Owl 实测「无码」显示后提的两点）：
+// ① 不能让人「去看最近一次运行」——这条 audit 多是还没开跑的场景，没有 run 行；
+// ② 不能只说「发给维护者」——自托管场景里用户往往就是维护者。
+func TestFallbackNextIsUsableBeforeAnyRunExists(t *testing.T) {
+	joined := strings.Join(fallbackNext, " ")
+	if strings.Contains(joined, "打开任务页 →「最近一次运行」") {
+		t.Fatal("兜底第 1 条把人引向「最近一次运行」，而这条路径常常没有 run 行")
+	}
+	if !strings.Contains(joined, "摘要") {
+		t.Fatal("兜底第 1 条应说明「原始报错就在摘要里」")
+	}
+	if !strings.Contains(joined, "DBA") || !strings.Contains(joined, "issue") {
+		t.Fatal("兜底最后一条应区分「自建部署发给 DBA/运维」与「用上游就提 issue」")
+	}
+	if len(fallbackNext) < 2 || len(fallbackNext) > 3 {
+		t.Fatalf("兜底应是 2–3 条可执行动作，实际 %d 条", len(fallbackNext))
+	}
 }
