@@ -28,6 +28,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: 最新 review 是否针对当前 head 且放行
+        id: gate
+        # advisory：失败不把 job 判红，只留 warning 注解；转 required 时删掉这一行。
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr }}
@@ -39,6 +42,6 @@ jobs:
           fi
           scripts/check_review_gate.sh "$PR_NUMBER"
       - name: 失败时的提示
-        if: failure()
+        if: steps.gate.outcome == 'failure'
         run: |
           echo "::warning::review-gate 未通过：最新结论必须锚在当前 head 且明确「必改 0/可合并」。这是 advisory，不挡合并；稳定后转 required。"
