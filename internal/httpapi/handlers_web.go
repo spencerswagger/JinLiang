@@ -463,6 +463,16 @@ func (s *Server) pageJobRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.startJob(r.Context(), job, control.ActorUI); err != nil {
+		if errors.Is(err, errOtherInstanceRunning) {
+			s.renderPartial(w, "error_card", apiError{
+				Class:   "user_action",
+				Message: "另一个实例正在跑这个任务",
+				Why:     "控制库里那条运行的心跳还新鲜，说明另一个 jinliang 进程正在写它",
+				Next:    []string{"等它跑完", "要停下就那台机器上 stop，别在本机重启 serve"},
+				Risk:    "本机重启不影响它，但也停不下它",
+			})
+			return
+		}
 		if errors.Is(err, errStaleRunInControlDB) {
 			s.renderPartial(w, "error_card", apiError{
 				Class:   "user_action",

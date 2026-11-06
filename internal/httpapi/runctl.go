@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/spencerswagger/jinliang/internal/control"
 	"github.com/spencerswagger/jinliang/internal/core"
@@ -82,6 +83,18 @@ func (r *runRegistry) active(jobID string) bool {
 // 用控制库而不是内存：进程重启后内存登记是空的，但刚被 kill 的 run 行还在
 // （ended_at IS NULL，靠心跳过期由 serve 启动时收尾），此时再起一条会被
 // idx_runs_one_active 挡住。先查库能把这种情况如实告诉用户。
+// runHeartbeatFresh 用与控制面收尾同一口径（StaleAfter = 3×心跳）判断那条 run 是否还活着。
+func (s *Server) runHeartbeatFresh(r *control.Run) bool {
+	if r == nil || r.HeartbeatAt == "" {
+		return false
+	}
+	at, err := time.Parse(time.RFC3339, r.HeartbeatAt)
+	if err != nil {
+		return false
+	}
+	return time.Since(at) < control.StaleAfter(s.store.HeartbeatInterval())
+}
+
 func (s *Server) activeSyncRun(ctx context.Context, jobID string) (*control.Run, error) {
 	runs, err := s.store.ListRuns(ctx, jobID, 5)
 	if err != nil {
@@ -104,7 +117,10 @@ func (s *Server) activeSyncRun(ctx context.Context, jobID string) (*control.Run,
 var (
 	// errThisProcessBusy：本进程里就有一条在跑（内存登记）。
 	errThisProcessBusy = fmt.Errorf("%w：这台机器上已有另一个 jinliang 进程在跑这个任务", control.ErrRunInProgress)
-	// errStaleRunInControlDB：控制库里有一条上次没结束的 run（进程被强杀留下的）。
+	// errOtherInstanceRunning：控制库里那条 run 的心跳还新鲜——另一个实例正在写。
+	// 这条**不能**建议重启 serve：重启会把别人的同步打断。
+	errOtherInstanceRunning = fmt.Errorf("%w：另一个实例正在跑这个任务", control.ErrRunInProgress)
+	// errStaleRunInControlDB：心跳过期，说明是上个进程被强杀留下的尸体。
 	errStaleRunInControlDB = fmt.Errorf("%w：控制库里还有一条上次没结束的运行", control.ErrRunInProgress)
 )
 
@@ -139,8 +155,15 @@ func (s *Server) startJob(ctx context.Context, job control.Job, actor string) er
 	if run, err := s.activeSyncRun(ctx, job.ID); err != nil {
 		return err
 	} else if run != nil {
-		// 控制库里确实有一条没结束的 run（上一个进程被 kill 留下的）。
-		return fmt.Errorf("%w（run %s，owner_instance=%s）", errStaleRunInControlDB, run.ID, run.OwnerInstance)
+		// 控制库里有一条没结束的 run。**心跳是否新鲜决定它在干什么**：
+		// 新鲜 = 另一个实例正在写（绝不能建议重启 serve——那会把别人的同步打断）；
+		// 过期 = 上个进程被强杀留下的尸体，这时才谈得上「等收尾 / 重启」。
+		if s.runHeartbeatFresh(run) {
+			return fmt.Errorf("%w（run %s，owner_instance=%s，最后心跳 %s）",
+				errOtherInstanceRunning, run.ID, run.OwnerInstance, run.HeartbeatAt)
+		}
+		return fmt.Errorf("%w（run %s，owner_instance=%s，最后心跳 %s）",
+			errStaleRunInControlDB, run.ID, run.OwnerInstance, run.HeartbeatAt)
 	}
 
 	// 故意用 context.Background：run 的生命周期比 HTTP 请求长，请求返回后还要继续跑。

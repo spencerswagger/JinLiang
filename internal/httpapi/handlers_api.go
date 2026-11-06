@@ -343,6 +343,21 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.startJob(ctx, job, actorOf(r)); err != nil {
+		if errors.Is(err, errOtherInstanceRunning) {
+			// 心跳还新鲜：另一个实例正在写。**千万不要建议重启 serve**——
+			// 用户真去重启，打断的是别人的同步。
+			s.writeError(w, r, http.StatusConflict, apiError{
+				Class:   "user_action",
+				Message: "另一个实例正在跑这个任务",
+				Why:     "控制库里那条运行的心跳还是新鲜的，说明另一个 jinliang 进程正在写它（多实例部署时的正常互斥）",
+				Next: []string{
+					"等它跑完：任务页的事件流能看到它的阶段",
+					"确实要停下：到跑它的那台机器上 POST /api/jobs/{id}/stop（别在本机重启 serve）",
+				},
+				Risk: "在本机重启 serve 不影响它，但也停不下它；两个进程同时写同一任务会被目标端租约挡住",
+			})
+			return
+		}
 		if errors.Is(err, errStaleRunInControlDB) {
 			// 控制库里确实有一条没结束的 run：这是唯一该去查 run 行的情形。
 			s.writeError(w, r, http.StatusConflict, apiError{
