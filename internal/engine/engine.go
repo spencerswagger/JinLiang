@@ -111,10 +111,16 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 	if err != nil {
 		return res, fmt.Errorf("解不开目标连接的口令（key 文件换过？）: %w", err)
 	}
-	if srcConn.Kind != dsn.KindPostgres || tgtConn.Kind != dsn.KindPostgres {
-		return res, fmt.Errorf("B1 只做了 PostgreSQL → PostgreSQL（当前 %s → %s）；"+
-			"MySQL 落在 B2，用 jinliang serve 里的任务页能看到进度说明",
-			srcConn.Kind, tgtConn.Kind)
+	// 源端目前只有 PG 的读实现；目标端允许 PG 与 MySQL，其它类型在构造阶段报清楚。
+	if srcConn.Kind != dsn.KindPostgres {
+		return res, fmt.Errorf("源端类型 %q 还没有读实现（现在支持 postgres 源）。"+
+			"你现在能做什么：把源连接换成 PostgreSQL；MySQL 源在下个版本。"+
+			"风险：没有（什么都没动）", srcConn.Kind)
+	}
+	if tgtConn.Kind != dsn.KindPostgres && tgtConn.Kind != dsn.KindMySQL {
+		return res, fmt.Errorf("目标端类型 %q 还不支持（现在支持 postgres / mysql）。"+
+			"你现在能做什么：把目标连接的 kind 改成 postgres 或 mysql。"+
+			"风险：没有（什么都没动）", tgtConn.Kind)
 	}
 	srcEP := endpointOf(srcConn, srcSecret)
 	tgtEP := endpointOf(tgtConn, tgtSecret)
@@ -230,8 +236,11 @@ type runner struct {
 
 	leaseTTL time.Duration
 
-	src    *pgsource.Source
-	sink   *pgsink.Sink
+	src  *pgsource.Source
+	sink *pgsink.Sink
+	// gsink 是「按接口」的目标端：PG 用 pgsink（COPY 快路径），MySQL 用 mysqlsink
+	// （走契约的 Apply）。构造阶段确定，之后引擎只用接口。
+	gsink  targetSink
 	cat    source.Catalog
 	tables []source.TableRef
 
@@ -275,6 +284,27 @@ func (r *runner) execute(parent context.Context, res *Result) error {
 	if err := r.preflight(ctx); err != nil {
 		return r.fail(ctx, err)
 	}
+	// 目标端不是 PG：走「只做全量」的通用路径（用契约里的 sink 接口，不按类型分支）。
+	if r.tgtEP.Kind != dsn.KindPostgres {
+		if err := r.prepareGeneric(ctx); err != nil {
+			return r.fail(ctx, err)
+		}
+		defer r.teardown()
+		if err := r.executeGenericFullCopy(ctx, res); err != nil {
+			if r.leaseLost.Load() {
+				return r.fail(ctx, r.leaseLostError())
+			}
+			if isUserStop(ctx, err) {
+				return r.fail(ctx, err)
+			}
+			if errors.As(err, new(*reachedDone)) {
+				return nil // 通用路径自己收尾到 done
+			}
+			return r.fail(ctx, err)
+		}
+		return nil
+	}
+
 	if err := r.prepare(ctx); err != nil {
 		return r.fail(ctx, err)
 	}
@@ -757,8 +787,9 @@ func (r *runner) teardown() {
 		if r.leaseOK {
 			_ = r.sink.ReleaseLease(ctx)
 		}
-		r.sink.Close()
+		_ = r.sink.Close()
 	}
+	closeTarget(r.gsink)
 	if r.src != nil {
 		r.src.Close()
 	}

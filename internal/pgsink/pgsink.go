@@ -193,10 +193,11 @@ func buildTables(cat source.Catalog) (map[string]*tableInfo, []string) {
 }
 
 // Close releases the connection.
-func (s *Sink) Close() {
+func (s *Sink) Close() error {
 	if s.conn != nil {
-		_ = s.conn.Close(context.Background())
+		return s.conn.Close(context.Background())
 	}
+	return nil
 }
 
 // Kind implements the sink contract.
@@ -830,6 +831,13 @@ func (s *Sink) Watermark(ctx context.Context) (string, error) {
 		return "", nil
 	}
 	return w, err
+}
+
+// BulkAppend 是 BulkApply 的「按表引用」版本，实现引擎的 bulkWriter 快路径
+// （引擎不该知道 tableInfo 这种内部类型）。
+func (s *Sink) BulkAppend(ctx context.Context, ref source.TableRef, chunkNo int,
+	rows [][]any, pos string) error {
+	return s.BulkApply(ctx, s.Table(ref), chunkNo, rows, pos, "", "")
 }
 
 // ── 增量：一批一个事务（数据 + 位点） ───────────────────────────
