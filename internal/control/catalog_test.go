@@ -29,10 +29,24 @@ func TestDefaultCatalogSchema(t *testing.T) {
 			want:    "a",
 		},
 		{
-			name:    "postgres 取搜索路径第一个 schema，不是数据库名",
+			name:    "postgres 优先 public",
 			ep:      dsn.Endpoint{Kind: dsn.KindPostgres, Database: "jinliang_test"},
 			schemas: []string{"public", "report"},
 			want:    "public",
+		},
+		{
+			// 回归：`ORDER BY nspname` 会把 jl_* / app 排到 public 前面，
+			// 于是向导默认列出一个空 schema，用户看到「这个库没有表」。
+			name:    "postgres 即使 public 不在第一个也选它",
+			ep:      dsn.Endpoint{Kind: dsn.KindPostgres, Database: "jinliang_test"},
+			schemas: []string{"jl_e2e_out", "public"},
+			want:    "public",
+		},
+		{
+			name:    "postgres 没有 public 时退回第一个",
+			ep:      dsn.Endpoint{Kind: dsn.KindPostgres},
+			schemas: []string{"app", "report"},
+			want:    "app",
 		},
 		{
 			name: "什么都没有时兜底 public",

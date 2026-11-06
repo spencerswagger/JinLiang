@@ -145,10 +145,19 @@ func (s *Store) Catalog(ctx context.Context, connID, schema string) (CatalogResu
 //
 // MySQL 的 schema 就是库名：必须用 DSN 里那个库，不能拿账号能看见的第一个库——
 // 那个常常是别的库（比如 jinliang_src），界面就会列出错的表。
-// PostgreSQL 里 database 与 schema 是两回事，仍取搜索路径的第一个 schema。
+// PostgreSQL 里 database 与 schema 是两回事：优先 `public`（绝大多数库的表在这里），
+// 没有 public 才退回第一个 schema。
+//
+// 为什么不能直接取 schemas[0]：`ORDER BY nspname` 会把 `jl_*`/`app` 这类名字排到
+// `public` 前面，于是向导默认列出的是一个空 schema —— 用户看到「这个库没有表」。
 func defaultCatalogSchema(ep dsn.Endpoint, schemas []string) string {
 	if ep.Kind == dsn.KindMySQL && ep.Database != "" {
 		return ep.Database
+	}
+	for _, s := range schemas {
+		if s == "public" {
+			return s
+		}
 	}
 	if len(schemas) > 0 {
 		return schemas[0]
