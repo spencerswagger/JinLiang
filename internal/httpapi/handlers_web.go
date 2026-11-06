@@ -464,14 +464,18 @@ func (s *Server) pageJobRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.startJob(r.Context(), job, control.ActorUI); err != nil {
+		// 注意用 errors.As 而不是 errors.Is：这个错误**带字段**（是哪一台），
+		// 用哨兵指针比较永远不相等，会掉到下面「本进程在跑」那条去。
+		if oi := asOtherInstance(err); oi != nil {
+			s.renderPartial(w, "error_card", conflictOtherInstance(oi.OwnerInstance, oi.RunID, oi.HeartbeatAt))
+			return
+		}
+		if errors.Is(err, errStaleRunInControlDB) {
+			s.renderPartial(w, "error_card", conflictStaleRun())
+			return
+		}
 		if errors.Is(err, control.ErrRunInProgress) {
-			s.renderPartial(w, "error_card", apiError{
-				Class:   "user_action",
-				Message: "这个任务已经在跑了",
-				Why:     "同一任务同时跑两份会互相覆盖",
-				Next:    []string{"先看下面的实时事件；要停下按「停止」"},
-				Risk:    "无",
-			})
+			s.renderPartial(w, "error_card", conflictThisProcess())
 			return
 		}
 		s.renderPartial(w, "error_card", plainError("%v", err))
