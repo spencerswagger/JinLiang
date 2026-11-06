@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
+	"time"
 
 	"github.com/spencerswagger/jinliang/internal/state"
 )
@@ -33,6 +35,9 @@ const (
 	// 第一个问题正是「它说已接受，为什么什么都没发生」。
 	ActionRunRejected = "job.run.rejected"
 	ActionAdminSet    = "admin.set"
+	// ActionAuditPrune 记录「清理审计」这件事本身。它自己永不参与清理——
+	// 删记录这件事也必须留痕，否则「谁清掉了什么」就无从查起。
+	ActionAuditPrune = "audit.prune"
 )
 
 // AuditEntry is one row of the audit trail.
@@ -98,6 +103,138 @@ func (s *Store) ListAudit(ctx context.Context, limit int) ([]AuditEntry, error) 
 		out = append(out, a)
 	}
 	return out, rows.Err()
+}
+
+// AuditRetention 是普通审计记录的默认保留期。
+//
+// hugo 定的口径：默认 180 天；**登录、凭证、连接变更类动作永久保留**
+// （见 permanentAuditAction）。理由是前者的价值随时间衰减，后者是「谁动过
+// 权限与连接」的证据，事后追责要靠它。
+const AuditRetention = 180 * 24 * time.Hour
+
+// permanentAuditAction 判断某个动作是否永久保留。
+// 用前缀而不是逐条枚举：新增一条 connection.* 时不该悄悄变成「可清理」。
+func permanentAuditAction(action string) bool {
+	for _, p := range []string{
+		"connection.", // 连接的新增/修改/删除/测连：凭证与对端地址的变更史
+		"job.delete",  // 删任务**连同它的 runs 一起删**，和删连接一样不可逆：
+		//                三个月后问「谁删的那个任务」，只有这条记录能回答
+		//                （Owl：不对称比漏删更糟——删连接留、删任务不留，讲不通）
+		"admin.", // 管理员口令、身份相关
+		"login",  // 登录/登出
+		"auth.",  // 认证类（为将来留位）
+		"session.",
+		"key.",        // 密钥相关
+		"audit.prune", // 清理动作本身
+	} {
+		if action == p || strings.HasPrefix(action, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// PruneResult 是清理的结论（dry-run 也会返回，用来先看一眼）。
+type PruneResult struct {
+	Cutoff     string   `json:"cutoff"`
+	Retention  string   `json:"retention"`
+	Apply      bool     `json:"apply"`
+	Deleted    int64    `json:"deleted"`
+	Batches    int      `json:"batches"`
+	Kept       int64    `json:"kept_permanent"`
+	Candidates []string `json:"candidates,omitempty"`
+}
+
+// pruneBatch 是一批删除的行数上限。
+//
+// 控制库单写锁：一条 `DELETE ... WHERE at < ?` 上几十万行就是长写事务，会把 15 秒
+// 一次的心跳（TouchRun）卡住——心跳一失败就触发「引擎没有退出」那条 note，严重时
+// doctor 会把活 run 判成幽灵。**一条会卡住心跳的清理命令比不清理更危险**，
+// 因为它的症状出现在别处。所以分批删、每批之间让出。
+const pruneBatch = 5000
+
+// PruneAudit 删除 before 之前的**非永久**审计记录。
+//
+// 默认 dry-run（apply=false 只统计不删）——清理是不可逆的，默认就该安全。
+// apply=true 时会写一条 ActionAuditPrune 的审计，detail 里带删除条数与截止时间。
+func (s *Store) PruneAudit(ctx context.Context, before time.Time, apply bool) (PruneResult, error) {
+	res := PruneResult{
+		Cutoff:    before.UTC().Format(time.RFC3339),
+		Retention: AuditRetention.String(),
+		Apply:     apply,
+	}
+	// 先统计候选（同时把永久保留的排除掉）
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT action, COUNT(*) FROM audit WHERE at < ? GROUP BY action`, res.Cutoff)
+	if err != nil {
+		return res, err
+	}
+	var pruneActions []string
+	for rows.Next() {
+		var action string
+		var n int64
+		if err := rows.Scan(&action, &n); err != nil {
+			rows.Close()
+			return res, err
+		}
+		if permanentAuditAction(action) {
+			res.Kept += n
+			continue
+		}
+		pruneActions = append(pruneActions, action)
+		res.Deleted += n
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return res, err
+	}
+	res.Candidates = pruneActions
+	if !apply || res.Deleted == 0 {
+		return res, nil
+	}
+	// 只删「过期且非永久」的行：动作名逐个进 IN 列表，永久保留的天然不在里面。
+	placeholders := make([]string, 0, len(pruneActions))
+	args := make([]any, 0, len(pruneActions)+1)
+	args = append(args, res.Cutoff)
+	for _, a := range pruneActions {
+		placeholders = append(placeholders, "?")
+		args = append(args, a)
+	}
+	// 分批：每批最多 pruneBatch 行，批与批之间让出（sql.DB 每次 Exec 结束就放锁，
+	// 这里额外让一小会儿，保证心跳有机会插进来）。
+	deleteQ := `DELETE FROM audit WHERE rowid IN (
+		SELECT rowid FROM audit WHERE at < ? AND action IN (` + strings.Join(placeholders, ",") + `) LIMIT ?)`
+	var deleted int64
+	for batch := 0; ; batch++ {
+		out, derr := s.db.ExecContext(ctx, deleteQ, append(args, pruneBatch)...)
+		if derr != nil {
+			return res, derr
+		}
+		n, _ := out.RowsAffected()
+		deleted += n
+		res.Batches = batch + 1
+		if n == 0 || n < pruneBatch {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return res, ctx.Err()
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	res.Deleted = deleted
+	// 清理动作本身要留痕
+	if err := s.Audit(ctx, ActorSystem, ActionAuditPrune, map[string]any{
+		"deleted":   res.Deleted,
+		"kept":      res.Kept,
+		"cutoff":    res.Cutoff,
+		"retention": res.Retention,
+		"actions":   pruneActions,
+		"batches":   res.Batches,
+	}); err != nil {
+		return res, fmt.Errorf("清理已完成但写审计失败（这次清理没有留痕）: %w", err)
+	}
+	return res, nil
 }
 
 // ListAuditByAction 按 action 过滤取最近的审计记录。

@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 )
 
 // 按 action 过滤必须下推到 SQL：诊断页原来取「最近 50 条」再在页面里筛 rejected，
@@ -130,5 +131,114 @@ func TestListAuditByActionClampsUpwards(t *testing.T) {
 	}
 	if len(zero) != RejectedWindow {
 		t.Fatalf("limit=0 应回落默认 %d，实际 %d", RejectedWindow, len(zero))
+	}
+}
+
+// 审计保留策略（hugo 口径）：默认 180 天；登录、凭证/连接变更类动作永久保留；
+// 清理动作本身要留痕。
+func TestPruneAuditKeepsPermanentActions(t *testing.T) {
+	store, err := Open(Options{DataDir: t.TempDir(), Autogen: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+
+	old := time.Now().Add(-200 * 24 * time.Hour).UTC().Format(time.RFC3339)
+	write := func(action string, at string) string {
+		id, _ := NewID()
+		if _, err := store.DB().Exec(
+			`INSERT INTO audit (id, at, actor, action, detail_json) VALUES (?, ?, 'api', ?, '{}')`,
+			id, at, action); err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	fresh := time.Now().UTC().Format(time.RFC3339)
+	oldRun := write(ActionJobRun, old)       // 过期普通记录 → 应被清
+	oldLogin := write("login.ok", old)       // 过期登录 → 永久保留
+	oldConn := write(ActionConnUpdate, old)  // 过期连接变更 → 永久保留
+	oldPrune := write(ActionAuditPrune, old) // 清理动作本身 → 永久保留
+	newRun := write(ActionJobRun, fresh)     // 未过期 → 保留
+
+	// ① dry-run：只统计，不删
+	dry, err := store.PruneAudit(ctx, time.Now().Add(-180*24*time.Hour), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dry.Deleted != 1 {
+		t.Fatalf("dry-run 应只统计到 1 条可删，实际 %d（candidates=%v）", dry.Deleted, dry.Candidates)
+	}
+	if dry.Kept != 3 {
+		t.Fatalf("永久保留应是 3 条（登录/连接/清理自身），实际 %d", dry.Kept)
+	}
+
+	// ② apply：普通记录没了，永久保留的还在
+	res, err := store.PruneAudit(ctx, time.Now().Add(-180*24*time.Hour), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Deleted != 1 {
+		t.Fatalf("应删除 1 条，实际 %d", res.Deleted)
+	}
+	exists := func(id string) bool {
+		var n int
+		if err := store.DB().QueryRow(`SELECT COUNT(*) FROM audit WHERE id = ?`, id).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n > 0
+	}
+	if exists(oldRun) {
+		t.Fatal("过期普通记录没被清掉")
+	}
+	for name, id := range map[string]string{"登录": oldLogin, "连接变更": oldConn, "清理动作自身": oldPrune} {
+		if !exists(id) {
+			t.Fatalf("%s 的记录被误删了——这类动作必须永久保留", name)
+		}
+	}
+	if !exists(newRun) {
+		t.Fatal("未过期的记录被误删了")
+	}
+
+	// ③ 清理动作本身必须留痕
+	entries, err := store.ListAuditByAction(ctx, ActionAuditPrune, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found bool
+	for _, e := range entries {
+		if strings.Contains(e.Detail, `"deleted":1`) {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("清理动作没有留痕（或 detail 里没有删除条数）：%+v", entries)
+	}
+}
+
+// job.delete 与 connection.delete 同样不可逆（删任务会把它的 runs 一起删），
+// 必须永久保留；同时把「可清」的决定写下来作为断言——决定要落在代码里，
+// 而不是「没进前缀列表所以默认被清」。
+func TestPruneAuditPermanentActionsAreExplicit(t *testing.T) {
+	permanent := []string{
+		ActionConnCreate, ActionConnUpdate, ActionConnDelete, ActionConnTest,
+		ActionJobDelete, ActionAdminSet, ActionAuditPrune, "login.ok", "session.start",
+	}
+	for _, a := range permanent {
+		if !permanentAuditAction(a) {
+			t.Fatalf("%q 必须永久保留", a)
+		}
+	}
+	// 这些是「可以清」的**决定**（不是漏掉）：运行类记录的价值随时间衰减，
+	// 而任务/连接的变更史才是追责证据。
+	prunable := []string{
+		ActionJobRun, ActionRunStub, ActionRunRejected,
+		"job.run.lease_forced", "job.run.stop_timeout", "job.run.takeover",
+		ActionJobCreate, ActionJobUpdate, ActionJobExport,
+	}
+	for _, a := range prunable {
+		if permanentAuditAction(a) {
+			t.Fatalf("%q 被标成永久保留，但它应当可清（决定写在测试里，不是默认）", a)
+		}
 	}
 }
