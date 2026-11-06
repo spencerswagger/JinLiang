@@ -449,15 +449,30 @@ func cmdDelete(args []string) error {
 		fmt.Println("已经在跑的那个引擎没有在等待时间内退出。已记一条 audit 说明原因；" +
 			"目标端租约会在 TTL 后过期并可被抢占，期间的 run 会报 E1005——再跑一次即可接管。")
 	}
-	if serr != nil && stopped {
-		return serr
+	// **退出码必须反映事实**：等不到退出（serr != nil）时以前这里写的是
+	// `serr != nil && stopped`——而 stopped 恰恰是 false，条件恒假 → 超时错误被吞、
+	// delete 退出码 0，用户看到「删除成功」而引擎其实没停。这就是今晚一直在打的
+	// 「退出码与事实不一致」。现在：超时 = 非 0 退出，并说清楚为什么没停干净。
+	var stopTimeout error
+	if serr != nil {
+		stopTimeout = serr
+		fmt.Println("⚠️ 引擎没有在等待时间内退出：删除会继续，但**这一轮不算干净停下**。")
+		fmt.Printf("   原因：%v\n", serr)
+		fmt.Println("   影响：目标端租约删掉后，那个进程最多约 10 秒才会自己发现并退出；" +
+			"期间请勿在同一目标新建/重跑任务。")
 	}
 	// 跨进程的情况：那个引擎不在本进程里，cancel 不到它。做法是**删掉目标端租约行**——
 	// 它下一次续租会失败两次 → loseLease → cancelRun 自己停下（#30 的语义）。
 	// 不这么做，用户删了任务后租约还会续期，同目标新建任务一直撞 E1005。
-	if holder, alive, lerr := releaseTargetLease(ctx, store, job); lerr != nil {
+	holder, alive, hasLease, lerr := releaseTargetLease(ctx, store, job)
+	switch {
+	case !hasLease:
+		// 目标端没有租约能力（例如 MySQL 侧还没接状态表租约）：什么都不用做，
+		// 也不能打印一句假的「清租约失败」。
+		fmt.Println("该目标端没有租约（不支持租约能力），跳过清租约这一步。")
+	case lerr != nil:
 		fmt.Printf("清目标端租约失败（%v）：租约会在 TTL 后过期并可被抢占。\n", lerr)
-	} else if holder != "" {
+	case holder != "":
 		// 窗口要说出来：`watchLease` 对「行没了」(ok==false) 是**立刻** loseLease，
 		// 所以最坏 = leaseTTL/3 ≈ 10 秒，不是等 TTL。这 10 秒里新任务确实能起来 → 双写，
 		// 同一 job 同主键 upsert 多数幂等，但「删了重建时改了 content.tables/on_exists」不幂等。
@@ -488,23 +503,33 @@ func cmdDelete(args []string) error {
 		"job_id": job.ID, "job_key": job.JobKey, "job_name": job.Name, "engine_stopped": stopped,
 	})
 	fmt.Printf("已删除任务 %s。\n", job.Name)
+	if stopTimeout != nil {
+		// 记录已删（用户要的就是这个），但进程没确认停下 → 非 0，让脚本/CI 看得见。
+		return fmt.Errorf("任务已删除，但引擎没有在等待时间内确认退出：%w", stopTimeout)
+	}
 	return nil
 }
 
 // releaseTargetLease 删掉这个任务在目标端的租约行（删除任务专用）。
 // 目标端连不上时返回错误，由调用方如实说明「租约会在 TTL 后过期」，不静默。
-func releaseTargetLease(ctx context.Context, store *control.Store, job control.Job) (string, bool, error) {
+func releaseTargetLease(ctx context.Context, store *control.Store, job control.Job) (holder string, alive, hasLease bool, err error) {
 	conn, err := store.GetConnection(ctx, job.TargetID)
 	if err != nil {
-		return "", false, err
+		return "", false, false, err
+	}
+	// 能力探测（不按 kind 硬编码）：只有 PG 目标端实现了目标端租约表。
+	// MySQL 侧的 _jl_lease 还没有接入引擎的租约路径，这里跳过并如实说明——
+	// 以前无条件调 ForceReleaseLease，每次删除都会打印一句假的「清租约失败」。
+	if conn.Kind != dsn.KindPostgres {
+		return "", false, false, nil
 	}
 	secret, err := store.Secret(ctx, job.TargetID)
 	if err != nil {
-		return "", false, err
+		return "", false, true, err
 	}
 	doc, err := store.JobDoc(ctx, job)
 	if err != nil {
-		return "", false, err
+		return "", false, true, err
 	}
 	ep := dsn.Endpoint{
 		Kind: conn.Kind, Host: conn.Host, Port: conn.Port, Database: conn.Database,
@@ -518,7 +543,8 @@ func releaseTargetLease(ctx context.Context, store *control.Store, job control.J
 			schema = "public"
 		}
 	}
-	return pgsink.ForceReleaseLease(ctx, ep, schema, job.JobKey)
+	h, a, err := pgsink.ForceReleaseLease(ctx, ep, schema, job.JobKey)
+	return h, a, true, err
 }
 
 // settleActiveRuns 等这个任务的未结束 run 自己收尾；等不到就替它收尾。
