@@ -13,6 +13,7 @@ import (
 	"github.com/spencerswagger/jinliang/internal/control"
 	"github.com/spencerswagger/jinliang/internal/dsn"
 	"github.com/spencerswagger/jinliang/internal/mysqlsink"
+	"github.com/spencerswagger/jinliang/internal/pgsink"
 	"github.com/spencerswagger/jinliang/internal/pgsource"
 	"github.com/spencerswagger/jinliang/internal/sink"
 	"github.com/spencerswagger/jinliang/internal/source"
@@ -31,6 +32,39 @@ type targetSink interface {
 	// 这里只要求「能关」：错误在 teardown 里忽略（关连接失败不该盖住原错误）。
 	Close() error
 }
+
+// stateCapable 是「目标端状态表能力」：租约、位点、块记账、对象登记。
+//
+// 这些**不在 sink.Sink 契约里**（契约归 Ark，只描述数据写入），所以在引擎侧定义成
+// 可选能力接口——全量路径只要求 sink.Sink，增量路径才要求它。
+//
+// 关键：必须有编译期断言（下面 var _ 那两行）。否则签名差一个参数，
+// 运行时会静默 `ok == false` 而退回「这个目标端不支持增量」——功能看着在、其实从没被走到。
+// 故意**不**列 Position / Watermark / SetWatermark 之类：
+// 它们不是这条路径要用的能力，漏列只会变成编译错误（安全），
+// 而多补一条断言等于把「编译期保证」换成「运行时检查」——那是退步。
+// 换句话说：这个接口的成员应该由「谁在用」决定，不由「谁有」决定。
+type stateCapable interface {
+	AcquireLease(ctx context.Context, ttl time.Duration) (bool, string, error)
+	RenewLease(ctx context.Context, ttl time.Duration) (bool, error)
+	ReleaseLease(ctx context.Context) error
+	EnsureMeta(ctx context.Context, jobHash, phase, position, snapshotID string) error
+	SetPhase(ctx context.Context, phase string) error
+	State(ctx context.Context) (phase, position string, err error)
+	DoneChunks(ctx context.Context) (map[string]map[int]bool, error)
+	ResetChunks(ctx context.Context) error
+	DidCreateTable(ctx context.Context, ref source.TableRef) (bool, error)
+	TruncateTable(ctx context.Context, ref source.TableRef) error
+	RecordObject(ctx context.Context, name, kind string) error
+	MarkObjectDropped(ctx context.Context, name string) error
+	Count(ctx context.Context, ref source.TableRef) (int64, error)
+}
+
+// 编译期保证：两个目标端都满足状态能力接口（签名不一致会直接编译失败）。
+var (
+	_ stateCapable = (*pgsink.Sink)(nil)
+	_ stateCapable = (*mysqlsink.Sink)(nil)
+)
 
 // newTargetSink 在开跑前把目标端定下来；不支持的组合在这里就报清楚（四段式）。
 func newTargetSink(ctx context.Context, r *runner) (targetSink, error) {
@@ -98,7 +132,9 @@ func (r *runner) prepareGeneric(ctx context.Context) error {
 // executeGenericFullCopy 跑一次全量到非 PG 目标端（MySQL）。
 //
 // 本次范围只到全量：
-//   - 目标端状态表（_jl_lease / _jl_meta 的位点与阶段）还没实现，所以**不租约、不记位点**；
+//   - **虽然目标端（MySQL）已经有状态表能力（#50），本版这条路径仍然不 acquire 租约、
+//     不写位点、不记块进度**——「能力有了」和「这条路径用了」是两件事，
+//     别看到 `stateCapable` 就以为这里在用它；
 //   - 增量（Apply 的流式路径 / interval 的水位）明确报「本版仅支持全量」，不静默降级。
 //
 // 写入走契约里的 `sink.Apply`：把每一页行包成 EvInsert 事件（带 Relation=这一版列定义），
@@ -117,12 +153,8 @@ func (r *runner) executeGenericFullCopy(ctx context.Context, res *Result) error 
 	for _, a := range actions {
 		r.emit(ctx, control.Event{Type: "note", Message: a.What})
 	}
-	if r.mode() != "once" && r.mode() != "full_interval" {
-		return &notImplementedError{fmt.Sprintf(
-			"目标端是 %s 时本版只支持全量（mode.frequency 用 once 或 full_interval）："+
-				"位点/租约状态表与增量写入还没接上。你现在能做什么："+
-				"1) 把 mode.frequency 改成 once 先搬存量；2) 或等下一版增量。"+
-				"风险：没有（本次没有写入任何数据）", r.tgtEP.Kind)}
+	if err := r.incrementalGate(); err != nil {
+		return err
 	}
 
 	if err := r.phaseTo(ctx, state.Snapshot); err != nil {
@@ -196,6 +228,39 @@ func (r *runner) targetCatalog() source.Catalog {
 // 事件里的 Table 会被目标端直接拼进 SQL，必须是目标端的库名。
 func (r *runner) targetRef(ref source.TableRef) source.TableRef {
 	return source.TableRef{Schema: strings.TrimSpace(r.doc.Target.Schema), Table: ref.Table}
+}
+
+// incrementalGate 决定「这个目标端能不能跑增量」。
+//
+// 两件事分开说，因为它们对用户意味着完全不同的下一步：
+//   - 目标端**没有**状态能力（租约/位点/块记账）→ 这是接线没到，只能跑全量；
+//   - 目标端有状态能力、但引擎的非 PG 增量路径还没接 → 这是本版范围没到。
+//
+// 无论哪种都**显式拒绝**，不静默降级成「只搬一次」。
+func (r *runner) incrementalGate() error {
+	mode := r.mode()
+	if mode == "once" || mode == "full_interval" {
+		return nil
+	}
+	if r.tgtEP.Kind == dsn.KindPostgres {
+		return nil // PG 目标端的增量路径是完整实现的
+	}
+	_, hasState := r.gsink.(stateCapable)
+	if !hasState {
+		return &notImplementedError{fmt.Sprintf(
+			"目标端（%s）还没有租约/位点能力，只能跑全量：没有位点就没法知道「上次搬到哪」，"+
+				"跑增量会重复或漏数据。你现在能做什么：1) 把 mode.frequency 改成 once 先搬存量；"+
+				"2) 需要周期性重跑就用 full_interval；3) 或者换 PostgreSQL 目标端跑真增量。"+
+				"风险：没有（本次没有写入任何数据）", r.tgtEP.Kind)}
+	}
+	// 注意：**不要建议用户改 interval**——非 PG 目标端在 Run 里提前返回、走
+	// executeGenericFullCopy，而它第一步就是本函数，interval 会撞回这同一句拒绝
+	//（engine.go 的 interval 分派对 MySQL 不可达）。给的建议必须是走得通的。
+	return &notImplementedError{fmt.Sprintf(
+		"目标端（%s）的状态表已经就绪，但本版引擎的非 PG 增量路径还没接上：目前只搬全量。"+
+			"你现在能做什么：1) 把 mode.frequency 改成 once 先搬存量；"+
+			"2) 需要周期性重跑就用 full_interval（每轮整表重搬，明确接受这个代价）。"+
+			"风险：没有（本次没有写入任何数据）", r.tgtEP.Kind)}
 }
 
 // relationOf 给出这张表这一版的列定义（引擎据此告诉目标端「值按什么列序」）。

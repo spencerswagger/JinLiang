@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/spencerswagger/jinliang/internal/control"
+	"github.com/spencerswagger/jinliang/internal/dsn"
 	"github.com/spencerswagger/jinliang/internal/pgsource"
 	"github.com/spencerswagger/jinliang/internal/source"
 	"github.com/spencerswagger/jinliang/internal/state"
@@ -771,3 +772,61 @@ func TestToValuePropagatesValuerError(t *testing.T) {
 
 // preflight 的阻断口径：**只拦数组**（会被映成 json、元素可能没有 JSON 表示 → 静默写错），
 // 不拦 timestamptz 之类「丢时区但知情可接受」的 NeedsConfirm——否则几乎所有真实任务都跑不起来。
+
+// 增量闸门：两种「不能跑」要说清是哪一种，且都显式拒绝（不静默降级成只搬一次）。
+func TestIncrementalGateExplainsWhatIsMissing(t *testing.T) {
+	// PG 目标端：增量是完整实现的，全模式都放行
+	r := &runner{tgtEP: dsn.Endpoint{Kind: dsn.KindPostgres}}
+	r.doc.Mode.Frequency = "continuous+initial"
+	if err := r.incrementalGate(); err != nil {
+		t.Fatalf("PG 目标端不该被拦：%v", err)
+	}
+
+	// MySQL 目标端 + 状态能力已就绪（mysqlsink 满足 stateCapable）：
+	m := &runner{tgtEP: dsn.Endpoint{Kind: dsn.KindMySQL}, gsink: mustMySQLSink(t)}
+	m.doc.Mode.Frequency = "continuous+initial"
+	err := m.incrementalGate()
+	if err == nil {
+		t.Fatal("非 PG 增量本版还没接，必须显式拒绝")
+	}
+	if !strings.Contains(err.Error(), "状态表已经就绪") {
+		t.Fatalf("有状态能力时应说「能力有了、路径没接」，得到：%v", err)
+	}
+
+	// 只有全量的目标端（不满足 stateCapable）：说「没有状态能力」
+	only := &runner{tgtEP: dsn.Endpoint{Kind: dsn.KindMySQL}, gsink: sinkOnly{}}
+	only.doc.Mode.Frequency = "continuous+initial"
+	err = only.incrementalGate()
+	if err == nil || !strings.Contains(err.Error(), "还没有租约/位点能力") {
+		t.Fatalf("缺状态能力时应说清缺什么，得到：%v", err)
+	}
+
+	// full_interval / once 不受影响
+	for _, mode := range []string{"once", "full_interval"} {
+		ok := &runner{tgtEP: dsn.Endpoint{Kind: dsn.KindMySQL}, gsink: sinkOnly{}}
+		ok.doc.Mode.Frequency = mode
+		if err := ok.incrementalGate(); err != nil {
+			t.Fatalf("%s 不该被拦：%v", mode, err)
+		}
+	}
+}
+
+// MySQL 目标端上 interval / continuous 都必须被同一道闸门拒绝，
+// 而且**建议里不能再出现 interval**（照建议改完会撞回同一句拒绝——那是把人引向无效动作）。
+func TestMySQLIntervalIsRejectedWithUsableAdvice(t *testing.T) {
+	for _, mode := range []string{"interval", "continuous+initial", "continuous"} {
+		r := &runner{tgtEP: dsn.Endpoint{Kind: dsn.KindMySQL}, gsink: sinkOnly{}}
+		r.doc.Mode.Frequency = mode
+		err := r.incrementalGate()
+		if err == nil {
+			t.Fatalf("%s 在 MySQL 目标端必须被拒", mode)
+		}
+		msg := err.Error()
+		if strings.Contains(msg, "改用 interval") || strings.Contains(msg, "用 interval") {
+			t.Fatalf("%s 的建议把用户引向 interval，而同一条闸门又会拒它：%s", mode, msg)
+		}
+		if !strings.Contains(msg, "once") || !strings.Contains(msg, "full_interval") {
+			t.Fatalf("%s 的建议应给 once 与 full_interval 两条真正走得通的路：%s", mode, msg)
+		}
+	}
+}
