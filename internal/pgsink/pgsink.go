@@ -884,6 +884,11 @@ func (s *Sink) Apply(ctx context.Context, evs []source.Event, pos source.Positio
 		ev := evs[i]
 		switch ev.Kind {
 		case source.EvInsert, source.EvUpdate:
+			// 加列竞态：源端 DDL 之后的行带着**新的 Relation**，而目标端可能还没有那一列。
+			// 先对齐列再写行——否则这一批整体失败，一张表的 DDL 把整个任务打死。
+			if err := s.alignRelationTx(ctx, tx, ev); err != nil {
+				return err
+			}
 			j := i
 			for j < len(evs) && (evs[j].Kind == source.EvInsert || evs[j].Kind == source.EvUpdate) &&
 				evs[j].Table == ev.Table {
@@ -1004,6 +1009,67 @@ func checkDDLAllowed(stmt, srcSchema, tgtSchema string) error {
 		return fmt.Errorf("源端 schema 是 %q、目标端是 %q，这条 DDL 里的表名是源端原文（%s）："+
 			"直接执行可能改到同名但不相干的表。你能做什么：1) 把 target.schema 配成与源端一致；"+
 			"2) 或者手工在目标端执行这条语句。风险：改错表的后果不可逆", srcSchema, tgtSchema, stmt)
+	}
+	return nil
+}
+
+// alignRelationTx 让目标表的列与事件里的 Relation 对齐（**只加不减**）。
+//
+// 场景：源端刚 ALTER TABLE ADD COLUMN，随后那一批行带着**新的 Relation**，
+// 而目标端（和本 sink 的列缓存）还是旧的 → 整批行写失败、整个任务 failed。
+// 一张表的 DDL 不该把任务打死。
+//
+// 两条规矩：
+//   - **只加列**：删列/改类型是危险动作（删列丢数据、改窄类型截断），不能因为收到一条
+//     事件就替用户做——那些由 applyDDLTx 显式执行或明确拒绝；
+//   - **类型用 Relation 里的源端类型**：PG→PG 目标端与源端同类型，这正是 EnsureSchema
+//     建表时用的同一份定义（`tableInfo.types` 就是它），不在这里另发明一套映射。
+func (s *Sink) alignRelationTx(ctx context.Context, tx pgx.Tx, ev source.Event) error {
+	if ev.Relation == nil || len(ev.Relation.Columns) == 0 {
+		return nil
+	}
+	key := ev.Table.Schema + "." + ev.Table.Table
+	ti := s.tables[key]
+	if ti == nil {
+		return fmt.Errorf("收到未知表 %s 的变更（发布里多了表？）", ev.Table.Table)
+	}
+	if len(ev.Relation.Columns) == len(ti.cols) {
+		return nil // 列没变：沿用缓存
+	}
+
+	var added []string
+	for _, c := range ev.Relation.Columns {
+		if _, ok := ti.colIndex[c.Name]; ok {
+			continue
+		}
+		stmt := fmt.Sprintf("ALTER TABLE %s ADD COLUMN IF NOT EXISTS %s %s",
+			pgwire.Qualified(ev.Table.Schema, ev.Table.Table), pgwire.Quote(c.Name), c.Type)
+		if _, err := tx.Exec(ctx, stmt); err != nil {
+			return fmt.Errorf("源端新增了列 %s，但在目标表 %s 上补列失败: %w", c.Name, ev.Table.Table, err)
+		}
+		added = append(added, c.Name)
+	}
+
+	// 缓存跟着 Relation 走：列序以 Relation 为准（行值就是按这个顺序来的），
+	// **colIndex 必须一起重建**——只改 cols/types 会让按列名找下标的路径错位。
+	ti.cols = ti.cols[:0]
+	ti.types = ti.types[:0]
+	ti.collations = ti.collations[:0]
+	ti.colIndex = map[string]int{}
+	for _, c := range ev.Relation.Columns {
+		ti.colIndex[c.Name] = len(ti.cols)
+		ti.cols = append(ti.cols, c.Name)
+		ti.types = append(ti.types, c.Type)
+		ti.collations = append(ti.collations, c.Collation)
+	}
+	ti.pkIdx = ti.pkIdx[:0]
+	for _, name := range ti.pk {
+		if idx, ok := ti.colIndex[name]; ok {
+			ti.pkIdx = append(ti.pkIdx, idx)
+		}
+	}
+	if len(added) > 0 {
+		log.Printf("%s 跟随源端新增了 %d 列（%s）", ev.Table.Table, len(added), strings.Join(added, ", "))
 	}
 	return nil
 }

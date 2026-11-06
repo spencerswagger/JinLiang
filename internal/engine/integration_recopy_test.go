@@ -816,3 +816,89 @@ func continuousJob(t *testing.T, srcDSN, dstDSN, name, table string) (*control.S
 	}
 	return store, job.ID
 }
+
+// DDL 第②步：源端加列之后，**带新 Relation 的行必须能写进去**（先对齐列再写行）。
+// 一张表的 DDL 不该把整个任务打死——之前这种行会让整批失败、任务 failed。
+func TestDDLAddColumnThenRowsSucceed(t *testing.T) {
+	srcDSN, dstDSN := dsns(t)
+	srcDB := mustConn(t, srcDSN)
+	dstDB := mustConn(t, dstDSN)
+	table := "ddl_align"
+	ctx := context.Background()
+
+	exec(t, srcDB, "DROP TABLE IF EXISTS "+table)
+	exec(t, srcDB, "CREATE TABLE "+table+" (id bigint PRIMARY KEY, a text)")
+	exec(t, srcDB, "INSERT INTO "+table+" VALUES (1,'x')")
+	exec(t, dstDB, "DROP TABLE IF EXISTS "+table)
+	exec(t, dstDB, "DROP TABLE IF EXISTS _jl_meta, _jl_chunk, _jl_lease, _jl_object, _jl_instance")
+
+	ref := source.TableRef{Schema: "public", Table: table}
+	oldRel := source.Table{
+		TableRef:   ref,
+		Columns:    []source.Column{{Name: "id", Type: "bigint"}, {Name: "a", Type: "text"}},
+		PrimaryKey: []string{"id"},
+	}
+	s, err := pgsink.Open(ctx, pgsink.Options{
+		Target: mustEndpoint(t, dstDSN), JobKey: "ddlalign", JobName: "ddl-align",
+		InstanceID: "it-ddl-align", Schema: "public", OnExists: "append",
+		Catalog: source.Catalog{Tables: []source.Table{oldRel}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if _, err := s.EnsureSchema(ctx, source.Catalog{Tables: []source.Table{oldRel}}); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+
+	// 先把旧结构的行写进去（模拟「全量已经搬过」），否则下面「旧行还在」没有基数
+	if err := s.Apply(ctx, []source.Event{
+		{Kind: source.EvInsert, Table: ref, Relation: &oldRel,
+			New: source.Row{Table: ref, Values: []source.Value{
+				{Kind: source.KindString, S: "1"}, {Kind: source.KindString, S: "x"}}}},
+		{Kind: source.EvCommit},
+	}, nil); err != nil {
+		t.Fatalf("先写旧行失败：%v", err)
+	}
+
+	// 源端加列；随后的行带着新的 Relation（3 列）
+	exec(t, srcDB, "ALTER TABLE "+table+" ADD COLUMN b text")
+	newRel := source.Table{
+		TableRef: ref,
+		Columns: []source.Column{
+			{Name: "id", Type: "bigint"}, {Name: "a", Type: "text"}, {Name: "b", Type: "text"},
+		},
+		PrimaryKey: []string{"id"},
+	}
+	evs := []source.Event{
+		{Kind: source.EvDDL, Table: ref, Relation: &newRel,
+			DDL: "ALTER TABLE public." + table + " ADD COLUMN b text"},
+		{Kind: source.EvInsert, Table: ref, Relation: &newRel,
+			// 行值与生产路径一致：逻辑解码出来的是**文本**，占位符是 `$n::text::<type>`。
+			New: source.Row{Table: ref, Values: []source.Value{
+				{Kind: source.KindString, S: "2"},
+				{Kind: source.KindString, S: "y"},
+				{Kind: source.KindString, S: "new"},
+			}}},
+		{Kind: source.EvCommit},
+	}
+	if err := s.Apply(ctx, evs, nil); err != nil {
+		t.Fatalf("源端加列之后的行必须能写进去（先对齐列再写行）：%v", err)
+	}
+
+	var got string
+	if err := dstDB.QueryRow(ctx, "SELECT COALESCE(b,'（空）') FROM "+table+" WHERE id=2").Scan(&got); err != nil {
+		t.Fatalf("目标端没有列 b：%v", err)
+	}
+	if got != "new" {
+		t.Fatalf("新列的值应搬过去，得到 %q", got)
+	}
+	// 旧行还在（只加列、不动数据）
+	var n int
+	if err := dstDB.QueryRow(ctx, "SELECT count(*) FROM "+table).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Fatalf("应有 2 行（旧 1 + 新 1），得到 %d", n)
+	}
+}
