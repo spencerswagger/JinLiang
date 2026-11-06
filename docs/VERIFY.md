@@ -40,8 +40,10 @@
 分钟级（只读，比同步轻，但不适合每次同步都跑）。日常例检用
 `jinliang verify --level data --aggregate-only`：L1 下推成两端各一条
 `count/sum/min/max` 聚合查询（秒级）；全表行级比对留给发布前/周检。
-只跑聚合时结论会写「**聚合级通过（未做行级全表比对）**」，不会冒充「三级通过」；
-`--json` 的 `mode` 为 `aggregate_only`。
+结论行按**实际执行的级**逐级枚举，例如「结构级 ✓ / 数据级 ✓（行级全表比对 3 表；
+1 表仅聚合（无主键）） / 一致性 ✓」；只跑聚合时数据级会标「仅聚合，未做行级全表比对」，
+不会冒充三级；`--json` 的 `mode` 由执行记录推导（`aggregate_only` / `data_partial` /
+`all_partial` 等），不由 `--aggregate-only` 这个 flag 推导。
 
 ## 4. 订正
 

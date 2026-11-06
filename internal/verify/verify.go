@@ -170,9 +170,6 @@ func Run(ctx context.Context, opts Options) (Report, error) {
 		OK:          true,
 		Mode:        string(level),
 	}
-	if opts.AggregateOnly {
-		rep.Mode = "aggregate_only"
-	}
 
 	type tier struct {
 		level Level
@@ -198,7 +195,108 @@ func Run(ctx context.Context, opts Options) (Report, error) {
 	if len(rep.Levels) == 0 {
 		return Report{}, fmt.Errorf("不认识的校验级别 %q（structure / data / consistency / all）", level)
 	}
+	// Mode 由「实际执行的级 + 是否降级」推导，不由 flag 推导。
+	// 反例：--level structure --aggregate-only 根本没跑聚合，不能标 aggregate_only；
+	// --level all 遇到无主键表会降级成只聚合，不能只说「三级通过」。
+	rep.Mode = deriveMode(rep.Levels)
 	return rep, nil
+}
+
+// deriveMode records what actually ran. It is derived from the executed tiers
+// and their stats, never from the requested flags: a flag can be set while the
+// tier did nothing (structure + aggregate-only), and a tier can silently
+// degrade because of data shape (no-PK tables).
+//
+// 规矩：以后凡是加新的 level 或新的降级路径，先问「结论会跟着变吗」——
+// 结论由**执行记录**推导，不由配置推导；一句概括永远会在某个分支上说多或说少。
+func deriveMode(levels []LevelReport) string {
+	names := make([]string, 0, len(levels))
+	var data *LevelReport
+	for i := range levels {
+		names = append(names, string(levels[i].Level))
+		if levels[i].Level == LevelData {
+			data = &levels[i]
+		}
+	}
+	base := strings.Join(names, "+")
+	if len(levels) == 3 {
+		base = "all"
+	}
+	if data == nil {
+		return base
+	}
+	full := statInt(*data, "tables_full_scan")
+	agg := statInt(*data, "tables_aggregate_only")
+	if base == "all" {
+		if agg > 0 {
+			return "all_partial"
+		}
+		return "all"
+	}
+	switch {
+	case full == 0 && agg > 0:
+		return "aggregate_only"
+	case agg > 0:
+		return base + "_partial"
+	}
+	return base
+}
+
+// Conclusion renders one line that says what was actually done — and what was
+// not. A single summary sentence ("三级通过") will always overclaim on some
+// branch; enumerating the executed tiers is harder to lie with.
+func Conclusion(rep Report) string {
+	if !rep.OK {
+		return "结论：有级别未通过（详见上面的 code）"
+	}
+	labels := map[Level]string{
+		LevelStructure: "结构级", LevelData: "数据级", LevelConsistency: "一致性",
+	}
+	parts := make([]string, 0, len(rep.Levels))
+	for _, lr := range rep.Levels {
+		label := labels[lr.Level]
+		if label == "" {
+			label = string(lr.Level)
+		}
+		part := label + " ✓"
+		if lr.Level == LevelData {
+			full := statInt(lr, "tables_full_scan")
+			agg := statInt(lr, "tables_aggregate_only")
+			noPK := statInt(lr, "tables_no_pk")
+			switch {
+			case full == 0 && agg > 0:
+				part += "（仅聚合，未做行级全表比对"
+				if noPK > 0 {
+					part += "；无主键表只能聚合"
+				}
+				part += "）"
+			case agg > 0:
+				part += fmt.Sprintf("（行级全表比对 %d 表；%d 表仅聚合", full, agg)
+				if noPK > 0 {
+					part += "（无主键）"
+				}
+				part += "）"
+			case full > 0:
+				part += fmt.Sprintf("（行级全表比对 %d 表）", full)
+			}
+		}
+		parts = append(parts, part)
+	}
+	return "结论：" + strings.Join(parts, " / ")
+}
+
+func statInt(lr LevelReport, key string) int {
+	if v, ok := lr.Stats[key]; ok {
+		switch n := v.(type) {
+		case int:
+			return n
+		case int64:
+			return int(n)
+		case float64:
+			return int(n)
+		}
+	}
+	return 0
 }
 
 // ── L1 结构 ────────────────────────────────────────────────────────────
@@ -331,6 +429,7 @@ func checkPrimaryKey(lr *LevelReport, srcT, tgtT source.Table) {
 
 func runData(ctx context.Context, opts Options) LevelReport {
 	lr := newLevel(LevelData)
+	fullScanTables, aggregateOnlyTables, noPKTables := 0, 0, 0
 	for _, name := range opts.Tables {
 		lr.Tables++
 		srcT, ok, err := opts.Source.Table(ctx, opts.SourceSchema, name)
@@ -368,16 +467,20 @@ func runData(ctx context.Context, opts Options) LevelReport {
 			continue
 		}
 		if opts.AggregateOnly {
+			aggregateOnlyTables++
 			runAggregateSQL(ctx, &lr, opts, name, srcT, tgtT, commonCols)
 			continue
 		}
 		if len(srcT.PrimaryKey) == 0 || len(tgtT.PrimaryKey) == 0 {
+			noPKTables++
+			aggregateOnlyTables++
 			lr.add(SeverityWarn, "no_pk_aggregate", name, "",
 				"没有主键：只做全表聚合比对，无法逐行定位", "", "", "")
 			runAggregateOnly(ctx, &lr, opts, name, srcT, tgtT, commonCols)
 			continue
 		}
 
+		fullScanTables++
 		matched := runDataFull(ctx, &lr, opts, name, srcT, tgtT, commonCols)
 		lr.stat("matched", matched)
 
@@ -387,6 +490,9 @@ func runData(ctx context.Context, opts Options) LevelReport {
 			runSampling(ctx, &lr, opts, name, srcT, tgtT, commonCols, srcCount)
 		}
 	}
+	lr.stat("tables_full_scan", fullScanTables)
+	lr.stat("tables_aggregate_only", aggregateOnlyTables)
+	lr.stat("tables_no_pk", noPKTables)
 	lr.finish()
 	return lr
 }

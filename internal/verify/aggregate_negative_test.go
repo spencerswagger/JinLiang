@@ -261,3 +261,74 @@ func TestAggregateNumericVsTextReportsMismatch(t *testing.T) {
 		t.Fatalf("numeric→text 必须报聚合类型不一致：%+v", rep.Levels[0].Findings)
 	}
 }
+
+func TestConclusionAllNoDegradation(t *testing.T) {
+	src, tgt := newFake("postgres"), newFake("postgres")
+	src.add(ordersTable(), ordersRows()...)
+	tgt.add(ordersTable(), ordersRows()...)
+	rep, err := Run(context.Background(), baseOptions(src, tgt))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Mode != "all" {
+		t.Fatalf("mode=%q, want all", rep.Mode)
+	}
+	got := Conclusion(rep)
+	want := "结论：结构级 ✓ / 数据级 ✓（行级全表比对 1 表） / 一致性 ✓"
+	if got != want {
+		t.Fatalf("conclusion=%q, want %q", got, want)
+	}
+}
+
+func TestLevelStructureAggregateOnlyMode(t *testing.T) {
+	src, tgt := newFake("postgres"), newFake("postgres")
+	src.add(ordersTable(), ordersRows()...)
+	tgt.add(ordersTable(), ordersRows()...)
+	opts := baseOptions(src, tgt)
+	opts.Level = LevelStructure
+	opts.AggregateOnly = true
+	rep, err := Run(context.Background(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Mode != "structure" {
+		t.Fatalf("--level structure --aggregate-only 没跑聚合，mode 不能是 %q", rep.Mode)
+	}
+	if got := Conclusion(rep); got != "结论：结构级 ✓" {
+		t.Fatalf("conclusion=%q", got)
+	}
+}
+
+func TestConclusionNoPKAllShowsQualifier(t *testing.T) {
+	src, tgt := newFake("postgres"), newFake("postgres")
+	tab := source.Table{
+		TableRef: source.TableRef{Schema: "public", Table: "logs"},
+		Columns: []source.Column{
+			{Name: "message", Type: "text", Nullable: true},
+			{Name: "n", Type: "bigint", Nullable: true},
+		},
+		HasStablePK: false, // 无主键：只能聚合，不能逐行比对
+	}
+	rows := []map[string]any{
+		{"message": "a", "n": int64(1)},
+		{"message": "b", "n": int64(2)},
+	}
+	src.add(tab, rows...)
+	tgt.add(tab, rows...)
+	opts := baseOptions(src, tgt)
+	opts.Tables = []string{"logs"}
+	rep, err := Run(context.Background(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Mode != "all_partial" {
+		t.Fatalf("无主键表应降级为 all_partial，实际 %q", rep.Mode)
+	}
+	got := Conclusion(rep)
+	if !strings.Contains(got, "仅聚合") || !strings.Contains(got, "无主键") {
+		t.Fatalf("结论必须带「只做聚合」的限定语，实际 %q", got)
+	}
+	if strings.Contains(got, "结论：三级校验通过") {
+		t.Fatalf("无主键降级后不能再说三级通过：%q", got)
+	}
+}

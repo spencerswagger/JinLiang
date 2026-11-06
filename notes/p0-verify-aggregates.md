@@ -82,3 +82,14 @@ numeric(12,4) 精度截断）。
 - **P3 各端类型**：`runAggregateSQL`/`runDataFull`/`runAggregateOnly` 按源/目标各自的
   列类型建 numeric 集合；源 numeric → 目标 text 报 `aggregate_mismatch`（不再拿源端
   类型算目标端），用例 `TestAggregateNumericVsTextReportsMismatch`。
+
+## Owl #47 必改三：Mode 由执行记录推导，结论按级枚举
+
+- `deriveMode` 只看实际执行的 tier + stats：`--level structure --aggregate-only`
+  不会变成 `aggregate_only`（聚合没跑）；`--level all` 遇到无主键表 → `all_partial`。
+- `Conclusion` 按 `rep.Levels` 逐级拼：「结构级 ✓ / 数据级 ✓（行级全表比对 3 表；
+  1 表仅聚合（无主键）） / 一致性 ✓」；没有降级就不加括号。CLI 只打印这一行。
+- 用例：`TestConclusionAllNoDegradation`、`TestLevelStructureAggregateOnlyMode`、
+  `TestConclusionNoPKAllShowsQualifier`（核心：无主键降级后不得再说「三级通过」）。
+- `deriveMode` 注释写明规矩：**结论由执行记录推导，不由配置推导；加 level/降级路径先问
+  「结论会跟着变吗」**。
