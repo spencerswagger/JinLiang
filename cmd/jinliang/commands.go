@@ -20,6 +20,7 @@ import (
 	"github.com/spencerswagger/jinliang/internal/engine"
 	"github.com/spencerswagger/jinliang/internal/httpapi"
 	"github.com/spencerswagger/jinliang/internal/pgsink"
+	"github.com/spencerswagger/jinliang/internal/state"
 )
 
 // dataDir resolves --data-dir / JINLIANG_DATA_DIR / default.
@@ -454,19 +455,37 @@ func cmdDelete(args []string) error {
 	// 跨进程的情况：那个引擎不在本进程里，cancel 不到它。做法是**删掉目标端租约行**——
 	// 它下一次续租会失败两次 → loseLease → cancelRun 自己停下（#30 的语义）。
 	// 不这么做，用户删了任务后租约还会续期，同目标新建任务一直撞 E1005。
-	if holder, lerr := releaseTargetLease(ctx, store, job); lerr != nil {
+	if holder, alive, lerr := releaseTargetLease(ctx, store, job); lerr != nil {
 		fmt.Printf("清目标端租约失败（%v）：租约会在 TTL 后过期并可被抢占。\n", lerr)
 	} else if holder != "" {
-		fmt.Printf("已通知目标端那个还在跑的进程停下（原持有者 %s：租约行已删除，它下次续租会失败并自行退出）。\n", holder)
+		// 窗口要说出来：`watchLease` 对「行没了」(ok==false) 是**立刻** loseLease，
+		// 所以最坏 = leaseTTL/3 ≈ 10 秒，不是等 TTL。这 10 秒里新任务确实能起来 → 双写，
+		// 同一 job 同主键 upsert 多数幂等，但「删了重建时改了 content.tables/on_exists」不幂等。
+		if alive {
+			fmt.Println("（原持有者的进程还活着——这次是强制踢掉一个正在写的进程。）")
+		} else {
+			fmt.Println("（原持有者的进程已经不在了——这次清掉的是一条尸体租约。）")
+		}
+		fmt.Printf("已通知目标端那个还在跑的进程停下（原持有者 %s：租约行已删除，最坏约 10 秒内自行退出）。\n", holder)
+		fmt.Println("这 10 秒内请勿在同一目标新建/重跑任务——两个写入者会同时写（同主键 upsert 多数幂等，" +
+			"但如果你改了 content.tables 或 on_exists，就可能不幂等）。")
 		_ = store.Audit(ctx, control.ActorSystem, "job.run.lease_forced", map[string]any{
-			"job_id": job.ID, "job_key": job.JobKey, "holder": holder,
+			"job_id": job.ID, "job_key": job.JobKey, "job_name": job.Name,
+			"holder": holder, "holder_alive": alive,
 		})
+	}
+	// 守卫会拒删「还有未结束 run」的任务，而我们刚刚才把那个写入者踢下线——
+	// 所以这里等它自己收尾（最多 15 秒），等不到就**由我们替它收尾**（标 interrupted，
+	// 原因写清是删除时强制的），再删。不能让用户卡在「踢了引擎却删不掉」。
+	if err := settleActiveRuns(ctx, store, job.ID, 15*time.Second); err != nil {
+		return err
 	}
 	if err := store.DeleteJob(ctx, job.ID); err != nil {
 		return err
 	}
+	// detail 里带上 job_name：删完之后靠 key 认人，名字比 id 好用。
 	_ = store.Audit(ctx, control.ActorSystem, "job.delete", map[string]any{
-		"job_id": job.ID, "job_key": job.JobKey, "engine_stopped": stopped,
+		"job_id": job.ID, "job_key": job.JobKey, "job_name": job.Name, "engine_stopped": stopped,
 	})
 	fmt.Printf("已删除任务 %s。\n", job.Name)
 	return nil
@@ -474,18 +493,18 @@ func cmdDelete(args []string) error {
 
 // releaseTargetLease 删掉这个任务在目标端的租约行（删除任务专用）。
 // 目标端连不上时返回错误，由调用方如实说明「租约会在 TTL 后过期」，不静默。
-func releaseTargetLease(ctx context.Context, store *control.Store, job control.Job) (string, error) {
+func releaseTargetLease(ctx context.Context, store *control.Store, job control.Job) (string, bool, error) {
 	conn, err := store.GetConnection(ctx, job.TargetID)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	secret, err := store.Secret(ctx, job.TargetID)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	doc, err := store.JobDoc(ctx, job)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	ep := dsn.Endpoint{
 		Kind: conn.Kind, Host: conn.Host, Port: conn.Port, Database: conn.Database,
@@ -500,6 +519,43 @@ func releaseTargetLease(ctx context.Context, store *control.Store, job control.J
 		}
 	}
 	return pgsink.ForceReleaseLease(ctx, ep, schema, job.JobKey)
+}
+
+// settleActiveRuns 等这个任务的未结束 run 自己收尾；等不到就替它收尾。
+//
+// 为什么要这一步：DeleteJob 现在有「有未结束 run 就拒删」的守卫，而删除路径刚刚
+// 才把目标端租约删掉、那个进程要最多约 10 秒才自己发现并退出。
+// 不在这里等/收尾，用户就会看到「引擎被踢了、任务却删不掉」——比原来的问题更难懂。
+func settleActiveRuns(ctx context.Context, store *control.Store, jobID string, wait time.Duration) error {
+	deadline := time.Now().Add(wait)
+	for {
+		active, err := store.ActiveRuns(ctx)
+		if err != nil {
+			return err
+		}
+		var mine []control.Run
+		for _, r := range active {
+			if r.JobID == jobID {
+				mine = append(mine, r)
+			}
+		}
+		if len(mine) == 0 {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			for _, r := range mine {
+				_, ferr := store.FinishRun(ctx, r.ID, state.Failed,
+					"删除任务时强制收尾：目标端租约已删除，原进程会在续租失败后自行退出",
+					1, control.FinishInterrupted)
+				if ferr != nil {
+					return ferr
+				}
+			}
+			fmt.Printf("那个运行没有在 %s 内自己收尾，已由本次删除标记为 interrupted（审计里可查）。\n", wait)
+			return nil
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
 }
 
 func cmdStatus(args []string) error {
