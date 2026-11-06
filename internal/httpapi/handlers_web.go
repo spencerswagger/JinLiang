@@ -463,34 +463,18 @@ func (s *Server) pageJobRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.startJob(r.Context(), job, control.ActorUI); err != nil {
-		if errors.Is(err, errOtherInstanceRunning) {
-			s.renderPartial(w, "error_card", apiError{
-				Class:   "user_action",
-				Message: "另一个实例正在跑这个任务",
-				Why:     "控制库里那条运行的心跳还新鲜，说明另一个 jinliang 进程正在写它",
-				Next:    []string{"等它跑完", "要停下就那台机器上 stop，别在本机重启 serve"},
-				Risk:    "本机重启不影响它，但也停不下它",
-			})
+		// 注意用 errors.As 而不是 errors.Is：这个错误**带字段**（是哪一台），
+		// 用哨兵指针比较永远不相等，会掉到下面「本进程在跑」那条去。
+		if oi := asOtherInstance(err); oi != nil {
+			s.renderPartial(w, "error_card", conflictOtherInstance(oi.OwnerInstance, oi.RunID, oi.HeartbeatAt))
 			return
 		}
 		if errors.Is(err, errStaleRunInControlDB) {
-			s.renderPartial(w, "error_card", apiError{
-				Class:   "user_action",
-				Message: "这个任务起不来：控制库里还有一条上次没结束的运行",
-				Why:     "上一次的进程被强杀留下的占位；serve 启动时会按心跳过期替它收尾成「已中断」",
-				Next:    []string{"等一会儿再点「开始」", "或者重启用一次 serve"},
-				Risk:    "无：重跑会从目标端已提交的位点继续",
-			})
+			s.renderPartial(w, "error_card", conflictStaleRun())
 			return
 		}
 		if errors.Is(err, control.ErrRunInProgress) {
-			s.renderPartial(w, "error_card", apiError{
-				Class:   "user_action",
-				Message: "这个任务已经开始在跑了",
-				Why:     "同一任务同时只允许一条运行，否则两条写入流会互相覆盖",
-				Next:    []string{"先看下面的实时事件；要停下按「停止」"},
-				Risk:    "无",
-			})
+			s.renderPartial(w, "error_card", conflictThisProcess())
 			return
 		}
 		s.renderPartial(w, "error_card", plainError("%v", err))

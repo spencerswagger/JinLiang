@@ -1370,6 +1370,7 @@ func TestRunConflictFromControlDBSplitsByHeartbeat(t *testing.T) {
 		wantMsg     string
 		mustNotHave string
 		wantNext    string
+		wantOwner   bool
 	}{
 		{
 			name:      "心跳新鲜：另一个实例正在跑",
@@ -1378,7 +1379,8 @@ func TestRunConflictFromControlDBSplitsByHeartbeat(t *testing.T) {
 			// 这条最重要：不能**建议**重启（文案里可以提醒「别在本机重启」，
 			// 但不能把「重启一次 serve」当解药），否则用户会把别人的同步打断
 			mustNotHave: "重启一次",
-			wantNext:    "那台机器上",
+			wantNext:    "POST /api/jobs/{id}/stop",
+			wantOwner:   true,
 		},
 		{
 			name:        "心跳过期：上次没结束的运行",
@@ -1427,7 +1429,8 @@ func TestRunConflictFromControlDBSplitsByHeartbeat(t *testing.T) {
 				t.Fatal(err)
 			}
 			at := time.Now().Add(-c.heartbeat).UTC().Format(time.RFC3339)
-			if _, err := store.DB().Exec(`UPDATE runs SET heartbeat_at = ? WHERE id = ?`, at, run.ID); err != nil {
+			if _, err := store.DB().Exec(`UPDATE runs SET heartbeat_at = ?, owner_instance = ? WHERE id = ?`,
+				at, run.OwnerInstance, run.ID); err != nil {
 				t.Fatalf("钉心跳失败: %v", err)
 			}
 
@@ -1455,6 +1458,17 @@ func TestRunConflictFromControlDBSplitsByHeartbeat(t *testing.T) {
 			}
 			if !strings.Contains(nextStr, c.wantNext) {
 				t.Fatalf("next 应含 %q，实际 %q", c.wantNext, nextStr)
+			}
+			// 「到那台机器上 stop」必须可执行：界面上要有那台机器的标识。
+			// 跨实例那条要从结构化错误里取（errors.As），不许靠正则解析错误文本。
+			if c.wantOwner {
+				owner, _ := store.InstanceID(context.Background())
+				if owner == "" {
+					t.Fatal("测试环境拿不到 instance id")
+				}
+				if !strings.Contains(all, owner) {
+					t.Fatalf("文案里应出现实例标识 %q（用户要据此去那台机器 stop），实际：%s", owner, all)
+				}
 			}
 		})
 	}

@@ -117,12 +117,36 @@ func (s *Server) activeSyncRun(ctx context.Context, jobID string) (*control.Run,
 var (
 	// errThisProcessBusy：本进程里就有一条在跑（内存登记）。
 	errThisProcessBusy = fmt.Errorf("%w：这台机器上已有另一个 jinliang 进程在跑这个任务", control.ErrRunInProgress)
-	// errOtherInstanceRunning：控制库里那条 run 的心跳还新鲜——另一个实例正在写。
-	// 这条**不能**建议重启 serve：重启会把别人的同步打断。
-	errOtherInstanceRunning = fmt.Errorf("%w：另一个实例正在跑这个任务", control.ErrRunInProgress)
 	// errStaleRunInControlDB：心跳过期，说明是上个进程被强杀留下的尸体。
 	errStaleRunInControlDB = fmt.Errorf("%w：控制库里还有一条上次没结束的运行", control.ErrRunInProgress)
 )
+
+// otherInstanceRunningError 表示「另一个实例正在跑这个任务」，并带上**是哪一台**。
+// 用户被建议「去那台机器上 stop」，就必须能在界面上看到实例标识；把它放进结构体
+// 而不是拼进字符串，是为了让上层用 errors.As 取值——正则解析自己的错误文本太脆。
+type otherInstanceRunningError struct {
+	RunID         string
+	OwnerInstance string
+	HeartbeatAt   string
+}
+
+func (e *otherInstanceRunningError) Error() string {
+	return fmt.Sprintf("%v：另一个实例正在跑这个任务（run %s，实例 %s，最后心跳 %s）",
+		control.ErrRunInProgress, e.RunID, e.OwnerInstance, e.HeartbeatAt)
+}
+
+// Unwrap 让 errors.Is(err, control.ErrRunInProgress) 仍然成立。
+func (e *otherInstanceRunningError) Unwrap() error { return control.ErrRunInProgress }
+
+// asOtherInstance 取出「另一个实例在跑」这个错误里的实例信息。
+// 用 errors.As 而不是 errors.Is：这个错误带字段，哨兵指针比较永远不相等。
+func asOtherInstance(err error) *otherInstanceRunningError {
+	var oi *otherInstanceRunningError
+	if errors.As(err, &oi) {
+		return oi
+	}
+	return nil
+}
 
 // errEngineUnsupported 是「引擎只做了 PG→PG」这条能力边界的四段式。
 // 放在 HTTP 入口同步判，是为了不在返回 202 之后什么也不发生——那正是我们一直
@@ -159,8 +183,11 @@ func (s *Server) startJob(ctx context.Context, job control.Job, actor string) er
 		// 新鲜 = 另一个实例正在写（绝不能建议重启 serve——那会把别人的同步打断）；
 		// 过期 = 上个进程被强杀留下的尸体，这时才谈得上「等收尾 / 重启」。
 		if s.runHeartbeatFresh(run) {
-			return fmt.Errorf("%w（run %s，owner_instance=%s，最后心跳 %s）",
-				errOtherInstanceRunning, run.ID, run.OwnerInstance, run.HeartbeatAt)
+			// 用结构化错误带上实例标识：上层要让用户「去那台机器上 stop」，
+			// 就必须能把那台机器显示出来——不能靠正则解析自己的错误字符串。
+			return &otherInstanceRunningError{
+				RunID: run.ID, OwnerInstance: run.OwnerInstance, HeartbeatAt: run.HeartbeatAt,
+			}
 		}
 		return fmt.Errorf("%w（run %s，owner_instance=%s，最后心跳 %s）",
 			errStaleRunInControlDB, run.ID, run.OwnerInstance, run.HeartbeatAt)
