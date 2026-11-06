@@ -319,3 +319,89 @@ func TestLeaseNotStolenBySameInstance(t *testing.T) {
 		t.Fatal("没拿到租约的句柄不该续租成功")
 	}
 }
+
+// B5：interval 模式只搬「水位之后」的行，且第一次先整表搬完并把水位对齐到表尾。
+// 断言的是行数变化（不是「跑通了」）：第二轮必须只搬 4 行，不是 1000 行。
+func TestIntervalCopiesOnlyRowsAfterWatermark(t *testing.T) {
+	srcDSN, dstDSN := dsns(t)
+	srcDB := mustConn(t, srcDSN)
+	dstDB := mustConn(t, dstDSN)
+	table := "wm_it"
+	ctx := context.Background()
+
+	exec(t, srcDB, "DROP TABLE IF EXISTS "+table)
+	exec(t, srcDB, "CREATE TABLE "+table+" (id bigint PRIMARY KEY, payload text, updated_at timestamptz)")
+	exec(t, srcDB, "INSERT INTO "+table+
+		" SELECT g, 'row-'||g, now() - interval '1 hour' FROM generate_series(1,1000) g")
+	exec(t, dstDB, "DROP TABLE IF EXISTS "+table)
+	exec(t, dstDB, "DROP TABLE IF EXISTS _jl_meta, _jl_chunk, _jl_lease, _jl_object, _jl_instance")
+
+	dir := t.TempDir()
+	store, err := control.Open(control.Options{DataDir: dir, Autogen: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	sc, err := store.CreateConnection(ctx, control.ConnectionInput{
+		Name: "src", Kind: "postgres", Host: "127.0.0.1", Port: portOf(t, srcDSN),
+		Database: dbOf(t, srcDSN), Username: userOf(t, srcDSN), Password: passOf(t, srcDSN),
+		Params: map[string]string{"sslmode": "disable"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tc, err := store.CreateConnection(ctx, control.ConnectionInput{
+		Name: "dst", Kind: "postgres", Host: "127.0.0.1", Port: portOf(t, dstDSN),
+		Database: dbOf(t, dstDSN), Username: userOf(t, dstDSN), Password: passOf(t, dstDSN),
+		Params: map[string]string{"sslmode": "disable"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, err := store.CreateJob(ctx, control.JobInput{
+		Name: "wm-it", SourceID: sc.ID, TargetID: tc.ID,
+		Spec: control.JobDoc{
+			Version: 1, Job: "wm-it",
+			Source: control.SourceDoc{Kind: "postgres", Scope: &control.ScopeDoc{Schema: "public"}},
+			Target: control.TargetDoc{Kind: "postgres", Schema: "public", OnExists: "append"},
+			Mode: control.ModeDoc{Frequency: "interval", Interval: "1s",
+				IncrementalColumn: "updated_at", Lookback: "1m"},
+			Content: &control.ContentDoc{Tables: map[string]control.TableDoc{table: {}}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("建任务失败: %v", err)
+	}
+
+	// 第一轮：整表 1000 行 + 水位对齐表尾
+	if _, err := engine.Run(ctx, engine.Options{Store: store, JobID: job.ID}); err != nil {
+		t.Fatalf("第一轮失败: %v", err)
+	}
+	var n int
+	if err := dstDB.QueryRow(ctx, "SELECT count(*) FROM "+table).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1000 {
+		t.Fatalf("第一轮应整表搬 1000 行，得到 %d", n)
+	}
+
+	// 第二轮前：3 条新行 + 1 条老行被更新（水位之后的变更）
+	exec(t, srcDB, "INSERT INTO "+table+" VALUES (1001,'new-1',now()),(1002,'new-2',now()),(1003,'new-3',now())")
+	exec(t, srcDB, "UPDATE "+table+" SET payload='touched', updated_at=now() WHERE id=5")
+
+	res, err := engine.Run(ctx, engine.Options{Store: store, JobID: job.ID})
+	if err != nil {
+		t.Fatalf("第二轮失败: %v", err)
+	}
+	if res.RowsStream != 4 {
+		t.Fatalf("第二轮应只搬 4 行（3 新增 + 1 更新），实际 %d 行（说明水位没生效，整表又扫了一遍）",
+			res.RowsStream)
+	}
+	var touched int
+	if err := dstDB.QueryRow(ctx, "SELECT count(*) FROM "+table+" WHERE payload='touched'").Scan(&touched); err != nil {
+		t.Fatal(err)
+	}
+	if touched != 1 {
+		t.Fatalf("更新应被搬过去，得到 %d 行", touched)
+	}
+}

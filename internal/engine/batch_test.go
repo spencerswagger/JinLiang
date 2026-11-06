@@ -611,3 +611,24 @@ func TestClassifyErrorDoesNotDefaultToDecoderBug(t *testing.T) {
 		t.Fatalf("权限错误应指向 GRANT，得到 why=%q next=%v", why, next)
 	}
 }
+
+// interval 的调度参数：默认回看取「一个间隔」，最少 1 分钟（覆盖上一轮到现在）。
+func TestDefaultLookbackAndParseInterval(t *testing.T) {
+	cases := []struct {
+		every time.Duration
+		want  string
+	}{
+		{0, "1m"},
+		{30 * time.Second, "1m"},
+		{5 * time.Minute, "5m0s"},
+		{2 * time.Hour, "2h0m0s"},
+	}
+	for _, c := range cases {
+		if got := defaultLookback(c.every); got != c.want {
+			t.Fatalf("every=%s 应回看 %s，得到 %s", c.every, c.want, got)
+		}
+	}
+	if parseInterval("5m") != 5*time.Minute || parseInterval("cron:0 */2 * * *") != 0 {
+		t.Fatal("interval 解析不对（cron 形式暂不支持，应返回 0）")
+	}
+}

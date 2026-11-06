@@ -716,6 +716,80 @@ func (s *Sink) BulkApply(ctx context.Context, ti *tableInfo, chunkNo int, rows [
 	return tx.Commit(ctx)
 }
 
+// ApplyRowsRange 写一页 interval 增量：**数据 + 位点 + 水位** 同一个事务。
+//
+// 与 BulkApply 用同一套「临时表 + INSERT … SELECT … ON CONFLICT」：interval 模式下
+// 同一行会因为重叠回看被重复读到，必须有 upsert 语义，否则一重读就报主键冲突。
+func (s *Sink) ApplyRowsRange(ctx context.Context, ref source.TableRef, rows [][]any,
+	pos, watermark string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	ti := s.tables[ref.Schema+"."+ref.Table]
+	if ti == nil {
+		return fmt.Errorf("内部错误：目标端没有这张表的定义")
+	}
+	tx, err := s.conn.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	if len(rows) > 0 {
+		stage := "_jl_stage_range"
+		cols := quoteList(ti.cols)
+		if _, err := tx.Exec(ctx, fmt.Sprintf("CREATE TEMP TABLE %s (LIKE %s) ON COMMIT DROP",
+			pgwire.Quote(stage), pgwire.Qualified(ti.ref.Schema, ti.ref.Table))); err != nil {
+			return fmt.Errorf("准备临时落地区失败: %w", err)
+		}
+		values := make([][]any, len(rows))
+		for i, r := range rows {
+			vals := make([]any, len(ti.cols))
+			for j := range ti.cols {
+				if j < len(r) {
+					vals[j] = r[j]
+				}
+			}
+			values[i] = vals
+		}
+		if _, err := tx.CopyFrom(ctx, pgx.Identifier{stage}, ti.cols, pgx.CopyFromRows(values)); err != nil {
+			return fmt.Errorf("写入 %s 的一页数据失败: %w", ti.ref.Table, err)
+		}
+		insert := fmt.Sprintf("INSERT INTO %s (%s) SELECT %s FROM %s",
+			pgwire.Qualified(ti.ref.Schema, ti.ref.Table), cols, cols, pgwire.Quote(stage))
+		insert += conflictClause(ti)
+		if _, err := tx.Exec(ctx, insert); err != nil {
+			return fmt.Errorf("把 %s 的一页数据落库失败: %w", ti.ref.Table, err)
+		}
+	}
+	if pos != "" {
+		if err := s.setPositionTx(ctx, tx, pos); err != nil {
+			return err
+		}
+	}
+	if watermark != "" {
+		q := fmt.Sprintf(`UPDATE %s SET watermark=$1, updated_at=now() WHERE job_key=$2`,
+			s.stateTable("_jl_meta"))
+		if _, err := tx.Exec(ctx, q, watermark, s.opt.JobKey); err != nil {
+			return fmt.Errorf("记录水位失败: %w", err)
+		}
+	}
+	return tx.Commit(ctx)
+}
+
+// Watermark 读回 `_jl_meta.watermark`（interval 模式的每表水位 JSON）。
+func (s *Sink) Watermark(ctx context.Context) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	q := fmt.Sprintf(`SELECT COALESCE(watermark,'') FROM %s WHERE job_key=$1`, s.stateTable("_jl_meta"))
+	var w string
+	err := s.conn.QueryRow(ctx, q, s.opt.JobKey).Scan(&w)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil
+	}
+	return w, err
+}
+
 // ── 增量：一批一个事务（数据 + 位点） ───────────────────────────
 
 // Apply implements the sink contract. One call = one target transaction, and
