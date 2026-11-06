@@ -528,8 +528,9 @@ func TestStopJobNoOpWhenNotRunningHere(t *testing.T) {
 }
 
 // 退出码必须与事实一致：等不到引擎退出时，delete 不能装作成功。
-// （原来 `serr != nil && stopped` 恒为 false —— stopped 恰恰是 false，
-// 于是超时错误被吞、退出码 0，用户看到「删除成功」而引擎其实没停。）
+// （原来用的是「错误非空**且**已确认停下」的双条件——「已确认停下」在超时那刻恰恰为假，
+// 条件恒假 → 超时错误被吞、退出码 0，用户看到「删除成功」而引擎其实没停。
+// 注释刻意不写旧表达式的字面量：注释里出现旧代码，会让后来 grep 的人以为代码里还有它。）
 func TestStopJobTimeoutIsNotSilent(t *testing.T) {
 	store, jobID := newControlStore(t)
 	job, err := store.GetJob(context.Background(), jobID)
