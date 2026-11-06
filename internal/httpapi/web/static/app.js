@@ -91,11 +91,27 @@
     }
   }
 
-  // rows 刷新：progress 事件没有结构化字段（B5 才有），只能读控制库的 run 行；
-  // 但 snapshot 每块一条 progress，10M 会上百条 —— 必须节流，最多 1 秒一次。
+  // rows 显示：**优先**用 progress 事件里的结构化字段（B5 起引擎会填 rows_done）；
+  // 字段缺失时才退回「拉一次 /api/jobs/{id} 的 last_run」——两种来源都要能工作，
+  // 不能只写死一种（引擎与前端不是同一次发版的）。
+  // 轮询仍然节流：snapshot 每块一条 progress，10M 会上百条，最多 1 秒一次、单飞。
   var rowsEl = document.getElementById("live-rows");
   var lastRowsAt = 0;
   var rowsInflight = false;
+  function setRows(n) {
+    if (!rowsEl) return;
+    rowsEl.textContent = "已处理 " + n + " 行";
+  }
+
+  // 事件里带了 rows_done 就直接用（0 也是合法值，所以用 typeof 判存在）
+  function rowsFromEvent(ev) {
+    if (typeof ev.rows_done === "number") {
+      setRows(ev.rows_done);
+      return true;
+    }
+    return false;
+  }
+
   function refreshRows(jobID) {
     if (!rowsEl || !jobID || rowsInflight) return;
     var now = Date.now();
@@ -107,8 +123,7 @@
       .then(function (d) {
         var run = d && d.job && d.job.last_run;
         if (run) {
-          rowsEl.textContent =
-            "已处理 " + (run.rows_done || 0) + " 行（每 1 秒刷新一次；数字来自控制库的 run 行）";
+          setRows(run.rows_done || 0);
         }
       })
       .catch(function () { /* 拉不到就保留上一次的数字 */ })
@@ -135,8 +150,26 @@
       appendLine(ev);
       if (ev.phase_label && live) live.textContent = ev.phase_label;
       if (ev.phase_hint && hint) hint.textContent = ev.phase_hint;
-      if (ev.type === "progress" || ev.type === "phase") refreshRows(ev.job_id);
-      if (ev.type === "done" && dot) dot.classList.remove("on");
+      // run_id 为空 = 还没开跑就失败（Core 的收紧规则）：这种帧不推进阶段、
+      // 也不当作某一轮的历史记录，只把消息与四段式提示给出来。
+      if (ev.type !== "error" || ev.run_id) {
+        if (!rowsFromEvent(ev) && (ev.type === "progress" || ev.type === "phase")) {
+          refreshRows(ev.job_id);
+        }
+      }
+      if (ev.type === "done") {
+        if (dot) dot.classList.remove("on");
+        // finish_reason 是「跑完了」还是「被停止」的唯一权威（#18 的徽章同一口径）
+        var fr = ev.finish_reason;
+        if (fr && live) {
+          live.textContent =
+            fr === "completed" ? "已完成" :
+            fr === "stopped" ? "已停止（不是失败）" :
+            fr === "interrupted" ? "已中断（被别的实例接管）" :
+            fr === "failed" ? "失败" : fr;
+        }
+        if (fr && fr !== "completed" && dot) dot.classList.add("warn");
+      }
     }
     // 服务端给每条事件都带 event: <type>，所以必须按名字订阅；
     // onmessage 只收「没有 event 字段」的消息（保留它是为了兼容旧服务端）。
