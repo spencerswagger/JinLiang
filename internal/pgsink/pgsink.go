@@ -657,9 +657,6 @@ func (s *Sink) reconcileColumns(ctx context.Context, ti *tableInfo) error {
 // ErrTargetTableExists mirrors core.CodeTargetTableExists (E1002).
 var ErrTargetTableExists = errors.New("目标端已经有同名表")
 
-// ErrTypeMismatch means the target column cannot hold the source value as-is.
-var ErrTypeMismatch = errors.New("目标表的列类型和源端不一致")
-
 // ErrCollationMismatch means the two sides sort/compare the same text column
 // differently — upsert 判重会静默走偏，必须当成结构不兼容处理。
 var ErrCollationMismatch = errors.New("目标表的列排序规则和源端不一致")

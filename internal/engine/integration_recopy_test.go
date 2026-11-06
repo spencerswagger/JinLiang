@@ -20,6 +20,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/spencerswagger/jinliang/internal/control"
+	"github.com/spencerswagger/jinliang/internal/core"
 	"github.com/spencerswagger/jinliang/internal/dsn"
 	"github.com/spencerswagger/jinliang/internal/engine"
 	"github.com/spencerswagger/jinliang/internal/pgsink"
@@ -1059,4 +1060,77 @@ func TestEnsureSchemaTypeMismatchIsPausable(t *testing.T) {
 		t.Fatalf("原因码应与「跑起来时发现类型变了」一致（%q），得到 %q",
 			pgsink.PauseReasonTypeChanged, pe.Reason())
 	}
+}
+
+// E1015 落地后的端到端：目标列类型与源端不一致 → `runs.code` 必须是 E1015（不再留空）。
+// 这是 #64 那条必改的最终验收：机器能判等（Reason/Table）→ **人也看得到码**。
+func TestSchemaMismatchRunGetsE1015(t *testing.T) {
+	srcDSN, dstDSN := dsns(t)
+	srcDB := mustConn(t, srcDSN)
+	dstDB := mustConn(t, dstDSN)
+	table := "type_change_run"
+	ctx := context.Background()
+
+	exec(t, srcDB, "DROP TABLE IF EXISTS "+table)
+	exec(t, srcDB, "CREATE TABLE "+table+" (id bigint PRIMARY KEY, v bigint)")
+	// 目标端故意建「列名同、类型不同」的表：EnsureSchema 会撞上类型不一致
+	exec(t, dstDB, "DROP TABLE IF EXISTS "+table)
+	exec(t, dstDB, "CREATE TABLE "+table+" (id bigint PRIMARY KEY, v text)")
+	exec(t, dstDB, "DROP TABLE IF EXISTS _jl_meta, _jl_chunk, _jl_lease, _jl_object, _jl_instance")
+
+	store, jobID := onceJobSingleTable(t, srcDSN, dstDSN, "typechange", table)
+	res, err := engine.Run(ctx, engine.Options{Store: store, JobID: jobID, SnapshotOnly: true})
+	if err == nil {
+		t.Fatal("目标列类型不一致必须失败")
+	}
+	run, gerr := store.GetRun(ctx, res.RunID)
+	if gerr != nil {
+		t.Fatal(gerr)
+	}
+	if run.Code != string(core.CodeSchemaMismatch) {
+		t.Fatalf("runs.code 应为 %s，得到 %q；last_error=%s",
+			core.CodeSchemaMismatch, run.Code, run.LastError)
+	}
+	// 具体是哪张表哪一列，由运行时写进 last_error（码表只给类别）
+	if !strings.Contains(run.LastError, table) {
+		t.Fatalf("last_error 要点名那张表：%s", run.LastError)
+	}
+}
+
+// onceJobSingleTable 建一条 mode=once、只选一张表的任务（本文件的用例自用）。
+func onceJobSingleTable(t *testing.T, srcDSN, dstDSN, name, table string) (*control.Store, string) {
+	t.Helper()
+	ctx := context.Background()
+	store, err := control.Open(control.Options{DataDir: t.TempDir(), Autogen: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
+	mk := func(nm string, port int, db, user, pass string) string {
+		c, err := store.CreateConnection(ctx, control.ConnectionInput{
+			Name: nm, Kind: "postgres", Host: "127.0.0.1", Port: port,
+			Database: db, Username: user, Password: pass,
+			Params: map[string]string{"sslmode": "disable"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c.ID
+	}
+	srcID := mk("src", portOf(t, srcDSN), dbOf(t, srcDSN), userOf(t, srcDSN), passOf(t, srcDSN))
+	dstID := mk("dst", portOf(t, dstDSN), dbOf(t, dstDSN), userOf(t, dstDSN), passOf(t, dstDSN))
+	job, err := store.CreateJob(ctx, control.JobInput{
+		Name: name, SourceID: srcID, TargetID: dstID,
+		Spec: control.JobDoc{
+			Version: 1, Job: name,
+			Source:  control.SourceDoc{Kind: "postgres", Scope: &control.ScopeDoc{Schema: "public"}},
+			Target:  control.TargetDoc{Kind: "postgres", Schema: "public", OnExists: "append"},
+			Mode:    control.ModeDoc{Frequency: "once"},
+			Content: &control.ContentDoc{Tables: map[string]control.TableDoc{table: {}}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("建任务失败: %v", err)
+	}
+	return store, job.ID
 }
