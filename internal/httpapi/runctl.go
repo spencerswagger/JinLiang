@@ -36,9 +36,12 @@ type runningJob struct {
 // 为什么需要它：只有 ErrConflict 那条会填 Event.Next，而最常见的失败恰好没有码
 // （权限、schema 写错、连不上）——审计里留个 null 的 next 等于把问题丢回给用户。
 var fallbackNext = []string{
-	"看这次运行的原始报错：打开任务页 →「最近一次运行」，或 GET /api/runs?job_id=<id>",
+	// 第 1 条不能写「去看最近一次运行」：这条 audit 恰恰多是「还没开跑」的场景，
+	// 没有 run 行，按提示去看会什么都没看到。原始报错就在摘要里。
+	"原始报错就在上面的摘要里；若引擎已经开跑，再去看那条 run 的 last_error（任务页「最近一次运行」）",
 	"按报错里的关键词自查最常见三处：连接能否连通、源端表/schema 名是否写对、账号有没有 SELECT 与建表权限",
-	"仍解决不了：把错误摘要（含 SQLSTATE）与任务 id 发给维护者",
+	// 第 3 条不能只说「发给维护者」：自托管场景里用户往往就是维护者，那等于没说。
+	"还解决不了：记下错误摘要（含 SQLSTATE）与任务 id——自建部署发给你们的 DBA/运维，用上游项目就提 issue",
 }
 
 func newRunRegistry() *runRegistry {
