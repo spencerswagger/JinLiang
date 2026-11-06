@@ -12,6 +12,7 @@ import (
 
 	"github.com/spencerswagger/jinliang/internal/control"
 	"github.com/spencerswagger/jinliang/internal/core"
+	"github.com/spencerswagger/jinliang/internal/dsn"
 	"github.com/spencerswagger/jinliang/internal/state"
 )
 
@@ -372,5 +373,67 @@ func TestHeartbeatNotesOnlyOnStateTransitions(t *testing.T) {
 	time.Sleep(40 * time.Millisecond)
 	if n := notes.Load(); n != 2 {
 		t.Fatalf("恢复时应再发一条，实际累计 %d 条", n)
+	}
+}
+
+// ② 强杀后不该「不重启 serve 就永远跑不了」：控制面有一条未结束的 run 时，
+// 只要**心跳停了超过 StaleAfter**就应能替它收尾（不再只看目标端租约——
+// 读不到租约表/目标端连不上时，用户会永远卡在 E1005）。
+func TestReclaimAbandonedRunByStaleHeartbeat(t *testing.T) {
+	store, jobID := newControlStore(t)
+	run, err := store.StartRun(context.Background(), jobID, state.Streaming, control.RunKindSync)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 心跳停在一小时前（进程被 kill -9 的真实形态）
+	if _, err := store.DB().Exec(`UPDATE runs SET heartbeat_at = ? WHERE id = ?`,
+		time.Now().Add(-time.Hour).UTC().Format(time.RFC3339), run.ID); err != nil {
+		t.Fatal(err)
+	}
+	job, err := store.GetJob(context.Background(), jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 目标端给一个连不上的地址：租约读不到，必须靠心跳兜住
+	ep := dsn.Endpoint{Kind: dsn.KindPostgres, Host: "127.0.0.1", Port: 1, Database: "x",
+		Username: "x", Password: "x"}
+
+	reclaimed, err := reclaimAbandonedRun(context.Background(), store, job, ep, "public")
+	if err != nil {
+		t.Fatalf("替它收尾时不该报错：%v", err)
+	}
+	if !reclaimed {
+		t.Fatal("心跳停了一小时却没被收尾——用户会卡在「已经有一条未结束的运行」上")
+	}
+	got, err := store.GetRun(context.Background(), run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.FinishReason != control.FinishInterrupted {
+		t.Fatalf("应标成 interrupted，得到 %q", got.FinishReason)
+	}
+	if !strings.Contains(got.LastError, "心跳") {
+		t.Fatalf("last_error 应说清判据（心跳/租约），得到：%s", got.LastError)
+	}
+}
+
+// 心跳还很新的时候**不能**误杀（别把正常在跑的替它收尾）。
+func TestReclaimAbandonedRunKeepsFreshHeartbeat(t *testing.T) {
+	store, jobID := newControlStore(t)
+	if _, err := store.StartRun(context.Background(), jobID, state.Streaming, control.RunKindSync); err != nil {
+		t.Fatal(err)
+	}
+	job, err := store.GetJob(context.Background(), jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ep := dsn.Endpoint{Kind: dsn.KindPostgres, Host: "127.0.0.1", Port: 1, Database: "x",
+		Username: "x", Password: "x"}
+	reclaimed, err := reclaimAbandonedRun(context.Background(), store, job, ep, "public")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reclaimed {
+		t.Fatal("心跳是新的（刚起不到 StaleAfter），不该把这条 run 收掉")
 	}
 }

@@ -178,12 +178,23 @@ func reclaimAbandonedRun(ctx context.Context, store *control.Store, job control.
 		if run.JobID != job.ID {
 			continue
 		}
-		holder, err := pgsink.ReadLease(ctx, ep, schema, job.JobKey)
-		if err != nil || !holder.Abandoned(time.Now(), pgsink.ProcessAlive) {
+		// 两条证据链，任一成立就算「上一次真死了」：
+		//   1. 目标端租约没人续期（pid 已不在 / expires_at 已过）；
+		//   2. 控制面心跳停了超过 StaleAfter（3×心跳间隔）。
+		// 只看第 1 条会漏掉「读不到租约表 / 目标端连不上」的情况——那时用户会陷入
+		// 「崩过一次就永远 E1005 等 serve 来救」，而 serve 可能根本没在跑。
+		why := ""
+		holder, lerr := pgsink.ReadLease(ctx, ep, schema, job.JobKey)
+		switch {
+		case lerr == nil && holder.Abandoned(time.Now(), pgsink.ProcessAlive):
+			why = "目标端租约已无人续期"
+		case heartbeatStale(run, time.Now()):
+			why = "控制面心跳已停超过 " + control.StaleAfter(control.DefaultHeartbeatInterval).String()
+		default:
 			return false, nil
 		}
 		_, err = store.FinishRun(ctx, run.ID, state.Failed,
-			"上一次运行随进程退出中断（kill -9 或断电）；进度以目标端 _jl_meta 为准，重启会从断点续跑",
+			"上一次运行随进程退出中断（kill -9 或断电；判据："+why+"）；进度以目标端 _jl_meta 为准，重启会从断点续跑",
 			ExitFailed, control.FinishInterrupted)
 		if err != nil {
 			return false, fmt.Errorf("收尾上一次被中断的运行失败: %w", err)
@@ -191,6 +202,19 @@ func reclaimAbandonedRun(ctx context.Context, store *control.Store, job control.
 		return true, nil
 	}
 	return false, nil
+}
+
+// heartbeatStale 判断一条活跃 run 的心跳是否已经停了超过 StaleAfter。
+// 心跳时间解析不出来时按「不可证明」处理（返回 false），不让它变成误杀的理由。
+func heartbeatStale(run control.Run, now time.Time) bool {
+	if run.HeartbeatAt == "" {
+		return false
+	}
+	hb, err := time.Parse(time.RFC3339, run.HeartbeatAt)
+	if err != nil {
+		return false
+	}
+	return now.Sub(hb) > control.StaleAfter(control.DefaultHeartbeatInterval)
 }
 
 // schemaOf is targetSchema as a free function (Run() needs it before the runner exists).
