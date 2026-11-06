@@ -505,3 +505,165 @@ func TestIntegrationDataCommitsBeforeRejectedDDL(t *testing.T) {
 		t.Fatalf("DDL 失败时位点不能前进（否则重放会跳过这笔数据）: %q", p)
 	}
 }
+
+// 租约：拿到 → 别人抢不走 → 释放 → 别人能拿；过期可抢占。
+func TestIntegrationLeaseLifecycle(t *testing.T) {
+	ctx := context.Background()
+	a := openSink(t, nil)
+	_, _ = a.db.ExecContext(ctx, "DELETE FROM `_jl_lease` WHERE job_key = ?", a.opt.JobKey)
+	t.Cleanup(func() {
+		_, _ = a.db.ExecContext(context.Background(), "DELETE FROM `_jl_lease` WHERE job_key = ?", a.opt.JobKey)
+	})
+
+	ok, why, err := a.AcquireLease(ctx, 30*time.Second)
+	if err != nil || !ok {
+		t.Fatalf("第一次应拿到租约: ok=%v why=%q err=%v", ok, why, err)
+	}
+	// 续租：自己续自己必须成功。
+	if ok, err := a.RenewLease(ctx, 30*time.Second); err != nil || !ok {
+		t.Fatalf("自己续租应成功: ok=%v err=%v", ok, err)
+	}
+	// 另一个实例：周期内必须被拒，且说清是谁在跑。
+	b := openSink(t, func(o *Options) { o.InstanceID = "another-instance" })
+	ok, why, err = b.AcquireLease(ctx, 30*time.Second)
+	if err != nil {
+		t.Fatalf("第二个实例: %v", err)
+	}
+	if ok {
+		t.Fatal("同一 job 的租约期内，第二个实例不该拿到")
+	}
+	if !strings.Contains(why, a.opt.InstanceID) {
+		t.Fatalf("拒绝原因要说清谁在跑: %q", why)
+	}
+	// 释放后别人能拿。
+	if err := a.ReleaseLease(ctx); err != nil {
+		t.Fatalf("释放: %v", err)
+	}
+	if ok, _, err = b.AcquireLease(ctx, 30*time.Second); err != nil || !ok {
+		t.Fatalf("释放后应能拿到: ok=%v err=%v", ok, err)
+	}
+
+	// 过期可抢占：把到期时间改到过去。
+	if _, err := b.db.ExecContext(ctx, "UPDATE `_jl_lease` SET expires_at = ? WHERE job_key = ?",
+		time.Now().Add(-time.Minute), b.opt.JobKey); err != nil {
+		t.Fatal(err)
+	}
+	if ok, why, err = a.AcquireLease(ctx, 30*time.Second); err != nil || !ok {
+		t.Fatalf("过期租约应可抢占: ok=%v why=%q err=%v", ok, why, err)
+	}
+	if !strings.Contains(why, "过期") {
+		t.Fatalf("抢占原因应说明是过期: %q", why)
+	}
+}
+
+// 同机崩溃进程留下的租约可以立刻接管（不用等 30s），活着的进程则不行。
+func TestIntegrationLeaseTakesOverDeadPID(t *testing.T) {
+	ctx := context.Background()
+	s := openSink(t, nil)
+	_, _ = s.db.ExecContext(ctx, "DELETE FROM `_jl_lease` WHERE job_key = ?", s.opt.JobKey)
+	t.Cleanup(func() {
+		_, _ = s.db.ExecContext(context.Background(), "DELETE FROM `_jl_lease` WHERE job_key = ?", s.opt.JobKey)
+	})
+
+	// 直接写一条「同实例、pid 999999（几乎肯定不存在）」的有效期内租约。
+	deadPID := 999999
+	if _, err := s.db.ExecContext(ctx, `
+		INSERT INTO _jl_lease (job_key, instance_id, label, expires_at) VALUES (?,?,?,?)
+		ON DUPLICATE KEY UPDATE instance_id=VALUES(instance_id), label=VALUES(label), expires_at=VALUES(expires_at)`,
+		s.opt.JobKey, s.opt.InstanceID, leaseOwnerLabel(s.opt.Name, deadPID, "x"),
+		time.Now().Add(time.Minute)); err != nil {
+		t.Fatalf("造租约: %v", err)
+	}
+	ok, why, err := s.AcquireLease(ctx, 30*time.Second)
+	if err != nil || !ok {
+		t.Fatalf("崩溃进程的租约应可接管: ok=%v why=%q err=%v", ok, why, err)
+	}
+	if !strings.Contains(why, "崩溃") {
+		t.Fatalf("接管原因应说明是崩溃进程: %q", why)
+	}
+}
+
+// 元数据/位点/阶段/对象登记/块断点：增量要用的那套状态必须真能读写。
+func TestIntegrationStateTables(t *testing.T) {
+	ctx := context.Background()
+	// 用独立 job_key：_jl_meta 的 position 只由 Apply 推进，复用同一个 key 会读到
+	// 前面用例写进去的位点（这正是「位点不被 EnsureMeta 覆盖」的语义）。
+	s := openSink(t, func(o *Options) { o.JobKey = "itstate01" })
+	job := s.opt.JobKey
+	t.Cleanup(func() {
+		_, _ = s.db.ExecContext(context.Background(), "DELETE FROM `_jl_meta` WHERE job_key = ?", job)
+		_, _ = s.db.ExecContext(context.Background(), "DELETE FROM `_jl_object` WHERE job_key = ?", job)
+		_, _ = s.db.ExecContext(context.Background(), "DELETE FROM `_jl_chunk` WHERE job_key = ?", job)
+	})
+
+	if err := s.EnsureMeta(ctx, "hash123", "streaming", "postgres:v1:0/16B6C50", ""); err != nil {
+		t.Fatalf("EnsureMeta: %v", err)
+	}
+	phase, pos, err := s.State(ctx)
+	if err != nil || phase != "streaming" || pos != "postgres:v1:0/16B6C50" {
+		t.Fatalf("State = (%q,%q,%v)", phase, pos, err)
+	}
+	if err := s.SetPhase(ctx, "done"); err != nil {
+		t.Fatalf("SetPhase: %v", err)
+	}
+	if phase, _, _ = s.State(ctx); phase != "done" {
+		t.Fatalf("阶段没更新: %q", phase)
+	}
+	// 位点只由 Apply 推进；这里直接读回 EnsureMeta 写的值。
+	if p, err := s.Position(ctx); err != nil || p != "postgres:v1:0/16B6C50" {
+		t.Fatalf("Position = (%q,%v)", p, err)
+	}
+
+	// 对象登记：建表 → DidCreateTable 为真 → 软删 → 为假。
+	ref := source.TableRef{Table: "jl_b3_orders"}
+	if err := s.RecordObject(ctx, s.tableObjectName(ref), "table"); err != nil {
+		t.Fatalf("RecordObject: %v", err)
+	}
+	if ok, err := s.DidCreateTable(ctx, ref); err != nil || !ok {
+		t.Fatalf("登记后应判为本任务建的: ok=%v err=%v", ok, err)
+	}
+	if err := s.MarkObjectDropped(ctx, s.tableObjectName(ref)); err != nil {
+		t.Fatalf("MarkObjectDropped: %v", err)
+	}
+	if ok, _ := s.DidCreateTable(ctx, ref); ok {
+		t.Fatal("软删后不该再判为本任务建的（recopy 的 fail-closed 靠这条）")
+	}
+
+	// 块断点：写两行 → 读回 → 重置后为空。
+	if _, err := s.db.ExecContext(ctx, "INSERT INTO `_jl_chunk` (job_key, table_name, chunk_no, done, `rows`) VALUES (?,?,?,?,?)",
+		job, "jl_b3_orders", 1, true, 100); err != nil {
+		t.Fatal(err)
+	}
+	chunks, err := s.DoneChunks(ctx)
+	if err != nil || !chunks["jl_b3_orders"][1] {
+		t.Fatalf("DoneChunks = %v,%v", chunks, err)
+	}
+	if err := s.ResetChunks(ctx); err != nil {
+		t.Fatalf("ResetChunks: %v", err)
+	}
+	if chunks, _ := s.DoneChunks(ctx); len(chunks) != 0 {
+		t.Fatalf("重置后应为空: %v", chunks)
+	}
+}
+
+// ReadLease 是崩溃重启时唯一的可信来源：进程没了但 runs 行还是「在跑」。
+func TestIntegrationReadLease(t *testing.T) {
+	ctx := context.Background()
+	s := openSink(t, nil)
+	_, _ = s.db.ExecContext(ctx, "DELETE FROM `_jl_lease` WHERE job_key = ?", s.opt.JobKey)
+	t.Cleanup(func() {
+		_, _ = s.db.ExecContext(context.Background(), "DELETE FROM `_jl_lease` WHERE job_key = ?", s.opt.JobKey)
+	})
+
+	h, err := ReadLease(ctx, s.ep, s.opt.JobKey)
+	if err != nil || h.Exists {
+		t.Fatalf("没有租约时应 Exists=false: %+v err=%v", h, err)
+	}
+	if ok, _, err := s.AcquireLease(ctx, 30*time.Second); err != nil || !ok {
+		t.Fatalf("拿租约: ok=%v err=%v", ok, err)
+	}
+	h, err = ReadLease(ctx, s.ep, s.opt.JobKey)
+	if err != nil || !h.Exists || h.InstanceID != s.opt.InstanceID {
+		t.Fatalf("ReadLease = %+v err=%v", h, err)
+	}
+}
