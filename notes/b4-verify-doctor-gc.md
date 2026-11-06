@@ -101,7 +101,7 @@ DSN 名只用真名：`JINLIANG_TEST_{PG,MYSQL}[_SRC]_DSN`，先 `env | grep JIN
 $ gofmt -l .            # 空
 $ go vet ./...          # 通过
 $ go test ./...         # 全绿
-$ go test -p 1 -tags=integration ./internal/verify ./internal/gc ./internal/doctor ./internal/remedy   # 全绿
+$ go test -tags=integration ./internal/verify ./internal/gc ./internal/doctor ./internal/remedy   # 全绿（B6 起每包独立 schema）
 $ scripts/check_binary_size.sh dist/jinliang
 binary dist/jinliang: 19591328 bytes (18 MB), limit 25 MB → OK
 ```
@@ -142,8 +142,9 @@ CI 集成步骤同步加上 `./internal/remedy`。
   MySQL `TestBinlogPosFormats`、`TestParseBinlogPosForeignKind`。
 
 P3：main 已有 `race` job（`go test -race ./...`），合并 #5 后自动覆盖本分支的
-verify/gc/runtime/doctor/remedy 单测，不再另加。`-p 1` 仍是夹具权宜（PG
-`CREATE TABLE IF NOT EXISTS` 非并发安全）；更干净是每包独立 schema，记在这里。
+verify/gc/runtime/doctor/remedy 单测，不再另加。`-p 1` 的夹具权宜已由 B6 清掉：
+集成测试改成每包独立 schema（jl_test_verify / jl_test_gc / jl_test_remedy），
+可以并行跑，CI 不再串行。
 
 ## 共享契约与边界
 
