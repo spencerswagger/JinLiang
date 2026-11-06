@@ -19,8 +19,8 @@
 
 | 字段 | 关键语义 |
 |---|---|
-| `mode.frequency` | 五档：`once` / `continuous+initial` / `continuous` / `interval` / `full_interval`。只有前两类承诺秒级；`interval` 需要 `incremental_column` |
-| `mode.lookback` | 定时增量的重叠窗口：每轮从「水位 − lookback」开始，重复部分靠 upsert 幂等 |
+| `mode.frequency` | 五档：`once` / `continuous+initial` / `continuous` / `interval` / `full_interval`。只有前两类承诺秒级；`interval` 需要 `incremental_column`（语义与「第二轮为什么又搬了几万行」见 §1.2） |
+| `mode.lookback` | 定时增量的重叠窗口：每轮从「水位 − lookback」开始，重复部分靠 upsert 幂等。**缺省 = 一个 `mode.interval`，最少 1 分钟**；窗口大小是在「漏读」和「多写」之间取，宁重不漏（见 §1.2） |
 | `target.on_exists` | 默认 `error`（撞表就停），`recreate` 会清空目标表、需要二次确认 + 备份提示（语义见 §1.1） |
 | `content.schema_follow` | `whitelist` 只跟随四类 DDL（加列、放宽长度、加索引、可选删列），其余拦截并暂停该表 |
 | `guard.on_exceed` | `pause` 最保守；`invalidate` 只在 PG 13+（有 `max_slot_wal_keep_size`）；`advance` 会跳过变更，必须显式确认 |
@@ -37,6 +37,20 @@
 - 于是存在唯一一个仍会删数据的组合：**记录在（表确实是我们建的）+ 用户事后往该表补写过行**。这种情况下重搬会连同补写的行一起清掉，目前只有 `recreate` 的二次确认能兜住；B1 的「建表时刻 vs 现在」行数/校验和比对才能把这一格也堵上。
 
 `on_exists: append` 没有这个问题（不清表），但它有自己的代价：**源端删掉的行会在目标端残留**，因为 append 不负责删除。这是语义选择，不是缺陷——要消除残留就选 `recreate`，代价是上面那条。
+
+### 1.2 `interval` / `full_interval` 的语义（靠水位轮询，不碰变更流水）
+
+**先取表尾不会变成每轮重扫**：水位 `W0 = 搬快照之前`的表尾，下一轮从 `W0 − lookback` 读，只重读「快照期间新增的行 + 一窗回看」，而且**只发生一次**——那一轮结束 `saveWatermark(next)` 就把水位推到位。
+
+所以 `interval` 任务第二轮如果搬了几万行，**那是正常的**：它搬的是「第一轮搬快照期间新写进来的行」，不是重复搬全量。第三轮起就只剩窗口内的零星增量。
+
+三条配套语义（都容易误读，一起写在上面这段旁边）：
+
+- **`interval` 不碰变更流水**（不建 slot、不建 publication），进度唯一依赖 `_jl_meta.watermark`。代价是**晚提交的行只能靠 `lookback` 回看窗口捞回**：`mode.lookback` 缺省值 = **一个 `mode.interval`，且最少 1 分钟**（间隔小于 1 分钟时仍取 1 分钟）。窗口越大越不容易漏，但重复读的行也越多——重复读由目标端 upsert 吸收，**宁重不漏**：漏读是重跑也补不回来的错，重读只是多一次写。
+- **没有水位列的表**（`mode.incremental_column` 指向的列在表上不存在）只能**每轮整表重搬**。判据是 **fail-closed**：源库 `reltuples = -1`（从没 `ANALYZE` 过，等于「体量未知」）→ **拒绝**；已知且 **> 10 万行** → **拒绝**（大表每分钟一次全表拷贝不可接受）；小表 → 只 warn，继续搬。拒绝时给三条真出路：`ANALYZE` 一次 / 给表加更新时间列（推荐）/ 改 `full_interval` 明确接受周期整表重跑。
+- **`full_interval`** 是「明确接受整表周期重跑」的那一档，不需要水位列，也不做上面的行数拦截。
+
+**为什么这条写这么细**：定时增量的两档（`interval` / `full_interval`）与另外三档（`once` / `continuous` / `continuous+initial`）的差别是「有没有变更流水」，而用户看得见的差别只是「第二轮为什么又搬了这么多行」。这一段就是为了省掉那次误报。
 
 ## 2. 命令面
 
