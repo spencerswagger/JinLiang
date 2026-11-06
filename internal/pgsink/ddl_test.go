@@ -77,3 +77,26 @@ func TestStripLeadingComments(t *testing.T) {
 		}
 	}
 }
+
+// 第③步的前置：两类「这张表不能跟」的错误必须带**稳定原因码**，
+// 让 paused_tables / 恢复入口 / doctor 能判等，而不是去抠一句中文。
+func TestPausableErrorsCarryStableReasonCodes(t *testing.T) {
+	var errs = []PausableError{
+		&TypeChangedError{Table: "t", Detail: "v: bigint → text"},
+		&SchemaDriftError{Table: "t", Detail: "原 a 已不存在"},
+	}
+	want := []string{PauseReasonTypeChanged, PauseReasonSchemaDrift}
+	for i, e := range errs {
+		if got := e.Reason(); got != want[i] {
+			t.Fatalf("%T 的原因码应为 %q，得到 %q", e, want[i], got)
+		}
+		// 原因码要稳定、可判等：不能是中文长句
+		if strings.ContainsAny(e.Reason(), "，。 ") {
+			t.Fatalf("%T 的原因码不能是句子：%q", e, e.Reason())
+		}
+	}
+	// 两个原因码不能相同（否则暂停原因分不开）
+	if PauseReasonTypeChanged == PauseReasonSchemaDrift {
+		t.Fatal("改类型与改名/删列必须是不同原因码")
+	}
+}
