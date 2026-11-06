@@ -1293,6 +1293,11 @@ func classifyError(err error) (code core.Code, classified bool) {
 		return core.CodePositionKindMismatch, true
 	case errors.As(err, &tooBig):
 		return core.CodeTxTooLarge, true
+	case errors.As(err, new(pgsink.PausableError)):
+		// 「这张表的结构对不上」：prepare 补列时类型不一致，或跑起来后源端改类型/改名/删列。
+		// 目标写成**接口指针**（不是 *TypeChangedError）：将来第三个实现也能匹配上。
+		// 具体是哪一种、哪张表哪一列由 fail() 拼进 last_error——**码表说类别，运行时说具体**。
+		return core.CodeSchemaMismatch, true
 	case pgsource.IsNoPrivilege(err):
 		// 42501：源端 SELECT 或目标端 DDL/DML 被拒——用户要做的事都是「去要授权」。
 		return core.CodeNoPrivilege, true
