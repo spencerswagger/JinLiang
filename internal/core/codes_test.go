@@ -103,9 +103,17 @@ func TestObjectMissingNextIsLayeredByCase(t *testing.T) {
 	if !strings.Contains(spec.Next[1], "写错") {
 		t.Error("Next[1] 必须把「表名写错」并进去（动作与缺表相同）")
 	}
-	// Risk 对四种情形都要成立：位点不动；换 schema 的代价只在确实换 schema 时出现
-	if !strings.Contains(spec.Risk, "位点不动") {
-		t.Error("Risk 必须写清「位点不动、不重搬」——这是四种情形共同的保证")
+	// 「位点不动、不会重搬」是**陈述事实**，放 Why 而不是 Risk——
+	// Risk 里出现让人安心的话，会让「风险」这个词贬值（Owl 在 #66 上提的）。
+	if !strings.Contains(spec.Why, "位点没有推进") {
+		t.Error("Why 必须陈述「位点没有推进」这个事实")
+	}
+	if strings.Contains(spec.Risk, "不会重搬") || strings.Contains(spec.Risk, "位点不动") {
+		t.Error("Risk 里不该出现安抚性表述（「位点不动/不会重搬」应放在 Why）")
+	}
+	// Risk 只放真风险：改错方向的后果 + 换 schema 的代价
+	if !strings.Contains(spec.Risk, "继续失败") {
+		t.Error("Risk 必须写清「改错方向会继续失败」")
 	}
 	if !strings.Contains(spec.Risk, "不会自动搬过去") {
 		t.Error("Risk 必须保留「换 schema = 另一套表」的代价")
