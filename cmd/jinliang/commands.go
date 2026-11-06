@@ -457,6 +457,9 @@ func cmdDelete(args []string) error {
 	// 注：这里刻意**不复述旧表达式的字面量**——注释里写旧代码，会让后来的 grep / review
 	// 误以为代码里还有它（今晚已经发生过一次：有人 grep 到注释就判「带病合并」）。
 	// 注释只描述语义，代码才出现符号。
+	//
+	// 回归见 TestStopJobTimeoutIsNotSilent（**指向测试，不指向 PR 号**：
+	// 测试会被维护、PR 号会失效——本仓库已有 PR 号被分支删除连坐的先例）。
 	var stopTimeout error
 	if serr != nil {
 		stopTimeout = serr
