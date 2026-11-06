@@ -119,3 +119,36 @@ func TestObjectMissingNextIsLayeredByCase(t *testing.T) {
 		t.Error("Risk 必须保留「换 schema = 另一套表」的代价")
 	}
 }
+
+// TestSchemaMismatchPauseCaveatInAllThreePlaces：括注「若当前版本已支持按表暂停」在
+// Why / Next / Risk 三处**同生同灭**。
+//
+// 这次真实的错：Why 与 Next 都加了括注，唯独 Risk 漏了——而 Risk 是唯一陈述后果的那句，
+// 于是文案变成「其它表不受影响」，用户据此不管，实际整轮 run 会失败。
+// 第③步上线后三处要一起删：只删一处时这条用例会红，逼你三处一起动。
+func TestSchemaMismatchPauseCaveatInAllThreePlaces(t *testing.T) {
+	const caveat = "若当前版本已支持按表暂停"
+	spec, ok := Lookup(CodeSchemaMismatch)
+	if !ok {
+		t.Fatal("E1015 必须在码表里")
+	}
+	if !strings.Contains(spec.Why, caveat) {
+		t.Errorf("Why 缺括注 %q", caveat)
+	}
+	found := false
+	for _, n := range spec.Next {
+		if strings.Contains(n, caveat) {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("Next 里缺括注 %q（按表暂停还没实现，不能让用户以为会暂停）", caveat)
+	}
+	if !strings.Contains(spec.Risk, caveat) {
+		t.Errorf("Risk 缺括注 %q —— Risk 是唯一陈述后果的那句，漏了会诱导用户不管", caveat)
+	}
+	// 同一份事实的当前真相：第③步未实现时整轮会失败。这句必须写在 Risk 里。
+	if !strings.Contains(spec.Risk, "整轮 run 会失败") {
+		t.Error("Risk 必须写明「在此之前整轮 run 会失败」——这才是今天实际发生的事")
+	}
+}
