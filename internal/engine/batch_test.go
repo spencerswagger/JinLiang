@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/spencerswagger/jinliang/internal/control"
 	"github.com/spencerswagger/jinliang/internal/pgsource"
 	"github.com/spencerswagger/jinliang/internal/source"
 	"github.com/spencerswagger/jinliang/internal/state"
@@ -64,7 +65,7 @@ func commitEvent(src *fakeSource, pos string) source.Event {
 func ev(kind source.EventKind, _ string) source.Event { return source.Event{Kind: kind} }
 
 func newTestBatcher(sink applier, src acker, rows int) *batcher {
-	return newBatcher(sink, src, rows, time.Millisecond, pgsource.Position{}, nil)
+	return newBatcher(sink, src, control.JobDoc{}, rows, time.Millisecond, pgsource.Position{}, nil)
 }
 
 // 一个源事务必须整体提交：不足 batch_rows 时也不许拆开。
@@ -487,22 +488,38 @@ func TestBatcherStopsOversizedTransaction(t *testing.T) {
 	}
 }
 
-// 上限可以从环境变量调（与 Data 的 #11 用同一组变量名）。
-func TestTxLimitsFromEnv(t *testing.T) {
-	t.Setenv("JINLIANG_TX_MAX_BYTES", "1234")
-	t.Setenv("JINLIANG_TX_MAX_EVENTS", "56")
-	bytes, events := txLimits()
-	if bytes != 1234 || events != 56 {
-		t.Fatalf("环境变量没生效：%d %d", bytes, events)
+// 单事务上限的优先级：yaml 显式值 > 环境变量 > 内置默认（由 control.TxOversizeDoc.Limits 实现）。
+// 这里断言的是**接线正确**：引擎真的把任务的 doc 传下去了，而不是自己再读一遍环境变量。
+func TestTxLimitsFollowControlPrecedence(t *testing.T) {
+	// 只有环境变量（注意 Limits 会钳下限，所以这里用高于下限的值）
+	t.Setenv("JINLIANG_TX_MAX_BYTES", "2097152") // 2 MiB
+	t.Setenv("JINLIANG_TX_MAX_EVENTS", "5000")
+	if b, e := txLimits(control.JobDoc{}); b != 2097152 || e != 5000 {
+		t.Fatalf("环境变量没生效：%d %d", b, e)
 	}
+
+	// 非法环境变量回落默认（不是 0、不是报错）
 	t.Setenv("JINLIANG_TX_MAX_EVENTS", "不是数字")
-	if _, events := txLimits(); events != defaultMaxTxEvents {
-		t.Fatalf("非法值应回落到默认，得到 %d", events)
+	if _, e := txLimits(control.JobDoc{}); e != int(control.DefaultTxMaxEvents) {
+		t.Fatalf("非法值应回落默认，得到 %d", e)
+	}
+
+	// 低于下限会被钳到下限（100 字节 → MinTxMaxBytes）
+	t.Setenv("JINLIANG_TX_MAX_BYTES", "100")
+	if b, _ := txLimits(control.JobDoc{}); b != control.MinTxMaxBytes {
+		t.Fatalf("低于下限应钳到 %d，得到 %d", control.MinTxMaxBytes, b)
+	}
+
+	// yaml 显式值优先于环境变量
+	t.Setenv("JINLIANG_TX_MAX_BYTES", "9999999")
+	n := 4 << 20 // 4 MiB，高于下限，避免被钳
+	doc := control.JobDoc{Reliability: &control.ReliabilityDoc{
+		TxOversize: &control.TxOversizeDoc{Bytes: &n},
+	}}
+	if b, _ := txLimits(doc); b != 4<<20 {
+		t.Fatalf("yaml 显式值应优先，得到 %d", b)
 	}
 }
-
-// 续段伪装成新事务开头：ValidateBatch 单看本批认不出（契约里明确写了这半边归引擎）。
-// 这里用「上一批提交过 TxID=42，这一批开头直接来一条 TxID=42 的数据事件」复现。
 func TestBatcherRejectsContinuationOfCommittedTransaction(t *testing.T) {
 	sink := &fakeSink{}
 	src := &fakeSource{}
@@ -594,21 +611,26 @@ func TestClassifyErrorDoesNotDefaultToDecoderBug(t *testing.T) {
 		t.Fatalf("位点不连续应为 E3001，得到 %s %v", code, ok)
 	}
 
-	// schema 不存在：不能再被判成位点不连续（这条是本次修复的核心）
-	missing := &pgconn.PgError{Code: "3F000", Message: `schema "report" does not exist`}
-	if code, ok := classifyError(missing); ok {
-		t.Fatalf("schema 不存在不该有码（等 E1013 落地再挂），得到 %s", code)
-	}
-	why, next := hint(missing)
-	if !strings.Contains(why, "对象不存在") || len(next) == 0 {
-		t.Fatalf("未编号但已识别的错误要给方向，得到 why=%q next=%v", why, next)
+	// schema/表不存在 → E1013（**不能**再被判成位点不连续，也不能落 E4002）
+	for _, e := range []*pgconn.PgError{
+		{Code: "3F000", Message: `schema "report" does not exist`},
+		{Code: "42P01", Message: `relation "public.orders" does not exist`},
+	} {
+		if code, ok := classifyError(e); !ok || code != core.CodeObjectMissing {
+			t.Fatalf("%s 应映射 E1013，得到 %s %v", e.Code, code, ok)
+		}
 	}
 
-	// 权限不够同理
+	// 权限不够 → E1012
 	denied := &pgconn.PgError{Code: "42501", Message: "permission denied for schema public"}
-	why, next = hint(denied)
-	if !strings.Contains(why, "权限") || !strings.Contains(strings.Join(next, " "), "GRANT") {
-		t.Fatalf("权限错误应指向 GRANT，得到 why=%q next=%v", why, next)
+	if code, ok := classifyError(denied); !ok || code != core.CodeNoPrivilege {
+		t.Fatalf("42501 应映射 E1012，得到 %s %v", code, ok)
+	}
+
+	// 挂码之后这两类不再走 hint()（码表里已有 why/next，避免两套口径）
+	why, next := hint(denied)
+	if strings.Contains(why, "权限") || strings.Contains(why, "GRANT") {
+		t.Fatalf("挂了 E1012 之后 hint 不该再接管权限类，得到 why=%q next=%v", why, next)
 	}
 }
 
