@@ -171,3 +171,93 @@ func findFinding(rep Report, code string) *Finding {
 }
 
 var _ = source.TableRef{}
+
+// float32(0.1) 先转 float64 会带出二进制尾数；必须按 bitSize=32 格式化，
+// 否则 PG real / MySQL FLOAT 列会几乎每行误报。
+func TestFloat32SameValueDifferentEncoding(t *testing.T) {
+	tab := source.Table{
+		TableRef: source.TableRef{Schema: "public", Table: "floats"},
+		Columns: []source.Column{
+			{Name: "id", Type: "bigint", Nullable: false},
+			{Name: "v", Type: "real", Nullable: false},
+		},
+		PrimaryKey: []string{"id"}, HasStablePK: true,
+	}
+	src, tgt := newFake("postgres"), newFake("mysql")
+	src.add(tab, map[string]any{"id": int64(1), "v": float32(0.1)})
+	tgt.add(tab, map[string]any{"id": int64(1), "v": "0.1"})
+	opts := baseOptions(src, tgt)
+	opts.Tables = []string{"floats"}
+	opts.Level = LevelData
+	rep, err := Run(context.Background(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rep.OK {
+		t.Fatalf("float32(0.1) 与 \"0.1\" 必须相等：%+v", rep.Levels[0].Findings)
+	}
+
+	// 反例：不同值必须报（证明不是把所有 float 都判相等）。
+	tgt2 := newFake("mysql")
+	tgt2.add(tab, map[string]any{"id": int64(1), "v": "0.2"})
+	opts.Target = tgt2
+	rep, err = Run(context.Background(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.OK {
+		t.Fatal("float32(0.1) 与 \"0.2\" 不应相等")
+	}
+}
+
+// 结论必须与「实际跑了几级」一致：只跑 L1 不能印「三级通过」。
+func TestReportModeReflectsWhatRan(t *testing.T) {
+	src, tgt := newFake("postgres"), newFake("postgres")
+	src.add(ordersTable(), ordersRows()...)
+	tgt.add(ordersTable(), ordersRows()...)
+	opts := baseOptions(src, tgt)
+	opts.Level = LevelData
+	rep, err := Run(context.Background(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Mode != "data" {
+		t.Fatalf("mode=%q, want data", rep.Mode)
+	}
+	opts.AggregateOnly = true
+	rep, _ = Run(context.Background(), opts)
+	if rep.Mode != "aggregate_only" {
+		t.Fatalf("mode=%q, want aggregate_only", rep.Mode)
+	}
+}
+
+// 源 numeric → 目标 text：两端按各自类型聚合，必须报类型不一致而不是
+// 拿源端 numeric 集合去算目标端文本（P3）。
+func TestAggregateNumericVsTextReportsMismatch(t *testing.T) {
+	srcTab := source.Table{
+		TableRef: source.TableRef{Schema: "public", Table: "mixed"},
+		Columns: []source.Column{
+			{Name: "id", Type: "bigint", Nullable: false},
+			{Name: "v", Type: "numeric(12,2)", Nullable: false},
+		},
+		PrimaryKey: []string{"id"}, HasStablePK: true,
+	}
+	tgtTab := srcTab
+	tgtTab.Columns = []source.Column{
+		{Name: "id", Type: "bigint", Nullable: false},
+		{Name: "v", Type: "text", Nullable: false},
+	}
+	src, tgt := newFake("postgres"), newFake("mysql")
+	src.add(srcTab, map[string]any{"id": int64(1), "v": "1.00"})
+	tgt.add(tgtTab, map[string]any{"id": int64(1), "v": "1.00"})
+	opts := baseOptions(src, tgt)
+	opts.Tables = []string{"mixed"}
+	opts.Level = LevelData
+	rep, err := Run(context.Background(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.OK || !hasCode(rep, "aggregate_mismatch") {
+		t.Fatalf("numeric→text 必须报聚合类型不一致：%+v", rep.Levels[0].Findings)
+	}
+}

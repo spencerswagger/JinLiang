@@ -138,7 +138,14 @@ func printVerify(rep verify.Report) {
 		}
 	}
 	if rep.OK {
-		fmt.Println("\n结论：三级校验通过")
+		switch rep.Mode {
+		case "aggregate_only":
+			fmt.Println("\n结论：聚合级通过（未做行级全表比对；定位请跑完整 data 级）")
+		case "all":
+			fmt.Println("\n结论：三级校验通过")
+		default:
+			fmt.Printf("\n结论：%s 级校验通过\n", rep.Mode)
+		}
 	} else {
 		fmt.Println("\n结论：有级别未通过（详见上面的 code）")
 	}

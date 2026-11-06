@@ -88,7 +88,11 @@ type Report struct {
 	Target      string        `json:"target,omitempty"`
 	JobKey      string        `json:"job_key,omitempty"`
 	Levels      []LevelReport `json:"levels"`
-	OK          bool          `json:"ok"`
+	// Mode records what actually ran: structure/data/consistency/all/
+	// aggregate_only. The human conclusion must not say "三级通过" for a
+	// one-tier run (the exact "green says more than it did" bug).
+	Mode string `json:"mode,omitempty"`
+	OK   bool   `json:"ok"`
 }
 
 // Side is the read-only view verify needs from one endpoint. *runtime.DB
@@ -164,6 +168,10 @@ func Run(ctx context.Context, opts Options) (Report, error) {
 		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
 		JobKey:      opts.JobKey,
 		OK:          true,
+		Mode:        string(level),
+	}
+	if opts.AggregateOnly {
+		rep.Mode = "aggregate_only"
 	}
 
 	type tier struct {
@@ -360,13 +368,13 @@ func runData(ctx context.Context, opts Options) LevelReport {
 			continue
 		}
 		if opts.AggregateOnly {
-			runAggregateSQL(ctx, &lr, opts, name, srcT, commonCols)
+			runAggregateSQL(ctx, &lr, opts, name, srcT, tgtT, commonCols)
 			continue
 		}
 		if len(srcT.PrimaryKey) == 0 || len(tgtT.PrimaryKey) == 0 {
 			lr.add(SeverityWarn, "no_pk_aggregate", name, "",
 				"没有主键：只做全表聚合比对，无法逐行定位", "", "", "")
-			runAggregateOnly(ctx, &lr, opts, name, srcT, commonCols)
+			runAggregateOnly(ctx, &lr, opts, name, srcT, tgtT, commonCols)
 			continue
 		}
 

@@ -46,9 +46,12 @@ func newTableAgg(srcT source.Table, cols []string) *tableAgg {
 	}
 	for _, c := range cols {
 		key := strings.ToLower(c)
+		a.nulls[key] = 0
 		if isNumericType(types[key]) {
 			a.numeric[key] = true
 			a.sums[key] = new(big.Rat)
+		} else {
+			a.textLen[key] = 0
 		}
 	}
 	return a
@@ -86,38 +89,58 @@ func (a *tableAgg) add(row []any, cols []string) {
 func (a *tableAgg) compare(b *tableAgg, table string) []Finding {
 	var out []Finding
 	for c := range a.numeric {
-		if a.sums[c].Cmp(b.sums[c]) != 0 {
-			out = append(out, aggFinding(table, c, "sum", ratText(a.sums[c]), ratText(b.sums[c])))
+		bs, ok := b.sums[c]
+		if !ok {
+			out = append(out, Finding{Code: "aggregate_mismatch", Severity: SeverityError, Table: table, Column: c,
+				Detail: "两端列类型不一致（源端数值、目标端非数值），无法按数值聚合",
+				Source: ratText(a.sums[c]), Target: "non-numeric",
+				Hint: "先修类型映射；不要把数值当文本比"})
+			continue
 		}
+		if a.sums[c].Cmp(bs) != 0 {
+			out = append(out, aggFinding(table, c, "sum", ratText(a.sums[c]), ratText(bs)))
+		}
+		bm, ok := b.mins[c]
 		switch {
-		case a.mins[c] == nil && b.mins[c] != nil:
-			out = append(out, aggFinding(table, c, "min", "NULL", ratText(b.mins[c])))
-		case a.mins[c] != nil && b.mins[c] == nil:
+		case !ok:
+			out = append(out, aggFinding(table, c, "min", ratText(a.mins[c]), "non-numeric"))
+		case a.mins[c] == nil && bm != nil:
+			out = append(out, aggFinding(table, c, "min", "NULL", ratText(bm)))
+		case a.mins[c] != nil && bm == nil:
 			out = append(out, aggFinding(table, c, "min", ratText(a.mins[c]), "NULL"))
-		case a.mins[c] != nil && b.mins[c] != nil && a.mins[c].Cmp(b.mins[c]) != 0:
-			out = append(out, aggFinding(table, c, "min", ratText(a.mins[c]), ratText(b.mins[c])))
+		case a.mins[c] != nil && bm != nil && a.mins[c].Cmp(bm) != 0:
+			out = append(out, aggFinding(table, c, "min", ratText(a.mins[c]), ratText(bm)))
 		}
+		bx, ok := b.maxs[c]
 		switch {
-		case a.maxs[c] == nil && b.maxs[c] != nil:
-			out = append(out, aggFinding(table, c, "max", "NULL", ratText(b.maxs[c])))
-		case a.maxs[c] != nil && b.maxs[c] == nil:
+		case !ok:
+			out = append(out, aggFinding(table, c, "max", ratText(a.maxs[c]), "non-numeric"))
+		case a.maxs[c] == nil && bx != nil:
+			out = append(out, aggFinding(table, c, "max", "NULL", ratText(bx)))
+		case a.maxs[c] != nil && bx == nil:
 			out = append(out, aggFinding(table, c, "max", ratText(a.maxs[c]), "NULL"))
-		case a.maxs[c] != nil && b.maxs[c] != nil && a.maxs[c].Cmp(b.maxs[c]) != 0:
-			out = append(out, aggFinding(table, c, "max", ratText(a.maxs[c]), ratText(b.maxs[c])))
+		case a.maxs[c] != nil && bx != nil && a.maxs[c].Cmp(bx) != 0:
+			out = append(out, aggFinding(table, c, "max", ratText(a.maxs[c]), ratText(bx)))
 		}
 	}
 	for c := range a.textLen {
-		if a.numeric[c] {
+		bv, ok := b.textLen[c]
+		if !ok {
+			out = append(out, aggFinding(table, c, "text_len", fmt.Sprint(a.textLen[c]), "non-text"))
 			continue
 		}
-		if a.textLen[c] != b.textLen[c] {
-			out = append(out, aggFinding(table, c, "text_len",
-				fmt.Sprint(a.textLen[c]), fmt.Sprint(b.textLen[c])))
+		if a.textLen[c] != bv {
+			out = append(out, aggFinding(table, c, "text_len", fmt.Sprint(a.textLen[c]), fmt.Sprint(bv)))
 		}
 	}
 	for c := range a.nulls {
-		if a.nulls[c] != b.nulls[c] {
-			out = append(out, aggFinding(table, c, "nulls", fmt.Sprint(a.nulls[c]), fmt.Sprint(b.nulls[c])))
+		bv, ok := b.nulls[c]
+		if !ok {
+			out = append(out, aggFinding(table, c, "nulls", fmt.Sprint(a.nulls[c]), "unknown"))
+			continue
+		}
+		if a.nulls[c] != bv {
+			out = append(out, aggFinding(table, c, "nulls", fmt.Sprint(a.nulls[c]), fmt.Sprint(bv)))
 		}
 	}
 	sort.Slice(out, func(i, j int) bool {
@@ -171,13 +194,11 @@ func toRat(v any) (*big.Rat, bool) {
 	case uint64:
 		return new(big.Rat).SetUint64(x), true
 	case float64:
-		r := new(big.Rat)
-		if _, ok := r.SetString(fmt.Sprintf("%v", x)); ok {
-			return r, true
-		}
-		return nil, false
+		return ratFromString(strconv.FormatFloat(x, 'g', -1, 64))
 	case float32:
-		return toRat(float64(x))
+		// bitSize=32 才能得到 "0.1"；先转 float64 会带出
+		// 2500000037252903/25000000000000000 的二进制尾数。
+		return ratFromString(strconv.FormatFloat(float64(x), 'g', -1, 32))
 	case []byte:
 		return ratFromString(string(x))
 	case string:
@@ -286,7 +307,7 @@ func runDataFull(ctx context.Context, lr *LevelReport, opts Options, name string
 	}
 
 	srcAgg := newTableAgg(srcT, commonCols)
-	tgtAgg := newTableAgg(srcT, commonCols)
+	tgtAgg := newTableAgg(tgtT, commonCols)
 	srcStream := startRowStream(ctx, opts.Source, opts.SourceSchema, name, commonCols, srcPK)
 	tgtStream := startRowStream(ctx, opts.Target, opts.TargetSchema, name, commonCols, tgtPK)
 	defer srcStream.cancel()
@@ -404,9 +425,9 @@ func runDataFull(ctx context.Context, lr *LevelReport, opts Options, name string
 // runAggregateOnly handles tables without a stable PK: no row alignment, but
 // aggregates still must match (count/sum/min/max/text_len/nulls).
 func runAggregateOnly(ctx context.Context, lr *LevelReport, opts Options, name string,
-	srcT source.Table, commonCols []string) {
+	srcT, tgtT source.Table, commonCols []string) {
 	srcAgg := newTableAgg(srcT, commonCols)
-	tgtAgg := newTableAgg(srcT, commonCols)
+	tgtAgg := newTableAgg(tgtT, commonCols)
 	for _, side := range []struct {
 		s  Side
 		sc string
@@ -476,14 +497,17 @@ type SQLAggregator interface {
 // It is the daily-check path; it cannot localize a row, so a mismatch tells the
 // operator to run the full data level.
 func runAggregateSQL(ctx context.Context, lr *LevelReport, opts Options, name string,
-	srcT source.Table, commonCols []string) {
-	numeric := newTableAgg(srcT, commonCols).numeric
-	srcAgg, err := sqlAggFor(ctx, opts.Source, opts.SourceSchema, name, commonCols, numeric, srcT)
+	srcT, tgtT source.Table, commonCols []string) {
+	// 各端按自己的列类型决定是否按数值聚合：源 numeric → 目标 text 时，
+	// 目标端应走文本长度/NULL 数，而不是被源端类型带着当数字算。
+	srcNumeric := newTableAgg(srcT, commonCols).numeric
+	tgtNumeric := newTableAgg(tgtT, commonCols).numeric
+	srcAgg, err := sqlAggFor(ctx, opts.Source, opts.SourceSchema, name, commonCols, srcNumeric, srcT)
 	if err != nil {
 		lr.add(SeverityError, "probe_failed", name, "", "源端聚合查询失败："+err.Error(), "", "", "")
 		return
 	}
-	tgtAgg, err := sqlAggFor(ctx, opts.Target, opts.TargetSchema, name, commonCols, numeric, srcT)
+	tgtAgg, err := sqlAggFor(ctx, opts.Target, opts.TargetSchema, name, commonCols, tgtNumeric, tgtT)
 	if err != nil {
 		lr.add(SeverityError, "probe_failed", name, "", "目标端聚合查询失败："+err.Error(), "", "", "")
 		return
