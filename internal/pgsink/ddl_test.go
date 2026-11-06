@@ -6,10 +6,18 @@ import (
 )
 
 // 破坏性 DDL 必须先窄：白名单宁可窄，窄了能手工做，宽了会静默丢数据。
+//
+// **反例里必须带注释前缀**：原来 6 条反例全是干净语句，于是「`/*x*/ DROP TABLE t`
+// 判定落空、语句照旧执行」这个洞没被抓到——而 pg_dump / ORM 生成的 DDL 常带注释头。
 func TestDDLDestructiveDetection(t *testing.T) {
 	destructive := []string{
 		"DROP TABLE public.t",
 		"drop table if exists t",
+		"DROP  TABLE t", // 双空格
+		"/*x*/ DROP TABLE t",
+		"/* multi\nline */ TRUNCATE t",
+		"-- hi\nDROP TABLE t",
+		"  \n  /* lead */  -- x\nALTER TABLE public.t DROP COLUMN b",
 		"TRUNCATE TABLE public.t",
 		"ALTER TABLE public.t DROP COLUMN b",
 		"ALTER TABLE public.t RENAME TO t2",
@@ -26,7 +34,8 @@ func TestDDLDestructiveDetection(t *testing.T) {
 		"ALTER TABLE public.t ADD COLUMN b text",
 		"CREATE INDEX t_a_idx ON public.t (a)",
 		"CREATE INDEX IF NOT EXISTS t_a_idx ON public.t (a)",
-		"DROP INDEX public.t_a_idx", // 不删数据，且重放可幂等跳过
+		"/* 带注释的加列 */ ALTER TABLE public.t ADD COLUMN c text",
+		"DROP INDEX public.t_a_idx", // 不删数据（但会留痕，见 applyDDLTx）
 		"COMMENT ON TABLE public.t IS 'x'",
 	}
 	for _, s := range allowed {
@@ -36,16 +45,35 @@ func TestDDLDestructiveDetection(t *testing.T) {
 	}
 }
 
-// 源 schema ≠ 目标 schema 时拒绝：语句里的表名是源端原文，按文本重写太脆弱。
-func TestDDLRejectsCrossSchema(t *testing.T) {
+// schema 判定：不相同拒绝（不做文本重写表名）；**不确定也不做**。
+func TestDDLRejectsCrossSchemaAndUnknown(t *testing.T) {
 	if err := checkDDLAllowed("ALTER TABLE public.t ADD COLUMN b text", "public", "jl_target"); err == nil {
 		t.Fatal("跨 schema 的 DDL 必须拒绝（否则可能改到同名但不相干的表）")
 	}
-	// 同 schema 放行；schema 未知（空）不拦，交给数据库报错
 	if err := checkDDLAllowed("ALTER TABLE public.t ADD COLUMN b text", "public", "public"); err != nil {
 		t.Fatalf("同 schema 不该被拦：%v", err)
 	}
-	if err := checkDDLAllowed("ALTER TABLE t ADD COLUMN b text", "", ""); err != nil {
-		t.Fatalf("schema 未知时不该被拦：%v", err)
+	// 不确定 = 不做（结构变更改错表不可逆）
+	if err := checkDDLAllowed("ALTER TABLE t ADD COLUMN b text", "", "public"); err == nil {
+		t.Fatal("源 schema 未知时必须拒绝（不知道该改哪张表）")
+	}
+	if err := checkDDLAllowed("ALTER TABLE t ADD COLUMN b text", "public", ""); err == nil {
+		t.Fatal("目标 schema 未知时必须拒绝")
+	}
+}
+
+func TestStripLeadingComments(t *testing.T) {
+	cases := map[string]string{
+		"DROP TABLE t":                   "DROP TABLE t",
+		"/*x*/ DROP TABLE t":             "DROP TABLE t",
+		"-- hi\nDROP TABLE t":            "DROP TABLE t",
+		"/* a\nb */ TRUNCATE t":          "TRUNCATE t",
+		"  -- one\n /* two */  SELECT 1": "SELECT 1",
+		"-- only a comment":              "",
+	}
+	for in, want := range cases {
+		if got := stripLeadingComments(in); got != want {
+			t.Fatalf("%q 应剥成 %q，得到 %q", in, want, got)
+		}
 	}
 }

@@ -228,7 +228,14 @@ func schemaOf(doc control.JobDoc, tgt control.Connection) string {
 	if s := strings.TrimSpace(doc.Target.Schema); s != "" {
 		return s
 	}
-	return tgt.Database
+	// 回落值必须与目标端**真实落点**一致：
+	// PG 的默认 schema 是 public（数据库名不是 schema）；MySQL 的库就是 schema。
+	// 之前统一回落 tgt.Database，导致默认配置的 PG 目标变成
+	// 「源端 public ≠ 目标端 jinliang」→ DDL 闸门把每一条都拒掉，文案还很像真的。
+	if tgt.Kind == dsn.KindMySQL {
+		return tgt.Database
+	}
+	return "public"
 }
 
 func endpointOf(c control.Connection, secret string) dsn.Endpoint {

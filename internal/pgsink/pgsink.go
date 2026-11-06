@@ -931,7 +931,7 @@ func (s *Sink) Apply(ctx context.Context, evs []source.Event, pos source.Positio
 //
 // 窄了能手工做（我们会告诉用户该执行什么）；宽了会静默丢数据。
 func ddlDestructive(stmt string) bool {
-	up := strings.ToUpper(strings.Join(strings.Fields(stmt), " "))
+	up := strings.ToUpper(strings.Join(strings.Fields(stripLeadingComments(stmt)), " "))
 	banned := []string{
 		"DROP TABLE", "DROP SCHEMA", "DROP COLUMN", "DROP DATABASE",
 		"TRUNCATE", "RENAME ", "ALTER TABLE .* RENAME",
@@ -950,6 +950,34 @@ func ddlDestructive(stmt string) bool {
 	return strings.HasPrefix(up, "DROP INDEX") == false && strings.HasPrefix(up, "DROP ")
 }
 
+// stripLeadingComments 剥掉语句**前导**的注释（`/* … */` 与 `-- …` 行注释），
+// 返回第一条真正的 SQL。
+//
+// 为什么必须有：判定原来是 HasPrefix 匹配关键字，而 `/*x*/ DROP TABLE t`、
+// `-- hi` + 换行 + `DROP TABLE t`、多行注释前缀都不以关键字开头 → 判定落空、
+// 语句照旧被执行 → **目标表被删**。pg_dump / ORM 生成的 DDL 常带注释头，这不是特例。
+func stripLeadingComments(stmt string) string {
+	s := strings.TrimSpace(stmt)
+	for {
+		switch {
+		case strings.HasPrefix(s, "/*"):
+			if i := strings.Index(s, "*/"); i >= 0 {
+				s = strings.TrimSpace(s[i+2:])
+				continue
+			}
+			return s // 注释没闭合：原样返回，交给数据库报错
+		case strings.HasPrefix(s, "--"):
+			if i := strings.IndexByte(s, '\n'); i >= 0 {
+				s = strings.TrimSpace(s[i+1:])
+				continue
+			}
+			return "" // 整条都是行注释
+		default:
+			return s
+		}
+	}
+}
+
 // checkDDLAllowed 决定这条 DDL 能不能在目标端执行。
 //
 // 判据只有两条，都是「先窄后宽」：
@@ -963,7 +991,16 @@ func checkDDLAllowed(stmt, srcSchema, tgtSchema string) error {
 			"你能做什么：1) 确认目标端也要这样改之后，手工在那条连接上执行它；"+
 			"2) 或者回任务页把这张表移出同步范围。风险：手工执行是不可回滚的结构变更，删掉的列/表数据找不回来", stmt)
 	}
-	if srcSchema != "" && tgtSchema != "" && srcSchema != tgtSchema {
+	// 「不确定就不做」：源/目标 schema 任一为空意味着不知道该改哪张表
+	//（语句可能不带前缀、会落到连接默认 schema）——在结构变更上这等于「可能改错表」。
+	// 所以这里**拒绝**，而不是「未知就放行」。
+	if strings.TrimSpace(srcSchema) == "" || strings.TrimSpace(tgtSchema) == "" {
+		return fmt.Errorf("这条 DDL 的 schema 不确定（源 %q / 目标 %q），不跟随（%s）。"+
+			"你能做什么：手工在目标端执行这条语句；或在目标端把表名写全 schema 前缀。"+
+			"风险：结构变更改错表不可逆，所以我们宁可不做", srcSchema, tgtSchema, stmt)
+	}
+	if srcSchema != tgtSchema {
+
 		return fmt.Errorf("源端 schema 是 %q、目标端是 %q，这条 DDL 里的表名是源端原文（%s）："+
 			"直接执行可能改到同名但不相干的表。你能做什么：1) 把 target.schema 配成与源端一致；"+
 			"2) 或者手工在目标端执行这条语句。风险：改错表的后果不可逆", srcSchema, tgtSchema, stmt)
@@ -997,6 +1034,13 @@ func (s *Sink) applyDDLTx(ctx context.Context, tx pgx.Tx, ev source.Event) error
 			return fmt.Errorf("释放 DDL 保存点失败: %w", err)
 		}
 		return nil
+	}
+	if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(stripLeadingComments(stmt))), "DROP INDEX") {
+		// 不删数据，但索引名是 **schema 级**的：可能删掉另一张表上（别的任务建的）同名索引。
+		log.Printf("执行 DROP INDEX（索引名是 schema 级的，可能影响别的表）：%s", stmt)
+		if s.opt.OnDDLSkipped != nil {
+			s.opt.OnDDLSkipped("DROP INDEX：" + stmt)
+		}
 	}
 	if _, err := tx.Exec(ctx, stmt); err != nil {
 		var pgErr *pgconn.PgError
