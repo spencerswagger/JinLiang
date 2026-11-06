@@ -400,6 +400,55 @@ print("  运行记录：phase=%s finish_reason=%s rows=%s kind=%s" % (r["phase"]
 PYR
 fi
 
+say "8b. 跑一次必失败的任务：runs.code 必须有值（有列无写入点等于没有）"
+if [ "${SRC_LABEL}" != "postgres" ]; then
+  echo "  SKIP：没有 PG 源，造不出真失败"
+else
+  # 指向一个不存在的目标 schema：引擎会真跑、真失败，且错误能被分类成 E1013
+  # （指向不存在的**表**时 classifyError 认不出来，code 会留空——那是「未分类」，
+  #  也是正确行为；这条要验的是「分类成功时 code 真的被写进 runs.code」）
+  BAD_JOB=$(python3 - "${CONN_ID}" "${SRC_SCHEMA}" <<'PYBAD'
+import json,sys
+conn, schema = sys.argv[1], sys.argv[2]
+print(json.dumps({
+  "name": "e2e-bad-schema",
+  "source_id": conn, "target_id": conn, "enabled": False,
+  "spec": {
+    "source": {"scope": {"schema": schema, "include": ["e2e_customers", "e2e_logs"]}},
+    "target": {"schema": "no_such_schema_xyz", "on_exists": "append"},
+    "mode": {"frequency": "once"},
+    "content": {"tables": {"e2e_customers": {}, "e2e_logs": {}}}
+  }
+}))
+PYBAD
+)
+  BAD_CODE=$(curl -s -o "${WORK}/badjob.json" -w '%{http_code}' -X POST "${BASE}/api/jobs" \
+    -H "Authorization: Bearer ${TOKEN}" -H 'Content-Type: application/json' --data-binary "${BAD_JOB}")
+  if [ "${BAD_CODE}" != "201" ]; then
+    echo "  建任务返回 ${BAD_CODE}：$(head -c 200 "${WORK}/badjob.json")"
+    fail "8b 需要一个独立的必失败任务（不应撞已有指纹）"
+  fi
+  BAD_ID=$(json '["id"]' <"${WORK}/badjob.json")
+  curl -s -o /dev/null -X POST "${BASE}/api/jobs/${BAD_ID}/run" -H "Authorization: Bearer ${TOKEN}"
+  # 等它结束（最多 20 秒）
+  for _ in $(seq 1 20); do
+    sleep 1
+    if curl -s "${BASE}/api/runs?job_id=${BAD_ID}" -H "Authorization: Bearer ${TOKEN}" \
+      | grep -q '"ended_at"'; then break; fi
+  done
+  sleep 1  # code 是收尾时写的，给它一拍
+  api GET "/api/runs?job_id=${BAD_ID}" >"${WORK}/badruns.json"
+  python3 - "${WORK}/badruns.json" <<'PYCODE'
+import json, sys
+runs = json.load(open(sys.argv[1]))["runs"]
+assert runs, "必失败任务没有产生 run 行"
+r = runs[0]
+assert r.get("last_error"), "失败运行没有 last_error"
+assert r.get("code"), "runs.code 为空——有列没有写入点，历史页只会走截断分支"
+print("  失败运行的 code=%s（last_error 前 40 字：%s…）" % (r["code"], r["last_error"][:40]))
+PYCODE
+fi
+
 say "9. export 出 yaml（规范路径 /export；不能含任何密码）"
 curl -fsS "${BASE}/api/jobs/${JOB_ID}/export" -H "Authorization: Bearer ${TOKEN}" >"${WORK}/job.yaml"
 # 弃用别名 /yaml 必须返回逐字节相同的内容（保留一个周期，之后移除时同步改 E1009 文案）

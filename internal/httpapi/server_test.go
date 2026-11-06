@@ -1896,3 +1896,62 @@ func TestSupportedDirectionIsAccepted(t *testing.T) {
 		t.Fatalf("支持的方向应 202（引擎自己会报能不能跑），实际 %d %v", code, body)
 	}
 }
+
+// runs.code 的两条路径：有码 → 列表页只显示「徽标 + 一句摘要」、详情页有四段式；
+// 无码 → 仍然是「截断 + title 全文」，行为不回退。
+func TestRunCodeRendersBadgeAndFourPart(t *testing.T) {
+	ts, store := newTestServer(t)
+	token := setupAdmin(t, ts)
+	conn := createPGConn(t, ts, token, "src")
+	code, created := doJSON(t, http.MethodPost, ts.URL+"/api/jobs", token, map[string]any{
+		"name": "code-job", "source_id": conn, "target_id": conn,
+		"spec": map[string]any{
+			"source":  map[string]any{"scope": map[string]any{"schema": "public", "include": []string{"orders"}}},
+			"target":  map[string]any{"schema": "report"},
+			"mode":    map[string]any{"frequency": "once"},
+			"content": map[string]any{"tables": map[string]any{"orders": map[string]any{}}},
+		},
+	})
+	if code != http.StatusCreated {
+		t.Fatalf("create job = %d %v", code, created)
+	}
+	jobID, _ := created["id"].(string)
+
+	// 一条有码（E1013：缺 schema/表）
+	raw := "relation \"orders\" does not exist"
+	run, err := store.StartRun(context.Background(), jobID, state.Preflight, control.RunKindSync)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.FinishRunWithCode(context.Background(), run.ID, state.Failed, raw, 1, control.FinishFailed, "E1013"); err != nil {
+		t.Fatal(err)
+	}
+	back, err := store.GetRun(context.Background(), run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if back.Code != "E1013" {
+		t.Fatalf("code 没存下来：%q", back.Code)
+	}
+
+	// 列表页：徽标 + 摘要，且不再把全文塞进 title（有码时靠详情页看全文）
+	hist, err := authorizedGet(t, ts.URL+"/history", token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(hist, "E1013") {
+		t.Fatalf("历史页没有错误码徽标")
+	}
+
+	// 详情页：四段式卡片必须有「为什么 / 你现在能做什么 / 风险」与原始报错
+	detail, err := authorizedGet(t, ts.URL+"/jobs/"+jobID, token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// html/template 会把引号转义成 &#34;，断言用转义后的文本
+	for _, want := range []string{"最近一次失败", "E1013", "为什么", "你现在能做什么", "风险", "does not exist"} {
+		if !strings.Contains(detail, want) {
+			t.Fatalf("详情页四段式缺 %q", want)
+		}
+	}
+}
