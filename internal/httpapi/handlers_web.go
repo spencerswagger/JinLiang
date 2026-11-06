@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"strconv"
@@ -584,6 +585,19 @@ type diagnosticsData struct {
 	AdminConfigured bool
 	ActiveRuns      int
 	Audit           []control.AuditEntry
+	// Rejected：被拒绝的「开始」（HTTP 已回 202，但引擎没跑起来）。
+	// 单独抽出来渲染成人话，而不是让它埋在审计表的 JSON 里——这条正是
+	// 「它说已接受，然后什么都没发生」时用户唯一能查到的地方。
+	Rejected []rejectedRow
+}
+
+type rejectedRow struct {
+	At      string
+	JobID   string
+	Code    string
+	Message string
+	Next    []string
+	RunID   string
 }
 
 func (s *Server) pageDiagnostics(w http.ResponseWriter, r *http.Request) {
@@ -599,6 +613,28 @@ func (s *Server) pageDiagnostics(w http.ResponseWriter, r *http.Request) {
 		KeySource: str("key_source"), KeyPath: str("key_path"),
 		Listen: str("listen"), SchemaVersion: str("schema_version"),
 		DBBytes: num("db_bytes"), Audit: audit,
+	}
+	for _, e := range audit {
+		if e.Action != control.ActionRunRejected {
+			continue
+		}
+		var det struct {
+			JobID   string   `json:"job_id"`
+			Code    string   `json:"code"`
+			Message string   `json:"message"`
+			Next    []string `json:"next"`
+			RunID   string   `json:"run_id"`
+		}
+		if err := json.Unmarshal([]byte(e.Detail), &det); err != nil {
+			continue // 旧版本写的痕迹（没有结构化详情）就只留在下面的审计表里
+		}
+		d.Rejected = append(d.Rejected, rejectedRow{
+			At: e.At, JobID: det.JobID, Code: det.Code,
+			Message: det.Message, Next: det.Next, RunID: det.RunID,
+		})
+		if len(d.Rejected) >= 10 {
+			break
+		}
 	}
 	d.Problems, _ = doc["problems"].([]string)
 	d.Counts, _ = doc["counts"].(map[string]int64)

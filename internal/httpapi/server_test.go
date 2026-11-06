@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -1472,4 +1473,147 @@ func TestRunConflictFromControlDBSplitsByHeartbeat(t *testing.T) {
 			}
 		})
 	}
+}
+
+// P3（必修级）：202 之后失败、且引擎还没建出 run 行时，痕迹必须**落在控制库**里。
+// 事件只活在环形缓冲里，进程一重启就查不到——用户回头只能记得「它说已接受，
+// 然后什么都没发生」。这里用「换一个 Server 实例」（内存登记与 bus 都是新的）
+// 来模拟重启，断言 audit 里仍有这条拒绝，且**每条都有可执行的下一步**。
+//
+// 两种失败都覆盖：冲突（有码 E1005 + 码表里的 next）与无码（权限/schema/连不上，
+// 这是最常见的一种，next 必须来自兜底，否则审计里就是一个 null）。
+func TestRejectedRunLeavesDurableAuditTrace(t *testing.T) {
+	cases := []struct {
+		name       string
+		runErr     error
+		wantCode   string
+		wantNextIn string
+	}{
+		{
+			name:       "有码：另一个进程持有活跃 run",
+			runErr:     fmt.Errorf("%w：这个任务已经有一条未结束的运行", control.ErrConflict),
+			wantCode:   string(core.CodeJobRunningElsewhere),
+			wantNextIn: "",
+		},
+		{
+			name:       "无码：源端表读不到（最常见的失败）",
+			runErr:     errors.New("没读到源端的表清单（权限不足或 schema 写错）"),
+			wantCode:   "",
+			wantNextIn: "/api/runs",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			store, err := control.Open(control.Options{DataDir: t.TempDir(), Autogen: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+
+			srv1, err := New(Options{Store: store, Version: "test"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			rerErr := c.runErr
+			srv1.runFn = func(context.Context, *control.Store, control.Job, jobrun.Options) (engine.Result, error) {
+				return engine.Result{}, rerErr
+			}
+			ts1 := httptest.NewServer(srv1.Handler())
+			token := setupAdmin(t, ts1)
+			conn := createPGConn(t, ts1, token, "src")
+			code, created := doJSON(t, http.MethodPost, ts1.URL+"/api/jobs", token, map[string]any{
+				"name": "trace-job", "source_id": conn, "target_id": conn,
+				"spec": map[string]any{
+					"source":  map[string]any{"scope": map[string]any{"schema": "public", "include": []string{"orders"}}},
+					"target":  map[string]any{"schema": "report"},
+					"mode":    map[string]any{"frequency": "once"},
+					"content": map[string]any{"tables": map[string]any{"orders": map[string]any{}}},
+				},
+			})
+			if code != http.StatusCreated {
+				t.Fatalf("create job = %d %v", code, created)
+			}
+			jobID, _ := created["id"].(string)
+			if code, _ := doJSON(t, http.MethodPost, ts1.URL+"/api/jobs/"+jobID+"/run", token, nil); code != http.StatusAccepted {
+				t.Fatalf("run 应为 202")
+			}
+			deadline := time.Now().Add(5 * time.Second)
+			for srv1.runs.active(jobID) {
+				if time.Now().After(deadline) {
+					t.Fatal("run 没有结束")
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
+			ts1.Close()
+
+			// 「重启」：同一控制库、全新的 Server（内存登记与事件环形缓冲都是空的）
+			srv2, err := New(Options{Store: store, Version: "test"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			ts2 := httptest.NewServer(srv2.Handler())
+			defer ts2.Close()
+			tok2 := setupAdminExisting(t, ts2)
+
+			code, audit := doJSON(t, http.MethodGet, ts2.URL+"/api/audit?limit=50", tok2, nil)
+			if code != http.StatusOK {
+				t.Fatalf("audit = %d", code)
+			}
+			entries, _ := audit["audit"].([]any)
+			var found map[string]any
+			for _, raw := range entries {
+				e, _ := raw.(map[string]any)
+				if e["action"] == control.ActionRunRejected {
+					found = e
+					break
+				}
+			}
+			if found == nil {
+				t.Fatal("重启后查不到「run 被拒绝」的痕迹：用户会以为它从没被接受过")
+			}
+			detail, _ := found["detail_json"].(string)
+			if !strings.Contains(detail, jobID) {
+				t.Fatalf("痕迹里应带 job_id，实际 %s", detail)
+			}
+			var det struct {
+				Code  string   `json:"code"`
+				Next  []string `json:"next"`
+				Actor string   `json:"actor"`
+			}
+			if err := json.Unmarshal([]byte(detail), &det); err != nil {
+				t.Fatalf("detail 不是合法 JSON: %v", err)
+			}
+			if det.Code != c.wantCode {
+				t.Fatalf("code = %q，期望 %q", det.Code, c.wantCode)
+			}
+			// 每一条都必须有「现在做什么」：没有码的那些不能留 null。
+			if len(det.Next) == 0 {
+				t.Fatalf("审计里 next 为空：只写了「发生了什么」，没写「现在做什么」（code=%q）", det.Code)
+			}
+			if c.wantNextIn != "" && !strings.Contains(strings.Join(det.Next, " "), c.wantNextIn) {
+				t.Fatalf("兜底 next 应提到 %q，实际 %v", c.wantNextIn, det.Next)
+			}
+			if det.Actor != control.ActorAPI {
+				t.Fatalf("审计 actor 应为真实发起者 %q，实际 %q", control.ActorAPI, det.Actor)
+			}
+			// 审计行本身的「谁」也要是真实发起者，否则按 actor 过滤看不到这次被拒绝
+			if got, _ := found["actor"].(string); got != control.ActorAPI {
+				t.Fatalf("audit 行的 actor 应为 %q，实际 %q", control.ActorAPI, got)
+			}
+		})
+	}
+}
+
+// setupAdminExisting 给「已经有管理员口令」的库拿一个 token（不走 /api/setup）。
+func setupAdminExisting(t *testing.T, ts *httptest.Server) string {
+	t.Helper()
+	code, body := doJSON(t, http.MethodPost, ts.URL+"/api/login", "", map[string]string{"password": testPassword})
+	if code != http.StatusOK {
+		t.Fatalf("login = %d %v", code, body)
+	}
+	token, _ := body["token"].(string)
+	if token == "" {
+		t.Fatalf("login 没有返回 token: %v", body)
+	}
+	return token
 }
