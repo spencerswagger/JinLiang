@@ -289,12 +289,17 @@ func Conclusion(rep Report) string {
 				note = fmt.Sprintf("行级全表比对 %d 表", full)
 			}
 			// 指纹不可比与「跑了几张表」无关：聚合级、混合级也要说。
+			// 但措辞不能自相矛盾：只跑聚合时不能说「已改用逐行比对」。
 			if v, ok := lr.Stats["fingerprint_comparable"]; ok {
 				if b, ok := v.(bool); ok && !b {
+					fpNote := "跨端指纹不可比，已改用逐行比对"
+					if full == 0 && agg > 0 {
+						fpNote = "聚合级不涉及指纹比对"
+					}
 					if note != "" {
 						note += "；"
 					}
-					note += "跨端指纹不可比，已改用逐行比对"
+					note += fpNote
 				}
 			}
 			if note != "" {

@@ -392,7 +392,29 @@ func TestConclusionFingerprintNoteIndependentOfTables(t *testing.T) {
 		},
 	}}}
 	got := Conclusion(rep)
-	if !strings.Contains(got, "仅聚合") || !strings.Contains(got, "跨端指纹不可比") {
-		t.Fatalf("聚合级结论也必须带指纹不可比：%q", got)
+	if !strings.Contains(got, "仅聚合") || !strings.Contains(got, "聚合级不涉及指纹比对") {
+		t.Fatalf("聚合级应说「不涉及指纹比对」而不是「已改用逐行」：%q", got)
+	}
+	if strings.Contains(got, "已改用逐行比对") {
+		t.Fatalf("只跑聚合却说已改用逐行，自相矛盾：%q", got)
+	}
+}
+
+// 组合断言：aggregate_only + fingerprint_comparable=false 时，
+// 不得同时出现「未做行级全表比对」与「已改用逐行比对」。
+func TestConclusionAggregateOnlyFingerprintNoContradiction(t *testing.T) {
+	rep := Report{OK: true, Levels: []LevelReport{{
+		Level: LevelData, OK: true,
+		Stats: map[string]any{
+			"tables_full_scan": 0, "tables_aggregate_only": 2,
+			"fingerprint_comparable": false,
+		},
+	}}}
+	got := Conclusion(rep)
+	if strings.Contains(got, "未做行级全表比对") && strings.Contains(got, "已改用逐行比对") {
+		t.Fatalf("同一句里既说没做行级又说改用行级：%q", got)
+	}
+	if !strings.Contains(got, "聚合级不涉及指纹比对") {
+		t.Fatalf("聚合级应明确「不涉及指纹比对」：%q", got)
 	}
 }
