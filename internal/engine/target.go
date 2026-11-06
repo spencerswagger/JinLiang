@@ -3,7 +3,9 @@ package engine
 import (
 	"context"
 	"database/sql/driver"
+	"encoding/json"
 	"fmt"
+	"reflect"
 	"strings"
 	"time"
 
@@ -21,18 +23,13 @@ import (
 //
 // 为什么不写 `if target.Kind == "mysql"`：那样的分支会长在所有用到目标端的
 // 地方（全量、增量、校验、清理各一次），把 B2/B3 的边界焊死在引擎里。
-// 这里只有一个工厂（newTargetSink），之后全是接口调用 + 能力探测（bulkWriter）。
+// 这里只有一个工厂（newTargetSink），之后全是接口调用——写路径只有两条：
+// PG 快照直连 pgsink.BulkApply（COPY + 块记账），其它目标端走契约的 sink.Apply。
 type targetSink interface {
 	sink.Sink
 	// Close 两种 sink 的签名不同（pgsink.Close() / mysqlsink.Close() error），
 	// 这里只要求「能关」：错误在 teardown 里忽略（关连接失败不该盖住原错误）。
 	Close() error
-}
-
-// bulkWriter 是可选的「整块写入」快路径（PG 用 COPY；MySQL 走契约的 Apply）。
-// 用类型断言做**能力探测**，不按连接类型分支——新目标端实现了就自动用上。
-type bulkWriter interface {
-	BulkAppend(ctx context.Context, ref source.TableRef, chunkNo int, rows [][]any, pos string) error
 }
 
 // newTargetSink 在开跑前把目标端定下来；不支持的组合在这里就报清楚（四段式）。
@@ -84,7 +81,9 @@ func (r *runner) prepareGeneric(ctx context.Context) error {
 	}
 	r.gsink = gs
 	if r.tgtEP.Kind == dsn.KindMySQL {
-		r.note(ctx, "目标端是 MySQL：本版只支持全量（不建同步书签、不写位点），增量下一版")
+		r.note(ctx, "目标端是 MySQL：本版只支持全量（不建同步书签、不写位点、不记块进度）。"+
+			"崩溃/中断后重跑会**从头重搬**；幂等靠目标表有主键/唯一键（没有唯一键会在写入前直接报错，不会插重复），"+
+			"所以恢复时间按「整表重搬」估，而不是 PG 那边的「从断点续搬」")
 	}
 	src, err := r.openSource(ctx)
 	if err != nil {
@@ -242,6 +241,14 @@ func toValue(v any) source.Value {
 		return source.Value{Kind: source.KindBytes, B: x}
 	case time.Time:
 		return source.Value{Kind: source.KindTime, T: x}
+	case []any, []int16, []int32, []int64, []float32, []float64, []string, []bool, []time.Time:
+		// pgx 把 SQL 数组解成原生切片，**不实现 driver.Valuer**——落到 fmt.Sprint 会写出
+		// "[1 2 3]"，而 typemap 把数组映成 MySQL 的 json 列，于是错误要等到插第一行时才现形
+		// （"Invalid JSON text"，离真实原因很远）。这里显式 json.Marshal，落成合法 JSON。
+		if b, err := json.Marshal(x); err == nil {
+			return source.Value{Kind: source.KindJSON, S: string(b)}
+		}
+		return source.Value{Kind: source.KindString, S: fmt.Sprint(x)}
 	case driver.Valuer:
 		// pgx 对 numeric/uuid/array/interval 等返回自己的类型（pgtype.*），
 		// 它们都实现了 driver.Valuer；**不能 fmt.Sprint** —— 那会把 numeric 变成
@@ -251,50 +258,16 @@ func toValue(v any) source.Value {
 		}
 		return source.Value{Kind: source.KindString, S: fmt.Sprint(x)}
 	default:
+		// 兜底前再看一眼「其它元素类型的数组」（pgx 对 uuid[]/numeric[] 等也给原生切片）：
+		// 用反射判断种类，仍然走 json.Marshal，绝不 fmt.Sprint。
+		switch reflect.ValueOf(v).Kind() {
+		case reflect.Slice, reflect.Array:
+			if b, err := json.Marshal(v); err == nil {
+				return source.Value{Kind: source.KindJSON, S: string(b)}
+			}
+		}
 		return source.Value{Kind: source.KindString, S: fmt.Sprint(x)}
 	}
-}
-
-// bulkAppend 走「整块写入」快路径；目标端没实现就退回契约的 Apply（一批 500 行）。
-//
-// 这是**能力探测**，不是类型分支：pgsink 实现了 bulkWriter 就用 COPY，
-// MySQL 目标端没实现就走 Apply，行为正确性由契约保证、速度差一截而已。
-func (r *runner) bulkAppend(ctx context.Context, ref source.TableRef, chunkNo int,
-	rows [][]any, pos string) error {
-	if bw, ok := r.gsink.(bulkWriter); ok {
-		return bw.BulkAppend(ctx, ref, chunkNo, rows, pos)
-	}
-	const perBatch = 500
-	for i := 0; i < len(rows); i += perBatch {
-		end := i + perBatch
-		if end > len(rows) {
-			end = len(rows)
-		}
-		evs := make([]source.Event, 0, end-i)
-		tref := r.targetRef(ref)
-		rel := r.relationOf(ref)
-		for _, row := range rows[i:end] {
-			evs = append(evs, source.Event{
-				Kind: source.EvInsert, Table: tref,
-				Relation: rel,
-				New:      source.Row{Table: tref, Values: toValues(row)},
-			})
-		}
-		if pos == "" {
-			if err := r.gsink.Apply(ctx, evs, nil); err != nil {
-				return err
-			}
-			continue
-		}
-		p, err := pgsource.ParsePosition(pos)
-		if err != nil {
-			return err
-		}
-		if err := r.gsink.Apply(ctx, evs, p); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 // catalogEngine 把连接类型映射到类型字典的引擎名（类型映射用）。

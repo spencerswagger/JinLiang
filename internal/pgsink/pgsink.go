@@ -833,13 +833,6 @@ func (s *Sink) Watermark(ctx context.Context) (string, error) {
 	return w, err
 }
 
-// BulkAppend 是 BulkApply 的「按表引用」版本，实现引擎的 bulkWriter 快路径
-// （引擎不该知道 tableInfo 这种内部类型）。
-func (s *Sink) BulkAppend(ctx context.Context, ref source.TableRef, chunkNo int,
-	rows [][]any, pos string) error {
-	return s.BulkApply(ctx, s.Table(ref), chunkNo, rows, pos, "", "")
-}
-
 // ── 增量：一批一个事务（数据 + 位点） ───────────────────────────
 
 // Apply implements the sink contract. One call = one target transaction, and

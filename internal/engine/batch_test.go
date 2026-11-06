@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"database/sql/driver"
 	"errors"
 	"github.com/spencerswagger/jinliang/internal/core"
 
@@ -681,5 +682,40 @@ func TestFullRecopyDecision(t *testing.T) {
 		if !allow && why == "" {
 			t.Fatalf("%s：拒绝时必须给一句话说明", c.name)
 		}
+	}
+}
+
+// toValue 的两类「看起来是值、其实是结构」：
+//   - pgtype.* 实现了 driver.Valuer → 取其值（numeric 不能变成 "{1 -2 false finite true}"）
+//   - 数组是**原生切片**、不实现 driver.Valuer → 必须 json.Marshal（不能 "[1 2 3]"）
+func TestToValueHandlesPgxStructures(t *testing.T) {
+	// 数组
+	if v := toValue([]int32{1, 2, 3}); v.Kind != source.KindJSON || v.S != "[1,2,3]" {
+		t.Fatalf("int32 数组应落成 JSON 文本，得到 kind=%d %q", v.Kind, v.S)
+	}
+	if v := toValue([]string{"a", "b"}); v.Kind != source.KindJSON || v.S != `["a","b"]` {
+		t.Fatalf("text 数组应落成 JSON 文本，得到 kind=%d %q", v.Kind, v.S)
+	}
+	// 标量照旧
+	if v := toValue(int64(7)); v.Kind != source.KindInt || v.I != 7 {
+		t.Fatal("整数应保持 KindInt")
+	}
+	if v := toValue(nil); v.Kind != source.KindNull {
+		t.Fatal("nil 应是 KindNull")
+	}
+	if v := toValue([]byte{0xde, 0xad}); v.Kind != source.KindBytes {
+		t.Fatal("[]byte 必须仍是 KindBytes（不能当成数组做 JSON）")
+	}
+}
+
+// driver.Valuer 路径：pgtype.Numeric 这类结构体必须取 Value()，不能被 fmt.Sprint 打印成结构体。
+type fakeValuer struct{ s string }
+
+func (f fakeValuer) Value() (driver.Value, error) { return f.s, nil }
+
+func TestToValueUsesDriverValuer(t *testing.T) {
+	v := toValue(fakeValuer{s: "12.34"})
+	if v.Kind != source.KindString || v.S != "12.34" {
+		t.Fatalf("driver.Valuer 应取其值，得到 kind=%d %q", v.Kind, v.S)
 	}
 }
