@@ -101,3 +101,28 @@ $ scripts/check_review_gate.sh 55        → FAIL「正文含否决词…必改 
 
 advisory→required 顺序：job 名保持 `review-gate` / `admin-merge-audit` 不变，
 先删 `continue-on-error`，再把这两个已有 check 加进 required；不要同时改名。
+
+## 锚定判据修订（strict 死锁）
+
+旧规则「review.commit == head」在 `strict: true` 下必然死锁：合并前要 merge main → head 前进 →
+锚点失效 → 再等 review。现在改为两条同时满足：
+
+1. `review.commit` 是当前 head 的**祖先**（GitHub compare status=`ahead`；rebase/force push 后
+   `diverged` 直接拒）；
+2. `review..head` 的差异**不包含本 PR 改的文件**（只允许别人已合的改动/merge main 进来）。
+
+任何本 PR 的新改动（哪怕一行注释）仍然要求重审。失败信息分三种：
+「结论早于本 PR 的新改动」「结论不是放行/是否决词」「结论不是 head 祖先」。
+
+真 PR 复测：
+
+```
+# ① 当前 head + 放行
+$ scripts/check_review_gate.sh 10   → PASS
+# ② review 旧 + 仅 merge main（#31：review c63dee1，head ed0c5f1，diff 27 文件均非本 PR）
+$ scripts/check_review_gate.sh 31   → PASS（head 前进仅来自 merge main / 别人已合的改动，未触及本 PR 文件）
+# ③ review 旧 + 本 PR 文件又改了（#44）
+$ scripts/check_review_gate.sh 44   → FAIL「结论早于本 PR 的新改动…涉及 internal/engine/engine.go」
+# ④ 必改 2 条（#55）
+$ scripts/check_review_gate.sh 55   → FAIL「首行结论含否决词…必改 2 条」
+```

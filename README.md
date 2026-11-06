@@ -143,8 +143,9 @@ python scripts/validate_schema.py examples/*.yaml
 
 ## 合并门禁 review-gate（advisory）
 
-- 查 PR **最新一条 review**：`commit_id` 必须等于当前 head，正文必须明确「必改 0 / 可合并 / 放行」；
-  任一不满足就失败并打印原因（旧 head 的通过不算）。
+- 查 PR **最新一条 review**：锚定判据**不是 head 相等**（strict 下合并前必须 merge main，head 一动
+  锚点就失效，会死锁）——而是「review commit 是当前 head 的祖先，且 review..head 的差异**不触及本 PR
+  改的文件**」；任何本 PR 的新改动（哪怕一行注释）都要求重审。正文必须明确「必改 0 / 可合并 / 放行」。
 - 跑在 `pull_request` 的 synchronize/reopened/edited/closed 与 `pull_request_review` 上；
   **现在只告警不挡合并**。转 required 的有序步骤：① 删掉两个 job 的 `continue-on-error`
   （job 名从第一天起就是稳定的 `review-gate` / `admin-merge-audit`，**不要改名**）；

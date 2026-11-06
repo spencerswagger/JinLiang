@@ -55,7 +55,41 @@ if [ "$MODE" = "review" ]; then
     echo "review-gate: 复读 head 失败" >&2
     exit 1
   }
-  python3 "$LOGIC" review "$tmp/pr.json" "$tmp/pr2.json" "$tmp/reviews.json"
+  # 锚定判据：review commit 是 head 祖先，且 review..head 未触及本 PR 文件。
+  HEAD_SHA="$(python3 - "$tmp/pr.json" <<'PY'
+import json, sys
+print((json.load(open(sys.argv[1])).get("head") or {}).get("sha") or "")
+PY
+)"
+  REVIEW_SHA="$(python3 - "$tmp/reviews.json" <<'PY'
+import json, sys
+rs = json.load(open(sys.argv[1]))
+if not rs:
+    print("")
+else:
+    r = max(rs, key=lambda x: (x.get("submitted_at") or "", x.get("id") or 0))
+    print(r.get("commit_id") or "")
+PY
+)"
+  if [ -n "$REVIEW_SHA" ] && [ "$REVIEW_SHA" != "$HEAD_SHA" ]; then
+    gh api "repos/${GITHUB_REPOSITORY}/compare/${REVIEW_SHA}...${HEAD_SHA}" >"$tmp/compare.json" || {
+      echo "review-gate: 读不到 compare ${REVIEW_SHA:0:12}...${HEAD_SHA:0:12}" >&2
+      exit 1
+    }
+    gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls/${PR}/files?per_page=100" --jq '.[].filename' >"$tmp/prfiles.txt" || {
+      echo "review-gate: 读不到 PR #${PR} 的文件清单" >&2
+      exit 1
+    }
+    python3 - "$tmp/prfiles.txt" "$tmp/prfiles.json" <<'PY'
+import json, sys
+files = [l.rstrip("\n") for l in open(sys.argv[1], encoding="utf-8") if l.strip()]
+open(sys.argv[2], "w", encoding="utf-8").write(json.dumps(files))
+PY
+  else
+    echo '{}' >"$tmp/compare.json"
+    echo '[]' >"$tmp/prfiles.json"
+  fi
+  python3 "$LOGIC" review "$tmp/pr.json" "$tmp/pr2.json" "$tmp/reviews.json" "$tmp/compare.json" "$tmp/prfiles.json"
   exit $?
 fi
 
