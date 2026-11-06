@@ -46,7 +46,7 @@ def compute_anchor(review, head, pr_files, cwd="."):
     """
     out = {"ancestor": False, "touched": [], "production_touched": [],
            "test_touched": [], "test_disallowed": [], "pr_files_missing": False,
-           "error": ""}
+           "compare_files_missing": False, "error": ""}
     if not review or not head:
         out["error"] = "缺少 review 或 head"
         return out
@@ -72,6 +72,11 @@ def compute_anchor(review, head, pr_files, cwd="."):
         out["error"] = "git diff 失败: " + r.stderr.strip()
         return out
     changed = {ln for ln in r.stdout.splitlines() if ln}
+    if not changed:
+        # git diff 成功但没有文件（空 merge 提交）：默认拒绝而不是猜「只 merge 了 main」。
+        # /compare 300 上限截断也会表现成「文件清单为空」，同类风险一并堵。
+        out["compare_files_missing"] = True
+        return out
     touched = sorted(changed & owned)
     out["touched"] = touched
 
@@ -120,6 +125,11 @@ def decide_review(pr, pr2, reviews, anchor=None):
         if not anchor or not anchor.get("ancestor"):
             detail = (anchor or {}).get("error") or "不是当前 head 的祖先（rebase/force push 后必须重审）"
             return False, f"结论 {commit[:12]} → head {head[:12]}：{detail}", "head_mismatch"
+        if anchor.get("compare_files_missing"):
+            return False, (
+                "review..head 的文件清单为空（可能是空 merge 提交，或 /compare 300 上限截断）；"
+                "默认拒绝而不是放行"
+            ), "compare_files_missing"
         if anchor.get("pr_files_missing"):
             return False, (
                 "读不到本 PR 的文件清单（输入为空），无法判定 review..head 是否只含 merge main；"
@@ -182,9 +192,10 @@ def selftest():
     pr = {"head": {"sha": head}}
     pr2 = {"head": {"sha": head}}
 
-    def anchor(production=None, test=None, disallowed=None, touched=None, missing=False, ancestor=True):
+    def anchor(production=None, test=None, disallowed=None, touched=None, missing=False, ancestor=True, no_changes=False):
         return {
             "ancestor": ancestor, "pr_files_missing": missing,
+            "compare_files_missing": no_changes,
             "production_touched": production or [], "test_touched": test or [],
             "test_disallowed": disallowed or [], "touched": touched or [],
         }
@@ -205,6 +216,8 @@ def selftest():
          anchor(test=["internal/verify/x_test.go"], disallowed=["internal/verify/x_test.go"]), False, "stale_conclusion"),
         ("rebase-not-ancestor", {"body": "**可合并（必改 0）**", "state": "COMMENTED", "commit_id": old},
          anchor(ancestor=False), False, "head_mismatch"),
+        ("missing-compare-files", {"body": "**可合并（必改 0）**", "state": "COMMENTED", "commit_id": old},
+         anchor(no_changes=True), False, "compare_files_missing"),
         ("pr-files-missing", {"body": "**可合并（必改 0）**", "state": "COMMENTED", "commit_id": old},
          anchor(missing=True), False, "pr_files_missing"),
         ("approval-conclusion", {"body": "结论：可合并", "state": "COMMENTED", "commit_id": head}, None, True, "pass"),
