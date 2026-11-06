@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -47,7 +48,17 @@ type Options struct {
 	// Catalog is the source table list the job selected; it defines the
 	// canonical column order every Row follows.
 	Catalog source.Catalog
+
+	// ApplyBatchRows 是一条多行 upsert 里最多放几行（默认 500）。
+	//
+	// 逐行 Exec 时 500 行/事务 = 500 次往返，增量吞吐卡在 ~10.5k 行/s（稳态线）；
+	// 拼成多行 INSERT … ON CONFLICT 实测能到 80k+。这里做成可配是因为「最佳批大小」
+	// 随行宽与网络 RTT 变：宽表/高延迟链路调小更稳（单条 SQL 太长会被 planner 罚）。
+	ApplyBatchRows int
 }
+
+// DefaultApplyBatchRows 是一条多行 upsert 的默认行数。
+const DefaultApplyBatchRows = 500
 
 type tableInfo struct {
 	ref   source.TableRef
@@ -103,6 +114,14 @@ func Open(ctx context.Context, opt Options) (*Sink, error) {
 	}
 	if opt.OnExists == "" {
 		opt.OnExists = "error"
+	}
+	if opt.ApplyBatchRows <= 0 {
+		// 环境变量兜底：引擎还没把 job 配置传进来时也能调（运维侧热调批大小）。
+		if v := os.Getenv("JINLIANG_APPLY_BATCH_ROWS"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n > 0 {
+				opt.ApplyBatchRows = n
+			}
+		}
 	}
 	tables, order := buildTables(opt.Catalog)
 	s := &Sink{opt: opt, tables: tables, order: order, ownerToken: newOwnerToken()}
@@ -737,12 +756,23 @@ func (s *Sink) Apply(ctx context.Context, evs []source.Event, pos source.Positio
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 
-	for _, ev := range evs {
+	// 插入/更新按「同表连续」分组，多条拼成一条多行 upsert：这是增量吞吐的关键
+	// （逐行 = 每行一次往返）。
+	i := 0
+	for i < len(evs) {
+		ev := evs[i]
 		switch ev.Kind {
 		case source.EvInsert, source.EvUpdate:
-			if err := s.upsertTx(ctx, tx, ev); err != nil {
+			j := i
+			for j < len(evs) && (evs[j].Kind == source.EvInsert || evs[j].Kind == source.EvUpdate) &&
+				evs[j].Table == ev.Table {
+				j++
+			}
+			if err := s.upsertBatchTx(ctx, tx, evs[i:j]); err != nil {
 				return err
 			}
+			i = j
+			continue
 		case source.EvDelete:
 			if err := s.deleteTx(ctx, tx, ev); err != nil {
 				return err
@@ -754,6 +784,7 @@ func (s *Sink) Apply(ctx context.Context, evs []source.Event, pos source.Positio
 		default:
 			// Begin/Commit/Heartbeat/DDL 由引擎处理，不落 SQL
 		}
+		i++
 	}
 	if advance {
 		if err := s.setPositionTx(ctx, tx, pos.String()); err != nil {
@@ -769,23 +800,62 @@ func endsWithCommit(evs []source.Event) bool {
 	return len(evs) > 0 && evs[len(evs)-1].Kind == source.EvCommit
 }
 
-func (s *Sink) upsertTx(ctx context.Context, tx pgx.Tx, ev source.Event) error {
-	ti := s.tables[ev.Table.Schema+"."+ev.Table.Table]
+// upsertBatchTx 把同表连续的插入/更新拼成**一条**多行 upsert。
+//
+// 与单行路径共用同一个 conflictClause / castedHoldersFor，保证两条路径的
+// ON CONFLICT 语义不可能分叉（分叉了就是最难查的一类 bug）。
+//
+// 部分失败怎么办（取舍写清）：多行 INSERT 是**一条语句**，任一行失败整条回滚、
+// 整个事务回滚、位点不推进 → 引擎按批重放 → upsert 幂等吸收。我们**不做逐行死信**：
+// 逐行重试等于退回 N 次往返，正好把这次优化抹掉；而且错误的行在 Postgres 的
+// DETAIL/上下文里能定位到表与约束，足够人工处理。
+func (s *Sink) upsertBatchTx(ctx context.Context, tx pgx.Tx, evs []source.Event) error {
+	if len(evs) == 0 {
+		return nil
+	}
+	ti := s.tables[evs[0].Table.Schema+"."+evs[0].Table.Table]
 	if ti == nil {
-		return fmt.Errorf("收到未知表 %s 的变更（发布里多了表？）", ev.Table.Table)
+		return fmt.Errorf("收到未知表 %s 的变更（发布里多了表？）", evs[0].Table.Table)
+	}
+	limit := s.opt.ApplyBatchRows
+	if limit <= 0 {
+		limit = DefaultApplyBatchRows
+	}
+	for start := 0; start < len(evs); start += limit {
+		end := start + limit
+		if end > len(evs) {
+			end = len(evs)
+		}
+		if err := s.execUpsertChunk(ctx, tx, ti, evs[start:end]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Sink) execUpsertChunk(ctx context.Context, tx pgx.Tx, ti *tableInfo, evs []source.Event) error {
+	evs = dedupeByPK(ti, evs)
+	if len(evs) == 0 {
+		return nil
 	}
 	cols := quoteList(ti.cols)
-	holders := castedHolders(ti)
-	q := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)", pgwire.Qualified(ti.ref.Schema, ti.ref.Table), cols, holders)
+	holders := castedHoldersFor(ti, len(evs))
+	q := fmt.Sprintf("INSERT INTO %s (%s) VALUES %s",
+		pgwire.Qualified(ti.ref.Schema, ti.ref.Table), cols, holders)
 	q += conflictClause(ti)
-	params := make([]any, len(ti.cols))
-	for i := range ti.cols {
-		if i < len(ev.New.Values) {
-			params[i] = valueOf(ev.New.Values[i])
+
+	params := make([]any, 0, len(evs)*len(ti.cols))
+	for _, ev := range evs {
+		if len(ev.New.Values) != len(ti.cols) {
+			return fmt.Errorf("%s 的行有 %d 列，表定义是 %d 列（源端结构变了？）",
+				ti.ref.Table, len(ev.New.Values), len(ti.cols))
+		}
+		for i := range ti.cols {
+			params = append(params, valueOf(ev.New.Values[i]))
 		}
 	}
 	if _, err := tx.Exec(ctx, q, params...); err != nil {
-		return fmt.Errorf("写入 %s 失败: %w", ev.Table.Table, err)
+		return fmt.Errorf("写入 %s 失败（%d 行，%d 列）: %w", ti.ref.Table, len(evs), len(ti.cols), err)
 	}
 	return nil
 }
@@ -1037,12 +1107,69 @@ func quoteList(names []string) string {
 
 // castedHolders renders $1::text::<coltype> so pgoutput's text values reach
 // PostgreSQL through the column's own input function (bytea/array/json included).
-func castedHolders(ti *tableInfo) string {
-	out := make([]string, len(ti.cols))
-	for i := range ti.cols {
-		out[i] = fmt.Sprintf("$%d::text::%s", i+1, ti.types[i])
+func castedHolders(ti *tableInfo) string { return castedHoldersFor(ti, 1) }
+
+// dedupeByPK 去掉同一批里**同一主键的较早版本**，只留最后一次。
+//
+// 为什么必须有：单行路径是逐条执行的，同一事务里两次改同一个主键 = 后写覆盖（合法）；
+// 拼成一条多行 INSERT 后，同一个主键在一次语句里出现两次会让 Postgres 报
+// "ON CONFLICT DO UPDATE command cannot affect row a second time" —— 整批失败、
+// 重放还是失败，就成了永久卡死。留最后一条正好等于「后写覆盖」的最终状态。
+//
+// 无主键表不参与（没有 ON CONFLICT，多行插入本身合法）。
+func dedupeByPK(ti *tableInfo, evs []source.Event) []source.Event {
+	if !ti.hasPK || len(ti.pkIdx) == 0 || len(evs) < 2 {
+		return evs
 	}
-	return strings.Join(out, ", ")
+	last := make(map[string]int, len(evs))
+	keys := make([]string, len(evs))
+	for i, ev := range evs {
+		var b strings.Builder
+		for _, idx := range ti.pkIdx {
+			if idx < len(ev.New.Values) {
+				fmt.Fprintf(&b, "%v\x00", valueOf(ev.New.Values[idx]))
+			}
+		}
+		keys[i] = b.String()
+		last[keys[i]] = i
+	}
+	if len(last) == len(evs) {
+		return evs
+	}
+	out := make([]source.Event, 0, len(last))
+	for i, ev := range evs {
+		if last[keys[i]] == i {
+			out = append(out, ev)
+		}
+	}
+	return out
+}
+
+// castedHoldersFor 生成 rows 行 × len(cols) 列的参数占位：
+//
+//	($1::text::t1, $2::text::t2), ($3::text::t1, $4::text::t2), …
+//
+// 编号必须**行优先**递增，且与 execUpsertChunk 里 params 的追加顺序一致——
+// 错一位就是「值写进了别的列」，而且不会报错。
+func castedHoldersFor(ti *tableInfo, rows int) string {
+	perRow := make([]string, len(ti.cols))
+	var out strings.Builder
+	for r := 0; r < rows; r++ {
+		if r > 0 {
+			out.WriteString(", ")
+		}
+		out.WriteByte('(')
+		for i := range ti.cols {
+			if i > 0 {
+				out.WriteString(", ")
+			}
+			n := r*len(ti.cols) + i + 1
+			perRow[i] = fmt.Sprintf("$%d::text::%s", n, ti.types[i])
+			out.WriteString(perRow[i])
+		}
+		out.WriteByte(')')
+	}
+	return out.String()
 }
 
 // conflictClause renders the upsert tail. Tables whose every column is part of

@@ -89,10 +89,22 @@ func TestConflictClause(t *testing.T) {
 // bytea / 数组 / json 只有经列类型的输入函数才能正确落地。
 func TestCastedHoldersUseColumnTypes(t *testing.T) {
 	tables, _ := buildTables(testCatalog())
-	got := castedHolders(tables["public.orders"])
-	want := `$1::text::bigint, $2::text::text, $3::text::numeric(12,2)`
+	got := castedHoldersFor(tables["public.orders"], 1)
+	want := `($1::text::bigint, $2::text::text, $3::text::numeric(12,2))`
 	if got != want {
 		t.Fatalf("参数占位符不对:\n 得到 %s\n 期望 %s", got, want)
+	}
+}
+
+// 多行占位必须**行优先**递增，且与参数追加顺序一一对应：错一位不会报错，
+// 只会把值写进别的列。
+func TestCastedHoldersForMultipleRows(t *testing.T) {
+	tables, _ := buildTables(testCatalog())
+	ti := tables["public.kv"] // 两列：k, v
+	got := castedHoldersFor(ti, 3)
+	want := `($1::text::text, $2::text::text), ($3::text::text, $4::text::text), ($5::text::text, $6::text::text)`
+	if got != want {
+		t.Fatalf("三行两列的占位不对:\n 得到 %s\n 期望 %s", got, want)
 	}
 }
 
