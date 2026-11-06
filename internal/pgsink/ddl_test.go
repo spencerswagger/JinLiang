@@ -1,6 +1,8 @@
 package pgsink
 
 import (
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -119,5 +121,24 @@ func TestPausableErrorCarriesTable(t *testing.T) {
 	var pe PausableError = &TypeChangedError{TableName: "t2", Detail: "x"}
 	if pe.Table() != "t2" || pe.Reason() != PauseReasonTypeChanged {
 		t.Fatalf("接口取值不对：table=%q reason=%q", pe.Table(), pe.Reason())
+	}
+}
+
+// EnsureSchema 那条路返回的通常是**包装过**的错误，第③步也是从包装里取表名与原因码。
+// 这条验的是真正的调用形状（直接构造接口值的用例验不到 errors.As 的穿透）。
+func TestPausableErrorSurvivesWrapping(t *testing.T) {
+	wrapped := fmt.Errorf("准备目标表失败: %w", &TypeChangedError{TableName: "orders", Detail: "v: bigint → text"})
+	var pe PausableError
+	if !errors.As(wrapped, &pe) {
+		t.Fatalf("包装之后必须仍能 errors.As 到 PausableError：%v", wrapped)
+	}
+	if pe.Table() != "orders" || pe.Reason() != PauseReasonTypeChanged {
+		t.Fatalf("从包装里取出的值不对：table=%q reason=%q", pe.Table(), pe.Reason())
+	}
+
+	// 再套一层（pgsink → engine 的转述）也要穿透
+	deep := fmt.Errorf("写 %s 失败: %w", "orders", wrapped)
+	if !errors.As(deep, &pe) || pe.Table() != "orders" {
+		t.Fatalf("两层包装也要能取出表名：%v", deep)
 	}
 }
