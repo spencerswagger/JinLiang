@@ -1,6 +1,8 @@
 package control
 
 import (
+	"encoding/json"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -149,5 +151,41 @@ func TestReplayDetectsRingGap(t *testing.T) {
 	// 连续起点（正好是缓冲第一条的前一条）也算能补齐。
 	if _, ok := bus.Replay("j", "e1", 50); !ok {
 		t.Fatal("50 之后正好是 51 起，应该能补")
+	}
+}
+
+// 三个新字段是「加法」：不填时不能出现在 JSON 里（老客户端/老回放不受影响），
+// 填了要能被前端读到（rows_done=0 也必须出现——0 行是合法结果，不是"没给"）。
+func TestEventProgressFieldsAreOptionalButDistinguishableFromZero(t *testing.T) {
+	plain, err := json.Marshal(Event{Type: "phase", Message: "准备对象"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range []string{"rows_done", "lag_bytes", "finish_reason"} {
+		if strings.Contains(string(plain), k) {
+			t.Fatalf("未填的 %s 不应出现在 JSON 里：%s", k, plain)
+		}
+	}
+
+	zero := int64(0)
+	one := int64(7)
+	withFields, err := json.Marshal(Event{
+		Type: "progress", RowsDone: &zero, LagBytes: &one, FinishReason: "completed",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back map[string]any
+	if err := json.Unmarshal(withFields, &back); err != nil {
+		t.Fatal(err)
+	}
+	if v, ok := back["rows_done"]; !ok || v.(float64) != 0 {
+		t.Fatalf("rows_done=0 必须出现（0 行是合法结果），实际 %s", withFields)
+	}
+	if back["lag_bytes"].(float64) != 7 {
+		t.Fatalf("lag_bytes 丢了：%s", withFields)
+	}
+	if back["finish_reason"] != "completed" {
+		t.Fatalf("finish_reason 丢了：%s", withFields)
 	}
 }
