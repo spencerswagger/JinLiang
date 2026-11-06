@@ -1,0 +1,255 @@
+package engine
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
+
+	"github.com/spencerswagger/jinliang/internal/control"
+	"github.com/spencerswagger/jinliang/internal/state"
+)
+
+// 在 preflight / prepare 阶段按停止，必须记成 stopped + 130，不能记成 failed，
+// 更不能挂 E4002（「津梁自己的 bug」）——用户做了一件正确的事。
+//
+// 用真控制库（纯 Go 的 sqlite，不需要数据库 DSN），断言读回来的 run 行。
+func TestUserStopBeforeDataIsStoppedNotFailed(t *testing.T) {
+	for _, phase := range []state.Phase{state.Preflight, state.Prepare} {
+		t.Run(string(phase), func(t *testing.T) {
+			store, jobID := newControlStore(t)
+			run, err := store.StartRun(context.Background(), jobID, phase, control.RunKindSync)
+			if err != nil {
+				t.Fatalf("建 run 失败: %v", err)
+			}
+			// 订阅事件，确认没有 error/E4002：停止不是错误事件。
+			ch, cancel := store.Bus().Subscribe(jobID)
+			defer cancel()
+
+			r := &runner{opt: Options{Store: store}, job: control.Job{ID: jobID}, run: run, phase: phase}
+			if err := r.fail(context.Background(), context.Canceled); err != nil {
+				t.Fatalf("用户停止不该返回错误，得到 %v", err)
+			}
+
+			got, err := store.GetRun(context.Background(), run.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.Phase != state.Done {
+				t.Fatalf("阶段应落 done（停止不是失败），得到 %s", got.Phase)
+			}
+			if got.FinishReason != control.FinishStopped {
+				t.Fatalf("finish_reason 应为 stopped，得到 %q", got.FinishReason)
+			}
+			if got.ExitCode == nil || *got.ExitCode != ExitStopped {
+				t.Fatalf("exit_code 应为 %d，得到 %v", ExitStopped, got.ExitCode)
+			}
+			if got.LastError != "" {
+				t.Fatalf("手动停止不该写 last_error，得到 %q", got.LastError)
+			}
+
+			// 事件流里只有 done，没有 error、没有 E4002
+			timeout := time.After(500 * time.Millisecond)
+			for {
+				select {
+				case ev := <-ch:
+					if ev.Type == "error" {
+						t.Fatalf("停止不该产生 error 事件（code=%q）：%s", ev.Code, ev.Message)
+					}
+					if strings.Contains(ev.Code, "E4002") {
+						t.Fatal("停止不该被归成 E4002「我们的 bug」")
+					}
+				case <-timeout:
+					return
+				}
+			}
+		})
+	}
+}
+
+// 非取消类错误仍然走 failed（别把这条修复扩大成「所有错误都 stopped」）。
+func TestRealErrorStillFails(t *testing.T) {
+	store, jobID := newControlStore(t)
+	run, err := store.StartRun(context.Background(), jobID, state.Preflight, control.RunKindSync)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := &runner{opt: Options{Store: store}, job: control.Job{ID: jobID}, run: run, phase: state.Preflight}
+	cause := context.DeadlineExceeded // 不是 Canceled
+	if err := r.fail(context.Background(), cause); err == nil {
+		t.Fatal("非取消类错误应返回错误")
+	}
+	got, _ := store.GetRun(context.Background(), run.ID)
+	if got.FinishReason != control.FinishFailed {
+		t.Fatalf("真失败应记 failed，得到 %q", got.FinishReason)
+	}
+}
+
+// newControlStore 建一个临时控制库 + 一条连接 + 一个任务，返回 store 与 job id。
+func newControlStore(t *testing.T) (*control.Store, string) {
+	t.Helper()
+	ctx := context.Background()
+	store, err := control.Open(control.Options{DataDir: t.TempDir(), Autogen: true})
+	if err != nil {
+		t.Fatalf("打开控制库失败: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+	c, err := store.CreateConnection(ctx, control.ConnectionInput{
+		Name: "src", Kind: "postgres", Host: "127.0.0.1", Port: 5432,
+		Database: "d", Username: "u", Password: "p",
+	})
+	if err != nil {
+		t.Fatalf("建连接失败: %v", err)
+	}
+	job, err := store.CreateJob(ctx, control.JobInput{
+		Name: "stop-test", SourceID: c.ID, TargetID: c.ID,
+		Spec: control.JobDoc{
+			Version: 1, Job: "stop-test",
+			Source: control.SourceDoc{Kind: "postgres"},
+			Target: control.TargetDoc{Kind: "postgres", OnExists: "append"},
+			Mode:   control.ModeDoc{Frequency: "once"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("建任务失败: %v", err)
+	}
+	return store, job.ID
+}
+
+// P3-2（升为必修）：排查方向必须落进 runs.last_error。
+// 事件是易失的（进程重启就没了），用户回头找原因看的是历史页；
+// 诊断信息只在事件流里活一次，等于没做。
+func TestUnclassifiedErrorHintPersistsToLastError(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want []string
+	}{
+		{
+			name: "权限不够",
+			err:  &pgconn.PgError{Code: "42501", Message: "permission denied for schema public"},
+			want: []string{"权限", "GRANT", "原始错误"},
+		},
+		{
+			name: "对象不存在",
+			err:  &pgconn.PgError{Code: "3F000", Message: `schema "report" does not exist`},
+			want: []string{"对象不存在", "target.schema", "原始错误"},
+		},
+		{
+			name: "完全未识别",
+			err:  errors.New("something we have never seen"),
+			want: []string{"还没分类", "维护者", "原始错误"},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			store, jobID := newControlStore(t)
+			run, err := store.StartRun(context.Background(), jobID, state.Prepare, control.RunKindSync)
+			if err != nil {
+				t.Fatal(err)
+			}
+			r := &runner{opt: Options{Store: store}, job: control.Job{ID: jobID}, run: run, phase: state.Prepare}
+			if err := r.fail(context.Background(), c.err); err == nil {
+				t.Fatal("这条错误应返回错误")
+			}
+			got, err := store.GetRun(context.Background(), run.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.FinishReason != control.FinishFailed {
+				t.Fatalf("应记 failed，得到 %q", got.FinishReason)
+			}
+			for _, w := range c.want {
+				if !strings.Contains(got.LastError, w) {
+					t.Fatalf("last_error 缺 %q（历史页看不到排查方向）：%s", w, got.LastError)
+				}
+			}
+		})
+	}
+}
+
+// 丢租约**不是**用户停止：loseLease 自己会 cancel(runCtx)，所以进 fail() 时 ctx 已经
+// 是 Canceled —— 之前这个误判把「另一个实例接管」记成「用户点了停止 +130 + done」，
+// 历史页显示「已手动停止」，真原因彻底消失。Owl 的探针就是撞到这条。
+func TestLeaseLostIsInterruptedNotStopped(t *testing.T) {
+	for _, phase := range []state.Phase{state.Preflight, state.Streaming} {
+		t.Run(string(phase), func(t *testing.T) {
+			store, jobID := newControlStore(t)
+			run, err := store.StartRun(context.Background(), jobID, phase, control.RunKindSync)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// 造出「租约已丢」的状态：run ctx 被 cancel（loseLease 的行为）+ leaseLost 置位
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			r := &runner{opt: Options{Store: store}, job: control.Job{ID: jobID}, run: run, phase: phase}
+			r.leaseLost.Store(true)
+			r.leaseWhy.Store("租约被别的实例接管了")
+			r.cancelRun = cancel
+
+			err = r.fail(ctx, r.leaseLostError())
+			if err == nil {
+				t.Fatal("丢租约应返回错误（不是静默成功）")
+			}
+
+			got, gerr := store.GetRun(context.Background(), run.ID)
+			if gerr != nil {
+				t.Fatal(gerr)
+			}
+			if got.FinishReason != control.FinishInterrupted {
+				t.Fatalf("丢租约应记 interrupted，得到 %q（被误判成用户停止？）", got.FinishReason)
+			}
+			if got.ExitCode != nil && *got.ExitCode == ExitStopped {
+				t.Fatal("丢租约不能记成 130（那是「用户主动停止」）")
+			}
+			if got.Phase != state.Failed {
+				t.Fatalf("丢租约的阶段应为 failed，得到 %s", got.Phase)
+			}
+			if !strings.Contains(got.LastError, "租约") {
+				t.Fatalf("last_error 必须写清是租约原因，得到 %q", got.LastError)
+			}
+		})
+	}
+}
+
+// Owl 用变异证明过：「用户 stop 仍记 stopped」这条是 TestUserStopBeforeDataIsStoppedNotFailed
+// 的严格子集（那里断言更全、还覆盖 prepare）。所以这条测试存在的唯一理由是覆盖
+// **它覆盖不到的角度：丢租约之后再 stop，也不会把这一轮改回 stopped**——
+// 否则历史页会显示「用户停止」，而真相是「被另一个实例接管」。
+// （变异验证：去掉 fail() 里的租约优先判断，这条会红。）
+func TestStopAfterLeaseLostKeepsInterrupted(t *testing.T) {
+	store, jobID := newControlStore(t)
+	run, err := store.StartRun(context.Background(), jobID, state.Streaming, control.RunKindSync)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	r := &runner{opt: Options{Store: store}, job: control.Job{ID: jobID}, run: run, phase: state.Streaming}
+	r.cancelRun = cancel
+	r.leaseLost.Store(true)
+	r.leaseWhy.Store("租约被别的实例接管了")
+
+	// 第一下：丢租约
+	if err := r.fail(ctx, r.leaseLostError()); err == nil {
+		t.Fatal("丢租约应返回错误")
+	}
+	// 第二下：同一个 run 上又来一次「用户取消」（例如用户随后点了停止）
+	if err := r.fail(ctx, context.Canceled); err == nil {
+		t.Fatal("第二次 fail 也应返回错误")
+	}
+
+	got, err := store.GetRun(context.Background(), run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.FinishReason != control.FinishInterrupted {
+		t.Fatalf("丢租约之后再 stop，仍应是 interrupted，得到 %q（被改写成了用户停止？）", got.FinishReason)
+	}
+	if got.ExitCode != nil && *got.ExitCode == ExitStopped {
+		t.Fatal("丢租约的收尾不能被后来的 stop 改写成 130")
+	}
+}
