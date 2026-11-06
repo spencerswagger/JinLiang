@@ -215,20 +215,41 @@ func TestLeaseLostIsInterruptedNotStopped(t *testing.T) {
 	}
 }
 
-// 反过来守住：用户真 stop 时（leaseLost 未置位）仍然记 stopped +130，
-// 别为了修这条把用户停止又改回 failed。
-func TestUserStopStillStoppedAfterLeaseFix(t *testing.T) {
+// Owl 用变异证明过：「用户 stop 仍记 stopped」这条是 TestUserStopBeforeDataIsStoppedNotFailed
+// 的严格子集（那里断言更全、还覆盖 prepare）。所以这条测试存在的唯一理由是覆盖
+// **它覆盖不到的角度：丢租约之后再 stop，也不会把这一轮改回 stopped**——
+// 否则历史页会显示「用户停止」，而真相是「被另一个实例接管」。
+// （变异验证：去掉 fail() 里的租约优先判断，这条会红。）
+func TestStopAfterLeaseLostKeepsInterrupted(t *testing.T) {
 	store, jobID := newControlStore(t)
-	run, err := store.StartRun(context.Background(), jobID, state.Preflight, control.RunKindSync)
+	run, err := store.StartRun(context.Background(), jobID, state.Streaming, control.RunKindSync)
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := &runner{opt: Options{Store: store}, job: control.Job{ID: jobID}, run: run, phase: state.Preflight}
-	if err := r.fail(context.Background(), context.Canceled); err != nil {
-		t.Fatalf("用户停止不该返回错误: %v", err)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	r := &runner{opt: Options{Store: store}, job: control.Job{ID: jobID}, run: run, phase: state.Streaming}
+	r.cancelRun = cancel
+	r.leaseLost.Store(true)
+	r.leaseWhy.Store("租约被别的实例接管了")
+
+	// 第一下：丢租约
+	if err := r.fail(ctx, r.leaseLostError()); err == nil {
+		t.Fatal("丢租约应返回错误")
 	}
-	got, _ := store.GetRun(context.Background(), run.ID)
-	if got.FinishReason != control.FinishStopped || got.ExitCode == nil || *got.ExitCode != ExitStopped {
-		t.Fatalf("用户停止应仍是 stopped+130，得到 %q %v", got.FinishReason, got.ExitCode)
+	// 第二下：同一个 run 上又来一次「用户取消」（例如用户随后点了停止）
+	if err := r.fail(ctx, context.Canceled); err == nil {
+		t.Fatal("第二次 fail 也应返回错误")
+	}
+
+	got, err := store.GetRun(context.Background(), run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.FinishReason != control.FinishInterrupted {
+		t.Fatalf("丢租约之后再 stop，仍应是 interrupted，得到 %q（被改写成了用户停止？）", got.FinishReason)
+	}
+	if got.ExitCode != nil && *got.ExitCode == ExitStopped {
+		t.Fatal("丢租约的收尾不能被后来的 stop 改写成 130")
 	}
 }

@@ -1140,6 +1140,11 @@ func hint(err error) (string, []string) {
 func (r *runner) fail(ctx context.Context, err error) error {
 	// 丢租约优先于「用户停止」：loseLease 自己也会 cancel(runCtx)，所以丢租约之后
 	// 那个 ctx 带着 Canceled 进来——先判停止会把它记成「用户点的」。
+	//
+	// 承重的是 `leaseLost` 这个 flag：`loseLease()` 先置 flag 再 cancel，而所有
+	// `fail(ctx, leaseLostError())` 的调用点都在 `if r.leaseLost.Load()` 里面，
+	// 所以两个条件今天同真同假。`errors.As` 那半是**兜底**：将来若有人把
+	// `leaseLostError` 包一层再传进来（不再经过那三处检查），这里仍能认出来。
 	if r.leaseLost.Load() || errors.As(err, new(*leaseLostError)) {
 		return r.failLostLease(ctx, err)
 	}
