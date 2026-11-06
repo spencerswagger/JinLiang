@@ -126,3 +126,15 @@ $ scripts/check_review_gate.sh 44   → FAIL「结论早于本 PR 的新改动�
 # ④ 必改 2 条（#55）
 $ scripts/check_review_gate.sh 55   → FAIL「首行结论含否决词…必改 2 条」
 ```
+
+## 最后一条 fail-open：pr_files 空/None 必须拒绝
+
+`decide_review` 在 `commit != head` 时依赖「本 PR 文件清单」求交集；空清单/没传
+等于「未触及本 PR 文件」→ PASS，而通过消息里那句话是假的。现在：
+
+```
+if not owned: return False, "读不到本 PR 的文件清单…", "pr_files_missing"
+```
+
+selftest 新增 `missing-prfiles-empty`、`missing-prfiles-none` 两例；这是第三次
+「拿不到数据就放行」（前两次：B5 `reltuples=-1`、verify 抽样），判据必须倒向拒绝。

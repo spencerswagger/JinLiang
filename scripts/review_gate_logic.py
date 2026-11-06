@@ -57,6 +57,13 @@ def decide_review(pr, pr2, reviews, compare=None, pr_files=None):
             ), "head_mismatch"
         changed = {f.get("filename") for f in (compare.get("files") or []) if f.get("filename")}
         owned = {n for n in (pr_files or []) if n}
+        # 输入缺失必须倒向拒绝：空清单时「未触及本 PR 文件」这句话是假的
+        # （今晚第三次「拿不到数据就放行」——B5 reltuples=-1、verify 抽样、这里）。
+        if not owned:
+            return False, (
+                "读不到本 PR 的文件清单（输入为空），无法判定 review..head 是否只含 merge main；"
+                "按纪律拒绝而不是放行"
+            ), "pr_files_missing"
         touched = sorted(changed & owned)
         if touched:
             return False, (
@@ -118,6 +125,10 @@ def selftest():
          {"status": "ahead", "files": [{"filename": "cmd/x.go"}]}, ["cmd/x.go"], False, "stale_conclusion"),
         ("rebase-not-ancestor", {"body": "**可合并（必改 0）**", "state": "COMMENTED", "commit_id": old},
          {"status": "diverged", "files": []}, ["cmd/x.go"], False, "head_mismatch"),
+        ("missing-prfiles-empty", {"body": "**可合并（必改 0）**", "state": "COMMENTED", "commit_id": old},
+         {"status": "ahead", "files": [{"filename": "internal/other.go"}]}, [], False, "pr_files_missing"),
+        ("missing-prfiles-none", {"body": "**可合并（必改 0）**", "state": "COMMENTED", "commit_id": old},
+         {"status": "ahead", "files": [{"filename": "internal/other.go"}]}, None, False, "pr_files_missing"),
         ("approval-conclusion", {"body": "结论：可合并", "state": "COMMENTED", "commit_id": head}, None, None, True, "pass"),
         ("history-in-tail", {"body": "**可合并（必改 0）**，按 head x\n\n…上轮必改 1 条已修…", "state": "COMMENTED", "commit_id": head}, None, None, True, "pass"),
     ]
