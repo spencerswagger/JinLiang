@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/spencerswagger/jinliang/internal/dsn"
+	"github.com/spencerswagger/jinliang/internal/mysqlcanon"
 	"github.com/spencerswagger/jinliang/internal/source"
 )
 
@@ -330,6 +331,78 @@ func (s *Sink) DidCreateTable(ctx context.Context, ref source.TableRef) (bool, e
 // tableObjectName 是表在 `_jl_object` 里的登记名（与 PG 侧同构：schema.table）。
 func (s *Sink) tableObjectName(ref source.TableRef) string {
 	return s.schemaOf(ref) + "." + ref.Table + "#table"
+}
+
+// PositionDurability 告诉引擎「位点是怎么落盘的」，决定它能不能在 Apply 返回后立刻 ack。
+//
+// MySQL 的 DDL/TRUNCATE 会**隐式提交**，含它们的批次必须拆三段（数据+旧位点 → DDL →
+// 新位点），所以「一个 Apply = 一个事务」在这里不成立——ack 前必须确认新位点真的落盘。
+// pgsink 返回 "same_tx"（数据与位点同事务），引擎据此走原路径。
+func (s *Sink) PositionDurability() string { return "staged_phases" }
+
+// PositionState 是「期望位点 vs 库里位点」的三态。
+//
+// 为什么不用 bool：false 混杂了三种含义，调用方分不清「再等等」和「必须停」——
+// 拿它当 ack 门槛就会变成重试到天亮的阻塞点。
+type PositionState uint8
+
+const (
+	// PositionDurable：库里就是这个位点，可以 ack。
+	PositionDurable PositionState = iota
+	// PositionBehind：库里还是更早的位点（这批还没落盘），**再等等**是合理的。
+	PositionBehind
+	// PositionDifferent：库里是别的值（被回退/被别的实例改过），**必须停**并报清楚。
+	PositionDifferent
+)
+
+// String 让日志与错误里能读出人话。
+func (p PositionState) String() string {
+	switch p {
+	case PositionDurable:
+		return "durable"
+	case PositionBehind:
+		return "behind"
+	case PositionDifferent:
+		return "different"
+	}
+	return "unknown"
+}
+
+// PositionDurable 报告「这个位点是否已经真的落库」，三态而不是 bool。
+//
+// **全部安全性的依据（与 Source.SafeAckPoint 是同一个等式的两端）**：
+//
+//	`Apply(nil)` ⇔ 目标端 `_jl_meta.position` 已等于该事务的提交位点
+//
+// 引擎在 `staged_phases` 模式下 ack 之前必须调它并区分三态：
+// `durable` 才 ack；`behind` 等（DDL 批次中间）；`different` 立刻停（位点被改过）。
+func (s *Sink) PositionDurable(ctx context.Context, want string) (PositionState, error) {
+	got, err := s.MetaPosition(ctx)
+	if err != nil {
+		return PositionDifferent, err
+	}
+	switch {
+	case want == "":
+		return PositionDifferent, nil
+	case got == want:
+		return PositionDurable, nil
+	case got == "":
+		return PositionBehind, nil
+	default:
+		return PositionDifferent, nil
+	}
+}
+
+// FingerprintScope 标识本连接器指纹的可比范围。
+//
+// **只在 MySQL↔MySQL 之间可比**：PG 侧是服务端 `sum(hashtextextended(...))`，
+// 与本包的客户端 sha256 永远不可能相等，跨引擎比对必须走 internal/verify 的逐行比对。
+func (s *Sink) FingerprintScope() string { return mysqlcanon.Scope }
+
+// Fingerprint 与 mysqlsource 共用同一套规范编码（列名排序 + 主键定序 + sha256），
+// 所以 MySQL 源与 MySQL 目标的指纹可以**直接比**。
+func (s *Sink) Fingerprint(ctx context.Context, ref source.TableRef) (string, error) {
+	return mysqlcanon.Fingerprint(ctx, s.db, s.schemaOf(ref), ref.Table)
 }
 
 // Count 目标表行数（全量/增量对账用）。
