@@ -125,6 +125,8 @@ def selftest():
          {"status": "ahead", "files": [{"filename": "cmd/x.go"}]}, ["cmd/x.go"], False, "stale_conclusion"),
         ("rebase-not-ancestor", {"body": "**可合并（必改 0）**", "state": "COMMENTED", "commit_id": old},
          {"status": "diverged", "files": []}, ["cmd/x.go"], False, "head_mismatch"),
+        ("pr-files-missing", {"body": "**可合并（必改 0）**", "state": "COMMENTED", "commit_id": old},
+         {"status": "ahead", "files": [{"filename": "internal/other.go"}]}, [], False, "pr_files_missing"),
         ("missing-prfiles-empty", {"body": "**可合并（必改 0）**", "state": "COMMENTED", "commit_id": old},
          {"status": "ahead", "files": [{"filename": "internal/other.go"}]}, [], False, "pr_files_missing"),
         ("missing-prfiles-none", {"body": "**可合并（必改 0）**", "state": "COMMENTED", "commit_id": old},
