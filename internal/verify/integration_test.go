@@ -326,3 +326,70 @@ func TestPGVerifyCatchesSwapAndPrecision(t *testing.T) {
 		t.Fatalf("精度截断必须报行级 + 聚合差异：%+v", rep.Levels[0].Findings)
 	}
 }
+
+// 日常例检的便宜路：L1 下推 SQL（一条聚合查询/端），不扫全表。
+func TestPGVerifyAggregateOnly(t *testing.T) {
+	src := openDSN(t, "JINLIANG_TEST_PG_SRC_DSN")
+	tgt := openDSN(t, "JINLIANG_TEST_PG_DSN")
+	ctx := context.Background()
+	for _, db := range []*runtime.DB{src, tgt} {
+		mustExec(t, db, `CREATE SCHEMA IF NOT EXISTS `+verifySchema)
+	}
+	t.Cleanup(func() {
+		mustExec(t, src, `DROP SCHEMA IF EXISTS `+verifySchema+` CASCADE`)
+		mustExec(t, tgt, `DROP SCHEMA IF EXISTS `+verifySchema+` CASCADE`)
+	})
+	setupPG(t, src, tgt, false)
+	srcS, tgtS := src.WithSchema(verifySchema), tgt.WithSchema(verifySchema)
+	opts := verify.Options{
+		Source: srcS, Target: tgtS,
+		SourceSchema: verifySchema, TargetSchema: verifySchema,
+		Tables: []string{verifyTable}, Level: verify.LevelData, AggregateOnly: true,
+	}
+	rep, err := verify.Run(ctx, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rep.OK {
+		t.Fatalf("聚合基线应通过：%+v", rep.Levels[0])
+	}
+	mustExec(t, tgt, `UPDATE `+pgVerifyTable+` SET amount = amount + 1 WHERE id = 2`)
+	rep, err = verify.Run(ctx, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.OK || !hasFinding(rep, "aggregate_mismatch") {
+		t.Fatalf("SQL 聚合必须发现值变化：%+v", rep.Levels[0].Findings)
+	}
+}
+
+func TestMySQLVerifyAggregateOnly(t *testing.T) {
+	src := openDSN(t, "JINLIANG_TEST_MYSQL_SRC_DSN")
+	tgt := openDSN(t, "JINLIANG_TEST_MYSQL_DSN")
+	ctx := context.Background()
+	setupMySQL(t, src, tgt, false)
+	t.Cleanup(func() {
+		mustExec(t, src, `DROP TABLE IF EXISTS `+verifyTable)
+		mustExec(t, tgt, `DROP TABLE IF EXISTS `+verifyTable)
+	})
+	opts := verify.Options{
+		Source: src, Target: tgt,
+		SourceSchema: src.Schema(), TargetSchema: tgt.Schema(),
+		Tables: []string{verifyTable}, Level: verify.LevelData, AggregateOnly: true,
+	}
+	rep, err := verify.Run(ctx, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rep.OK {
+		t.Fatalf("MySQL 聚合基线应通过：%+v", rep.Levels[0])
+	}
+	mustExec(t, tgt, `UPDATE `+verifyTable+` SET amount = amount + 1 WHERE id = 2`)
+	rep, err = verify.Run(ctx, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.OK || !hasFinding(rep, "aggregate_mismatch") {
+		t.Fatalf("MySQL SQL 聚合必须发现值变化：%+v", rep.Levels[0].Findings)
+	}
+}

@@ -6,6 +6,7 @@ import (
 	"hash/fnv"
 	"math/big"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/spencerswagger/jinliang/internal/source"
@@ -44,9 +45,10 @@ func newTableAgg(srcT source.Table, cols []string) *tableAgg {
 		types[strings.ToLower(c.Name)] = c.Type
 	}
 	for _, c := range cols {
-		if isNumericType(types[strings.ToLower(c)]) {
-			a.numeric[c] = true
-			a.sums[c] = new(big.Rat)
+		key := strings.ToLower(c)
+		if isNumericType(types[key]) {
+			a.numeric[key] = true
+			a.sums[key] = new(big.Rat)
 		}
 	}
 	return a
@@ -55,27 +57,28 @@ func newTableAgg(srcT source.Table, cols []string) *tableAgg {
 func (a *tableAgg) add(row []any, cols []string) {
 	a.rows++
 	for i, c := range cols {
+		key := strings.ToLower(c)
 		var v any
 		if i < len(row) {
 			v = row[i]
 		}
 		if v == nil {
-			a.nulls[c]++
+			a.nulls[key]++
 			continue
 		}
-		if a.numeric[c] {
+		if a.numeric[key] {
 			if r, ok := toRat(v); ok {
-				a.sums[c].Add(a.sums[c], r)
-				if a.mins[c] == nil || r.Cmp(a.mins[c]) < 0 {
-					a.mins[c] = new(big.Rat).Set(r)
+				a.sums[key].Add(a.sums[key], r)
+				if a.mins[key] == nil || r.Cmp(a.mins[key]) < 0 {
+					a.mins[key] = new(big.Rat).Set(r)
 				}
-				if a.maxs[c] == nil || r.Cmp(a.maxs[c]) > 0 {
-					a.maxs[c] = new(big.Rat).Set(r)
+				if a.maxs[key] == nil || r.Cmp(a.maxs[key]) > 0 {
+					a.maxs[key] = new(big.Rat).Set(r)
 				}
 			}
 			continue
 		}
-		a.textLen[c] += int64(len(canonicalValue(v)))
+		a.textLen[key] += int64(len(canonicalValue(v)))
 	}
 }
 
@@ -357,10 +360,10 @@ func runDataFull(ctx context.Context, lr *LevelReport, opts Options, name string
 				srcAgg.add(srcRow, commonCols)
 				tgtAgg.add(tgtRow, commonCols)
 				pkDesc := pkDescription(srcRow, srcIdx)
-				srcCanon := canonicalRow(commonCols, srcRow)
-				tgtCanon := canonicalRow(commonCols, tgtRow)
+				srcCanon := canonicalRowNumeric(commonCols, srcRow, srcAgg.numeric)
+				tgtCanon := canonicalRowNumeric(commonCols, tgtRow, tgtAgg.numeric)
 				if srcCanon != tgtCanon {
-					col, sv, tv := firstDiff(commonCols, srcRow, tgtRow)
+					col, sv, tv := firstDiffNumeric(commonCols, srcRow, tgtRow, srcAgg.numeric)
 					lr.add(SeverityError, "row_mismatch", name, col,
 						"行内容不一致（主键 "+pkDesc+"）", trunc(sv, 80), trunc(tv, 80),
 						"按主键重放该行；若反复出现，检查转换规则")
@@ -461,4 +464,82 @@ func pkDescription(row []any, idx []int) string {
 		parts[i] = fmt.Sprint(v)
 	}
 	return strings.Join(parts, ",")
+}
+
+// SQLAggregator is the optional cheap L1 path: one aggregate query per side
+// instead of a full row scan. runtime.DB implements it for PG/MySQL.
+type SQLAggregator interface {
+	AggregateSQL(ctx context.Context, schema, table string, columns []string, numeric map[string]bool) (int64, map[string]string, error)
+}
+
+// runAggregateSQL compares L1 evidence only (count/sum/min/max/text_len/nulls).
+// It is the daily-check path; it cannot localize a row, so a mismatch tells the
+// operator to run the full data level.
+func runAggregateSQL(ctx context.Context, lr *LevelReport, opts Options, name string,
+	srcT source.Table, commonCols []string) {
+	numeric := newTableAgg(srcT, commonCols).numeric
+	srcAgg, err := sqlAggFor(ctx, opts.Source, opts.SourceSchema, name, commonCols, numeric, srcT)
+	if err != nil {
+		lr.add(SeverityError, "probe_failed", name, "", "源端聚合查询失败："+err.Error(), "", "", "")
+		return
+	}
+	tgtAgg, err := sqlAggFor(ctx, opts.Target, opts.TargetSchema, name, commonCols, numeric, srcT)
+	if err != nil {
+		lr.add(SeverityError, "probe_failed", name, "", "目标端聚合查询失败："+err.Error(), "", "", "")
+		return
+	}
+	for _, f := range srcAgg.compare(tgtAgg, name) {
+		lr.Findings = append(lr.Findings, f)
+		lr.OK = false
+	}
+	lr.stat("aggregate_only", true)
+	lr.stat("rows_source", srcAgg.rows)
+	lr.stat("rows_target", tgtAgg.rows)
+}
+
+func sqlAggFor(ctx context.Context, side Side, schema, table string, cols []string,
+	numeric map[string]bool, srcT source.Table) (*tableAgg, error) {
+	agg, ok := side.(SQLAggregator)
+	if !ok {
+		return nil, fmt.Errorf("该连接不支持 SQL 聚合下推（用完整 data 级）")
+	}
+	rows, vals, err := agg.AggregateSQL(ctx, schema, table, cols, numeric)
+	if err != nil {
+		return nil, err
+	}
+	return aggFromSQL(rows, vals, cols, numeric, srcT), nil
+}
+
+func aggFromSQL(rows int64, vals map[string]string, cols []string, numeric map[string]bool, srcT source.Table) *tableAgg {
+	a := newTableAgg(srcT, cols)
+	a.rows = rows
+	for _, c := range cols {
+		key := strings.ToLower(c)
+		if numeric[key] {
+			if r, ok := ratFromString(vals["sum:"+key]); ok {
+				a.sums[key] = r
+			}
+			if r, ok := ratFromString(vals["min:"+key]); ok {
+				a.mins[key] = r
+			}
+			if r, ok := ratFromString(vals["max:"+key]); ok {
+				a.maxs[key] = r
+			}
+		}
+		if n, ok := parseInt64(vals["len:"+key]); ok {
+			a.textLen[key] = n
+		}
+		if n, ok := parseInt64(vals["nulls:"+key]); ok {
+			a.nulls[key] = n
+		}
+	}
+	return a
+}
+
+func parseInt64(s string) (int64, bool) {
+	if s == "" {
+		return 0, false
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
+	return n, err == nil
 }

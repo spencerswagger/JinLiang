@@ -50,3 +50,21 @@ numeric(12,4) 精度截断）。
 - `verify` 现在默认全表扫描（按主键有序），成本与表大小线性相关；无主键表只聚合。
 - `docs/VERIFY.md` 已按实现更新；抽样明确标为「补充、不是判据」。
 - nightly 集成按资源隔离分组（engine/pgsink 各自在 public 建 `_jl_*`，不能并发）。
+
+## Owl #47 必改：数值口径统一（避免 PG→MySQL 天天假红）
+
+- 行级 `canonicalRow`/`firstDiff` 现在接收 numeric 列集合：`numeric`/`decimal` 先
+  `toRat` 再统一成 `RatString()`，与 L1 的 `big.Rat` 同口径；`"1.0000"` 与 `"1.00"`、
+  `"0.10"` 与 `"0.1"` 判相等。
+- 新用例 `TestNumericSameValueDifferentScaleIsEqual`（源 PG `1.0000/0.10`，目标 MySQL
+  `1.00/0.1`，必须通过）；`TestAggregateCatchesPrecisionChange` 改为真正不同值
+  `2.3450 → 2.3400`，断言 `metrics.v` + 主键 2 + `aggregate_mismatch`。
+- 文档修正：互换是**逐行比对**发现，块 checksum 只负责定位（不是唯一判据）。
+
+## 日常例检的便宜路：`--aggregate-only`
+
+- `runtime.DB.AggregateSQL`：两端各一条 `count/sum/min/max/text_len/nulls` 查询
+  （PG 用 `::text`/`CAST AS text`，MySQL 用 `CAST AS CHAR`），秒级。
+- `jinliang verify --level data --aggregate-only` 只跑 L1；不一致时提示改跑完整 data 级定位。
+- 测试：`TestPGVerifyAggregateOnly`、`TestMySQLVerifyAggregateOnly`（真库）。
+- 完整全表扫描仍是默认；10M 行分钟级，留给发布前/周检，文档已写清量级。

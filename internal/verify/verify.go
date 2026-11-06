@@ -119,6 +119,9 @@ type Options struct {
 
 	// SampleRows is the number of primary keys compared per table.
 	SampleRows int
+	// AggregateOnly runs only the cheap SQL aggregate tier (count/sum/min/max/
+	// text_len/nulls). Use it for daily checks; full row scan is for release/weekly.
+	AggregateOnly bool
 
 	// Position probes for the consistency tier. Nil means "not available"
 	// and the tier reports that honestly instead of passing.
@@ -356,6 +359,10 @@ func runData(ctx context.Context, opts Options) LevelReport {
 			lr.add(SeverityError, "missing_column", name, "", "两端没有共同的列，无法比对", "", "", "")
 			continue
 		}
+		if opts.AggregateOnly {
+			runAggregateSQL(ctx, &lr, opts, name, srcT, commonCols)
+			continue
+		}
 		if len(srcT.PrimaryKey) == 0 || len(tgtT.PrimaryKey) == 0 {
 			lr.add(SeverityWarn, "no_pk_aggregate", name, "",
 				"没有主键：只做全表聚合比对，无法逐行定位", "", "", "")
@@ -410,11 +417,12 @@ func runSampling(ctx context.Context, lr *LevelReport, opts Options, name string
 			continue
 		}
 		matched++
-		srcCanon := canonicalRow(commonCols, srcRow)
-		tgtCanon := canonicalRow(commonCols, tgtRow)
+		numCols := newTableAgg(srcT, commonCols).numeric
+		srcCanon := canonicalRowNumeric(commonCols, srcRow, numCols)
+		tgtCanon := canonicalRowNumeric(commonCols, tgtRow, numCols)
 		digest.Write([]byte(rowDigest(srcCanon)))
 		if srcCanon != tgtCanon {
-			col, sv, tv := firstDiff(commonCols, srcRow, tgtRow)
+			col, sv, tv := firstDiffNumeric(commonCols, srcRow, tgtRow, numCols)
 			lr.add(SeverityError, "row_mismatch", name, col,
 				"抽样行的内容不一致（全表扫描后又被改？）", trunc(sv, 80), trunc(tv, 80),
 				"确认是否有并发写入；按主键重放该行")
@@ -602,14 +610,36 @@ func commonColumns(srcT, tgtT source.Table) []string {
 // canonicalRow renders values the same way on both sides, then joins them with
 // a separator that cannot appear in the escaped form.
 func canonicalRow(cols []string, vals []any) string {
+	return canonicalRowNumeric(cols, vals, nil)
+}
+
+// canonicalRowNumeric is canonicalRow with the numeric-column set applied.
+// numeric/decimal come back from database/sql as strings ("1.0000", "1.00");
+// comparing those as text makes every cross-scale pair look different even
+// though L1's big.Rat says equal. Numeric columns must use RatString().
+func canonicalRowNumeric(cols []string, vals []any, numeric map[string]bool) string {
 	var b strings.Builder
 	for i, v := range vals {
 		if i > 0 {
 			b.WriteByte('|')
 		}
-		b.WriteString(canonicalValue(v))
+		name := ""
+		if i < len(cols) {
+			name = cols[i]
+		}
+		b.WriteString(canonicalValueFor(name, v, numeric))
 	}
 	return b.String()
+}
+
+func canonicalValueFor(col string, v any, numeric map[string]bool) string {
+	key := strings.ToLower(col)
+	if numeric[key] || numeric[col] {
+		if r, ok := toRat(v); ok {
+			return "n" + r.RatString()
+		}
+	}
+	return canonicalValue(v)
 }
 
 func canonicalValue(v any) string {
@@ -650,6 +680,10 @@ func rowDigest(canon string) string {
 }
 
 func firstDiff(cols []string, a, b []any) (string, string, string) {
+	return firstDiffNumeric(cols, a, b, nil)
+}
+
+func firstDiffNumeric(cols []string, a, b []any, numeric map[string]bool) (string, string, string) {
 	n := len(cols)
 	if len(a) < n {
 		n = len(a)
@@ -658,8 +692,10 @@ func firstDiff(cols []string, a, b []any) (string, string, string) {
 		n = len(b)
 	}
 	for i := 0; i < n; i++ {
-		if canonicalValue(a[i]) != canonicalValue(b[i]) {
-			return cols[i], canonicalValue(a[i]), canonicalValue(b[i])
+		av := canonicalValueFor(cols[i], a[i], numeric)
+		bv := canonicalValueFor(cols[i], b[i], numeric)
+		if av != bv {
+			return cols[i], av, bv
 		}
 	}
 	if len(a) != len(b) {

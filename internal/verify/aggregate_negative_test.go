@@ -61,12 +61,30 @@ func TestAggregateCatchesDeletedRow(t *testing.T) {
 
 func TestAggregateCatchesPrecisionChange(t *testing.T) {
 	src, tgt := newFake("postgres"), newFake("postgres")
-	src.add(ordersTable(), ordersRows()...)
-	rows := cloneRows(ordersRows())
-	rows[2]["amount"] = "30.0" // 1.234 -> 1.23 同类：值变了但行数不变
-	tgt.add(ordersTable(), rows...)
+	tab := source.Table{
+		TableRef: source.TableRef{Schema: "public", Table: "metrics"},
+		Columns: []source.Column{
+			{Name: "id", Type: "bigint", Nullable: false},
+			{Name: "v", Type: "numeric(12,4)", Nullable: false},
+		},
+		PrimaryKey: []string{"id"}, HasStablePK: true,
+	}
+	src.add(tab,
+		map[string]any{"id": int64(1), "v": "1.2340"},
+		map[string]any{"id": int64(2), "v": "2.3450"},
+		map[string]any{"id": int64(3), "v": "3.4560"},
+	)
+	tgt.add(tab,
+		map[string]any{"id": int64(1), "v": "1.2340"},
+		map[string]any{"id": int64(2), "v": "2.3400"}, // 2.3450 -> 2.3400：精度被截
+		map[string]any{"id": int64(3), "v": "3.4560"},
+	)
+	opts := baseOptions(src, tgt)
+	opts.Tables = []string{"metrics"}
+	opts.Level = LevelData
+	opts.SampleRows = 1
 
-	rep, err := Run(context.Background(), dataOnly(t, src, tgt))
+	rep, err := Run(context.Background(), opts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,8 +92,44 @@ func TestAggregateCatchesPrecisionChange(t *testing.T) {
 		t.Fatalf("精度变化没被发现：%+v", rep.Levels[0])
 	}
 	f := findFinding(rep, "row_mismatch")
-	if f == nil || f.Table != "orders" || f.Column != "amount" || !strings.Contains(f.Detail, "主键 3") {
-		t.Fatalf("必须指到具体行/列（orders.amount, 主键 3），实际 findings=%+v", rep.Levels[0].Findings)
+	if f == nil || f.Table != "metrics" || f.Column != "v" || !strings.Contains(f.Detail, "主键 2") {
+		t.Fatalf("必须指到具体行/列（metrics.v, 主键 2），实际 findings=%+v", rep.Levels[0].Findings)
+	}
+	if !hasCode(rep, "aggregate_mismatch") {
+		t.Fatalf("聚合 sum/min/max 也应报不一致，实际 findings=%+v", rep.Levels[0].Findings)
+	}
+}
+
+// 同一逻辑值不同 scale 必须判相等（PG numeric(12,4) 的 "1.0000" 与 MySQL
+// decimal(12,2) 的 "1.00" 是同一个数；按文本比会天天假红）。
+func TestNumericSameValueDifferentScaleIsEqual(t *testing.T) {
+	src, tgt := newFake("postgres"), newFake("mysql")
+	tab := source.Table{
+		TableRef: source.TableRef{Schema: "public", Table: "amounts"},
+		Columns: []source.Column{
+			{Name: "id", Type: "bigint", Nullable: false},
+			{Name: "v", Type: "numeric(12,4)", Nullable: false},
+		},
+		PrimaryKey: []string{"id"}, HasStablePK: true,
+	}
+	src.add(tab,
+		map[string]any{"id": int64(1), "v": "1.0000"},
+		map[string]any{"id": int64(2), "v": "0.10"},
+	)
+	tgt.add(tab,
+		map[string]any{"id": int64(1), "v": "1.00"},
+		map[string]any{"id": int64(2), "v": "0.1"},
+	)
+	opts := baseOptions(src, tgt)
+	opts.Tables = []string{"amounts"}
+	opts.Level = LevelData
+	opts.SampleRows = 10
+	rep, err := Run(context.Background(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rep.OK {
+		t.Fatalf("同一逻辑值不同 scale 必须判相等，实际 findings=%+v", rep.Levels[0].Findings)
 	}
 }
 
