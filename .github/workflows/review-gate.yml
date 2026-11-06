@@ -30,6 +30,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: 判定逻辑自测（否决词/state/锚定）
+        run: scripts/check_review_gate.sh selftest
       - name: 最新 review 是否针对当前 head 且放行
         id: gate
         # advisory：失败不把 job 判红，只留 warning 注解；转 required 时删掉这一行。
