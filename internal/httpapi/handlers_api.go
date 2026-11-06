@@ -343,20 +343,18 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.startJob(ctx, job, actorOf(r)); err != nil {
+		// 注意用 errors.As 而不是 errors.Is：这个错误**带字段**（是哪一台），
+		// 用哨兵指针比较永远不相等，会掉到下面「本进程在跑」那条去。
+		if oi := asOtherInstance(err); oi != nil {
+			s.writeError(w, r, http.StatusConflict, conflictOtherInstance(oi.OwnerInstance, oi.RunID, oi.HeartbeatAt))
+			return
+		}
+		if errors.Is(err, errStaleRunInControlDB) {
+			s.writeError(w, r, http.StatusConflict, conflictStaleRun())
+			return
+		}
 		if errors.Is(err, control.ErrRunInProgress) {
-			s.writeError(w, r, http.StatusConflict, apiError{
-				Class:   "user_action",
-				Message: "这个任务暂时起不来：控制库里还有一条未结束的运行",
-				Why: "一个任务同时只允许一条活跃运行（库里有唯一索引挡着）。" +
-					"如果上一次是进程被强杀（没有心跳），引擎会在下一次启动时把它收尾成「已中断」再接管——" +
-					"所以这里拒绝的通常是「真的还有另一个进程在写」",
-				Next: []string{
-					"打开任务页看实时事件：GET /api/jobs/{id}/events",
-					"确认没有别的进程在跑（多实例部署时尤其要看）：看那条 run 的 owner_instance",
-					"确实卡住了：等心跳过期（默认 90 秒）后重试，或 POST /api/jobs/{id}/stop",
-				},
-				Risk: "无：位点与数据同事务提交，重跑从断点继续",
-			})
+			s.writeError(w, r, http.StatusConflict, conflictThisProcess())
 			return
 		}
 		// 引擎能力边界（例如 MySQL 目标端）是「用户可修正」的问题：422 + 四段式，
@@ -729,4 +727,53 @@ func (s *Server) handleCodes(w http.ResponseWriter, r *http.Request) {
 	// 免得每打开一个任务页都重新拉一遍（页面里只拉一次，但刷新会重来）。
 	w.Header().Set("Cache-Control", "private, max-age=300")
 	writeJSON(w, http.StatusOK, map[string]any{"codes": out, "count": len(out)})
+}
+
+// 三个「这个任务起不来」的四段式都定义在这里，**HTTP 与表单两个入口共用**。
+// 今晚的教训：双入口各写一份文案，改一处漏一处（表单版曾漏掉端点与动词）。
+func conflictThisProcess() apiError {
+	return apiError{
+		Class:   "user_action",
+		Message: "这个任务已经开始在跑了",
+		Why:     "同一个任务同时只允许一条运行（本机靠这层登记，多实例靠目标端租约），否则两条写入流会互相覆盖",
+		Next: []string{
+			"看实时事件确认它在做什么：GET /api/jobs/{id}/events",
+			"想停下：POST /api/jobs/{id}/stop（位点已提交，重跑从断点继续）",
+		},
+		Risk: "无",
+	}
+}
+
+func conflictOtherInstance(owner, runID, heartbeatAt string) apiError {
+	why := "控制库里那条运行的心跳还是新鲜的，说明另一个 jinliang 进程正在写它（多实例部署时的正常互斥）"
+	if owner != "" {
+		why += "。跑它的是实例 " + owner
+		if heartbeatAt != "" {
+			why += "，最后心跳 " + heartbeatAt
+		}
+	}
+	return apiError{
+		Class:   "user_action",
+		Message: "另一个实例正在跑这个任务",
+		Why:     why,
+		Next: []string{
+			"等它跑完：任务页的事件流能看到它的阶段",
+			"确实要停下：到上面那个实例所在的机器上执行 POST /api/jobs/{id}/stop（别在本机重启 serve）",
+		},
+		Risk: "在本机重启 serve 不影响它，但也停不下它；两个进程同时写同一任务会被目标端租约挡住",
+	}
+}
+
+func conflictStaleRun() apiError {
+	return apiError{
+		Class:   "user_action",
+		Message: "这个任务起不来：控制库里还有一条上次没结束的运行",
+		Why: "上一次的进程被强杀（没有心跳）留下的占位。" +
+			"serve 启动时会按心跳过期（默认 90 秒）替它收尾成「已中断」，然后就能起来了",
+		Next: []string{
+			"等一会儿再点「开始」（超过心跳阈值后 serve 会收尾）",
+			"或者重启用一次 serve：启动时的收尾会把这条标成「已中断」",
+		},
+		Risk: "无：那条运行已经不会写数据了；重跑会从目标端已提交的位点继续",
+	}
 }
