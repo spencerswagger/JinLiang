@@ -145,8 +145,10 @@ python scripts/validate_schema.py examples/*.yaml
 
 - 查 PR **最新一条 review**：`commit_id` 必须等于当前 head，正文必须明确「必改 0 / 可合并 / 放行」；
   任一不满足就失败并打印原因（旧 head 的通过不算）。
-- 跑在 `pull_request` 的 synchronize/reopened/edited 与 `pull_request_review` 上；
-  **现在只告警不挡合并**，稳定一周后把 `review-gate (advisory)` 转成 required。
+- 跑在 `pull_request` 的 synchronize/reopened/edited/closed 与 `pull_request_review` 上；
+  **现在只告警不挡合并**。转 required 的有序步骤：① 删掉两个 job 的 `continue-on-error`
+  （job 名从第一天起就是稳定的 `review-gate` / `admin-merge-audit`，**不要改名**）；
+  ② 在 branch protection 把这两个已有 check 设为 required；③ 用一个 PR 确认 required 生效。
 - 合并后审计：若合并时 base 已前进（squash/merge 第一父提交 ≠ PR base，疑似 `--admin` 绕过），
   PR 上必须有含 `--admin` 与原因的 comment，否则告警；后门只用于救红 main。
 - 绕过它需要管理员操作，并在 PR 里写明原因与负责人（事后追认）；不允许自己点掉检查。

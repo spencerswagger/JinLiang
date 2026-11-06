@@ -74,3 +74,30 @@ exit=0
 
 advisory 起步，与 review-gate 同一个 workflow；转 required 时把 `admin-merge-audit (advisory)`
 的 `continue-on-error` 去掉并加进 branch protection。
+
+## 第二轮必改：门禁自己不误放行
+
+旧实现两个洞：`不可合并` 含「可合并」会 MATCH；`CHANGES_REQUESTED` 没特判。
+现在（`scripts/review_gate_logic.py`，可 `scripts/check_review_gate.sh selftest`）：
+
+- `state in (DISMISSED, CHANGES_REQUESTED)` → 硬否决，不看正文；
+- 先否决词：`不可合并|不予放行|不通过|必须修|必改\s*[1-9]` 命中即 FAIL；
+- 放行必须在行首结论行：`(?m)^[*_>#\-\s]*(结论[:：]\s*)?... (可合并|必改 0|...)`；
+- 取完 reviews 再读一次 head，两次不一致 → FAIL（head 竞态）。
+
+selftest 覆盖 8 个输入（`不可合并` / `不予放行` / `上一轮必改 0，本轮必改 2 条` /
+`必改 2 条` / `CHANGES_REQUESTED` + 可合并 / 旧 head / 正常放行）全部按预期。
+
+三种真 PR 复测：
+
+```
+# ① 当前 head + 放行
+$ scripts/check_review_gate.sh 10        → PASS，exit 0
+# ② 旧 head + 放行（#44：review 46288d8，head 0ffb544）
+$ scripts/check_review_gate.sh 44        → FAIL「结论针对 46288d8，当前 head 0ffb544」，exit 1
+# ③ 当前/旧 head + 必改 2 条（#55）
+$ scripts/check_review_gate.sh 55        → FAIL「正文含否决词…必改 2 条」，exit 1
+```
+
+advisory→required 顺序：job 名保持 `review-gate` / `admin-merge-audit` 不变，
+先删 `continue-on-error`，再把这两个已有 check 加进 required；不要同时改名。
