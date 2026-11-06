@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql/driver"
 	"errors"
+	"fmt"
 	"github.com/spencerswagger/jinliang/internal/core"
 
 	"github.com/jackc/pgx/v5/pgconn"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/spencerswagger/jinliang/internal/control"
+	"github.com/spencerswagger/jinliang/internal/dsn"
 	"github.com/spencerswagger/jinliang/internal/pgsource"
 	"github.com/spencerswagger/jinliang/internal/source"
 	"github.com/spencerswagger/jinliang/internal/state"
@@ -689,22 +691,59 @@ func TestFullRecopyDecision(t *testing.T) {
 //   - pgtype.* 实现了 driver.Valuer → 取其值（numeric 不能变成 "{1 -2 false finite true}"）
 //   - 数组是**原生切片**、不实现 driver.Valuer → 必须 json.Marshal（不能 "[1 2 3]"）
 func TestToValueHandlesPgxStructures(t *testing.T) {
-	// 数组
-	if v := toValue([]int32{1, 2, 3}); v.Kind != source.KindJSON || v.S != "[1,2,3]" {
-		t.Fatalf("int32 数组应落成 JSON 文本，得到 kind=%d %q", v.Kind, v.S)
+	// 普通标量数组：元素是可 JSON 化的基本类型，照旧落 JSON
+	if v, err := toValue([]int32{1, 2, 3}); err != nil || v.Kind != source.KindJSON || v.S != "[1,2,3]" {
+		t.Fatalf("int32 数组应落成 JSON 文本，得到 kind=%d %q err=%v", v.Kind, v.S, err)
 	}
-	if v := toValue([]string{"a", "b"}); v.Kind != source.KindJSON || v.S != `["a","b"]` {
-		t.Fatalf("text 数组应落成 JSON 文本，得到 kind=%d %q", v.Kind, v.S)
+	if v, err := toValue([]string{"a", "b"}); err != nil || v.Kind != source.KindJSON || v.S != `["a","b"]` {
+		t.Fatalf("text 数组应落成 JSON 文本，得到 kind=%d %q err=%v", v.Kind, v.S, err)
 	}
 	// 标量照旧
-	if v := toValue(int64(7)); v.Kind != source.KindInt || v.I != 7 {
+	if v, _ := toValue(int64(7)); v.Kind != source.KindInt || v.I != 7 {
 		t.Fatal("整数应保持 KindInt")
 	}
-	if v := toValue(nil); v.Kind != source.KindNull {
+	if v, _ := toValue(nil); v.Kind != source.KindNull {
 		t.Fatal("nil 应是 KindNull")
 	}
-	if v := toValue([]byte{0xde, 0xad}); v.Kind != source.KindBytes {
+	if v, _ := toValue([]byte{0xde, 0xad}); v.Kind != source.KindBytes {
 		t.Fatal("[]byte 必须仍是 KindBytes（不能当成数组做 JSON）")
+	}
+}
+
+// Owl 实测的反例：`[]pgtype.Interval` 没实现 json.Marshaler，json.Marshal 会写出
+// `[{"Microseconds":100,"Days":1,"Months":0,"Valid":true}]` —— 合法 JSON、内容是结构体字段，
+// 会被静默写进 json 列，**md5 也发现不了**。反射分支因此要求元素实现 json.Marshaler，
+// 不满足就响亮失败。
+func TestToValueRejectsSliceWithoutJSONMarshaler(t *testing.T) {
+	type intervalLike struct {
+		Microseconds int64
+		Days         int
+		Months       int
+		Valid        bool
+	}
+	_, err := toValue([]intervalLike{{Microseconds: 100, Days: 1, Valid: true}})
+	if err == nil {
+		t.Fatal("元素没有 JSON 表示时必须报错，不能静默写出结构体字段")
+	}
+	if !strings.Contains(err.Error(), "json.Marshaler") {
+		t.Fatalf("错误要说清缺的是 JSON 表示，得到：%v", err)
+	}
+}
+
+// 元素实现了 json.Marshaler 的数组照旧可以落 JSON。
+type jsonableElem struct{ V int }
+
+func (e jsonableElem) MarshalJSON() ([]byte, error) {
+	return []byte(fmt.Sprintf(`{"v":%d}`, e.V)), nil
+}
+
+func TestToValueAcceptsSliceWithJSONMarshaler(t *testing.T) {
+	v, err := toValue([]jsonableElem{{V: 1}, {V: 2}})
+	if err != nil {
+		t.Fatalf("实现了 json.Marshaler 的数组应可序列化: %v", err)
+	}
+	if v.Kind != source.KindJSON || v.S != `[{"v":1},{"v":2}]` {
+		t.Fatalf("得到 kind=%d %q", v.Kind, v.S)
 	}
 }
 
@@ -714,8 +753,67 @@ type fakeValuer struct{ s string }
 func (f fakeValuer) Value() (driver.Value, error) { return f.s, nil }
 
 func TestToValueUsesDriverValuer(t *testing.T) {
-	v := toValue(fakeValuer{s: "12.34"})
-	if v.Kind != source.KindString || v.S != "12.34" {
-		t.Fatalf("driver.Valuer 应取其值，得到 kind=%d %q", v.Kind, v.S)
+	v, err := toValue(fakeValuer{s: "12.34"})
+	if err != nil || v.Kind != source.KindString || v.S != "12.34" {
+		t.Fatalf("driver.Valuer 应取其值，得到 kind=%d %q err=%v", v.Kind, v.S, err)
+	}
+}
+
+// Valuer 自己报错时不能退回 fmt.Sprint（那会写结构体打印、错误信息离真相很远）。
+type failingValuer struct{}
+
+func (failingValuer) Value() (driver.Value, error) { return nil, errors.New("取值炸了") }
+
+func TestToValuePropagatesValuerError(t *testing.T) {
+	if _, err := toValue(failingValuer{}); err == nil {
+		t.Fatal("driver.Valuer 返回错误时必须向上抛，不能兜底成字符串")
+	}
+}
+
+// preflight 的阻断口径：**只拦数组**（会被映成 json、元素可能没有 JSON 表示 → 静默写错），
+// 不拦 timestamptz 之类「丢时区但知情可接受」的 NeedsConfirm——否则几乎所有真实任务都跑不起来。
+func TestTypeCompatibilityBlocksOnlyArrays(t *testing.T) {
+	cat := source.Catalog{Tables: []source.Table{
+		{
+			TableRef: source.TableRef{Schema: "public", Table: "with_array"},
+			Columns: []source.Column{
+				{Name: "id", Type: "bigint"},
+				{Name: "tags", Type: "integer[]"},
+			},
+			PrimaryKey: []string{"id"},
+		},
+		{
+			TableRef: source.TableRef{Schema: "public", Table: "normal"},
+			Columns: []source.Column{
+				{Name: "id", Type: "bigint"},
+				{Name: "created_at", Type: "timestamp with time zone"},
+				{Name: "payload", Type: "text"},
+			},
+			PrimaryKey: []string{"id"},
+		},
+	}}
+	refs := []source.TableRef{
+		{Schema: "public", Table: "with_array"},
+		{Schema: "public", Table: "normal"},
+	}
+	mk := func(kind string) *runner {
+		return &runner{
+			cat:   cat,
+			doc:   control.JobDoc{},
+			tgtEP: dsn.Endpoint{Kind: kind},
+		}
+	}
+	// MySQL 目标端：数组列必须被拦
+	err := mk(dsn.KindMySQL).checkTypeCompatibility(refs)
+	if err == nil || !strings.Contains(err.Error(), "tags") {
+		t.Fatalf("数组列应被 preflight 拦下，得到 %v", err)
+	}
+	// MySQL 目标端：只有 timestamptz 的普通表不该被拦
+	if err := mk(dsn.KindMySQL).checkTypeCompatibility(refs[1:]); err != nil {
+		t.Fatalf("timestamptz 不该被阻断（它只是预检 warn）：%v", err)
+	}
+	// PG 目标端：类型原样搬，什么都不拦
+	if err := mk(dsn.KindPostgres).checkTypeCompatibility(refs); err != nil {
+		t.Fatalf("PG→PG 不该走这道检查：%v", err)
 	}
 }

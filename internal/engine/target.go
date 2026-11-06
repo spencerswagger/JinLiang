@@ -143,11 +143,15 @@ func (r *runner) executeGenericFullCopy(ctx context.Context, res *Result) error 
 				}
 				evs := make([]source.Event, 0, end-i)
 				for _, row := range rows[i:end] {
+					vals, verr := toValues(row)
+					if verr != nil {
+						return fmt.Errorf("转换 %s 的一行失败（宁可停下也不写错数据）: %w", ch.Table.Table, verr)
+					}
 					evs = append(evs, source.Event{
 						Kind:     source.EvInsert,
 						Table:    ref,
 						Relation: rel,
-						New:      source.Row{Table: ref, Values: toValues(row)},
+						New:      source.Row{Table: ref, Values: vals},
 					})
 				}
 				// 位点留空：非 PG 目标端本次不写位点（状态表未实现），不是「忘了传」。
@@ -207,66 +211,89 @@ func (r *runner) relationOf(ref source.TableRef) *source.Table {
 // toValues 把驱动原生值（pgx 已解好的 any）转成契约里的 source.Value。
 // 目标端只按 Kind 取值，所以这里不需要什么聪明处理；认不出的类型按字符串兜底
 // （mysqlsink 的 driverValue 会按 KindString 传，最差是让数据库自己转）。
-func toValues(row []any) []source.Value {
+func toValues(row []any) ([]source.Value, error) {
 	out := make([]source.Value, len(row))
 	for i, v := range row {
-		out[i] = toValue(v)
+		sv, err := toValue(v)
+		if err != nil {
+			return nil, fmt.Errorf("第 %d 列：%w", i+1, err)
+		}
+		out[i] = sv
 	}
-	return out
+	return out, nil
 }
 
-func toValue(v any) source.Value {
+func toValue(v any) (source.Value, error) {
 	switch x := v.(type) {
 	case nil:
-		return source.Value{Kind: source.KindNull}
+		return source.Value{Kind: source.KindNull}, nil
 	case int16:
-		return source.Value{Kind: source.KindInt, I: int64(x)}
+		return source.Value{Kind: source.KindInt, I: int64(x)}, nil
 	case int32:
-		return source.Value{Kind: source.KindInt, I: int64(x)}
+		return source.Value{Kind: source.KindInt, I: int64(x)}, nil
 	case int64:
-		return source.Value{Kind: source.KindInt, I: x}
+		return source.Value{Kind: source.KindInt, I: x}, nil
 	case float32:
-		return source.Value{Kind: source.KindFloat, F: float64(x)}
+		return source.Value{Kind: source.KindFloat, F: float64(x)}, nil
 	case float64:
-		return source.Value{Kind: source.KindFloat, F: x}
+		return source.Value{Kind: source.KindFloat, F: x}, nil
 	case bool:
 		b := int64(0)
 		if x {
 			b = 1
 		}
-		return source.Value{Kind: source.KindBool, I: b}
+		return source.Value{Kind: source.KindBool, I: b}, nil
 	case string:
-		return source.Value{Kind: source.KindString, S: x}
+		return source.Value{Kind: source.KindString, S: x}, nil
 	case []byte:
-		return source.Value{Kind: source.KindBytes, B: x}
+		return source.Value{Kind: source.KindBytes, B: x}, nil
 	case time.Time:
-		return source.Value{Kind: source.KindTime, T: x}
+		return source.Value{Kind: source.KindTime, T: x}, nil
 	case []any, []int16, []int32, []int64, []float32, []float64, []string, []bool, []time.Time:
 		// pgx 把 SQL 数组解成原生切片，**不实现 driver.Valuer**——落到 fmt.Sprint 会写出
 		// "[1 2 3]"，而 typemap 把数组映成 MySQL 的 json 列，于是错误要等到插第一行时才现形
 		// （"Invalid JSON text"，离真实原因很远）。这里显式 json.Marshal，落成合法 JSON。
 		if b, err := json.Marshal(x); err == nil {
-			return source.Value{Kind: source.KindJSON, S: string(b)}
+			return source.Value{Kind: source.KindJSON, S: string(b)}, nil
 		}
-		return source.Value{Kind: source.KindString, S: fmt.Sprint(x)}
+		return source.Value{Kind: source.KindString, S: fmt.Sprint(x)}, nil
 	case driver.Valuer:
-		// pgx 对 numeric/uuid/array/interval 等返回自己的类型（pgtype.*），
-		// 它们都实现了 driver.Valuer；**不能 fmt.Sprint** —— 那会把 numeric 变成
-		// "{1 -2 false finite true}" 这种结构体打印，目标端报「Incorrect decimal value」。
-		if dv, err := x.Value(); err == nil {
-			return toValue(dv)
+		// pgx 对 numeric/uuid 等返回自己的类型（pgtype.*），它们实现了 driver.Valuer；
+		// **不能 fmt.Sprint** —— 那会把 numeric 变成 "{1 -2 false finite true}" 这种结构体打印，
+		// 目标端报「Incorrect decimal value」，离真相很远。
+		dv, err := x.Value()
+		if err != nil {
+			return source.Value{}, fmt.Errorf("%T 取值失败（driver.Valuer）: %w", v, err)
 		}
-		return source.Value{Kind: source.KindString, S: fmt.Sprint(x)}
+		return toValue(dv)
 	default:
-		// 兜底前再看一眼「其它元素类型的数组」（pgx 对 uuid[]/numeric[] 等也给原生切片）：
-		// 用反射判断种类，仍然走 json.Marshal，绝不 fmt.Sprint。
-		switch reflect.ValueOf(v).Kind() {
-		case reflect.Slice, reflect.Array:
-			if b, err := json.Marshal(v); err == nil {
-				return source.Value{Kind: source.KindJSON, S: string(b)}
+		// 其它元素类型的数组（pgx 对 interval[]/自定义类型数组也给原生切片）：
+		// **只有元素实现了 json.Marshaler 才敢 marshal**。
+		// 反例（Owl 实测）：`[]pgtype.Interval` 没有 MarshalJSON，json.Marshal 会写出
+		// `[{"Microseconds":100,"Days":1,"Months":0,"Valid":true}]` —— 合法 JSON，内容是
+		// 结构体字段。它会被当合法 JSON 写进 json 列，**全程不报错，md5 也发现不了**
+		// （因为它一致地写错了）。所以这里宁可响亮失败，也不静默写错。
+		rv := reflect.ValueOf(v)
+		if k := rv.Kind(); k == reflect.Slice || k == reflect.Array {
+			if rv.Len() == 0 {
+				return source.Value{Kind: source.KindJSON, S: "[]"}, nil
 			}
+			elem := rv.Type().Elem()
+			if !elem.Implements(reflect.TypeOf((*json.Marshaler)(nil)).Elem()) {
+				return source.Value{}, fmt.Errorf(
+					"%s 是数组，但元素类型 %s 没有 JSON 表示（没实现 json.Marshaler）："+
+						"直接序列化会写出结构体字段（看起来是合法 JSON，实际写错数据）。"+
+						"要么把该列排除出同步范围，要么等我们为它加专门映射", elem, elem)
+			}
+			b, err := json.Marshal(v)
+			if err != nil {
+				return source.Value{}, fmt.Errorf("%s 数组序列化失败: %w", elem, err)
+			}
+			return source.Value{Kind: source.KindJSON, S: string(b)}, nil
 		}
-		return source.Value{Kind: source.KindString, S: fmt.Sprint(x)}
+		return source.Value{}, fmt.Errorf(
+			"不认识的 %T 值：没有 JSON 表示也没有可用的转换，宁可不写也不写错。"+
+				"请把这一列排除出同步范围，或把它反馈给我们补映射", v)
 	}
 }
 
@@ -276,4 +303,49 @@ func catalogEngine(kind string) catalog.Engine {
 		return catalog.MySQL
 	}
 	return catalog.Postgres
+}
+
+// checkTypeCompatibility 在开跑前检查「源类型 → 目标类型」里那些**我们不保证**的组合。
+//
+// 判据来自类型字典（catalog.Map 的 Loss）：`NeedsConfirm` 表示语义不同、必须用户知情，
+// 典型就是 PostgreSQL 数组 → MySQL json。以前它只是预检报告里的一条 warn，用户很容易
+// 忽略；而最坏的情况（元素没有 JSON 表示）会静默写出结构体字段——所以这里升级成**阻断**。
+func (r *runner) checkTypeCompatibility(tables []source.TableRef) error {
+	if r.tgtEP.Kind != dsn.KindMySQL {
+		return nil // PG→PG 类型原样搬，不需要这道
+	}
+	want := map[string]bool{}
+	for _, t := range tables {
+		want[t.Schema+"."+t.Table] = true
+	}
+	var bad []string
+	for _, t := range r.cat.Tables {
+		if !want[t.Schema+"."+t.Table] {
+			continue
+		}
+		for _, c := range t.Columns {
+			m, ok := catalog.Map(catalog.Postgres, catalog.MySQL, c.Type)
+			if !ok || m.Loss < catalog.NeedsConfirm {
+				continue
+			}
+			// **只拦数组**：它们被映成 json，而元素没有 JSON 表示时会静默写出结构体字段
+			//（Owl 实测 `[]pgtype.Interval`）。其它 NeedsConfirm（典型 `timestamptz` 丢时区）
+			// 仍是预检里的 warn —— 把它们也拦掉会让几乎所有真实任务都跑不起来，
+			// 而「丢时区」是知情后可接受的代价，不是写错数据。
+			if !strings.HasSuffix(strings.TrimSpace(c.Type), "[]") {
+				continue
+			}
+			bad = append(bad, fmt.Sprintf("%s.%s（%s → %s）", t.Table, c.Name, c.Type, m.Target))
+		}
+	}
+	if len(bad) == 0 {
+		return nil
+	}
+	// 用 notImplementedError：这不是「用户做错了什么」，是「这个组合我们还没支持」——
+	// 它自带完整四段式，不该再被 hint() 追加一段泛泛的「未分类」建议。
+	return &notImplementedError{fmt.Sprintf("这些列的类型到 MySQL 目标端**不能保证语义**：%s。\n"+
+		"你现在能做什么：1) 把这几列从任务范围里排除（content.tables.<表>.columns.exclude）；"+
+		"2) 或等我们为它加专门映射后再同步。\n"+
+		"风险：直接跑会写出「看起来能读、实际不是原值」的数据（例如数组被序列化成结构体字段），"+
+		"而 md5 比对也发现不了——因为它是一致地写错的", strings.Join(bad, "、"))}
 }
