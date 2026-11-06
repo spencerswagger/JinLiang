@@ -50,6 +50,9 @@ type Options struct {
 	// Catalog is the source table list the job selected; it defines the
 	// canonical column order every Row follows.
 	Catalog source.Catalog
+	// OnDDLSkipped 在「DDL 因目标端已有同名对象而被跳过」时回调（引擎用它发一条 note）。
+	// 跳过是最需要留痕的一类结果：失败会有人看，跳过不会。
+	OnDDLSkipped func(stmt string)
 
 	// ApplyBatchRows 是一条多行 upsert 里最多放几行（默认 500）。
 	//
@@ -920,34 +923,99 @@ func (s *Sink) Apply(ctx context.Context, evs []source.Event, pos source.Positio
 	return tx.Commit(ctx)
 }
 
-// applyDDLTx 在目标端执行源端的 DDL（原样执行 + 幂等跳过）。
+// ddlDestructive 是破坏性 DDL 的判定（**白名单优先**：宁可先窄）。
 //
-// **为什么原样执行**：DDL 的语义（加列、建索引、改类型、约束）只有源端那条语句说得清；
-// 我们不去猜「它想干什么」，只负责把它落到目标端——猜错比不执行更危险。
+// 为什么必须有：MySQL 侧（#25 的四类白名单）对 DROP / RENAME 一律 reject，
+// 而这里如果「原样执行」，DROP TABLE 会立刻删掉目标表且没有任何确认环节——
+// 两侧策略相反本身就是 bug。
 //
-// **幂等**：崩溃重放时同一条 DDL 会再来一次，撞上「已经存在」的 SQLSTATE 视为成功：
-// 42701 duplicate_column / 42P07 duplicate_table / 42710 duplicate_object /
-// 42P16 invalid_table_definition / 42723 duplicate_function
+// 窄了能手工做（我们会告诉用户该执行什么）；宽了会静默丢数据。
+func ddlDestructive(stmt string) bool {
+	up := strings.ToUpper(strings.Join(strings.Fields(stmt), " "))
+	banned := []string{
+		"DROP TABLE", "DROP SCHEMA", "DROP COLUMN", "DROP DATABASE",
+		"TRUNCATE", "RENAME ", "ALTER TABLE .* RENAME",
+	}
+	for _, b := range banned {
+		if strings.HasPrefix(up, b) {
+			return true
+		}
+	}
+	// ALTER TABLE … DROP COLUMN / DROP CONSTRAINT / RENAME 也在其中
+	if strings.HasPrefix(up, "ALTER TABLE") &&
+		(strings.Contains(up, " DROP ") || strings.Contains(up, " RENAME ")) {
+		return true
+	}
+	// DROP INDEX 单独放行是有意的：它不删数据，且重放时可以幂等跳过。
+	return strings.HasPrefix(up, "DROP INDEX") == false && strings.HasPrefix(up, "DROP ")
+}
+
+// checkDDLAllowed 决定这条 DDL 能不能在目标端执行。
+//
+// 判据只有两条，都是「先窄后宽」：
+//  1. **破坏性语句不执行**（交给用户手工做，我们在错误里给原句）；
+//  2. **源 schema 必须等于目标 schema**——语句里的表名是源端原文，
+//     跨 schema 时要么报错，要么改到同名但非目标的表（最坏）。按文本重写表名太脆弱，
+//     所以先拒绝，等有真实需求再做映射。
+func checkDDLAllowed(stmt, srcSchema, tgtSchema string) error {
+	if ddlDestructive(stmt) {
+		return fmt.Errorf("这条 DDL 会删数据，我们不替你执行（%s）。"+
+			"你能做什么：1) 确认目标端也要这样改之后，手工在那条连接上执行它；"+
+			"2) 或者回任务页把这张表移出同步范围。风险：手工执行是不可回滚的结构变更，删掉的列/表数据找不回来", stmt)
+	}
+	if srcSchema != "" && tgtSchema != "" && srcSchema != tgtSchema {
+		return fmt.Errorf("源端 schema 是 %q、目标端是 %q，这条 DDL 里的表名是源端原文（%s）："+
+			"直接执行可能改到同名但不相干的表。你能做什么：1) 把 target.schema 配成与源端一致；"+
+			"2) 或者手工在目标端执行这条语句。风险：改错表的后果不可逆", srcSchema, tgtSchema, stmt)
+	}
+	return nil
+}
+
+// applyDDLTx 在目标端执行源端的 DDL。
+//
+// ⚠️ 现状（务必知道）：**这条能力在真实运行里目前产生不出来**——非测试代码里只有
+// `mysqlsource/assembler.go` 产出 EvDDL，而引擎的源端只做 PostgreSQL（pgoutput 不解码 DDL）。
+// 也就是说今天只有测试能触发它。等接上「PG 源 DDL 捕获」或「MySQL 源 → PG 目标」时，
+// 破坏性语句的拦截（checkDDLAllowed）就是唯一那道闸——这也是它必须先窄的原因。
+//
+// 幂等：崩溃重放时同一条 DDL 会再来一次，撞上「已经存在」的 SQLSTATE 视为成功，
+// 但**跳过必须留痕**（同名不同定义也是 42P07：跳过等于静默放过）。
 func (s *Sink) applyDDLTx(ctx context.Context, tx pgx.Tx, ev source.Event) error {
 	stmt := strings.TrimSpace(ev.DDL)
 	if stmt == "" {
 		return nil
 	}
-	// 用 SAVEPOINT 包住：PostgreSQL 里一条语句失败会让**整个事务**进入 aborted 状态
-	//（25P02），不回到保存点就没法「跳过这条、继续下一条」——而重放时恰恰会遇到
-	// 「这条 DDL 已经执行过」。
-	if _, err := tx.Exec(ctx, "SAVEPOINT jl_ddl"); err != nil {
+	if err := checkDDLAllowed(stmt, ev.Table.Schema, s.opt.Schema); err != nil {
+		return err
+	}
+	sp := fmt.Sprintf("jl_ddl_%d", time.Now().UnixNano())
+	if _, err := tx.Exec(ctx, "SAVEPOINT "+pgwire.Quote(sp)); err != nil {
 		return fmt.Errorf("为 DDL 建保存点失败: %w", err)
+	}
+	release := func() error {
+		if _, err := tx.Exec(ctx, "RELEASE SAVEPOINT "+pgwire.Quote(sp)); err != nil {
+			return fmt.Errorf("释放 DDL 保存点失败: %w", err)
+		}
+		return nil
 	}
 	if _, err := tx.Exec(ctx, stmt); err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) {
 			switch pgErr.Code {
 			case "42701", "42P07", "42710", "42P16", "42723":
-				if _, rerr := tx.Exec(ctx, "ROLLBACK TO SAVEPOINT jl_ddl"); rerr != nil {
+				if _, rerr := tx.Exec(ctx, "ROLLBACK TO SAVEPOINT "+pgwire.Quote(sp)); rerr != nil {
 					return fmt.Errorf("回滚 DDL 保存点失败: %w", rerr)
 				}
-				return nil // 已经存在：重放时的正常情形
+				if err := release(); err != nil {
+					return err
+				}
+				// 「跳过」比「失败」更需要留痕：失败会有人看，跳过不会。
+				// 而且同名不同定义也是 42P07——我们并没有核对过定义是否一致。
+				log.Printf("跳过一条 DDL（目标端已有同名对象，未核对定义是否一致）：%s", stmt)
+				if s.opt.OnDDLSkipped != nil {
+					s.opt.OnDDLSkipped(stmt)
+				}
+				return nil
 			}
 		}
 		return fmt.Errorf("在目标端执行源端 DDL 失败（%s）: %w。"+
@@ -955,8 +1023,8 @@ func (s *Sink) applyDDLTx(ctx context.Context, tx pgx.Tx, ev source.Event) error
 			"2) 如果这条 DDL 不该跟随到目标端，把对应对象排除出同步范围。"+
 			"风险：DDL 没跟随时两端结构不一致，之后写这批表会持续失败", stmt, err)
 	}
-	if _, err := tx.Exec(ctx, "RELEASE SAVEPOINT jl_ddl"); err != nil {
-		return fmt.Errorf("释放 DDL 保存点失败: %w", err)
+	if err := release(); err != nil {
+		return err
 	}
 	log.Printf("已在目标端执行源端 DDL：%s", stmt)
 	return nil
