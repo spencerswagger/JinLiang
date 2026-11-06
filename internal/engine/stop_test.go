@@ -129,14 +129,15 @@ func TestUnclassifiedErrorHintPersistsToLastError(t *testing.T) {
 		want []string
 	}{
 		{
-			name: "权限不够",
+			// 挂了 E1012 之后，方向来自码表（Message/Next），并带码本身
+			name: "权限不够（已挂码）",
 			err:  &pgconn.PgError{Code: "42501", Message: "permission denied for schema public"},
-			want: []string{"权限", "GRANT", "原始错误"},
+			want: []string{"E1012", "GRANT", "下一步"},
 		},
 		{
-			name: "对象不存在",
+			name: "对象不存在（已挂码）",
 			err:  &pgconn.PgError{Code: "3F000", Message: `schema "report" does not exist`},
-			want: []string{"对象不存在", "target.schema", "原始错误"},
+			want: []string{"E1013", "缺 schema", "下一步"},
 		},
 		{
 			name: "完全未识别",

@@ -855,7 +855,7 @@ func (r *runner) stream(ctx context.Context, res *Result) error {
 	r.lastPos = from
 	r.mu.Unlock()
 
-	b := newBatcher(r.sink, r.src, r.batchRows(), r.batchDelay(), from, func(rows int64, pos pgsource.Position) {
+	b := newBatcher(r.sink, r.src, r.doc, r.batchRows(), r.batchDelay(), from, func(rows int64, pos pgsource.Position) {
 		r.rowsStream += rows
 		r.mu.Lock()
 		r.lastPos = pos
@@ -1054,6 +1054,13 @@ func classifyError(err error) (code core.Code, classified bool) {
 		return core.CodePositionKindMismatch, true
 	case errors.As(err, &tooBig):
 		return core.CodeTxTooLarge, true
+	case pgsource.IsNoPrivilege(err):
+		// 42501：源端 SELECT 或目标端 DDL/DML 被拒——用户要做的事都是「去要授权」。
+		return core.CodeNoPrivilege, true
+	case pgsource.IsObjectMissing(err):
+		// 3F000/42P01：schema 或表不存在。next 里按 SQLSTATE 分流（缺 schema 建 schema、
+		// 缺表别去建 schema），文案以码表为准，不走 hint()。
+		return core.CodeObjectMissing, true
 	case pgsource.IsWalLevelTooLow(err):
 		// 运行期撞上「源库没开逻辑变更流」：用户要做的事与预检时一模一样，复用 E1001。
 		return core.CodeWalLevel, true
@@ -1120,18 +1127,10 @@ func (r *runner) stopEarly(cause error) error {
 // hint 给「已识别类别、但码表还没有编号」的错误一句可执行的方向。
 // 只写方向，不发明码；等 Ark 的 E1012/E1013 落地后由 classifyError 挂上。
 func hint(err error) (string, []string) {
-	switch {
-	case pgsource.IsNoPrivilege(err):
-		return "看起来是权限不够：用来同步的账号没有被授予这个动作。" +
-				"（源端要 SELECT；目标端要 CREATE / INSERT / UPDATE / DELETE）",
-			[]string{"让 DBA 按提示里的对象授权：源端 GRANT SELECT、目标端 GRANT CREATE, INSERT, UPDATE, DELETE",
-				"或换一个有权限的账号重建这条连接后重跑"}
-	case pgsource.IsObjectMissing(err):
-		return "看起来是对象不存在：schema 或表的名字对不上（或源端那张表被删/改名了）。",
-			[]string{"目标端先建好 schema，或把任务的 target.schema 改成已存在的",
-				"源端表被删过就回任务页重选表",
-				"改完直接重跑：位点不动，不需要重搬历史"}
-	}
+	// 注意：42501 / 3F000 / 42P01 已经在 classifyError 里挂了 E1012 / E1013，
+	// 这里**不再接管它们**——否则同一类错误会有两套 why/next，迟早对不上。
+	// 这个函数只服务「已知类别、但码表还没编号」的错误。
+	_ = err
 	return "未识别的数据库错误：这条错误还没分类，我们不想给你一个错误的处理方向。",
 		[]string{"把这次的日志（含 SQLSTATE 与原始报错）发给维护者，我们补进码表",
 			"如果是权限或对象不存在，上面那句提示可能已经指向原因"}
@@ -1165,6 +1164,14 @@ func (r *runner) fail(ctx context.Context, err error) error {
 	case classified:
 		ev = control.ErrorEvent(r.job.ID, r.run.ID, code, err.Error())
 		ev.Phase = r.phase
+		// 有码也要把方向写进 last_error：run 行**不存 code**，历史页只有这条字符串。
+		// 不写的话，「该怎么处理」只活在事件流里（进程一重启就没了）。
+		if spec, ok := core.Lookup(code); ok {
+			lastError = fmt.Sprintf("[%s] %s：%s 下一步：%s",
+				code, spec.Message, err.Error(), strings.Join(spec.Next, "；"))
+		} else {
+			lastError = fmt.Sprintf("[%s] %s", code, err.Error())
+		}
 	default:
 		// 未分类：如实说，不给假码（尤其不落 E4002「我们的 bug」）。
 		why, next := hint(err)
