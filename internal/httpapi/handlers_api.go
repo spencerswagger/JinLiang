@@ -357,17 +357,14 @@ func (s *Server) handleRun(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, r, http.StatusConflict, conflictThisProcess())
 			return
 		}
-		// 引擎能力边界（例如 MySQL 目标端）是「用户可修正」的问题：422 + 四段式，
-		// 而不是 202 之后什么都没发生。
-		s.writeError(w, r, http.StatusUnprocessableEntity, apiError{
+		// 其它错误一律回 409/400 一类「可修正」的四段式：能力边界由引擎在构造期
+		// 判（它的 message 已经是人话），入口只负责别把它降级成 500。
+		s.writeError(w, r, http.StatusConflict, apiError{
 			Class:   "user_action",
-			Message: "引擎暂时跑不了这种组合",
+			Message: "这次没能开始运行",
 			Why:     err.Error(),
-			Next: []string{
-				"把目标端换成一个 PostgreSQL 连接（新建连接 → 任务页改目标）",
-				"MySQL 目标端在 B2；现在可以先只验证源端读取与 full copy",
-			},
-			Risk: "无：这条在开跑之前就挡住了，不会留下半截数据",
+			Next:    []string{"按上面这句提示改配置或环境后重试", "改不了就把这句原话连同任务 id 发给维护者"},
+			Risk:    "无：这条在开跑之前就挡住了，不会留下半截数据",
 		})
 		return
 	}

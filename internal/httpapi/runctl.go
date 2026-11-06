@@ -161,29 +161,15 @@ func asOtherInstance(err error) *otherInstanceRunningError {
 	return nil
 }
 
-// errEngineUnsupported 是「引擎只做了 PG→PG」这条能力边界的四段式。
-// 放在 HTTP 入口同步判，是为了不在返回 202 之后什么也不发生——那正是我们一直
-// 在打的静默失败。（引擎里也有同样一条检查，见 internal/engine/engine.go:114。）
-func (s *Server) checkEngineSupported(ctx context.Context, job control.Job) error {
-	src, err := s.store.GetConnection(ctx, job.SourceID)
-	if err != nil {
-		return err
-	}
-	tgt, err := s.store.GetConnection(ctx, job.TargetID)
-	if err != nil {
-		return err
-	}
-	if src.Kind == "postgres" && tgt.Kind == "postgres" {
-		return nil
-	}
-	return fmt.Errorf("引擎暂时只支持 PostgreSQL → PostgreSQL（当前 %s → %s）：MySQL 目标端在 B2；"+
-		"现在可以先建一个 PostgreSQL 目标连接来验证链路", src.Kind, tgt.Kind)
-}
-
+// 注意：这里**不再**判断「连接类型组合能不能跑」。
+//
+// 判断只该有一处——引擎的构造阶段（newTargetSink 按连接类型选 pgsink/mysqlsink，
+// 不认识的类型当场四段式）。HTTP 入口再判一次，两处迟早分叉：今晚已经因为
+// 「同一个判断散在多处」出过好几次（IsLoopbackListen vs IsLoopbackRequest、文档阈值
+// 与代码常量、E1013 的分类器与码表）。能力边界前移曾经是必要的（那时引擎会先 202
+// 然后什么都不发生），但那个洞现在由「引擎返回错误 → 补一条 error 事件 + audit」
+// 兜住了，所以入口不必再自己认一遍类型。
 func (s *Server) startJob(ctx context.Context, job control.Job, actor string) error {
-	if err := s.checkEngineSupported(ctx, job); err != nil {
-		return err
-	}
 	if s.runs.active(job.ID) {
 		// 本进程里就有一条在跑：这是最常见的情况，文案不能说「控制库里有一条」——
 		// 那里可能什么都没有，按那句话去查会白忙。
@@ -246,6 +232,12 @@ func (s *Server) startJob(ctx context.Context, job control.Job, actor string) er
 			if spec, ok := core.Lookup(core.CodeJobRunningElsewhere); ok {
 				ev.Next = spec.Next
 			}
+		}
+		// 事件也要带「现在做什么」：只有 ErrConflict 会填 Next，而构造期拒绝
+		// （例如目标端类型不支持、增量未实现）同样需要下一步——否则这一帧又是
+		// 「有发生了什么，没有现在做什么」。
+		if len(ev.Next) == 0 {
+			ev.Next = fallbackNext
 		}
 		// 事件只活在环形缓冲里，进程重启就没了。用户回头问「它说已接受，为什么
 		// 什么都没发生」时，唯一能查的地方是控制库——所以这里必须落一条 audit。
