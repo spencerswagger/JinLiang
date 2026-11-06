@@ -68,3 +68,17 @@ numeric(12,4) 精度截断）。
 - `jinliang verify --level data --aggregate-only` 只跑 L1；不一致时提示改跑完整 data 级定位。
 - 测试：`TestPGVerifyAggregateOnly`、`TestMySQLVerifyAggregateOnly`（真库）。
 - 完整全表扫描仍是默认；10M 行分钟级，留给发布前/周检，文档已写清量级。
+
+## Owl #47 必改二：一个假绿、一个假红
+
+- **假绿**：`Report.Mode` 记录实际跑法（structure/data/consistency/all/aggregate_only）；
+  `--aggregate-only` 结论改成「**聚合级通过（未做行级全表比对；定位请跑完整 data 级）**」，
+  `--json` 带 `"mode":"aggregate_only"`；`--level data` 也不再印「三级通过」。
+  用例 `TestReportModeReflectsWhatRan`。
+- **假红（浮点）**：`toRat(float32)` 用 `strconv.FormatFloat(..., 'g', -1, 32)`，
+  避免 `float32(0.1)` 变成 `2500000037252903/25000000000000000`；
+  用例 `TestFloat32SameValueDifferentEncoding`（`float32(0.1)` vs `"0.1"` 相等，
+  vs `"0.2"` 不等）。
+- **P3 各端类型**：`runAggregateSQL`/`runDataFull`/`runAggregateOnly` 按源/目标各自的
+  列类型建 numeric 集合；源 numeric → 目标 text 报 `aggregate_mismatch`（不再拿源端
+  类型算目标端），用例 `TestAggregateNumericVsTextReportsMismatch`。
