@@ -1,0 +1,44 @@
+name: review-gate
+
+# 合并门禁（advisory）：PR 的最新 review 必须针对当前 head，且明确「必改 0/可合并」。
+# 真实事故：Owl 的结论异步到达、锚在旧 head，#53 就是带着必改合进了 main。
+#
+# 现在是 advisory：失败只亮红/告警，不挡合并（还没看的 PR 不该被锁死）。
+# 跑稳一周后（建议 2026-11-13 之后）把 `review-gate (advisory)` 加进 branch protection
+# 的 required checks，并把 job 名去掉 (advisory)。
+on:
+  pull_request:
+    types: [synchronize, reopened, edited]
+  pull_request_review:
+    types: [submitted, edited, dismissed]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "PR number"
+        required: true
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  review-gate:
+    name: review-gate (advisory)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 最新 review 是否针对当前 head 且放行
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr }}
+        run: |
+          set -e
+          if [ -z "$PR_NUMBER" ]; then
+            echo "review-gate: 没有 PR number（workflow_dispatch 需要填 pr）" >&2
+            exit 2
+          fi
+          scripts/check_review_gate.sh "$PR_NUMBER"
+      - name: 失败时的提示
+        if: failure()
+        run: |
+          echo "::warning::review-gate 未通过：最新结论必须锚在当前 head 且明确「必改 0/可合并」。这是 advisory，不挡合并；稳定后转 required。"
