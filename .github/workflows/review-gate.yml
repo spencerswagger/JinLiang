@@ -8,7 +8,7 @@ name: review-gate
 # 的 required checks，并把 job 名去掉 (advisory)。
 on:
   pull_request:
-    types: [synchronize, reopened, edited]
+    types: [synchronize, reopened, edited, closed]
   pull_request_review:
     types: [submitted, edited, dismissed]
   workflow_dispatch:
@@ -24,6 +24,8 @@ permissions:
 jobs:
   review-gate:
     name: review-gate (advisory)
+    # closed 事件交给下面的 admin-merge-audit，不在这里重复跑 review 检查
+    if: github.event.action != 'closed'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -45,3 +47,22 @@ jobs:
         if: steps.gate.outcome == 'failure'
         run: |
           echo "::warning::review-gate 未通过：最新结论必须锚在当前 head 且明确「必改 0/可合并」。这是 advisory，不挡合并；稳定后转 required。"
+
+  admin-merge-audit:
+    name: admin-merge audit (advisory)
+    # 合并后审计：base 在合并时已前进（疑似 --admin 绕过）就必须有说明 comment。
+    if: github.event.action == 'closed' && github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: --admin 绕过是否留痕
+        id: admin
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: scripts/check_review_gate.sh admin "$PR_NUMBER"
+      - name: 失败时的提示
+        if: steps.admin.outcome == 'failure'
+        run: |
+          echo "::warning::疑似 --admin 合并但没有说明理由的 comment（需写 --admin 与原因）。后门是救红 main 的，不是赶时间的。"

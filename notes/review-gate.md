@@ -50,3 +50,27 @@ exit=1
 ## 绕过
 
 需要管理员操作；必须在 PR 里写明原因与负责人（事后追认），不允许作者自己点掉检查。
+
+## 追加：`--admin` 绕过必须留痕
+
+`scripts/check_review_gate.sh admin <pr>`（GHA 在 `pull_request: closed` 合并后跑）：
+
+- 正常合并：合并提交第一父提交 == PR `base.sha` → PASS；
+- 疑似 `--admin`：base 已前进（如 #55：base `de9ddb3`，合并 parent `06ae9a8`，
+  merge `fd62b2e`）→ PR 上必须有含 `--admin` 与原因的 comment，否则 FAIL。
+
+实跑（真实数据）：
+
+```
+$ scripts/check_review_gate.sh admin 55
+review-gate: FAIL PR #55 合并时 base 已前进（base de9ddb362465，合并 parent 06ae9a8fd96f，
+merge fd62b2e8d7cf，by=spencerswagger）——疑似 --admin 绕过；PR 上没有说明理由的 comment
+exit=1
+
+$ scripts/check_review_gate.sh admin 53
+review-gate: PASS PR #53 正常合并（base 与合并 parent 一致，by=spencerswagger）
+exit=0
+```
+
+advisory 起步，与 review-gate 同一个 workflow；转 required 时把 `admin-merge-audit (advisory)`
+的 `continue-on-error` 去掉并加进 branch protection。
