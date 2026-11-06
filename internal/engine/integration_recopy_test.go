@@ -1091,9 +1091,11 @@ func TestSchemaMismatchRunGetsE1015(t *testing.T) {
 		t.Fatalf("runs.code 应为 %s，得到 %q；last_error=%s",
 			core.CodeSchemaMismatch, run.Code, run.LastError)
 	}
-	// 具体是哪张表哪一列，由运行时写进 last_error（码表只给类别）
-	if !strings.Contains(run.LastError, table) {
-		t.Fatalf("last_error 要点名那张表：%s", run.LastError)
+	// 具体是哪张表、哪种情况，由运行时写进 last_error（码表只给类别）
+	for _, want := range []string{table, pgsink.PauseReasonTypeChanged} {
+		if !strings.Contains(run.LastError, want) {
+			t.Fatalf("last_error 应含 %q（表名与原因码），得到：%s", want, run.LastError)
+		}
 	}
 }
 
