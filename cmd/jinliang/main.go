@@ -67,6 +67,8 @@ func main() {
 		err = cmdRun(args)
 	case "status":
 		err = cmdStatus(args)
+	case "delete":
+		err = cmdDelete(args)
 	case "doctor":
 		err = cmdDoctor(args)
 	case "verify":

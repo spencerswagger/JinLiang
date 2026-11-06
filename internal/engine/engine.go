@@ -143,6 +143,14 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 	}
 	res.RunID = run.ID
 
+	// 登记到本进程的登记表：删任务时 StopJob 才能 cancel 到这个 run 并等它退出
+	//（退出路径自己会 ReleaseLease —— 租约是退出时才真正放掉的）。
+	runCtx, runCancel := context.WithCancel(ctx)
+	defer runCancel()
+	_, unregister := registerRun(job.ID, runCancel)
+	defer unregister()
+	ctx = runCtx
+
 	r := &runner{
 		opt:    opt,
 		job:    job,

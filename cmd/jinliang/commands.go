@@ -16,8 +16,11 @@ import (
 
 	"github.com/spencerswagger/jinliang/internal/control"
 	"github.com/spencerswagger/jinliang/internal/doctor"
+	"github.com/spencerswagger/jinliang/internal/dsn"
 	"github.com/spencerswagger/jinliang/internal/engine"
 	"github.com/spencerswagger/jinliang/internal/httpapi"
+	"github.com/spencerswagger/jinliang/internal/pgsink"
+	"github.com/spencerswagger/jinliang/internal/state"
 )
 
 // dataDir resolves --data-dir / JINLIANG_DATA_DIR / default.
@@ -401,6 +404,160 @@ func cmdRun(args []string) error {
 }
 
 // cmdStatus prints where a job is now, without touching anything.
+func cmdDelete(args []string) error {
+	fs := flag.NewFlagSet("delete", flag.ExitOnError)
+	dir := fs.String("data-dir", "", "数据目录（默认 ~/.config/jinliang）")
+	jobRef := fs.String("job", "", "任务 ID 或名字")
+	wait := fs.Duration("wait", 30*time.Second, "等引擎退出多久；等不到就留一条 audit 说明原因")
+	force := fs.Bool("yes", false, "不再交互确认")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if strings.TrimSpace(*jobRef) == "" {
+		return errors.New("delete 需要 --job <ID 或名字>")
+	}
+	store, err := openStore(dataDir(*dir), "", false)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	ctx := context.Background()
+	job, err := store.ResolveJob(ctx, *jobRef)
+	if err != nil {
+		return err
+	}
+	if !*force {
+		fmt.Printf("即将删除任务 %s（%s）：runs 记录会一起删掉，目标端已同步的数据不受影响。\n", job.Name, job.JobKey)
+		fmt.Print("确认删除请输入 yes：")
+		var answer string
+		fmt.Scanln(&answer)
+		if strings.ToLower(strings.TrimSpace(answer)) != "yes" {
+			fmt.Println("已取消，什么都没删。")
+			return nil
+		}
+	}
+
+	// **先停引擎，再删记录**：反过来会留下「记录没了、goroutine 还在写、租约还在续期」，
+	// 同目标新建任务直接撞 E1005，而用户没有任何办法让那个进程停下来。
+	canceled, stopped, serr := engine.StopJob(ctx, store, job.ID, job.JobKey, *wait)
+	switch {
+	case !canceled:
+		fmt.Println("本进程里没有这个任务在跑（可能在另一个进程里，或已经结束）——直接删记录。")
+	case stopped:
+		fmt.Println("已让正在跑的引擎停下并等它退出（退出时已释放目标端租约）。")
+	default:
+		fmt.Println("已经在跑的那个引擎没有在等待时间内退出。已记一条 audit 说明原因；" +
+			"目标端租约会在 TTL 后过期并可被抢占，期间的 run 会报 E1005——再跑一次即可接管。")
+	}
+	if serr != nil && stopped {
+		return serr
+	}
+	// 跨进程的情况：那个引擎不在本进程里，cancel 不到它。做法是**删掉目标端租约行**——
+	// 它下一次续租会失败两次 → loseLease → cancelRun 自己停下（#30 的语义）。
+	// 不这么做，用户删了任务后租约还会续期，同目标新建任务一直撞 E1005。
+	if holder, alive, lerr := releaseTargetLease(ctx, store, job); lerr != nil {
+		fmt.Printf("清目标端租约失败（%v）：租约会在 TTL 后过期并可被抢占。\n", lerr)
+	} else if holder != "" {
+		// 窗口要说出来：`watchLease` 对「行没了」(ok==false) 是**立刻** loseLease，
+		// 所以最坏 = leaseTTL/3 ≈ 10 秒，不是等 TTL。这 10 秒里新任务确实能起来 → 双写，
+		// 同一 job 同主键 upsert 多数幂等，但「删了重建时改了 content.tables/on_exists」不幂等。
+		if alive {
+			fmt.Println("（原持有者的进程还活着——这次是强制踢掉一个正在写的进程。）")
+		} else {
+			fmt.Println("（原持有者的进程已经不在了——这次清掉的是一条尸体租约。）")
+		}
+		fmt.Printf("已通知目标端那个还在跑的进程停下（原持有者 %s：租约行已删除，最坏约 10 秒内自行退出）。\n", holder)
+		fmt.Println("这 10 秒内请勿在同一目标新建/重跑任务——两个写入者会同时写（同主键 upsert 多数幂等，" +
+			"但如果你改了 content.tables 或 on_exists，就可能不幂等）。")
+		_ = store.Audit(ctx, control.ActorSystem, "job.run.lease_forced", map[string]any{
+			"job_id": job.ID, "job_key": job.JobKey, "job_name": job.Name,
+			"holder": holder, "holder_alive": alive,
+		})
+	}
+	// 守卫会拒删「还有未结束 run」的任务，而我们刚刚才把那个写入者踢下线——
+	// 所以这里等它自己收尾（最多 15 秒），等不到就**由我们替它收尾**（标 interrupted，
+	// 原因写清是删除时强制的），再删。不能让用户卡在「踢了引擎却删不掉」。
+	if err := settleActiveRuns(ctx, store, job.ID, 15*time.Second); err != nil {
+		return err
+	}
+	if err := store.DeleteJob(ctx, job.ID); err != nil {
+		return err
+	}
+	// detail 里带上 job_name：删完之后靠 key 认人，名字比 id 好用。
+	_ = store.Audit(ctx, control.ActorSystem, "job.delete", map[string]any{
+		"job_id": job.ID, "job_key": job.JobKey, "job_name": job.Name, "engine_stopped": stopped,
+	})
+	fmt.Printf("已删除任务 %s。\n", job.Name)
+	return nil
+}
+
+// releaseTargetLease 删掉这个任务在目标端的租约行（删除任务专用）。
+// 目标端连不上时返回错误，由调用方如实说明「租约会在 TTL 后过期」，不静默。
+func releaseTargetLease(ctx context.Context, store *control.Store, job control.Job) (string, bool, error) {
+	conn, err := store.GetConnection(ctx, job.TargetID)
+	if err != nil {
+		return "", false, err
+	}
+	secret, err := store.Secret(ctx, job.TargetID)
+	if err != nil {
+		return "", false, err
+	}
+	doc, err := store.JobDoc(ctx, job)
+	if err != nil {
+		return "", false, err
+	}
+	ep := dsn.Endpoint{
+		Kind: conn.Kind, Host: conn.Host, Port: conn.Port, Database: conn.Database,
+		Username: conn.Username, Password: secret, Params: conn.Params(),
+	}
+	schema := strings.TrimSpace(doc.Target.Schema)
+	if schema == "" {
+		if conn.Kind == dsn.KindMySQL {
+			schema = conn.Database
+		} else {
+			schema = "public"
+		}
+	}
+	return pgsink.ForceReleaseLease(ctx, ep, schema, job.JobKey)
+}
+
+// settleActiveRuns 等这个任务的未结束 run 自己收尾；等不到就替它收尾。
+//
+// 为什么要这一步：DeleteJob 现在有「有未结束 run 就拒删」的守卫，而删除路径刚刚
+// 才把目标端租约删掉、那个进程要最多约 10 秒才自己发现并退出。
+// 不在这里等/收尾，用户就会看到「引擎被踢了、任务却删不掉」——比原来的问题更难懂。
+func settleActiveRuns(ctx context.Context, store *control.Store, jobID string, wait time.Duration) error {
+	deadline := time.Now().Add(wait)
+	for {
+		active, err := store.ActiveRuns(ctx)
+		if err != nil {
+			return err
+		}
+		var mine []control.Run
+		for _, r := range active {
+			if r.JobID == jobID {
+				mine = append(mine, r)
+			}
+		}
+		if len(mine) == 0 {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			for _, r := range mine {
+				_, ferr := store.FinishRun(ctx, r.ID, state.Failed,
+					"删除任务时强制收尾：目标端租约已删除，原进程会在续租失败后自行退出",
+					1, control.FinishInterrupted)
+				if ferr != nil {
+					return ferr
+				}
+			}
+			fmt.Printf("那个运行没有在 %s 内自己收尾，已由本次删除标记为 interrupted（审计里可查）。\n", wait)
+			return nil
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+}
+
 func cmdStatus(args []string) error {
 	fs := flag.NewFlagSet("status", flag.ExitOnError)
 	jobRef := fs.String("job", "", "任务 id 或名字（空 = 列出全部任务）")
