@@ -109,6 +109,21 @@ func defaultSchemaForKind(kind string) string {
 // Kind returns postgres / mysql.
 func (d *DB) Kind() string { return d.kind }
 
+// FingerprintScope names this endpoint's fingerprint canonicalization.
+//
+// 与连接器实现保持一致：MySQL 是客户端 sha256（mysql-canon-v1），PG 是服务端
+// sum(hashtextextended)。verify 看到两侧 scope 不同就拒绝跨端指纹比对，
+// 改走逐行全表比对——否则 PG→MySQL 会永久假红。
+func (d *DB) FingerprintScope() string {
+	switch d.kind {
+	case KindPostgres:
+		return "pg-hashtextextended-v1"
+	case KindMySQL:
+		return "mysql-canon-v1"
+	}
+	return ""
+}
+
 // Schema returns the default schema this DB was opened with.
 func (d *DB) Schema() string { return d.schema }
 

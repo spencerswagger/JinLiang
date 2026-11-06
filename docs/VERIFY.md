@@ -13,6 +13,11 @@
 校验器说谎比不校验更危险。两行互换由**逐行比对**发现（块 checksum 负责定位到块，
 不是唯一判据）；L1 的 count/sum/min/max 对互换可能完全不变。
 
+**跨端指纹不可直接比**：MySQL 指纹是客户端 sha256（`mysql-canon-v1`：列名排序 + 主键定序），
+PG 是服务端 `sum(hashtextextended)`（`pg-hashtextextended-v1`），两个数永远不可能相等。
+`verify` 先看两侧 `FingerprintScope`：不同就**不做指纹比对**，直接走逐行全表比对，并在
+`fingerprint_scope_mismatch` 与 `Report.Fingerprint` 里如实说明（不静默、不假红）。
+
 **数值口径**：`numeric`/`decimal` 从 `database/sql` 取出是字符串（`"1.0000"`、`"1.00"`），
 行级与聚合都先 `big.Rat` 归一（`RatString()`）再比，**同一逻辑值不同 scale 必须判相等**，
 否则 PG→MySQL 会天天假红。
