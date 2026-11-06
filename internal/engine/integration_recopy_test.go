@@ -953,8 +953,15 @@ func TestDDLTypeChangeIsRefusedNotSilent(t *testing.T) {
 	if !errors.As(err, &te) {
 		t.Fatalf("应返回 TypeChangedError（第③步要按类型降级成「只暂停该表」），得到 %T: %v", err, err)
 	}
-	if !strings.Contains(err.Error(), "bigint → text") {
-		t.Fatalf("错误里要指明哪一列、从什么变成什么：%v", err)
+	// ① 方向必须无歧义：标出两端各是什么，而不是一个可能读反的箭头
+	if !strings.Contains(err.Error(), "目标端当前是 bigint") || !strings.Contains(err.Error(), "源端是 text") {
+		t.Fatalf("错误里要标清「目标端当前」与「源端」各是什么：%v", err)
+	}
+	// ② typed error 只带事实：动作与风险交给码表（否则同一条错误两段动作）
+	for _, unwanted := range []string{"你能做什么", "风险"} {
+		if strings.Contains(err.Error(), unwanted) {
+			t.Fatalf("动作/风险应由码表给，typed error 里不该有 %q：%v", unwanted, err)
+		}
 	}
 }
 

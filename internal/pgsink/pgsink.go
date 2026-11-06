@@ -650,7 +650,7 @@ func (s *Sink) reconcileColumns(ctx context.Context, ti *tableInfo) error {
 				// prepare 时发现类型不一致却打死整任务，用户会当成两个 bug。
 				// 所以这里也走 TypeChangedError（同一个原因码），由第③步统一按表暂停。
 				return &TypeChangedError{TableName: ti.ref.Table,
-					Detail: fmt.Sprintf("%s: %s → %s", col, typ, ti.types[i])}
+					Detail: fmt.Sprintf("列 %s：目标端当前是 %s，源端是 %s", col, typ, ti.types[i])}
 			}
 			if want := ti.collation(i); want != "" && haveColl[col] != want {
 				// 排序规则不同 → 唯一索引判重与 ORDER BY 会不一致，而且是静默的。
@@ -1167,7 +1167,7 @@ func relationMatches(ti *tableInfo, rel *source.Table, src catalog.Engine) (same
 		}
 		if i < len(ti.types) && typ != ti.types[i] {
 			sameTypes = false
-			tparts = append(tparts, fmt.Sprintf("%s: %s → %s", name, ti.types[i], typ))
+			tparts = append(tparts, fmt.Sprintf("列 %s：目标端当前是 %s，源端是 %s", name, ti.types[i], typ))
 		}
 		if i < len(rel.Columns) && rel.Columns[i].Name != name {
 			nparts = append(nparts, fmt.Sprintf("第 %d 列 原 %s → 现 %s", i+1, name, rel.Columns[i].Name))
@@ -1211,10 +1211,9 @@ type SchemaDriftError struct {
 	Detail    string
 }
 
+// Error 同样只带事实（动作与风险交给码表）。
 func (e *SchemaDriftError) Error() string {
-	return fmt.Sprintf("源端表 %s 的列发生变化（改名/删列），本版不跟随：%s。"+
-		"你能做什么：1) 手工把目标表的列改成与源端一致后重跑（位点不动）；"+
-		"2) 或把该表移出同步范围。风险：结构不一致时继续写会让数据与列错位", e.TableName, e.Detail)
+	return fmt.Sprintf("表 %s 的列在源端被改名或删掉（%s）", e.TableName, e.Detail)
 }
 
 // Reason 实现 PausableError。
@@ -1234,11 +1233,13 @@ type PausableError interface {
 	Table() string
 }
 
+// Error 只陈述**事实**（表名 + 每列两端各是什么）。
+//
+// 动作与风险交给码表（E1015 的 Next/Risk）：last_error 的落盘格式是
+// `[E1015] <码表 Message>：<err.Error()> 下一步：<码表 Next>`，
+// 这里再写一遍就成了「同一条错误两段动作」。TableNotFoundError 已经是这个形态。
 func (e *TypeChangedError) Error() string {
-	return fmt.Sprintf("源端表 %s 的列类型发生变化，本版不跟随：%s。"+
-		"你能做什么：1) 确认目标端也要改成新类型后，手工执行 ALTER 再重跑（位点不动）；"+
-		"2) 或把该表移出同步范围。"+
-		"风险：类型不一致时继续写，要么被截断、要么报一个看起来像「数据问题」的编码错", e.TableName, e.Detail)
+	return fmt.Sprintf("表 %s 与源端的列类型不一致（%s）", e.TableName, e.Detail)
 }
 
 // applyDDLTx 在目标端执行源端的 DDL。
