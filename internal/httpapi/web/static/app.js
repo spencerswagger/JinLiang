@@ -104,8 +104,10 @@
   }
 
   // 事件里带了 rows_done 就直接用（0 也是合法值，所以用 typeof 判存在）
+  var rowsFromEventSeen = false; // 事件已经给过数字之后，就不许轮询把旧值写回来
   function rowsFromEvent(ev) {
     if (typeof ev.rows_done === "number") {
+      rowsFromEventSeen = true;
       setRows(ev.rows_done);
       return true;
     }
@@ -121,6 +123,9 @@
     fetch("/api/jobs/" + encodeURIComponent(jobID), { credentials: "same-origin" })
       .then(function (r) { return r.ok ? r.json() : null; })
       .then(function (d) {
+        // 轮询是在途请求：事件可能已经先一步给出更新的数字。此时丢弃轮询结果，
+        // 否则进度会往回跳（最多回退 1 秒，但用户看到的就是「倒退」）。
+        if (rowsFromEventSeen) return;
         var run = d && d.job && d.job.last_run;
         if (run) {
           setRows(run.rows_done || 0);

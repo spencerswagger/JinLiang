@@ -12,6 +12,7 @@ import (
 	"net/http/cookiejar"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -1634,5 +1635,25 @@ func TestFallbackNextIsUsableBeforeAnyRunExists(t *testing.T) {
 	}
 	if len(fallbackNext) < 2 || len(fallbackNext) > 3 {
 		t.Fatalf("兜底应是 2–3 条可执行动作，实际 %d 条", len(fallbackNext))
+	}
+}
+
+// 前端脚本的两条不变量（纯文本断言，避免为几行 JS 引入构建链）：
+// ① 事件给过 rows_done 之后，轮询回来的旧值不许覆盖它（进度不能往回跳）；
+// ② 未知 finish_reason 直接显示原值，不能静默当成「已完成」。
+func TestAppJSProgressNeverGoesBackwards(t *testing.T) {
+	raw, err := os.ReadFile("web/static/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	js := string(raw)
+	if !strings.Contains(js, "rowsFromEventSeen") {
+		t.Fatal("缺少「事件已更新」标记：在途轮询会把旧值写回去，进度会往回跳")
+	}
+	if !strings.Contains(js, "if (rowsFromEventSeen) return;") {
+		t.Fatal("轮询回调里必须丢弃已被事件更新的情况")
+	}
+	if !strings.Contains(js, ": fr;") {
+		t.Fatal("未知 finish_reason 必须原样显示（`: fr` 兜底），不能静默成「已完成」")
 	}
 }
