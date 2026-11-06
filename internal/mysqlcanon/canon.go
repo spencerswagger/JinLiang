@@ -39,6 +39,10 @@ type Querier interface {
 // Fingerprint 返回「行数:内容哈希」。
 //
 // 哈希输入是**按列名排序后的规范编码**，所以：列顺序不同不影响、行序由主键固定。
+//
+// ⚠️ **跨端对账请用 verify 的共同列口径（commonColumns 交集），不要直接比 Fingerprint**：
+// 它是对 `t::text` 求哈希，目标端**多一列就整个换哈希**（DDL 只加不减时尤其容易发生）。
+// 数据级比对用交集不会假红；指纹会因为列集合不同而假红——两者口径不同，别混用。
 func Fingerprint(ctx context.Context, q Querier, schema, table string) (string, error) {
 	cols, err := columns(ctx, q, schema, table)
 	if err != nil {

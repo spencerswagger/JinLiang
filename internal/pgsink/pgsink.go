@@ -1033,14 +1033,41 @@ func (s *Sink) alignRelationTx(ctx context.Context, tx pgx.Tx, ev source.Event) 
 	if ti == nil {
 		return fmt.Errorf("收到未知表 %s 的变更（发布里多了表？）", ev.Table.Table)
 	}
-	if len(ev.Relation.Columns) == len(ti.cols) {
-		return nil // 列没变：沿用缓存
+	// **只比列数是不够的**：改类型与改名的列数都没变。
+	// 早退会让它们走「一切正常」的路——缓存仍是旧类型/旧名字，写行时静默按旧口径编码，
+	// 或者报一个看起来像「数据问题」的编码错。原来「整批失败」至少是响亮的，
+	// 静默写错更坏。所以这里同时比名字与类型。
+	sameNames, sameTypes, keptAll, typeDiff, nameDiff := relationMatches(ti, ev.Relation)
+
+	switch {
+	case sameNames && sameTypes:
+		return nil // 真的没变
+	case keptAll && sameTypes:
+		// 原有列都还在、类型也没变——只可能是**追加了新列**：继续走对齐。
+		_ = nameDiff
+	case sameNames && !sameTypes:
+		// 改类型：本版**不跟随**（改窄会截断、改宽会静默变更语义）。
+		// 第③步会把它降级成「只暂停这张表 + 明确原因码」，其它表继续跑；
+		// 在那之前先响亮拒绝，别让它安静写错。
+		return &TypeChangedError{Table: ev.Table.Table, Detail: typeDiff}
+	case !keptAll:
+		return fmt.Errorf("源端表 %s 的列发生变化（改名/删列），本版不跟随：%s。"+
+			"你能做什么：1) 手工把目标表的列改成与源端一致后重跑（位点不动）；"+
+			"2) 或把该表移出同步范围。风险：结构不一致时继续写会让数据与列错位", ev.Table.Table,
+			nameDiffText(ti, ev.Relation))
 	}
 
 	var added []string
 	for _, c := range ev.Relation.Columns {
 		if _, ok := ti.colIndex[c.Name]; ok {
 			continue
+		}
+		// ADD COLUMN 在**数据事务内部**执行会拿 ACCESS EXCLUSIVE 并持有到提交：
+		// 这一批对齐期间目标表对所有读写都不可见（verify 在读、别的任务在写都会被挡）。
+		// 设一个短的 lock_timeout：别人占着表时**快速失败并说清**，而不是排队把后面批次
+		// 一起堵住。这个代价只在「Relation 真的变列」的那一次付。
+		if _, err := tx.Exec(ctx, "SET LOCAL lock_timeout = '3s'"); err != nil {
+			return fmt.Errorf("设置 lock_timeout 失败: %w", err)
 		}
 		stmt := fmt.Sprintf("ALTER TABLE %s ADD COLUMN IF NOT EXISTS %s %s",
 			pgwire.Qualified(ev.Table.Schema, ev.Table.Table), pgwire.Quote(c.Name), c.Type)
@@ -1072,6 +1099,91 @@ func (s *Sink) alignRelationTx(ctx context.Context, tx pgx.Tx, ev source.Event) 
 		log.Printf("%s 跟随源端新增了 %d 列（%s）", ev.Table.Table, len(added), strings.Join(added, ", "))
 	}
 	return nil
+}
+
+// relationMatches 比较缓存的列定义与事件里的 Relation：**名字与类型都要比**。
+//
+// 三个返回值都要用，因为它们对应三种完全不同的处置：
+//   - sameNames && sameTypes：真的没变（最常见的每批路径，零成本早退）；
+//   - keptAll && sameTypes：原有列都还在、类型没变 → 只是**追加了新列**，走对齐；
+//   - 其余：改名 / 删列 / 改类型 → 本版不跟随，响亮拒绝（第③步再降级成只暂停该表）。
+//
+// 只比列数会把后两种悄悄放过——缓存留着旧类型/旧名字继续写，静默写错。
+func relationMatches(ti *tableInfo, rel *source.Table) (sameNames, sameTypes, keptAll bool, typeDiff, nameDiff string) {
+	byName := map[string]string{}
+	for _, c := range rel.Columns {
+		byName[c.Name] = c.Type
+	}
+	sameNames = len(rel.Columns) == len(ti.cols)
+	if sameNames {
+		for i := range ti.cols {
+			if rel.Columns[i].Name != ti.cols[i] {
+				sameNames = false
+				break
+			}
+		}
+	}
+	sameTypes, keptAll = true, true
+	var tparts, nparts []string
+	for i, name := range ti.cols {
+		typ, ok := byName[name]
+		if !ok {
+			keptAll = false
+			nparts = append(nparts, fmt.Sprintf("原 %s 已不存在", name))
+			continue
+		}
+		if i < len(ti.types) && typ != ti.types[i] {
+			sameTypes = false
+			tparts = append(tparts, fmt.Sprintf("%s: %s → %s", name, ti.types[i], typ))
+		}
+		if i < len(rel.Columns) && rel.Columns[i].Name != name {
+			nparts = append(nparts, fmt.Sprintf("第 %d 列 原 %s → 现 %s", i+1, name, rel.Columns[i].Name))
+		}
+	}
+	if len(rel.Columns) != len(ti.cols) {
+		for _, c := range rel.Columns {
+			if _, ok := ti.colIndex[c.Name]; !ok {
+				nparts = append(nparts, "新增 "+c.Name)
+			}
+		}
+	}
+	typeDiff = strings.Join(tparts, "；")
+	nameDiff = strings.Join(nparts, "；")
+	return sameNames, sameTypes, keptAll, typeDiff, nameDiff
+}
+
+// TypeChangedError 表示源端改了列类型——本版不跟随（会截断或静默变更语义）。
+// 单独成类型，方便第③步把它降级成「只暂停这张表」而不是整个任务。
+type TypeChangedError struct {
+	Table  string
+	Detail string
+}
+
+func (e *TypeChangedError) Error() string {
+	return fmt.Sprintf("源端表 %s 的列类型发生变化，本版不跟随：%s。"+
+		"你能做什么：1) 确认目标端也要改成新类型后，手工执行 ALTER 再重跑（位点不动）；"+
+		"2) 或把该表移出同步范围。"+
+		"风险：类型不一致时继续写，要么被截断、要么报一个看起来像「数据问题」的编码错", e.Table, e.Detail)
+}
+
+func typeDiffText(ti *tableInfo, rel *source.Table) string {
+	var parts []string
+	for i, c := range rel.Columns {
+		if i < len(ti.types) && c.Type != ti.types[i] {
+			parts = append(parts, fmt.Sprintf("%s: %s → %s", c.Name, ti.types[i], c.Type))
+		}
+	}
+	return strings.Join(parts, "；")
+}
+
+func nameDiffText(ti *tableInfo, rel *source.Table) string {
+	var parts []string
+	for i, c := range rel.Columns {
+		if i < len(ti.cols) && c.Name != ti.cols[i] {
+			parts = append(parts, fmt.Sprintf("原 %s → 现 %s", ti.cols[i], c.Name))
+		}
+	}
+	return strings.Join(parts, "；")
 }
 
 // applyDDLTx 在目标端执行源端的 DDL。

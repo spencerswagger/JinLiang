@@ -10,6 +10,7 @@ package engine_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -900,5 +901,105 @@ func TestDDLAddColumnThenRowsSucceed(t *testing.T) {
 	}
 	if n != 2 {
 		t.Fatalf("应有 2 行（旧 1 + 新 1），得到 %d", n)
+	}
+}
+
+// DDL 必改：**列数没变但类型变了**不许走「一切正常」那条路。
+// 早退只比列数时，改类型会让缓存留着旧类型、写行仍用旧口径——静默写错，比原来整批失败更坏。
+func TestDDLTypeChangeIsRefusedNotSilent(t *testing.T) {
+	srcDSN, dstDSN := dsns(t)
+	srcDB := mustConn(t, srcDSN)
+	dstDB := mustConn(t, dstDSN)
+	table := "ddl_typechange"
+	ctx := context.Background()
+
+	exec(t, srcDB, "DROP TABLE IF EXISTS "+table)
+	exec(t, srcDB, "CREATE TABLE "+table+" (id bigint PRIMARY KEY, v bigint)")
+	exec(t, dstDB, "DROP TABLE IF EXISTS "+table)
+	exec(t, dstDB, "DROP TABLE IF EXISTS _jl_meta, _jl_chunk, _jl_lease, _jl_object, _jl_instance")
+
+	ref := source.TableRef{Schema: "public", Table: table}
+	oldRel := source.Table{TableRef: ref,
+		Columns:    []source.Column{{Name: "id", Type: "bigint"}, {Name: "v", Type: "bigint"}},
+		PrimaryKey: []string{"id"}}
+	s, err := pgsink.Open(ctx, pgsink.Options{
+		Target: mustEndpoint(t, dstDSN), JobKey: "ddltype", JobName: "ddl-type",
+		InstanceID: "it-ddl-type", Schema: "public", OnExists: "append",
+		Catalog: source.Catalog{Tables: []source.Table{oldRel}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if _, err := s.EnsureSchema(ctx, source.Catalog{Tables: []source.Table{oldRel}}); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+
+	// 列数不变、类型变了（bigint → text）
+	newRel := source.Table{TableRef: ref,
+		Columns:    []source.Column{{Name: "id", Type: "bigint"}, {Name: "v", Type: "text"}},
+		PrimaryKey: []string{"id"}}
+	err = s.Apply(ctx, []source.Event{
+		{Kind: source.EvInsert, Table: ref, Relation: &newRel,
+			New: source.Row{Table: ref, Values: []source.Value{
+				{Kind: source.KindString, S: "1"}, {Kind: source.KindString, S: "abc"}}}},
+		{Kind: source.EvCommit},
+	}, nil)
+	if err == nil {
+		t.Fatal("列类型变了必须响亮拒绝（不能安静按旧类型写）")
+	}
+	var te *pgsink.TypeChangedError
+	if !errors.As(err, &te) {
+		t.Fatalf("应返回 TypeChangedError（第③步要按类型降级成「只暂停该表」），得到 %T: %v", err, err)
+	}
+	if !strings.Contains(err.Error(), "bigint → text") {
+		t.Fatalf("错误里要指明哪一列、从什么变成什么：%v", err)
+	}
+}
+
+// 改名同样不是「列数没变就没事」：必须带列名报出来，而不是按名找不到下标时丢一个模糊错。
+func TestDDLRenameIsReported(t *testing.T) {
+	srcDSN, dstDSN := dsns(t)
+	srcDB := mustConn(t, srcDSN)
+	dstDB := mustConn(t, dstDSN)
+	table := "ddl_rename"
+	ctx := context.Background()
+
+	exec(t, srcDB, "DROP TABLE IF EXISTS "+table)
+	exec(t, srcDB, "CREATE TABLE "+table+" (id bigint PRIMARY KEY, a text)")
+	exec(t, dstDB, "DROP TABLE IF EXISTS "+table)
+	exec(t, dstDB, "DROP TABLE IF EXISTS _jl_meta, _jl_chunk, _jl_lease, _jl_object, _jl_instance")
+
+	ref := source.TableRef{Schema: "public", Table: table}
+	oldRel := source.Table{TableRef: ref,
+		Columns:    []source.Column{{Name: "id", Type: "bigint"}, {Name: "a", Type: "text"}},
+		PrimaryKey: []string{"id"}}
+	s, err := pgsink.Open(ctx, pgsink.Options{
+		Target: mustEndpoint(t, dstDSN), JobKey: "ddlrename", JobName: "ddl-rename",
+		InstanceID: "it-ddl-rename", Schema: "public", OnExists: "append",
+		Catalog: source.Catalog{Tables: []source.Table{oldRel}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if _, err := s.EnsureSchema(ctx, source.Catalog{Tables: []source.Table{oldRel}}); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+
+	newRel := source.Table{TableRef: ref,
+		Columns:    []source.Column{{Name: "id", Type: "bigint"}, {Name: "b", Type: "text"}},
+		PrimaryKey: []string{"id"}}
+	err = s.Apply(ctx, []source.Event{
+		{Kind: source.EvInsert, Table: ref, Relation: &newRel,
+			New: source.Row{Table: ref, Values: []source.Value{
+				{Kind: source.KindString, S: "1"}, {Kind: source.KindString, S: "x"}}}},
+		{Kind: source.EvCommit},
+	}, nil)
+	if err == nil {
+		t.Fatal("列改名必须报错")
+	}
+	if !strings.Contains(err.Error(), "a → 现 b") && !strings.Contains(err.Error(), "→ 现 b") {
+		t.Fatalf("错误里要带上的新旧列名：%v", err)
 	}
 }
