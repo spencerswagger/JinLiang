@@ -2,7 +2,9 @@ package mysqlsink
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strconv"
@@ -59,6 +61,10 @@ type Sink struct {
 	width       WidthOptions
 	aliasUpsert bool // 8.0.19+ 支持 INSERT ... AS new ON DUPLICATE KEY UPDATE new.c=…
 	uniqueCache map[string]bool
+
+	// ownerToken 让同一进程里的两个 Sink（测试/两次 run）在租约里彼此可分：
+	// 光靠 pid 分不开它们，后一个会把前一个当成「自己」直接续租。
+	ownerToken string
 }
 
 var _ sink.Sink = (*Sink)(nil)
@@ -81,7 +87,11 @@ func Open(ctx context.Context, opt Options) (*Sink, error) {
 		db.Close()
 		return nil, fmt.Errorf("连不上目标库 %s:%d: %w", opt.DSN.Host, opt.DSN.Port, err)
 	}
-	s := &Sink{db: db, ep: opt.DSN, opt: opt, uniqueCache: map[string]bool{}}
+	s := &Sink{db: db, ep: opt.DSN, opt: opt, uniqueCache: map[string]bool{}, ownerToken: newOwnerToken()}
+	if err := s.ensureStateTables(ctx); err != nil {
+		db.Close()
+		return nil, err
+	}
 	if opt.Width == (WidthOptions{}) {
 		s.width = s.probeWidthOptions(ctx)
 	} else {
@@ -93,6 +103,15 @@ func Open(ctx context.Context, opt Options) (*Sink, error) {
 
 // Close 释放连接池。
 func (s *Sink) Close() error { return s.db.Close() }
+
+// newOwnerToken 生成一个短随机标识（租约 label 里用）。
+func newOwnerToken() string {
+	b := make([]byte, 4)
+	if _, err := rand.Read(b); err != nil {
+		return strconv.FormatInt(time.Now().UnixNano()%1e9, 36)
+	}
+	return hex.EncodeToString(b)
+}
 
 // Kind 实现 sink.Sink。
 func (s *Sink) Kind() string { return dsn.KindMySQL }

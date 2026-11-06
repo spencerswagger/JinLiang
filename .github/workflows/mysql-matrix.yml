@@ -12,6 +12,7 @@ on:
   pull_request:
     paths:
       - "internal/mysqlsource/**"
+      - "internal/mysqlsink/**"
       - ".github/workflows/mysql-matrix.yml"
   workflow_dispatch:
 
