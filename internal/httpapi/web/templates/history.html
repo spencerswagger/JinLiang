@@ -15,7 +15,11 @@
         <td class="num">{{.Run.RowsDone}}</td>
         <!-- last_error 现在带错误码与下一步（E1013 那条约 250–300 字符），全文直出会把行撑高；
              正文截到 120 字，全文放 title（悬停可看全）。属性里的引号由 html/template 转义。 -->
+        {{if .Run.Code}}
+        <td><span class="badge bad">{{.Run.Code}}</span> <span class="meta">{{clip (dash .Run.LastError) 60}}</span></td>
+        {{else}}
         <td title="{{dash .Run.LastError}}">{{clip (dash .Run.LastError) 120}}</td>
+        {{end}}
       </tr>
     {{end}}
     </tbody>

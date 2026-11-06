@@ -121,6 +121,15 @@ var migrations = []migration{
 			`CREATE INDEX IF NOT EXISTS idx_audit_action_at_id ON audit(action, at DESC, id DESC)`,
 		},
 	},
+	{
+		Version: 5,
+		Name:    "runs-code",
+		Stmts: []string{
+			// 错误码单独一列：列表页只显示「徽标 + 一句摘要」，全文留给详情页。
+			// 在此之前只能把 250–300 字的 last_error 截断（#41），那是止血不是根治。
+			`ALTER TABLE runs ADD COLUMN code TEXT`,
+		},
+	},
 }
 
 // closeOnlyStaleRunsThenIndex 是 v2 的收尾。

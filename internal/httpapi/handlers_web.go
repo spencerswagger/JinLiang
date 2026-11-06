@@ -400,6 +400,8 @@ type jobDetailData struct {
 	Runs    []control.Run
 	Active  *control.Run
 	Tables  []string
+	// LastError 是「最近一条带错误码的运行」的四段式卡片；没有就为 nil。
+	LastError *lastErrorCard
 }
 
 func (s *Server) pageJobDetail(w http.ResponseWriter, r *http.Request) {
@@ -425,9 +427,16 @@ func (s *Server) pageJobDetail(w http.ResponseWriter, r *http.Request) {
 			tables = append(tables, name)
 		}
 	}
+	d := jobDetailData{Summary: sum, Doc: doc, Runs: runs, Active: active, Tables: tables}
+	// 最近一条带错误码的运行 → 四段式卡片（why/next/risk 与 /api/codes 同一份码表）
+	for i := range d.Runs {
+		if c := codeCardOf(d.Runs[i].Code, d.Runs[i].LastError); c != nil {
+			d.LastError = c
+			break
+		}
+	}
 	s.renderPage(w, r, "job_detail.html", pageData{
-		Title: sum.Name, Nav: "jobs",
-		Data: jobDetailData{Summary: sum, Doc: doc, Runs: runs, Active: active, Tables: tables},
+		Title: sum.Name, Nav: "jobs", Data: d,
 	})
 }
 
@@ -577,6 +586,35 @@ func (s *Server) pageHistory(w http.ResponseWriter, r *http.Request) {
 		rows = append(rows, historyRow{Run: run, Job: j.Name, Kind: j.SourceKind})
 	}
 	s.renderPage(w, r, "history.html", pageData{Title: "历史", Nav: "history", Data: rows})
+}
+
+// lastErrorCard 把「最近一条带错误码的运行」渲染成四段式：
+// why/next/risk 从码表取（与 /api/codes 同一份），last_error 只作原始报错。
+type lastErrorCard struct {
+	Code    string
+	Message string
+	Why     string
+	Next    []string
+	Risk    string
+	Raw     string
+}
+
+func codeCardOf(code, raw string) *lastErrorCard {
+	if code == "" {
+		if raw == "" {
+			return nil
+		}
+		// 未分类：给一句实话，不编造码（与诊断页的「未分类」徽标同一口径）
+		return &lastErrorCard{Message: "这条错误还没分类", Raw: raw}
+	}
+	spec, ok := core.Lookup(core.Code(code))
+	if !ok {
+		return &lastErrorCard{Code: code, Message: raw, Raw: raw}
+	}
+	return &lastErrorCard{
+		Code: string(spec.Code), Message: spec.Message, Why: spec.Why,
+		Next: spec.Next, Risk: spec.Risk, Raw: raw,
+	}
 }
 
 type diagnosticsData struct {
