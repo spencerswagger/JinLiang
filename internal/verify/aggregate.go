@@ -27,6 +27,7 @@ const verifyBlockRows = 1000
 type tableAgg struct {
 	rows    int64
 	numeric map[string]bool
+	textual map[string]bool
 	sums    map[string]*big.Rat
 	mins    map[string]*big.Rat
 	maxs    map[string]*big.Rat
@@ -36,7 +37,7 @@ type tableAgg struct {
 
 func newTableAgg(srcT source.Table, cols []string) *tableAgg {
 	a := &tableAgg{
-		numeric: map[string]bool{}, sums: map[string]*big.Rat{},
+		numeric: map[string]bool{}, textual: map[string]bool{}, sums: map[string]*big.Rat{},
 		mins: map[string]*big.Rat{}, maxs: map[string]*big.Rat{},
 		textLen: map[string]int64{}, nulls: map[string]int64{},
 	}
@@ -52,6 +53,9 @@ func newTableAgg(srcT source.Table, cols []string) *tableAgg {
 			a.sums[key] = new(big.Rat)
 		} else {
 			a.textLen[key] = 0
+			if isTextType(types[key]) {
+				a.textual[key] = true
+			}
 		}
 	}
 	return a
@@ -81,7 +85,7 @@ func (a *tableAgg) add(row []any, cols []string) {
 			}
 			continue
 		}
-		a.textLen[key] += int64(len(canonicalValue(v)))
+		a.textLen[key] += int64(dataLength(v))
 	}
 }
 
@@ -165,6 +169,35 @@ func ratText(r *big.Rat) string {
 		return "NULL"
 	}
 	return r.FloatString(10)
+}
+
+func isTextType(t string) bool {
+	s := strings.ToLower(strings.TrimSpace(t))
+	if i := strings.IndexByte(s, '('); i >= 0 {
+		s = strings.TrimSpace(s[:i])
+	}
+	switch {
+	case strings.Contains(s, "char"), strings.Contains(s, "text"),
+		strings.Contains(s, "json"), strings.Contains(s, "enum"),
+		strings.Contains(s, "set"), strings.Contains(s, "uuid"),
+		strings.Contains(s, "xml"), strings.Contains(s, "inet"),
+		strings.Contains(s, "cidr"), strings.Contains(s, "macaddr"),
+		strings.Contains(s, "interval"):
+		return true
+	}
+	return false
+}
+
+// dataLength counts bytes for text/binary values. Looking at []byte avoids the
+// cross-engine mismatch "s..." vs "x'hex'" doubling the length.
+func dataLength(v any) int {
+	switch x := v.(type) {
+	case []byte:
+		return len(x)
+	case string:
+		return len(x)
+	}
+	return len(canonicalValue(v))
 }
 
 func isNumericType(t string) bool {
@@ -381,10 +414,10 @@ func runDataFull(ctx context.Context, lr *LevelReport, opts Options, name string
 				srcAgg.add(srcRow, commonCols)
 				tgtAgg.add(tgtRow, commonCols)
 				pkDesc := pkDescription(srcRow, srcIdx)
-				srcCanon := canonicalRowNumeric(commonCols, srcRow, srcAgg.numeric)
-				tgtCanon := canonicalRowNumeric(commonCols, tgtRow, tgtAgg.numeric)
+				srcCanon := canonicalRowNumeric(commonCols, srcRow, srcAgg.numeric, srcAgg.textual)
+				tgtCanon := canonicalRowNumeric(commonCols, tgtRow, tgtAgg.numeric, tgtAgg.textual)
 				if srcCanon != tgtCanon {
-					col, sv, tv := firstDiffNumeric(commonCols, srcRow, tgtRow, srcAgg.numeric)
+					col, sv, tv := firstDiffNumeric(commonCols, srcRow, tgtRow, srcAgg.numeric, srcAgg.textual)
 					lr.add(SeverityError, "row_mismatch", name, col,
 						"行内容不一致（主键 "+pkDesc+"）", trunc(sv, 80), trunc(tv, 80),
 						"按主键重放该行；若反复出现，检查转换规则")

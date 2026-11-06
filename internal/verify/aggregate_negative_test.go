@@ -335,3 +335,87 @@ func TestConclusionNoPKAllShowsQualifier(t *testing.T) {
 		t.Fatalf("无主键降级后不能再说三级通过：%q", got)
 	}
 }
+
+func TestFingerprintScopeMismatchUsesRowScan(t *testing.T) {
+	src, tgt := newFake("postgres"), newFake("mysql")
+	src.scope = "pg-hashtextextended-v1"
+	tgt.scope = "mysql-canon-v1"
+	src.add(ordersTable(), ordersRows()...)
+	tgt.add(ordersTable(), ordersRows()...)
+	opts := baseOptions(src, tgt)
+	opts.Level = LevelData
+	rep, err := Run(context.Background(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Fingerprint.Comparable {
+		t.Fatal("PG 与 MySQL 的指纹作用域不同，不能比")
+	}
+	if !hasCode(rep, "fingerprint_scope_mismatch") {
+		t.Fatalf("必须明确报告指纹不可比：%+v", rep.Levels[0].Findings)
+	}
+	if !strings.Contains(Conclusion(rep), "跨端指纹不可比") {
+		t.Fatalf("结论必须说明已改用逐行比对：%q", Conclusion(rep))
+	}
+	if n := statInt(rep.Levels[0], "tables_full_scan"); n != 1 {
+		t.Fatalf("必须真的逐行扫描了 1 表，实际 %d", n)
+	}
+}
+
+func TestFingerprintSameScopeComparable(t *testing.T) {
+	src, tgt := newFake("mysql"), newFake("mysql")
+	src.scope = "mysql-canon-v1"
+	tgt.scope = "mysql-canon-v1"
+	src.add(ordersTable(), ordersRows()...)
+	tgt.add(ordersTable(), ordersRows()...)
+	opts := baseOptions(src, tgt)
+	opts.Level = LevelData
+	rep, err := Run(context.Background(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rep.Fingerprint.Comparable {
+		t.Fatal("同 scope 应该可比")
+	}
+	if hasCode(rep, "fingerprint_scope_mismatch") {
+		t.Fatalf("同 scope 不该报警：%+v", rep.Levels[0].Findings)
+	}
+}
+
+// 指纹不可比与「跑了几张表」无关：只跑聚合时也要在结论里说。
+func TestConclusionFingerprintNoteIndependentOfTables(t *testing.T) {
+	rep := Report{OK: true, Levels: []LevelReport{{
+		Level: LevelData, OK: true,
+		Stats: map[string]any{
+			"tables_full_scan": 0, "tables_aggregate_only": 2, "tables_no_pk": 0,
+			"fingerprint_comparable": false,
+		},
+	}}}
+	got := Conclusion(rep)
+	if !strings.Contains(got, "仅聚合") || !strings.Contains(got, "聚合级不涉及指纹比对") {
+		t.Fatalf("聚合级应说「不涉及指纹比对」而不是「已改用逐行」：%q", got)
+	}
+	if strings.Contains(got, "已改用逐行比对") {
+		t.Fatalf("只跑聚合却说已改用逐行，自相矛盾：%q", got)
+	}
+}
+
+// 组合断言：aggregate_only + fingerprint_comparable=false 时，
+// 不得同时出现「未做行级全表比对」与「已改用逐行比对」。
+func TestConclusionAggregateOnlyFingerprintNoContradiction(t *testing.T) {
+	rep := Report{OK: true, Levels: []LevelReport{{
+		Level: LevelData, OK: true,
+		Stats: map[string]any{
+			"tables_full_scan": 0, "tables_aggregate_only": 2,
+			"fingerprint_comparable": false,
+		},
+	}}}
+	got := Conclusion(rep)
+	t.Logf("aggregate_only conclusion: %s", got)
+	if strings.Contains(got, "未做行级全表比对") && strings.Contains(got, "已改用逐行比对") {
+		t.Fatalf("同一句里既说没做行级又说改用行级：%q", got)
+	}
+	if !strings.Contains(got, "聚合级不涉及指纹比对") {
+		t.Fatalf("聚合级应明确「不涉及指纹比对」：%q", got)
+	}
+}

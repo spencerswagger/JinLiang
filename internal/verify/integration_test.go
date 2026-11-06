@@ -393,3 +393,39 @@ func TestMySQLVerifyAggregateOnly(t *testing.T) {
 		t.Fatalf("MySQL SQL 聚合必须发现值变化：%+v", rep.Levels[0].Findings)
 	}
 }
+
+// PG→MySQL 跨端：指纹算法不同（服务端 hashtextextended vs 客户端 sha256），
+// verify 必须明确报「不可比」并改用逐行比对，绝不能直接比指纹造成永久假红。
+func TestCrossEngineVerifyPGToMySQL(t *testing.T) {
+	src := openDSN(t, "JINLIANG_TEST_PG_SRC_DSN")
+	tgt := openDSN(t, "JINLIANG_TEST_MYSQL_DSN")
+	ctx := context.Background()
+	mustExec(t, src, `CREATE SCHEMA IF NOT EXISTS `+verifySchema)
+	t.Cleanup(func() { mustExec(t, src, `DROP SCHEMA IF EXISTS `+verifySchema+` CASCADE`) })
+	mustExec(t, src, `DROP TABLE IF EXISTS `+verifySchema+`.jl_cross`)
+	mustExec(t, src, `CREATE TABLE `+verifySchema+`.jl_cross (id bigint PRIMARY KEY, name text, amount numeric(12,2))`)
+	mustExec(t, src, `INSERT INTO `+verifySchema+`.jl_cross VALUES (1,'alice',10.00),(2,'bob',20.00),(3,NULL,30.00)`)
+	mustExec(t, tgt, `DROP TABLE IF EXISTS jl_cross`)
+	mustExec(t, tgt, `CREATE TABLE jl_cross (id bigint PRIMARY KEY, name text, amount decimal(12,2))`)
+	mustExec(t, tgt, `INSERT INTO jl_cross VALUES (1,'alice',10.00),(2,'bob',20.00),(3,NULL,30.00)`)
+	t.Cleanup(func() { mustExec(t, tgt, `DROP TABLE IF EXISTS jl_cross`) })
+
+	opts := verify.Options{
+		Source: src.WithSchema(verifySchema), Target: tgt,
+		SourceSchema: verifySchema, TargetSchema: tgt.Schema(),
+		Tables: []string{"jl_cross"}, Level: verify.LevelData,
+	}
+	rep, err := verify.Run(ctx, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Fingerprint.Comparable {
+		t.Fatalf("PG 与 MySQL 的指纹不可比，实际 %+v", rep.Fingerprint)
+	}
+	if !rep.OK {
+		t.Fatalf("数据一致时应逐行比对通过：%+v", rep.Levels[0].Findings)
+	}
+	if !hasFinding(rep, "fingerprint_scope_mismatch") {
+		t.Fatalf("必须报告指纹不可比：%+v", rep.Levels[0].Findings)
+	}
+}
