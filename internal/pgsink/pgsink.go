@@ -50,6 +50,9 @@ type Options struct {
 	// Catalog is the source table list the job selected; it defines the
 	// canonical column order every Row follows.
 	Catalog source.Catalog
+	// OnDDLSkipped 在「DDL 因目标端已有同名对象而被跳过」时回调（引擎用它发一条 note）。
+	// 跳过是最需要留痕的一类结果：失败会有人看，跳过不会。
+	OnDDLSkipped func(stmt string)
 
 	// ApplyBatchRows 是一条多行 upsert 里最多放几行（默认 500）。
 	//
@@ -899,8 +902,16 @@ func (s *Sink) Apply(ctx context.Context, evs []source.Event, pos source.Positio
 			if _, err := tx.Exec(ctx, "TRUNCATE TABLE "+pgwire.Qualified(ev.Table.Schema, ev.Table.Table)); err != nil {
 				return fmt.Errorf("截断目标表 %s 失败: %w", ev.Table.Table, err)
 			}
+		case source.EvDDL:
+			// **DDL 必须在这里执行**。之前这行注释写的是「由引擎处理」——而引擎里
+			// 根本没有 EvDDL 的处理代码（`grep EvDDL internal/engine` 为空），
+			// 于是源端 DDL 从来没搬到目标端：加列后整批行写失败、建索引完全静默、
+			// 改类型下次 EnsureSchema 撞 ErrTypeMismatch 把整个任务打死。
+			if err := s.applyDDLTx(ctx, tx, ev); err != nil {
+				return err
+			}
 		default:
-			// Begin/Commit/Heartbeat/DDL 由引擎处理，不落 SQL
+			// Begin/Commit/Heartbeat 由引擎处理，不落 SQL
 		}
 		i++
 	}
@@ -910,6 +921,163 @@ func (s *Sink) Apply(ctx context.Context, evs []source.Event, pos source.Positio
 		}
 	}
 	return tx.Commit(ctx)
+}
+
+// ddlDestructive 是破坏性 DDL 的判定（**白名单优先**：宁可先窄）。
+//
+// 为什么必须有：MySQL 侧（#25 的四类白名单）对 DROP / RENAME 一律 reject，
+// 而这里如果「原样执行」，DROP TABLE 会立刻删掉目标表且没有任何确认环节——
+// 两侧策略相反本身就是 bug。
+//
+// 窄了能手工做（我们会告诉用户该执行什么）；宽了会静默丢数据。
+func ddlDestructive(stmt string) bool {
+	up := strings.ToUpper(strings.Join(strings.Fields(stripLeadingComments(stmt)), " "))
+	banned := []string{
+		"DROP TABLE", "DROP SCHEMA", "DROP COLUMN", "DROP DATABASE",
+		"TRUNCATE", "RENAME ", "ALTER TABLE .* RENAME",
+	}
+	for _, b := range banned {
+		if strings.HasPrefix(up, b) {
+			return true
+		}
+	}
+	// ALTER TABLE … DROP COLUMN / DROP CONSTRAINT / RENAME 也在其中
+	if strings.HasPrefix(up, "ALTER TABLE") &&
+		(strings.Contains(up, " DROP ") || strings.Contains(up, " RENAME ")) {
+		return true
+	}
+	// DROP INDEX 单独放行是有意的：它不删数据，且重放时可以幂等跳过。
+	return strings.HasPrefix(up, "DROP INDEX") == false && strings.HasPrefix(up, "DROP ")
+}
+
+// stripLeadingComments 剥掉语句**前导**的注释（`/* … */` 与 `-- …` 行注释），
+// 返回第一条真正的 SQL。
+//
+// 为什么必须有：判定原来是 HasPrefix 匹配关键字，而 `/*x*/ DROP TABLE t`、
+// `-- hi` + 换行 + `DROP TABLE t`、多行注释前缀都不以关键字开头 → 判定落空、
+// 语句照旧被执行 → **目标表被删**。pg_dump / ORM 生成的 DDL 常带注释头，这不是特例。
+func stripLeadingComments(stmt string) string {
+	s := strings.TrimSpace(stmt)
+	for {
+		switch {
+		case strings.HasPrefix(s, "/*"):
+			if i := strings.Index(s, "*/"); i >= 0 {
+				s = strings.TrimSpace(s[i+2:])
+				continue
+			}
+			return s // 注释没闭合：原样返回，交给数据库报错
+		case strings.HasPrefix(s, "--"):
+			if i := strings.IndexByte(s, '\n'); i >= 0 {
+				s = strings.TrimSpace(s[i+1:])
+				continue
+			}
+			return "" // 整条都是行注释
+		default:
+			return s
+		}
+	}
+}
+
+// checkDDLAllowed 决定这条 DDL 能不能在目标端执行。
+//
+// 判据只有两条，都是「先窄后宽」：
+//  1. **破坏性语句不执行**（交给用户手工做，我们在错误里给原句）；
+//  2. **源 schema 必须等于目标 schema**——语句里的表名是源端原文，
+//     跨 schema 时要么报错，要么改到同名但非目标的表（最坏）。按文本重写表名太脆弱，
+//     所以先拒绝，等有真实需求再做映射。
+func checkDDLAllowed(stmt, srcSchema, tgtSchema string) error {
+	if ddlDestructive(stmt) {
+		return fmt.Errorf("这条 DDL 会删数据，我们不替你执行（%s）。"+
+			"你能做什么：1) 确认目标端也要这样改之后，手工在那条连接上执行它；"+
+			"2) 或者回任务页把这张表移出同步范围。风险：手工执行是不可回滚的结构变更，删掉的列/表数据找不回来", stmt)
+	}
+	// 「不确定就不做」：源/目标 schema 任一为空意味着不知道该改哪张表
+	//（语句可能不带前缀、会落到连接默认 schema）——在结构变更上这等于「可能改错表」。
+	// 所以这里**拒绝**，而不是「未知就放行」。
+	if strings.TrimSpace(srcSchema) == "" || strings.TrimSpace(tgtSchema) == "" {
+		return fmt.Errorf("这条 DDL 的 schema 不确定（源 %q / 目标 %q），不跟随（%s）。"+
+			"你能做什么：手工在目标端执行这条语句；或在目标端把表名写全 schema 前缀。"+
+			"风险：结构变更改错表不可逆，所以我们宁可不做", srcSchema, tgtSchema, stmt)
+	}
+	if srcSchema != tgtSchema {
+
+		return fmt.Errorf("源端 schema 是 %q、目标端是 %q，这条 DDL 里的表名是源端原文（%s）："+
+			"直接执行可能改到同名但不相干的表。你能做什么：1) 把 target.schema 配成与源端一致；"+
+			"2) 或者手工在目标端执行这条语句。风险：改错表的后果不可逆", srcSchema, tgtSchema, stmt)
+	}
+	return nil
+}
+
+// applyDDLTx 在目标端执行源端的 DDL。
+//
+// ⚠️ 现状（务必知道）：**这条能力在真实运行里目前产生不出来**——非测试代码里只有
+// `mysqlsource/assembler.go` 产出 EvDDL，而引擎的源端只做 PostgreSQL（pgoutput 不解码 DDL）。
+// 也就是说今天只有测试能触发它。等接上「PG 源 DDL 捕获」或「MySQL 源 → PG 目标」时，
+// 破坏性语句的拦截（checkDDLAllowed）就是唯一那道闸——这也是它必须先窄的原因。
+//
+// 幂等：崩溃重放时同一条 DDL 会再来一次，撞上「已经存在」的 SQLSTATE 视为成功，
+// 但**跳过必须留痕**（同名不同定义也是 42P07：跳过等于静默放过）。
+func (s *Sink) applyDDLTx(ctx context.Context, tx pgx.Tx, ev source.Event) error {
+	stmt := strings.TrimSpace(ev.DDL)
+	if stmt == "" {
+		return nil
+	}
+	// 纯注释（`-- …` 且没有换行、或只有注释）剥完是空的：没有 SQL 可执行，
+	// 别拿它去撞数据库（也不该因此判成破坏性语句）。
+	if strings.TrimSpace(stripLeadingComments(stmt)) == "" {
+		return nil
+	}
+	if err := checkDDLAllowed(stmt, ev.Table.Schema, s.opt.Schema); err != nil {
+		return err
+	}
+	sp := fmt.Sprintf("jl_ddl_%d", time.Now().UnixNano())
+	if _, err := tx.Exec(ctx, "SAVEPOINT "+pgwire.Quote(sp)); err != nil {
+		return fmt.Errorf("为 DDL 建保存点失败: %w", err)
+	}
+	release := func() error {
+		if _, err := tx.Exec(ctx, "RELEASE SAVEPOINT "+pgwire.Quote(sp)); err != nil {
+			return fmt.Errorf("释放 DDL 保存点失败: %w", err)
+		}
+		return nil
+	}
+	if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(stripLeadingComments(stmt))), "DROP INDEX") {
+		// 不删数据，但索引名是 **schema 级**的：可能删掉另一张表上（别的任务建的）同名索引。
+		log.Printf("执行 DROP INDEX（索引名是 schema 级的，可能影响别的表；"+
+			"若这条索引由别的任务/人工维护，删掉后**不会自动重建**，后果通常要等查询变慢才暴露）：%s", stmt)
+		if s.opt.OnDDLSkipped != nil {
+			s.opt.OnDDLSkipped("DROP INDEX：" + stmt)
+		}
+	}
+	if _, err := tx.Exec(ctx, stmt); err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) {
+			switch pgErr.Code {
+			case "42701", "42P07", "42710", "42P16", "42723":
+				if _, rerr := tx.Exec(ctx, "ROLLBACK TO SAVEPOINT "+pgwire.Quote(sp)); rerr != nil {
+					return fmt.Errorf("回滚 DDL 保存点失败: %w", rerr)
+				}
+				if err := release(); err != nil {
+					return err
+				}
+				// 「跳过」比「失败」更需要留痕：失败会有人看，跳过不会。
+				// 而且同名不同定义也是 42P07——我们并没有核对过定义是否一致。
+				log.Printf("跳过一条 DDL（目标端已有同名对象，未核对定义是否一致）：%s", stmt)
+				if s.opt.OnDDLSkipped != nil {
+					s.opt.OnDDLSkipped(stmt)
+				}
+				return nil
+			}
+		}
+		return fmt.Errorf("在目标端执行源端 DDL 失败（%s）: %w。"+
+			"你能做什么：1) 在目标端手工执行这条语句后重跑（位点不动，不需要重搬历史）；"+
+			"2) 如果这条 DDL 不该跟随到目标端，把对应对象排除出同步范围。"+
+			"风险：DDL 没跟随时两端结构不一致，之后写这批表会持续失败", stmt, err)
+	}
+	if err := release(); err != nil {
+		return err
+	}
+	log.Printf("已在目标端执行源端 DDL：%s", stmt)
+	return nil
 }
 
 // endsWithCommit reports whether this batch closes on a committed transaction.

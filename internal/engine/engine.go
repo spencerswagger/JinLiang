@@ -228,7 +228,14 @@ func schemaOf(doc control.JobDoc, tgt control.Connection) string {
 	if s := strings.TrimSpace(doc.Target.Schema); s != "" {
 		return s
 	}
-	return tgt.Database
+	// 回落值必须与目标端**真实落点**一致：
+	// PG 的默认 schema 是 public（数据库名不是 schema）；MySQL 的库就是 schema。
+	// 之前统一回落 tgt.Database，导致默认配置的 PG 目标变成
+	// 「源端 public ≠ 目标端 jinliang」→ DDL 闸门把每一条都拒掉，文案还很像真的。
+	if tgt.Kind == dsn.KindMySQL {
+		return tgt.Database
+	}
+	return "public"
 }
 
 func endpointOf(c control.Connection, secret string) dsn.Endpoint {
@@ -1486,11 +1493,16 @@ func (r *runner) snapshotConns() int {
 	return 1
 }
 
+// targetSchema 是「目标端真实落点 schema」的**唯一取值入口**。
+//
+// 它必须与自由函数 schemaOf 同值（Run() 在 runner 存在之前也要算这个值），
+// 所以这里直接委托——**不另写一份回落逻辑**。
+//
+// 之前这里回落 r.tgtEP.Database（数据库名），而 PG 的默认 schema 是 public：
+// 默认配置的任务被算成「源端 public ≠ 目标端 jinliang」，DDL 闸门把每一条都拒了，
+// 文案还很像真的。同一个判断两处实现，就一定会分叉（今晚这是第四次）。
 func (r *runner) targetSchema() string {
-	if s := strings.TrimSpace(r.doc.Target.Schema); s != "" {
-		return s
-	}
-	return r.tgtEP.Database
+	return schemaOf(r.doc, control.Connection{Kind: r.tgtEP.Kind, Database: r.tgtEP.Database})
 }
 
 func (r *runner) publication() string {
