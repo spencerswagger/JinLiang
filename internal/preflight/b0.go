@@ -8,6 +8,7 @@ package preflight
 
 import (
 	"fmt"
+	typecat "github.com/spencerswagger/jinliang/internal/catalog"
 	"sort"
 	"strings"
 
@@ -57,6 +58,16 @@ func Run(in Input) source.Report {
 		})
 	} else {
 		add(source.Check{ID: "TLS-01", Title: "传输已加密且校验证书", Status: source.StatusOK, Detail: "证书校验通过"})
+	}
+
+	// ── 类型映射：异构目标端才有损，必须开跑前就看到 ─────────
+	//
+	// 这条之前不存在：`catalog.Map` 只有拦截器（engine）、两个 sink 内部和 verify 在用，
+	// 预检链里一条都没有。于是 `timestamptz`（丢时区）、`money`、`interval → varchar`
+	// 这类**有损**映射，用户的第一次知情是「跑完之后 verify 报差异」。
+	// 「知情后可接受」的前提是用户真的被告知，所以这里把它摆到开跑前。
+	if in.SourceCat != nil && in.TargetKind != "" && in.TargetKind != in.SourceKind {
+		checks = append(checks, typeMappingChecks(in)...)
 	}
 
 	// ── 源端能力：能不能做实时增量 ───────────────────────────
@@ -283,4 +294,71 @@ func preview(names []string) string {
 		return strings.Join(names, "、")
 	}
 	return strings.Join(names[:3], "、") + "…"
+}
+
+// typeMappingChecks 把一个任务范围里**有损**的列类型收集成预检项。
+//
+// 分两档，与引擎的拦截口径一致：
+//   - 数组（映成 json）：可能写出结构体字段 → blocked（引擎那边也是拦）；
+//   - 其它 NeedsConfirm（timestamptz 丢时区、money、interval → varchar）：warn。
+//     它们是「知情后可接受」的代价，不是写错数据。
+func typeMappingChecks(in Input) []source.Check {
+	from := catalogEngine(in.SourceKind)
+	to := catalogEngine(in.TargetKind)
+	if from == "" || to == "" {
+		return nil
+	}
+	want := map[string]bool{}
+	for _, t := range in.Tables {
+		want[t] = true
+	}
+	var blocked, warned []string
+	for _, t := range in.SourceCat.Tables {
+		if len(want) > 0 && !want[t.Table] {
+			continue
+		}
+		for _, c := range t.Columns {
+			m, ok := typecat.Map(from, to, c.Type)
+			if !ok || m.Loss < typecat.NeedsConfirm {
+				continue
+			}
+			line := fmt.Sprintf("%s.%s（%s → %s）", t.Table, c.Name, c.Type, m.Target)
+			if m.Note != "" {
+				line += "：" + m.Note
+			}
+			if strings.HasSuffix(strings.TrimSpace(c.Type), "[]") {
+				blocked = append(blocked, line)
+			} else {
+				warned = append(warned, line)
+			}
+		}
+	}
+	var out []source.Check
+	if len(blocked) > 0 {
+		out = append(out, source.Check{
+			ID: "TYPE-01", Title: "这些列的类型到目标端不能保证语义", Status: source.StatusBlocked,
+			Detail: strings.Join(blocked, "；") +
+				"。数组会被序列化成 JSON，元素若没有 JSON 表示就会写成结构体字段（看起来能用，实际不是原值）",
+			Who: "you",
+		})
+	}
+	if len(warned) > 0 {
+		out = append(out, source.Check{
+			ID: "TYPE-02", Title: "这些列的类型到目标端会有损转换", Status: source.StatusWarn,
+			Detail: strings.Join(warned, "；") + "。知情的代价（例如丢时区），跑完可用 verify 复核",
+			Who:    "you",
+		})
+	}
+	return out
+}
+
+// catalogEngine 把连接类型映射到类型字典的引擎名。
+func catalogEngine(kind string) typecat.Engine {
+	switch kind {
+	case "postgres":
+		return typecat.Postgres
+	case "mysql":
+		return typecat.MySQL
+	}
+	return ""
 }

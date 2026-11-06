@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/spencerswagger/jinliang/internal/control"
-	"github.com/spencerswagger/jinliang/internal/dsn"
 	"github.com/spencerswagger/jinliang/internal/pgsource"
 	"github.com/spencerswagger/jinliang/internal/source"
 	"github.com/spencerswagger/jinliang/internal/state"
@@ -772,48 +771,3 @@ func TestToValuePropagatesValuerError(t *testing.T) {
 
 // preflight 的阻断口径：**只拦数组**（会被映成 json、元素可能没有 JSON 表示 → 静默写错），
 // 不拦 timestamptz 之类「丢时区但知情可接受」的 NeedsConfirm——否则几乎所有真实任务都跑不起来。
-func TestTypeCompatibilityBlocksOnlyArrays(t *testing.T) {
-	cat := source.Catalog{Tables: []source.Table{
-		{
-			TableRef: source.TableRef{Schema: "public", Table: "with_array"},
-			Columns: []source.Column{
-				{Name: "id", Type: "bigint"},
-				{Name: "tags", Type: "integer[]"},
-			},
-			PrimaryKey: []string{"id"},
-		},
-		{
-			TableRef: source.TableRef{Schema: "public", Table: "normal"},
-			Columns: []source.Column{
-				{Name: "id", Type: "bigint"},
-				{Name: "created_at", Type: "timestamp with time zone"},
-				{Name: "payload", Type: "text"},
-			},
-			PrimaryKey: []string{"id"},
-		},
-	}}
-	refs := []source.TableRef{
-		{Schema: "public", Table: "with_array"},
-		{Schema: "public", Table: "normal"},
-	}
-	mk := func(kind string) *runner {
-		return &runner{
-			cat:   cat,
-			doc:   control.JobDoc{},
-			tgtEP: dsn.Endpoint{Kind: kind},
-		}
-	}
-	// MySQL 目标端：数组列必须被拦
-	err := mk(dsn.KindMySQL).checkTypeCompatibility(refs)
-	if err == nil || !strings.Contains(err.Error(), "tags") {
-		t.Fatalf("数组列应被 preflight 拦下，得到 %v", err)
-	}
-	// MySQL 目标端：只有 timestamptz 的普通表不该被拦
-	if err := mk(dsn.KindMySQL).checkTypeCompatibility(refs[1:]); err != nil {
-		t.Fatalf("timestamptz 不该被阻断（它只是预检 warn）：%v", err)
-	}
-	// PG 目标端：类型原样搬，什么都不拦
-	if err := mk(dsn.KindPostgres).checkTypeCompatibility(refs); err != nil {
-		t.Fatalf("PG→PG 不该走这道检查：%v", err)
-	}
-}

@@ -579,12 +579,9 @@ func (r *runner) preflight(ctx context.Context) error {
 		return err
 	}
 	r.tables = tables
-	// 类型映射里 NeedsConfirm 的列（典型：数组 → MySQL json）：**开跑前就拦**。
-	// 让它跑到写第一行才报错，用户已经等了很久、而且错误信息离真相很远；
-	// 更糟的是某些 pgtype 元素会序列化成结构体字段——合法 JSON、静默写错。
-	if err := r.checkTypeCompatibility(tables); err != nil {
-		return err
-	}
+	// 类型映射的判定**只有一处**：`preflight` 的 TYPE-01（数组 → blocked）/ TYPE-02（其它有损 → warn），
+	// 由 report.CanStart 决定能不能开跑。引擎不再自己另写一份判断——两份判断迟早分叉。
+
 	in.Tables = tableNames(tables)
 	for _, t := range tables {
 		for _, c := range r.cat.Tables {

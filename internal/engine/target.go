@@ -249,7 +249,10 @@ func toValue(v any) (source.Value, error) {
 		return source.Value{Kind: source.KindBytes, B: x}, nil
 	case time.Time:
 		return source.Value{Kind: source.KindTime, T: x}, nil
-	case []any, []int16, []int32, []int64, []float32, []float64, []string, []bool, []time.Time:
+	// 注意：**`[]any` 不在这份白名单里** —— 复合类型可能被 pgx 解成 `[]any`，
+	// 无条件 marshal 会写出 `["a",1]` 这种丢了字段名的位置数组（正是今天修掉的形状换个入口）。
+	// 它落到下面的反射分支：元素必须实现 json.Marshaler，否则响亮失败。
+	case []int16, []int32, []int64, []float32, []float64, []string, []bool, []time.Time:
 		// pgx 把 SQL 数组解成原生切片，**不实现 driver.Valuer**——落到 fmt.Sprint 会写出
 		// "[1 2 3]"，而 typemap 把数组映成 MySQL 的 json 列，于是错误要等到插第一行时才现形
 		// （"Invalid JSON text"，离真实原因很远）。这里显式 json.Marshal，落成合法 JSON。
@@ -303,49 +306,4 @@ func catalogEngine(kind string) catalog.Engine {
 		return catalog.MySQL
 	}
 	return catalog.Postgres
-}
-
-// checkTypeCompatibility 在开跑前检查「源类型 → 目标类型」里那些**我们不保证**的组合。
-//
-// 判据来自类型字典（catalog.Map 的 Loss）：`NeedsConfirm` 表示语义不同、必须用户知情，
-// 典型就是 PostgreSQL 数组 → MySQL json。以前它只是预检报告里的一条 warn，用户很容易
-// 忽略；而最坏的情况（元素没有 JSON 表示）会静默写出结构体字段——所以这里升级成**阻断**。
-func (r *runner) checkTypeCompatibility(tables []source.TableRef) error {
-	if r.tgtEP.Kind != dsn.KindMySQL {
-		return nil // PG→PG 类型原样搬，不需要这道
-	}
-	want := map[string]bool{}
-	for _, t := range tables {
-		want[t.Schema+"."+t.Table] = true
-	}
-	var bad []string
-	for _, t := range r.cat.Tables {
-		if !want[t.Schema+"."+t.Table] {
-			continue
-		}
-		for _, c := range t.Columns {
-			m, ok := catalog.Map(catalog.Postgres, catalog.MySQL, c.Type)
-			if !ok || m.Loss < catalog.NeedsConfirm {
-				continue
-			}
-			// **只拦数组**：它们被映成 json，而元素没有 JSON 表示时会静默写出结构体字段
-			//（Owl 实测 `[]pgtype.Interval`）。其它 NeedsConfirm（典型 `timestamptz` 丢时区）
-			// 仍是预检里的 warn —— 把它们也拦掉会让几乎所有真实任务都跑不起来，
-			// 而「丢时区」是知情后可接受的代价，不是写错数据。
-			if !strings.HasSuffix(strings.TrimSpace(c.Type), "[]") {
-				continue
-			}
-			bad = append(bad, fmt.Sprintf("%s.%s（%s → %s）", t.Table, c.Name, c.Type, m.Target))
-		}
-	}
-	if len(bad) == 0 {
-		return nil
-	}
-	// 用 notImplementedError：这不是「用户做错了什么」，是「这个组合我们还没支持」——
-	// 它自带完整四段式，不该再被 hint() 追加一段泛泛的「未分类」建议。
-	return &notImplementedError{fmt.Sprintf("这些列的类型到 MySQL 目标端**不能保证语义**：%s。\n"+
-		"你现在能做什么：1) 把这几列从任务范围里排除（content.tables.<表>.columns.exclude）；"+
-		"2) 或等我们为它加专门映射后再同步。\n"+
-		"风险：直接跑会写出「看起来能读、实际不是原值」的数据（例如数组被序列化成结构体字段），"+
-		"而 md5 比对也发现不了——因为它是一致地写错的", strings.Join(bad, "、"))}
 }

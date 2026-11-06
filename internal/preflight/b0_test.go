@@ -212,3 +212,55 @@ func TestBatchBoundsAreChecked(t *testing.T) {
 		t.Fatalf("conns=64 必须 blocked")
 	}
 }
+
+// 类型映射必须在**开跑前**出现在预检里：有损但可接受的是 warn，数组是 blocked。
+// （这条之前预检链里一条类型映射检查都没有，用户的第一次知情是跑完 verify 报差异。）
+func TestTypeMappingChecksAppearInPreflight(t *testing.T) {
+	cat := &source.Catalog{Tables: []source.Table{
+		{
+			TableRef: source.TableRef{Schema: "public", Table: "t"},
+			Columns: []source.Column{
+				{Name: "id", Type: "bigint"},
+				{Name: "created_at", Type: "timestamp with time zone"},
+				{Name: "tags", Type: "integer[]"},
+				{Name: "amount", Type: "money"},
+			},
+		},
+	}}
+	rep := Run(Input{
+		SourceKind: "postgres", TargetKind: "mysql", Mode: "once",
+		SourceCat: cat, Tables: []string{"t"},
+	})
+	var blocked, warned bool
+	for _, c := range rep.Checks {
+		switch c.ID {
+		case "TYPE-01":
+			blocked = true
+			if c.Status != source.StatusBlocked || !strings.Contains(c.Detail, "tags") {
+				t.Fatalf("数组应 blocked 且点名到列：%+v", c)
+			}
+			if strings.Contains(c.Detail, "created_at") {
+				t.Fatalf("数组项不该混进有损列：%+v", c)
+			}
+		case "TYPE-02":
+			warned = true
+			if c.Status != source.StatusWarn {
+				t.Fatalf("有损转换应是 warn：%+v", c)
+			}
+			if !strings.Contains(c.Detail, "created_at") {
+				t.Fatalf("timestamptz 应出现在 warn 里（用户开跑前就该知道）：%+v", c)
+			}
+		}
+	}
+	if !blocked || !warned {
+		t.Fatalf("TYPE-01/TYPE-02 都应出现，得到 blocked=%v warned=%v", blocked, warned)
+	}
+
+	// 同构（PG→PG）不产出这两项
+	rep = Run(Input{SourceKind: "postgres", TargetKind: "postgres", Mode: "once", SourceCat: cat, Tables: []string{"t"}})
+	for _, c := range rep.Checks {
+		if c.ID == "TYPE-01" || c.ID == "TYPE-02" {
+			t.Fatalf("同构不该有类型映射项：%+v", c)
+		}
+	}
+}
