@@ -170,3 +170,86 @@ func TestUnclassifiedErrorHintPersistsToLastError(t *testing.T) {
 		})
 	}
 }
+
+// 丢租约**不是**用户停止：loseLease 自己会 cancel(runCtx)，所以进 fail() 时 ctx 已经
+// 是 Canceled —— 之前这个误判把「另一个实例接管」记成「用户点了停止 +130 + done」，
+// 历史页显示「已手动停止」，真原因彻底消失。Owl 的探针就是撞到这条。
+func TestLeaseLostIsInterruptedNotStopped(t *testing.T) {
+	for _, phase := range []state.Phase{state.Preflight, state.Streaming} {
+		t.Run(string(phase), func(t *testing.T) {
+			store, jobID := newControlStore(t)
+			run, err := store.StartRun(context.Background(), jobID, phase, control.RunKindSync)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// 造出「租约已丢」的状态：run ctx 被 cancel（loseLease 的行为）+ leaseLost 置位
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			r := &runner{opt: Options{Store: store}, job: control.Job{ID: jobID}, run: run, phase: phase}
+			r.leaseLost.Store(true)
+			r.leaseWhy.Store("租约被别的实例接管了")
+			r.cancelRun = cancel
+
+			err = r.fail(ctx, r.leaseLostError())
+			if err == nil {
+				t.Fatal("丢租约应返回错误（不是静默成功）")
+			}
+
+			got, gerr := store.GetRun(context.Background(), run.ID)
+			if gerr != nil {
+				t.Fatal(gerr)
+			}
+			if got.FinishReason != control.FinishInterrupted {
+				t.Fatalf("丢租约应记 interrupted，得到 %q（被误判成用户停止？）", got.FinishReason)
+			}
+			if got.ExitCode != nil && *got.ExitCode == ExitStopped {
+				t.Fatal("丢租约不能记成 130（那是「用户主动停止」）")
+			}
+			if got.Phase != state.Failed {
+				t.Fatalf("丢租约的阶段应为 failed，得到 %s", got.Phase)
+			}
+			if !strings.Contains(got.LastError, "租约") {
+				t.Fatalf("last_error 必须写清是租约原因，得到 %q", got.LastError)
+			}
+		})
+	}
+}
+
+// Owl 用变异证明过：「用户 stop 仍记 stopped」这条是 TestUserStopBeforeDataIsStoppedNotFailed
+// 的严格子集（那里断言更全、还覆盖 prepare）。所以这条测试存在的唯一理由是覆盖
+// **它覆盖不到的角度：丢租约之后再 stop，也不会把这一轮改回 stopped**——
+// 否则历史页会显示「用户停止」，而真相是「被另一个实例接管」。
+// （变异验证：去掉 fail() 里的租约优先判断，这条会红。）
+func TestStopAfterLeaseLostKeepsInterrupted(t *testing.T) {
+	store, jobID := newControlStore(t)
+	run, err := store.StartRun(context.Background(), jobID, state.Streaming, control.RunKindSync)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	r := &runner{opt: Options{Store: store}, job: control.Job{ID: jobID}, run: run, phase: state.Streaming}
+	r.cancelRun = cancel
+	r.leaseLost.Store(true)
+	r.leaseWhy.Store("租约被别的实例接管了")
+
+	// 第一下：丢租约
+	if err := r.fail(ctx, r.leaseLostError()); err == nil {
+		t.Fatal("丢租约应返回错误")
+	}
+	// 第二下：同一个 run 上又来一次「用户取消」（例如用户随后点了停止）
+	if err := r.fail(ctx, context.Canceled); err == nil {
+		t.Fatal("第二次 fail 也应返回错误")
+	}
+
+	got, err := store.GetRun(context.Background(), run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.FinishReason != control.FinishInterrupted {
+		t.Fatalf("丢租约之后再 stop，仍应是 interrupted，得到 %q（被改写成了用户停止？）", got.FinishReason)
+	}
+	if got.ExitCode != nil && *got.ExitCode == ExitStopped {
+		t.Fatal("丢租约的收尾不能被后来的 stop 改写成 130")
+	}
+}

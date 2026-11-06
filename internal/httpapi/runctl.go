@@ -9,6 +9,7 @@ import (
 	"github.com/spencerswagger/jinliang/internal/control"
 	"github.com/spencerswagger/jinliang/internal/core"
 	"github.com/spencerswagger/jinliang/internal/jobrun"
+	"github.com/spencerswagger/jinliang/internal/state"
 )
 
 // 控制面这一侧只需要管三件事：谁在跑、怎么停、停完怎么收尾。
@@ -28,6 +29,15 @@ type runRegistry struct {
 type runningJob struct {
 	cancel context.CancelFunc
 	done   chan struct{}
+}
+
+// fallbackNext 是「没有错误码」时的下一步：不编造原因，只给能自己动手的三条。
+// 为什么需要它：只有 ErrConflict 那条会填 Event.Next，而最常见的失败恰好没有码
+// （权限、schema 写错、连不上）——审计里留个 null 的 next 等于把问题丢回给用户。
+var fallbackNext = []string{
+	"看这次运行的原始报错：打开任务页 →「最近一次运行」，或 GET /api/runs?job_id=<id>",
+	"按报错里的关键词自查最常见三处：连接能否连通、源端表/schema 名是否写对、账号有没有 SELECT 与建表权限",
+	"仍解决不了：把错误摘要（含 SQLSTATE）与任务 id 发给维护者",
 }
 
 func newRunRegistry() *runRegistry {
@@ -161,8 +171,12 @@ func (s *Server) startJob(ctx context.Context, job control.Job, actor string) er
 		// 它自己不会发事件——HTTP 已经回了 202，客户端会以为「跑了但什么都没发生」。
 		// 这里补一条 error 事件，让事件流上一定看得见原因。
 		s.logf("job %s 未能开始: %v", job.ID, err)
+		// 这一帧不属于任何 run（引擎还没建出 run 行），所以 RunID 留空、
+		// Phase 只是「失败发生在开跑前」的标注——UI 对 error 不做阶段推进。
 		ev := control.Event{
-			JobID: job.ID, Type: "error", Phase: "preflight",
+			JobID:   job.ID,
+			Type:    "error",
+			Phase:   state.Preflight,
 			Message: err.Error(),
 		}
 		if errors.Is(err, control.ErrConflict) {
@@ -170,6 +184,38 @@ func (s *Server) startJob(ctx context.Context, job control.Job, actor string) er
 			if spec, ok := core.Lookup(core.CodeJobRunningElsewhere); ok {
 				ev.Next = spec.Next
 			}
+		}
+		// 事件只活在环形缓冲里，进程重启就没了。用户回头问「它说已接受，为什么
+		// 什么都没发生」时，唯一能查的地方是控制库——所以这里必须落一条 audit。
+		// 「现在能做什么」必须每条都有。只有 ErrConflict 那条会填 ev.Next，
+		// 而最常见的恰恰是没码的那些（权限、schema 写错、连不上）——只写
+		// 「发生了什么」而留个 null 的 next，等于把问题原样丢回给用户。
+		next := ev.Next
+		if len(next) == 0 {
+			next = fallbackNext
+		}
+		detail := map[string]any{
+			"job_id":  job.ID,
+			"actor":   actor,
+			"code":    ev.Code,
+			"message": ev.Message,
+			"next":    next,
+			"note":    "HTTP 已回 202，但引擎返回了错误；这里留一条不随进程重启消失的痕迹",
+		}
+		// 引擎若已经建出 run 行（失败发生在开跑之后），把那条 run 也指出来，
+		// 免得读者以为「没有 run 行」。
+		if last, lerr := s.store.LatestRun(context.Background(), job.ID); lerr == nil {
+			detail["run_id"] = last.ID
+			detail["run_phase"] = string(last.Phase)
+			detail["run_finish_reason"] = last.FinishReason
+			if last.LastError != "" {
+				detail["run_last_error"] = last.LastError
+			}
+		}
+		// 审计行的「谁」用真实发起者：同一次 startJob 里 job.run 记的就是它，
+		// 写成 runner 会导致「按 actor 过滤时看得到发起、看不到被拒绝」。
+		if aerr := s.store.Audit(context.Background(), actor, control.ActionRunRejected, detail); aerr != nil {
+			s.logf("job %s 的拒绝痕迹写入失败（audit）: %v", job.ID, aerr)
 		}
 		s.store.Bus().Publish(ev)
 	}()

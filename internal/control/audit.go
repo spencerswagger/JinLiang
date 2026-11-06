@@ -28,7 +28,11 @@ const (
 	ActionJobExport  = "job.export"
 	ActionJobRun     = "job.run"
 	ActionRunStub    = "run.stub"
-	ActionAdminSet   = "admin.set"
+	// ActionRunRejected：run 被接受（HTTP 202）但引擎在「还没建出 run 行」之前就失败。
+	// 这条必须落控制库——事件只活在环形缓冲里，进程一重启就查不到了，而用户回来
+	// 第一个问题正是「它说已接受，为什么什么都没发生」。
+	ActionRunRejected = "job.run.rejected"
+	ActionAdminSet    = "admin.set"
 )
 
 // AuditEntry is one row of the audit trail.

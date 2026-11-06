@@ -14,11 +14,22 @@
 `INSERT…SELECT` 灌 2000 万行是真实场景；继续撑下去是 OOM（进程直接没了，看不出原因），
 而 `E1011` 是可读的、带下一步的失败（拆事务 / 调上限，风险写清「调高会推高峰值内存」）。
 
-**配置口径（诚实记录）**：上限的默认值是代码里的常量（128 MB / 100 万事件）。要调高，目前只有
-**环境变量**：`JINLIANG_TX_MAX_BYTES` / `JINLIANG_TX_MAX_EVENTS`（MySQL 源已接；PostgreSQL 源尚未接，
-见 B1 遗留）。`reliability.tx_oversize` 在 `schema/job.schema.json` 里目前只是 `spill | fail` 的取值开关，
-**数值上限（`bytes` / `events`）的 yaml 形状还没定，B2 落**——在那之前别对用户说"改 job.yaml 的
-`tx_oversize.events`"，那个键会被 schema 校验直接拒掉。
+**配置口径**（2026-11-06 定形状）：上限有两个来源，按 **`yaml 显式值 > 环境变量 > 内置默认`** 取值。
+
+```yaml
+reliability:
+  tx_oversize: fail                 # 旧写法：spill（默认）| fail —— 继续有效，行为不变
+  # 或
+  tx_oversize:                      # 新写法：对象，可只给其中一项
+    mode: fail                      # 沿用 spill | fail
+    bytes: 134217728                # 单事务字节上限，最小 1 MiB
+    events: 1000000                 # 单事务事件数上限，最小 1000
+```
+
+- **向后兼容**：`spill | fail` 的字符串写法**继续有效**，旧 yaml 不受影响；`job.schema.json` 用 `oneOf` 同时接受两种形状（`examples/job.yaml` 是旧写法、`examples/job-tx-oversize.yaml` 是新写法，CI 每轮都校验这两份）。
+- **环境变量**：`JINLIANG_TX_MAX_BYTES` / `JINLIANG_TX_MAX_EVENTS` 仍可用，只在 yaml 没给对应项时生效。
+- **实现进度**：`jobspec` 的解析**已支持两种形态**（旧字符串与对象都能 import/export，旧写法导出后仍是字符串）；`bytes` / `events` 的**运行期读取**在 B5 接（引擎 `txLimits()` 改调 `TxOversizeDoc.Limits()`，取值顺序即上面那条）——在那之前它们只被校验与保存，运行期仍取环境变量/内置默认。
+- `spill` 仍未实现（见上表）：两种 `mode` 当前都表现为「超限即报 `E1011`」，区别要等 spill-to-disk 落地。
 
 **顺序**：事务内按源顺序；跨事务按提交顺序。写入端单线程，任何并行都在源端按表拆分。
 
