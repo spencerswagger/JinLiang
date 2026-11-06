@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -11,6 +12,7 @@ import (
 
 	"github.com/spencerswagger/jinliang/internal/control"
 	"github.com/spencerswagger/jinliang/internal/core"
+	"github.com/spencerswagger/jinliang/internal/dsn"
 	"github.com/spencerswagger/jinliang/internal/state"
 )
 
@@ -287,5 +289,151 @@ func TestMissingColumnUsesE1013WithUsableNextSteps(t *testing.T) {
 	got, _ := store.GetRun(context.Background(), run.ID)
 	if !strings.Contains(got.LastError, "E1013") || !strings.Contains(got.LastError, "预检") {
 		t.Fatalf("last_error 应含 E1013 与缺列的动作，得到：%s", got.LastError)
+	}
+}
+
+// ① 心跳必须真的刷新：`runs.heartbeat_at` 不更新的后果是「空闲 90 秒被判幽灵、
+// 重启把健康任务标成 interrupted」。这条测的是心跳循环本身（注入 interval 与 touch，
+// 不等真同步跑两分钟），另有一条对比断言：不调 TouchRun 时 heartbeat_at 不变。
+func TestHeartbeatLoopRefreshesRunRow(t *testing.T) {
+	store, jobID := newControlStore(t)
+	run, err := store.StartRun(context.Background(), jobID, state.Streaming, control.RunKindSync)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := store.GetRun(context.Background(), run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.HeartbeatAt == "" {
+		t.Fatal("StartRun 应写入初始 heartbeat_at")
+	}
+
+	// 把心跳手动推到「很久以前」，再看循环能不能把它刷新回来
+	if _, err := store.DB().Exec(`UPDATE runs SET heartbeat_at = '2000-01-01T00:00:00Z' WHERE id = ?`, run.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	r := &runner{opt: Options{Store: store}, job: control.Job{ID: jobID}, run: run, phase: state.Streaming}
+	ctx, cancel := context.WithCancel(context.Background())
+	go r.heartbeatLoop(ctx, 10*time.Millisecond, func(c context.Context) error {
+		return store.TouchRun(c, run.ID)
+	})
+	time.Sleep(80 * time.Millisecond)
+	cancel()
+
+	got, err := store.GetRun(context.Background(), run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.HeartbeatAt == "2000-01-01T00:00:00Z" {
+		t.Fatal("心跳没有被刷新（runs.heartbeat_at 还是旧值）——doctor 会把这轮判成幽灵")
+	}
+}
+
+// 心跳失败不能打断同步，但要 emit 一条 note（状态页可能误判，用户得知道）。
+func TestHeartbeatLoopReportsFailureButKeepsRunning(t *testing.T) {
+	r := &runner{opt: Options{}, job: control.Job{}, run: control.Run{ID: "x"}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var calls atomic.Int32 // race 检测器会盯着：计数只能在 goroutine 里原子加、主线程原子读
+	go r.heartbeatLoop(ctx, 5*time.Millisecond, func(context.Context) error {
+		calls.Add(1)
+		return errors.New("控制库暂时不可写")
+	})
+	time.Sleep(60 * time.Millisecond)
+	if n := calls.Load(); n < 2 {
+		t.Fatalf("心跳失败后应继续尝试，实际只调了 %d 次", n)
+	}
+}
+
+// 心跳 note 只在状态转换点发：每 15 秒一条会把 200 条环形缓冲铺满、
+// 把真正的 progress/error 挤掉（13 分钟就能铺满）。
+// 断言的是「两次失败只发一条、恢复时再发一条」，不是「至少发了一条」。
+func TestHeartbeatNotesOnlyOnStateTransitions(t *testing.T) {
+	var notes atomic.Int32
+	r := &runner{opt: Options{}, job: control.Job{}, run: control.Run{ID: "x"}}
+	r.emitHook = func(control.Event) { notes.Add(1) }
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	bad := atomic.Bool{}
+	bad.Store(true)
+	go r.heartbeatLoop(ctx, 5*time.Millisecond, func(context.Context) error {
+		if bad.Load() {
+			return errors.New("控制库暂时不可写")
+		}
+		return nil
+	})
+	time.Sleep(60 * time.Millisecond) // 期间会有多次失败
+	if n := notes.Load(); n != 1 {
+		t.Fatalf("连续失败只应发一条 note，实际 %d 条", n)
+	}
+	bad.Store(false) // 恢复
+	time.Sleep(40 * time.Millisecond)
+	if n := notes.Load(); n != 2 {
+		t.Fatalf("恢复时应再发一条，实际累计 %d 条", n)
+	}
+}
+
+// ② 强杀后不该「不重启 serve 就永远跑不了」：控制面有一条未结束的 run 时，
+// 只要**心跳停了超过 StaleAfter**就应能替它收尾（不再只看目标端租约——
+// 读不到租约表/目标端连不上时，用户会永远卡在 E1005）。
+func TestReclaimAbandonedRunByStaleHeartbeat(t *testing.T) {
+	store, jobID := newControlStore(t)
+	run, err := store.StartRun(context.Background(), jobID, state.Streaming, control.RunKindSync)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 心跳停在一小时前（进程被 kill -9 的真实形态）
+	if _, err := store.DB().Exec(`UPDATE runs SET heartbeat_at = ? WHERE id = ?`,
+		time.Now().Add(-time.Hour).UTC().Format(time.RFC3339), run.ID); err != nil {
+		t.Fatal(err)
+	}
+	job, err := store.GetJob(context.Background(), jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 目标端给一个连不上的地址：租约读不到，必须靠心跳兜住
+	ep := dsn.Endpoint{Kind: dsn.KindPostgres, Host: "127.0.0.1", Port: 1, Database: "x",
+		Username: "x", Password: "x"}
+
+	reclaimed, err := reclaimAbandonedRun(context.Background(), store, job, ep, "public")
+	if err != nil {
+		t.Fatalf("替它收尾时不该报错：%v", err)
+	}
+	if !reclaimed {
+		t.Fatal("心跳停了一小时却没被收尾——用户会卡在「已经有一条未结束的运行」上")
+	}
+	got, err := store.GetRun(context.Background(), run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.FinishReason != control.FinishInterrupted {
+		t.Fatalf("应标成 interrupted，得到 %q", got.FinishReason)
+	}
+	if !strings.Contains(got.LastError, "心跳") {
+		t.Fatalf("last_error 应说清判据（心跳/租约），得到：%s", got.LastError)
+	}
+}
+
+// 心跳还很新的时候**不能**误杀（别把正常在跑的替它收尾）。
+func TestReclaimAbandonedRunKeepsFreshHeartbeat(t *testing.T) {
+	store, jobID := newControlStore(t)
+	if _, err := store.StartRun(context.Background(), jobID, state.Streaming, control.RunKindSync); err != nil {
+		t.Fatal(err)
+	}
+	job, err := store.GetJob(context.Background(), jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ep := dsn.Endpoint{Kind: dsn.KindPostgres, Host: "127.0.0.1", Port: 1, Database: "x",
+		Username: "x", Password: "x"}
+	reclaimed, err := reclaimAbandonedRun(context.Background(), store, job, ep, "public")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reclaimed {
+		t.Fatal("心跳是新的（刚起不到 StaleAfter），不该把这条 run 收掉")
 	}
 }
