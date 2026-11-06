@@ -21,7 +21,11 @@ import (
 //   - 同一个 job_key 同时只允许一个实例写；TTL 30s；过期可抢占；
 //   - 同机同 job：租约 label 里带 pid，进程已死可立刻接管（kill -9 后不用等 30s），
 //     进程还活着则拒绝并告诉用户是哪个 pid；
-//   - 位点写 `_jl_meta.position`，与数据同事务（本包 Apply 里已实现）。
+//   - 位点写 `_jl_meta.position`。**注意限定**：只有**不含 DDL/TRUNCATE** 的批次才是
+//     「数据 + 位点同一个事务」；含 DDL/TRUNCATE 的批次必须拆成三段——数据（带**旧**位点）
+//     → DDL 单独执行 → 新位点单独提交，因为 MySQL 的 DDL/TRUNCATE 会隐式提交，塞进同一
+//     事务时 `Commit` 退化成空操作（`#25` 的必改）。方向仍安全：崩在中间位点停在旧值，
+//     重放时数据靠 upsert 幂等、DDL 靠 information_schema 判存在跳过。
 
 // defaultLeaseTTL 与控制面心跳同阶（docs/STATE-SCHEMA.md §3）。
 const defaultLeaseTTL = 30 * time.Second
