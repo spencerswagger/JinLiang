@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/spencerswagger/jinliang/internal/control"
+	"github.com/spencerswagger/jinliang/internal/core"
 	"github.com/spencerswagger/jinliang/internal/state"
 )
 
@@ -252,5 +253,39 @@ func TestStopAfterLeaseLostKeepsInterrupted(t *testing.T) {
 	}
 	if got.ExitCode != nil && *got.ExitCode == ExitStopped {
 		t.Fatal("丢租约的收尾不能被后来的 stop 改写成 130")
+	}
+}
+
+// 42703（缺列）也归 E1013——码表已扩到「schema / 表 / 列」，并且 Next 里
+// **必须有一条专门针对缺列的有效动作**（回任务页重跑预检）。
+// 之前那条码只讲「建 schema」，对缺列的用户全是无效动作（Owl 的必改）。
+func TestMissingColumnUsesE1013WithUsableNextSteps(t *testing.T) {
+	missingCol := &pgconn.PgError{Code: "42703", Message: `column "updated_at" does not exist`}
+	code, ok := classifyError(missingCol)
+	if !ok || code != core.CodeObjectMissing {
+		t.Fatalf("42703 应映射 E1013，得到 %s %v", code, ok)
+	}
+	spec, found := core.Lookup(core.CodeObjectMissing)
+	if !found {
+		t.Fatal("码表里应有 E1013")
+	}
+	if len(spec.Next) < 3 {
+		t.Fatalf("E1013 的 next 应有 3 条（schema / 表 / 列各一条），实际 %d 条：%v", len(spec.Next), spec.Next)
+	}
+	joined := strings.Join(spec.Next, "；")
+	if !strings.Contains(joined, "42703") || !strings.Contains(joined, "预检") {
+		t.Fatalf("缺列必须有一条可执行动作（回任务页重跑预检），得到：%s", joined)
+	}
+	// 挂码的错误也要把这条方向写进 last_error（历史页只有这条字符串）
+	store, jobID := newControlStore(t)
+	run, err := store.StartRun(context.Background(), jobID, state.Prepare, control.RunKindSync)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := &runner{opt: Options{Store: store}, job: control.Job{ID: jobID}, run: run, phase: state.Prepare}
+	_ = r.fail(context.Background(), missingCol)
+	got, _ := store.GetRun(context.Background(), run.ID)
+	if !strings.Contains(got.LastError, "E1013") || !strings.Contains(got.LastError, "预检") {
+		t.Fatalf("last_error 应含 E1013 与缺列的动作，得到：%s", got.LastError)
 	}
 }
