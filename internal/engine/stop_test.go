@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -334,13 +335,13 @@ func TestHeartbeatLoopReportsFailureButKeepsRunning(t *testing.T) {
 	r := &runner{opt: Options{}, job: control.Job{}, run: control.Run{ID: "x"}}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	calls := 0
+	var calls atomic.Int32 // race 检测器会盯着：计数只能在 goroutine 里原子加、主线程原子读
 	go r.heartbeatLoop(ctx, 5*time.Millisecond, func(context.Context) error {
-		calls++
+		calls.Add(1)
 		return errors.New("控制库暂时不可写")
 	})
 	time.Sleep(60 * time.Millisecond)
-	if calls < 2 {
-		t.Fatalf("心跳失败后应继续尝试，实际只调了 %d 次", calls)
+	if n := calls.Load(); n < 2 {
+		t.Fatalf("心跳失败后应继续尝试，实际只调了 %d 次", n)
 	}
 }
