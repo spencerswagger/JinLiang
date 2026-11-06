@@ -40,6 +40,10 @@ type targetSink interface {
 //
 // 关键：必须有编译期断言（下面 var _ 那两行）。否则签名差一个参数，
 // 运行时会静默 `ok == false` 而退回「这个目标端不支持增量」——功能看着在、其实从没被走到。
+// 故意**不**列 Position / Watermark / SetWatermark 之类：
+// 它们不是这条路径要用的能力，漏列只会变成编译错误（安全），
+// 而多补一条断言等于把「编译期保证」换成「运行时检查」——那是退步。
+// 换句话说：这个接口的成员应该由「谁在用」决定，不由「谁有」决定。
 type stateCapable interface {
 	AcquireLease(ctx context.Context, ttl time.Duration) (bool, string, error)
 	RenewLease(ctx context.Context, ttl time.Duration) (bool, error)
@@ -128,7 +132,9 @@ func (r *runner) prepareGeneric(ctx context.Context) error {
 // executeGenericFullCopy 跑一次全量到非 PG 目标端（MySQL）。
 //
 // 本次范围只到全量：
-//   - 目标端状态表（_jl_lease / _jl_meta 的位点与阶段）还没实现，所以**不租约、不记位点**；
+//   - **虽然目标端（MySQL）已经有状态表能力（#50），本版这条路径仍然不 acquire 租约、
+//     不写位点、不记块进度**——「能力有了」和「这条路径用了」是两件事，
+//     别看到 `stateCapable` 就以为这里在用它；
 //   - 增量（Apply 的流式路径 / interval 的水位）明确报「本版仅支持全量」，不静默降级。
 //
 // 写入走契约里的 `sink.Apply`：把每一页行包成 EvInsert 事件（带 Relation=这一版列定义），
@@ -243,12 +249,17 @@ func (r *runner) incrementalGate() error {
 	if !hasState {
 		return &notImplementedError{fmt.Sprintf(
 			"目标端（%s）还没有租约/位点能力，只能跑全量：没有位点就没法知道「上次搬到哪」，"+
-				"跑增量会重复或漏数据。你现在能做什么：把 mode.frequency 改成 once 先搬存量，"+
-				"或换 PostgreSQL 目标端跑增量。风险：没有（本次没有写入任何数据）", r.tgtEP.Kind)}
+				"跑增量会重复或漏数据。你现在能做什么：1) 把 mode.frequency 改成 once 先搬存量；"+
+				"2) 需要周期性重跑就用 full_interval；3) 或者换 PostgreSQL 目标端跑真增量。"+
+				"风险：没有（本次没有写入任何数据）", r.tgtEP.Kind)}
 	}
+	// 注意：**不要建议用户改 interval**——非 PG 目标端在 Run 里提前返回、走
+	// executeGenericFullCopy，而它第一步就是本函数，interval 会撞回这同一句拒绝
+	//（engine.go 的 interval 分派对 MySQL 不可达）。给的建议必须是走得通的。
 	return &notImplementedError{fmt.Sprintf(
 		"目标端（%s）的状态表已经就绪，但本版引擎的非 PG 增量路径还没接上：目前只搬全量。"+
-			"你现在能做什么：1) 用 mode.frequency=once 先搬存量；2) 定时增量改用 interval（按水位轮询）。"+
+			"你现在能做什么：1) 把 mode.frequency 改成 once 先搬存量；"+
+			"2) 需要周期性重跑就用 full_interval（每轮整表重搬，明确接受这个代价）。"+
 			"风险：没有（本次没有写入任何数据）", r.tgtEP.Kind)}
 }
 

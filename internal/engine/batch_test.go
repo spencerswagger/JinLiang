@@ -810,3 +810,23 @@ func TestIncrementalGateExplainsWhatIsMissing(t *testing.T) {
 		}
 	}
 }
+
+// MySQL 目标端上 interval / continuous 都必须被同一道闸门拒绝，
+// 而且**建议里不能再出现 interval**（照建议改完会撞回同一句拒绝——那是把人引向无效动作）。
+func TestMySQLIntervalIsRejectedWithUsableAdvice(t *testing.T) {
+	for _, mode := range []string{"interval", "continuous+initial", "continuous"} {
+		r := &runner{tgtEP: dsn.Endpoint{Kind: dsn.KindMySQL}, gsink: sinkOnly{}}
+		r.doc.Mode.Frequency = mode
+		err := r.incrementalGate()
+		if err == nil {
+			t.Fatalf("%s 在 MySQL 目标端必须被拒", mode)
+		}
+		msg := err.Error()
+		if strings.Contains(msg, "改用 interval") || strings.Contains(msg, "用 interval") {
+			t.Fatalf("%s 的建议把用户引向 interval，而同一条闸门又会拒它：%s", mode, msg)
+		}
+		if !strings.Contains(msg, "once") || !strings.Contains(msg, "full_interval") {
+			t.Fatalf("%s 的建议应给 once 与 full_interval 两条真正走得通的路：%s", mode, msg)
+		}
+	}
+}
