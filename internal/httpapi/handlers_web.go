@@ -614,10 +614,9 @@ func (s *Server) pageDiagnostics(w http.ResponseWriter, r *http.Request) {
 		Listen: str("listen"), SchemaVersion: str("schema_version"),
 		DBBytes: num("db_bytes"), Audit: audit,
 	}
-	for _, e := range audit {
-		if e.Action != control.ActionRunRejected {
-			continue
-		}
+	// 过滤下推到 SQL：窗口（最近 N 条）里筛，忙时会把拒绝记录筛没。
+	rejected, _ := s.store.ListAuditByAction(ctx, control.ActionRunRejected, 10)
+	for _, e := range rejected {
 		var det struct {
 			JobID   string   `json:"job_id"`
 			Code    string   `json:"code"`

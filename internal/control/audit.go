@@ -88,6 +88,34 @@ func (s *Store) ListAudit(ctx context.Context, limit int) ([]AuditEntry, error) 
 	return out, rows.Err()
 }
 
+// ListAuditByAction 按 action 过滤取最近的审计记录。
+//
+// 为什么必须有这个方法：诊断页原来取「最近 50 条 audit」再在页面里筛 rejected。
+// 忙时一小时的运行/登录就能把窗口填满，拒绝记录会掉出去——用户点开诊断页看到
+// 「没有被拒绝的记录」，而实际刚刚发生过。那和「没有痕迹」是同一个后果，
+// 所以过滤必须下推到 SQL。
+func (s *Store) ListAuditByAction(ctx context.Context, action string, limit int) ([]AuditEntry, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 10
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, at, actor, action, COALESCE(detail_json,'') FROM audit
+		 WHERE action = ? ORDER BY at DESC, id DESC LIMIT ?`, action, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []AuditEntry
+	for rows.Next() {
+		var a AuditEntry
+		if err := rows.Scan(&a.ID, &a.At, &a.Actor, &a.Action, &a.Detail); err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
 // PhaseLabel is the human word for a phase. The UI never shows raw phase codes
 // and never shows WAL/slot/LSN (docs/DESIGN.md: 用户不懂这些).
 // RunStateLabel is what the UI shows for one run. finish_reason wins over phase:
