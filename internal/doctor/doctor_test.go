@@ -182,3 +182,31 @@ func TestConflictAndDeadLetterChecksAreNotGreenWithoutWriter(t *testing.T) {
 		t.Fatal("StatusSkipped 必须是独立状态值，不能复用 OK")
 	}
 }
+
+// 汇总必须诚实：跳过的项要计数并出现在结论里，否则就是「逐行诚实、页脚撒谎」，
+// 而人只读页脚。
+func TestSkippedChecksAreCountedInSummary(t *testing.T) {
+	r := Report{Healthy: true}
+	checks := []Check{
+		{ID: "A", Status: StatusOK},
+		{ID: "B", Status: StatusWarn},
+		{ID: "C", Status: StatusSkipped},
+		{ID: "D", Status: StatusSkipped},
+	}
+	for _, c := range checks {
+		switch c.Status {
+		case StatusProblem:
+			r.Problems++
+		case StatusWarn:
+			r.Warnings++
+		case StatusSkipped:
+			r.Skipped++
+		}
+	}
+	if r.Skipped != 2 {
+		t.Fatalf("跳过项应计入 Skipped，得到 %d", r.Skipped)
+	}
+	if r.Problems != 0 || !r.Healthy {
+		t.Fatal("跳过不算不健康（Healthy 语义不变）")
+	}
+}

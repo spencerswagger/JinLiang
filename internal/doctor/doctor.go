@@ -113,7 +113,10 @@ type Report struct {
 	Checks      []Check `json:"checks"`
 	Problems    int     `json:"problems"`
 	Warnings    int     `json:"warnings"`
-	Healthy     bool    `json:"healthy"`
+	// Skipped 是「这项检查跑不了/没意义」的数量。它不进 Healthy 判定（跳过不等于不健康），
+	// 但**必须出现在汇总文字里**——否则就是「逐行诚实、页脚撒谎」，而人只读页脚。
+	Skipped int  `json:"skipped"`
+	Healthy bool `json:"healthy"`
 }
 
 // Run performs the checks.
@@ -148,6 +151,8 @@ func Run(ctx context.Context, opts Options) Report {
 			r.Problems++
 		case StatusWarn:
 			r.Warnings++
+		case StatusSkipped:
+			r.Skipped++
 		}
 	}
 	r.Healthy = r.Problems == 0
