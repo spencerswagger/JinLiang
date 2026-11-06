@@ -248,6 +248,7 @@ jinliang serve
 - CSRF：所有写操作校验双提交 token；SSE 只读。
 - 不提供多租户/多用户角色（v1 单管理员）；不做 OAuth（二期可选）。
 - 控制库权限 0600，key 0600；`--data-dir` 不允许落在世界可读目录。
+- 多副本部署（同一目标库、多个实例）的租约与 `instance_id` 规矩见 [`SECURITY.md` §7](SECURITY.md)。
 
 ## 10. 测试
 
