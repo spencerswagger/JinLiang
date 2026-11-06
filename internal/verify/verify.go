@@ -99,6 +99,10 @@ type Side interface {
 	Count(ctx context.Context, schema, table string) (int64, error)
 	SamplePKs(ctx context.Context, schema, table string, pk []string, n int) ([][]any, error)
 	RowByPK(ctx context.Context, schema, table string, columns, pk []string, values []any) ([]any, bool, error)
+	// ScanOrdered streams every row in PK order (no PK: table order). Data-level
+	// verification must compare aggregates over the full table; sampling is only
+	// supplementary evidence.
+	ScanOrdered(ctx context.Context, schema, table string, columns, pk []string, fn func([]any) error) error
 }
 
 // Options controls one verify run.
@@ -348,68 +352,86 @@ func runData(ctx context.Context, opts Options) LevelReport {
 		}
 
 		commonCols := commonColumns(srcT, tgtT)
-		if len(srcT.PrimaryKey) == 0 || len(tgtT.PrimaryKey) == 0 {
-			lr.add(SeverityWarn, "no_pk_sampling", name, "",
-				"没有主键：跳过抽样校验和，只比行数", "", "", "")
-			continue
-		}
 		if len(commonCols) == 0 {
 			lr.add(SeverityError, "missing_column", name, "", "两端没有共同的列，无法比对", "", "", "")
 			continue
 		}
-		n := opts.SampleRows
-		if int64(n) > srcCount {
-			n = int(srcCount)
-		}
-		if n <= 0 {
-			lr.add(SeverityWarn, "empty_table", name, "", "源表是空的：没有可抽样的行", "", "", "")
+		if len(srcT.PrimaryKey) == 0 || len(tgtT.PrimaryKey) == 0 {
+			lr.add(SeverityWarn, "no_pk_aggregate", name, "",
+				"没有主键：只做全表聚合比对，无法逐行定位", "", "", "")
+			runAggregateOnly(ctx, &lr, opts, name, srcT, commonCols)
 			continue
 		}
-		pks, err := opts.Source.SamplePKs(ctx, opts.SourceSchema, name, srcT.PrimaryKey, n)
-		if err != nil {
-			lr.add(SeverityError, "probe_failed", name, "", "抽样主键失败："+err.Error(), "", "", "")
-			continue
-		}
-		lr.stat("sampled", len(pks))
-		digest := fnv.New64a()
-		matched := 0
-		for _, pkVals := range pks {
-			pkDesc := fmt.Sprint(pkVals)
-			srcRow, ok, err := opts.Source.RowByPK(ctx, opts.SourceSchema, name, commonCols, srcT.PrimaryKey, pkVals)
-			if err != nil {
-				lr.add(SeverityError, "probe_failed", name, "", "按主键读源行失败："+err.Error(), pkDesc, "", "")
-				continue
-			}
-			if !ok {
-				lr.add(SeverityError, "source_row_vanished", name, "", "抽样后源行消失（并发写入），本次跳过", pkDesc, "", "")
-				continue
-			}
-			tgtRow, ok, err := opts.Target.RowByPK(ctx, opts.TargetSchema, name, commonCols, tgtT.PrimaryKey, pkVals)
-			if err != nil {
-				lr.add(SeverityError, "probe_failed", name, "", "按主键读目标行失败："+err.Error(), pkDesc, "", "")
-				continue
-			}
-			if !ok {
-				lr.add(SeverityError, "missing_row", name, "",
-					"源端有这一行，目标端没有（主键覆盖缺失）", pkDesc, "missing", "确认这条变更是否进了死信")
-				continue
-			}
-			matched++
-			srcCanon := canonicalRow(commonCols, srcRow)
-			tgtCanon := canonicalRow(commonCols, tgtRow)
-			digest.Write([]byte(rowDigest(srcCanon)))
-			if srcCanon != tgtCanon {
-				col, sv, tv := firstDiff(commonCols, srcRow, tgtRow)
-				lr.add(SeverityError, "row_mismatch", name, col,
-					"抽样行的内容不一致（字段级差异见 source/target）", trunc(sv, 80), trunc(tv, 80),
-					"优先按主键重放该行；若反复出现，检查转换规则")
-			}
-		}
+
+		matched := runDataFull(ctx, &lr, opts, name, srcT, tgtT, commonCols)
 		lr.stat("matched", matched)
-		lr.stat("checksum", hex.EncodeToString(digest.Sum(nil)))
+
+		// 抽样是补充证据：只有聚合与全表扫描都没有发现差异时才跑，
+		// 绝不能反过来用抽样结果当判据（Owl #44/P0 的根因）。
+		if lr.OK && opts.SampleRows > 0 {
+			runSampling(ctx, &lr, opts, name, srcT, tgtT, commonCols, srcCount)
+		}
 	}
 	lr.finish()
 	return lr
+}
+
+// runSampling is deliberately supplementary: it runs only after the full scan
+// and aggregates agree, and can add evidence but never override a green.
+func runSampling(ctx context.Context, lr *LevelReport, opts Options, name string,
+	srcT, tgtT source.Table, commonCols []string, srcCount int64) {
+	n := opts.SampleRows
+	if int64(n) > srcCount {
+		n = int(srcCount)
+	}
+	if n <= 0 {
+		lr.add(SeverityWarn, "empty_table", name, "", "源表是空的：没有可抽样的行", "", "", "")
+		return
+	}
+	pks, err := opts.Source.SamplePKs(ctx, opts.SourceSchema, name, srcT.PrimaryKey, n)
+	if err != nil {
+		lr.add(SeverityError, "probe_failed", name, "", "抽样主键失败："+err.Error(), "", "", "")
+		return
+	}
+	lr.stat("sampled", len(pks))
+	digest := fnv.New64a()
+	matched := 0
+	for _, pkVals := range pks {
+		pkDesc := fmt.Sprint(pkVals)
+		srcRow, ok, err := opts.Source.RowByPK(ctx, opts.SourceSchema, name, commonCols, srcT.PrimaryKey, pkVals)
+		if err != nil || !ok {
+			lr.add(SeverityError, "probe_failed", name, "", "抽样读源行失败："+errText(err, ok), pkDesc, "", "")
+			continue
+		}
+		tgtRow, ok, err := opts.Target.RowByPK(ctx, opts.TargetSchema, name, commonCols, tgtT.PrimaryKey, pkVals)
+		if err != nil || !ok {
+			lr.add(SeverityError, "missing_row", name, "", "抽样时目标端没有这一行", pkDesc, "missing",
+				"确认这条变更是否进了死信")
+			continue
+		}
+		matched++
+		srcCanon := canonicalRow(commonCols, srcRow)
+		tgtCanon := canonicalRow(commonCols, tgtRow)
+		digest.Write([]byte(rowDigest(srcCanon)))
+		if srcCanon != tgtCanon {
+			col, sv, tv := firstDiff(commonCols, srcRow, tgtRow)
+			lr.add(SeverityError, "row_mismatch", name, col,
+				"抽样行的内容不一致（全表扫描后又被改？）", trunc(sv, 80), trunc(tv, 80),
+				"确认是否有并发写入；按主键重放该行")
+		}
+	}
+	lr.stat("sample_matched", matched)
+	lr.stat("checksum", hex.EncodeToString(digest.Sum(nil)))
+}
+
+func errText(err error, found bool) string {
+	if err != nil {
+		return err.Error()
+	}
+	if !found {
+		return "行不存在"
+	}
+	return "未知"
 }
 
 // ── L3 一致性 ──────────────────────────────────────────────────────────

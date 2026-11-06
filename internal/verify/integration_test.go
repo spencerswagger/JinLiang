@@ -268,7 +268,61 @@ func setupMySQL(t *testing.T, src, tgt *runtime.DB, createMeta bool) {
 
 func setMySQLPosition(t *testing.T, tgt *runtime.DB, pos string) {
 	t.Helper()
-	mustExec(t, tgt, `INSERT INTO _jl_meta (job_key, name, position, phase)
-		VALUES ('verifytest','verify','`+pos+`','streaming')
+	mustExec(t, tgt, `INSERT INTO _jl_meta
+		(job_key, name, instance_id, schema_version, job_hash, phase, position, started_at, updated_at)
+		VALUES ('verifytest','verify','integration-test',1,'','streaming','`+pos+`',CURRENT_TIMESTAMP(6),CURRENT_TIMESTAMP(6))
 		ON DUPLICATE KEY UPDATE position = VALUES(position)`)
+}
+
+// 真库版四个反例里的两个「聚合不一定能发现」：两行互换、精度截断。
+// 断言不仅「失败」，还要指到具体行/列/块。
+func TestPGVerifyCatchesSwapAndPrecision(t *testing.T) {
+	src := openDSN(t, "JINLIANG_TEST_PG_SRC_DSN")
+	tgt := openDSN(t, "JINLIANG_TEST_PG_DSN")
+	ctx := context.Background()
+	for _, db := range []*runtime.DB{src, tgt} {
+		mustExec(t, db, `CREATE SCHEMA IF NOT EXISTS `+verifySchema)
+	}
+	t.Cleanup(func() {
+		mustExec(t, src, `DROP SCHEMA IF EXISTS `+verifySchema+` CASCADE`)
+		mustExec(t, tgt, `DROP SCHEMA IF EXISTS `+verifySchema+` CASCADE`)
+	})
+	setupPG(t, src, tgt, false)
+	srcS, tgtS := src.WithSchema(verifySchema), tgt.WithSchema(verifySchema)
+	opts := verify.Options{
+		Source: srcS, Target: tgtS,
+		SourceSchema: verifySchema, TargetSchema: verifySchema,
+		Tables: []string{verifyTable}, Level: verify.LevelData, SampleRows: 1,
+	}
+
+	// 两行互换：count/sum/min/max 全不变，只有行级 + 块 checksum 能发现。
+	mustExec(t, tgt, `UPDATE `+pgVerifyTable+` SET name='dave', amount=40 WHERE id=1`)
+	mustExec(t, tgt, `UPDATE `+pgVerifyTable+` SET name='alice', amount=10 WHERE id=4`)
+	rep, err := verify.Run(ctx, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.OK {
+		t.Fatalf("两行互换未被发现：%+v", rep.Levels)
+	}
+	if !hasFinding(rep, "row_mismatch") || !hasFinding(rep, "block_checksum_mismatch") {
+		t.Fatalf("必须指到行与块：%+v", rep.Levels[0].Findings)
+	}
+
+	// 精度截断：2.3450 -> 2.3400，行数不变，sum 变、行内容变。
+	setupPG(t, src, tgt, false)
+	mustExec(t, src, `CREATE TABLE `+verifySchema+`.jl_verify_precision (id bigint PRIMARY KEY, v numeric(12,4))`)
+	mustExec(t, tgt, `CREATE TABLE `+verifySchema+`.jl_verify_precision (id bigint PRIMARY KEY, v numeric(12,4))`)
+	for _, db := range []*runtime.DB{src, tgt} {
+		mustExec(t, db, `INSERT INTO `+verifySchema+`.jl_verify_precision VALUES (1,1.2340),(2,2.3450),(3,3.4560)`)
+	}
+	mustExec(t, tgt, `UPDATE `+verifySchema+`.jl_verify_precision SET v=2.3400 WHERE id=2`)
+	opts.Tables = []string{"jl_verify_precision"}
+	rep, err = verify.Run(ctx, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.OK || !hasFinding(rep, "row_mismatch") || !hasFinding(rep, "aggregate_mismatch") {
+		t.Fatalf("精度截断必须报行级 + 聚合差异：%+v", rep.Levels[0].Findings)
+	}
 }

@@ -398,6 +398,42 @@ func (d *DB) numericColumn(ctx context.Context, schema, table, column string) bo
 	return false
 }
 
+// ScanOrdered streams rows in primary-key order (or table order when pk is
+// empty). It is the full-scan primitive verify uses for real aggregate checks
+// and row-by-row drill-down; sampling alone must never be the verdict.
+func (d *DB) ScanOrdered(ctx context.Context, schema, table string, columns, pk []string, fn func([]any) error) error {
+	if len(columns) == 0 {
+		return errors.New("ScanOrdered 需要显式的列清单")
+	}
+	quoted := make([]string, len(columns))
+	for i, c := range columns {
+		quoted[i] = d.quoteIdent(c)
+	}
+	q := `SELECT ` + strings.Join(quoted, ", ") + ` FROM ` + d.qualify(schema, table)
+	if len(pk) > 0 {
+		order := make([]string, len(pk))
+		for i, c := range pk {
+			order[i] = d.quoteIdent(c)
+		}
+		q += ` ORDER BY ` + strings.Join(order, ", ")
+	}
+	rows, err := d.db.QueryContext(ctx, q)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		vals, err := scanInto(rows, len(columns))
+		if err != nil {
+			return err
+		}
+		if err := fn(vals); err != nil {
+			return err
+		}
+	}
+	return rows.Err()
+}
+
 // RowByPK fetches one row (all columns or the given list). found=false means
 // the target does not have this primary key.
 func (d *DB) RowByPK(ctx context.Context, schema, table string, columns, pk []string, values []any) ([]any, bool, error) {
