@@ -155,3 +155,30 @@ func (h LeaseHolder) Abandoned(now time.Time, alive func(int) bool) bool {
 // ProcessAlive exposes the platform liveness probe for callers that need to
 // judge a lease holder (engine's crash recovery path).
 func ProcessAlive(pid int) bool { return processAlive(pid) }
+
+// ForceReleaseLease 删掉这个任务在目标端的租约行，**不管它现在被谁持有**。
+//
+// 只有一个调用场景：用户删任务。那时租约属于一个可能已经没人管的进程，
+// 而它还在续期、还在写——同目标新建任务会一直撞 E1005，用户没有办法。
+//
+// 安全性：租约行一消失，**正在跑的那个进程下一次续租就会失败两次 → loseLease →
+// cancelRun 自己停下来**（#30 的语义），所以这不是「从别的进程手里硬抢」，而是
+// 「通知它别再写了」。返回被删掉的那一行的持有者描述（空表示本来就没有）。
+func ForceReleaseLease(ctx context.Context, ep dsn.Endpoint, schema, jobKey string) (string, error) {
+	s, err := Open(ctx, Options{Target: ep, Schema: schema, JobKey: jobKey, JobName: jobKey,
+		InstanceID: "gc-force-release", OnExists: "append"})
+	if err != nil {
+		return "", err
+	}
+	defer s.Close()
+	var label string
+	q := fmt.Sprintf(`DELETE FROM %s WHERE job_key=$1 RETURNING label`, s.stateTable("_jl_lease"))
+	err = s.conn.QueryRow(ctx, q, jobKey).Scan(&label)
+	if err != nil {
+		if strings.Contains(err.Error(), "no rows") {
+			return "", nil // 本来就没有
+		}
+		return "", err
+	}
+	return label, nil
+}

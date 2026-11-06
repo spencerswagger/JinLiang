@@ -16,8 +16,10 @@ import (
 
 	"github.com/spencerswagger/jinliang/internal/control"
 	"github.com/spencerswagger/jinliang/internal/doctor"
+	"github.com/spencerswagger/jinliang/internal/dsn"
 	"github.com/spencerswagger/jinliang/internal/engine"
 	"github.com/spencerswagger/jinliang/internal/httpapi"
+	"github.com/spencerswagger/jinliang/internal/pgsink"
 )
 
 // dataDir resolves --data-dir / JINLIANG_DATA_DIR / default.
@@ -401,6 +403,105 @@ func cmdRun(args []string) error {
 }
 
 // cmdStatus prints where a job is now, without touching anything.
+func cmdDelete(args []string) error {
+	fs := flag.NewFlagSet("delete", flag.ExitOnError)
+	dir := fs.String("data-dir", "", "数据目录（默认 ~/.config/jinliang）")
+	jobRef := fs.String("job", "", "任务 ID 或名字")
+	wait := fs.Duration("wait", 30*time.Second, "等引擎退出多久；等不到就留一条 audit 说明原因")
+	force := fs.Bool("yes", false, "不再交互确认")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if strings.TrimSpace(*jobRef) == "" {
+		return errors.New("delete 需要 --job <ID 或名字>")
+	}
+	store, err := openStore(dataDir(*dir), "", false)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	ctx := context.Background()
+	job, err := store.ResolveJob(ctx, *jobRef)
+	if err != nil {
+		return err
+	}
+	if !*force {
+		fmt.Printf("即将删除任务 %s（%s）：runs 记录会一起删掉，目标端已同步的数据不受影响。\n", job.Name, job.JobKey)
+		fmt.Print("确认删除请输入 yes：")
+		var answer string
+		fmt.Scanln(&answer)
+		if strings.ToLower(strings.TrimSpace(answer)) != "yes" {
+			fmt.Println("已取消，什么都没删。")
+			return nil
+		}
+	}
+
+	// **先停引擎，再删记录**：反过来会留下「记录没了、goroutine 还在写、租约还在续期」，
+	// 同目标新建任务直接撞 E1005，而用户没有任何办法让那个进程停下来。
+	canceled, stopped, serr := engine.StopJob(ctx, store, job.ID, job.JobKey, *wait)
+	switch {
+	case !canceled:
+		fmt.Println("本进程里没有这个任务在跑（可能在另一个进程里，或已经结束）——直接删记录。")
+	case stopped:
+		fmt.Println("已让正在跑的引擎停下并等它退出（退出时已释放目标端租约）。")
+	default:
+		fmt.Println("已经在跑的那个引擎没有在等待时间内退出。已记一条 audit 说明原因；" +
+			"目标端租约会在 TTL 后过期并可被抢占，期间的 run 会报 E1005——再跑一次即可接管。")
+	}
+	if serr != nil && stopped {
+		return serr
+	}
+	// 跨进程的情况：那个引擎不在本进程里，cancel 不到它。做法是**删掉目标端租约行**——
+	// 它下一次续租会失败两次 → loseLease → cancelRun 自己停下（#30 的语义）。
+	// 不这么做，用户删了任务后租约还会续期，同目标新建任务一直撞 E1005。
+	if holder, lerr := releaseTargetLease(ctx, store, job); lerr != nil {
+		fmt.Printf("清目标端租约失败（%v）：租约会在 TTL 后过期并可被抢占。\n", lerr)
+	} else if holder != "" {
+		fmt.Printf("已通知目标端那个还在跑的进程停下（原持有者 %s：租约行已删除，它下次续租会失败并自行退出）。\n", holder)
+		_ = store.Audit(ctx, control.ActorSystem, "job.run.lease_forced", map[string]any{
+			"job_id": job.ID, "job_key": job.JobKey, "holder": holder,
+		})
+	}
+	if err := store.DeleteJob(ctx, job.ID); err != nil {
+		return err
+	}
+	_ = store.Audit(ctx, control.ActorSystem, "job.delete", map[string]any{
+		"job_id": job.ID, "job_key": job.JobKey, "engine_stopped": stopped,
+	})
+	fmt.Printf("已删除任务 %s。\n", job.Name)
+	return nil
+}
+
+// releaseTargetLease 删掉这个任务在目标端的租约行（删除任务专用）。
+// 目标端连不上时返回错误，由调用方如实说明「租约会在 TTL 后过期」，不静默。
+func releaseTargetLease(ctx context.Context, store *control.Store, job control.Job) (string, error) {
+	conn, err := store.GetConnection(ctx, job.TargetID)
+	if err != nil {
+		return "", err
+	}
+	secret, err := store.Secret(ctx, job.TargetID)
+	if err != nil {
+		return "", err
+	}
+	doc, err := store.JobDoc(ctx, job)
+	if err != nil {
+		return "", err
+	}
+	ep := dsn.Endpoint{
+		Kind: conn.Kind, Host: conn.Host, Port: conn.Port, Database: conn.Database,
+		Username: conn.Username, Password: secret, Params: conn.Params(),
+	}
+	schema := strings.TrimSpace(doc.Target.Schema)
+	if schema == "" {
+		if conn.Kind == dsn.KindMySQL {
+			schema = conn.Database
+		} else {
+			schema = "public"
+		}
+	}
+	return pgsink.ForceReleaseLease(ctx, ep, schema, job.JobKey)
+}
+
 func cmdStatus(args []string) error {
 	fs := flag.NewFlagSet("status", flag.ExitOnError)
 	jobRef := fs.String("job", "", "任务 id 或名字（空 = 列出全部任务）")
