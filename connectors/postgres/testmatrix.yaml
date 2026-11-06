@@ -44,3 +44,36 @@ notes: |
   PG 10 有原生 pgoutput，但无 TRUNCATE 复制、无 slot 磁盘阀、无 pg_replication_slot_advance()；
   13+ 才有 max_slot_wal_keep_size；14+ 流式大事务；15+ 行过滤/列清单；17+ slot 随主备切换存活；
   18 冲突检测视图 + idle_replication_slot_timeout。
+
+# 组合分层：required 进每个 PR，nightly 才跑全量（docs/DESIGN.md §3）。
+# total_pairs = 9×9 = 81；required = 9 自洽 + 8 相邻 + 2 极端 = 19。
+matrix:
+  total_pairs: 81
+  required:
+    - name: t1-self
+      pairs: "每版本 → 自身"
+      count: 9
+      scenarios: [snapshot, incremental_crud, type_boundary]
+    - name: t2-adjacent
+      pairs: "n → n+1（10→11 … 17→18）"
+      count: 8
+      scenarios: [incremental_crud, ddl_whitelist]
+    - name: t3-extremes
+      pairs: "10 ↔ 18"
+      count: 2
+      scenarios: [incremental_crud]
+  nightly:
+    - name: t4-full
+      pairs: "全部 9×9"
+      count: 81
+      scenarios: [snapshot, incremental_crud, large_transaction, ddl_whitelist, crash_recovery, orphan_cleanup, type_boundary]
+
+# 异构：PG 9 × MySQL 4 × 2 方向 = 72，全部 nightly。
+cross_matrix:
+  target: mysql
+  mysql_versions: 4
+  pairs_per_direction: 36
+  total_pairs: 72
+  required: 0
+  nightly: 72
+  scenarios: [snapshot, incremental_crud, type_boundary]

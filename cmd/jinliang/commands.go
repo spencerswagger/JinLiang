@@ -306,6 +306,7 @@ func cmdRun(args []string) error {
 	stopAfter := fs.Duration("stop-after", 0, "跑这么久之后收尾（冒烟测试用；0 = 一直跑）")
 	idleAfter := fs.Duration("stop-when-idle", 0, "追平后安静这么久就收尾（一次性增量同步用；0 = 一直跑）")
 	maxLag := fs.Int64("max-lag", 0, "配 --stop-when-idle：源端积压小于这么多字节才算追平（默认 8MB）")
+	watch := fs.Bool("watch", false, "按 mode.interval 一轮轮跑（interval / full_interval 用）；Ctrl-C 停止")
 	verify := fs.Bool("verify", false, "跑完对比源端与目标端的行数与指纹")
 	batchRows := fs.Int("batch-rows", 0, "每批行数（默认取任务的 reliability.batch_rows）")
 	if err := fs.Parse(args); err != nil {
@@ -346,6 +347,19 @@ func cmdRun(args []string) error {
 		}
 	}()
 
+	if *watch {
+		// 调度模式：一个人一轮轮跑，每轮一条 kind=sync 的 run 行。
+		err := engine.Schedule(ctx, engine.Options{
+			Store: store, JobID: job.ID, Actor: control.ActorCLI, BatchRows: *batchRows,
+		})
+		if err != nil {
+			return err
+		}
+		if !*jsonOut {
+			fmt.Println("调度已停止（Ctrl-C）")
+		}
+		return nil
+	}
 	res, runErr := engine.Run(ctx, engine.Options{
 		Store:        store,
 		JobID:        job.ID,

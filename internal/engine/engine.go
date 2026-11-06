@@ -275,12 +275,6 @@ func (r *runner) execute(parent context.Context, res *Result) error {
 	if err := r.preflight(ctx); err != nil {
 		return r.fail(ctx, err)
 	}
-	// B1 的范围就两条路径。定时增量（interval / full_interval）没有实现调度器，
-	// 与其跑一半让人以为成了，不如在动数据之前就说清楚。
-	if m := r.mode(); m == "interval" || m == "full_interval" {
-		return r.fail(ctx, &notImplementedError{fmt.Sprintf(
-			"定时增量（mode.frequency=%s）在 B1 未实现；已实现的是 once（只搬存量）与 continuous+initial（存量+实时）", m)})
-	}
 	if err := r.prepare(ctx); err != nil {
 		return r.fail(ctx, err)
 	}
@@ -312,11 +306,30 @@ func (r *runner) execute(parent context.Context, res *Result) error {
 		res.Note = "只搬了存量数据（mode.frequency=" + r.mode() + "）"
 		return nil
 	}
-	if r.mode() == "interval" || r.mode() == "full_interval" {
-		r.note(ctx, "定时增量（interval）的执行器在 B2；本次只完成了全量，水位列 = "+r.doc.Mode.IncrementalColumn)
-		if err := r.drain(ctx, ExitOK, "全量完成（定时增量的调度在 B2）"); err != nil {
+	if r.mode() == "interval" {
+		if err := r.phaseForInterval(ctx); err != nil {
+			return r.fail(ctx, err)
+		}
+		if err := r.runIntervalRound(ctx); err != nil {
+			if r.leaseLost.Load() {
+				return r.fail(ctx, r.leaseLostError())
+			}
+			if isUserStop(ctx, err) {
+				return r.fail(ctx, err)
+			}
+			return r.fail(ctx, err)
+		}
+		if err := r.drain(ctx, ExitOK, "定时增量本轮完成（水位列 "+r.doc.Mode.IncrementalColumn+"）"); err != nil {
 			return err
 		}
+		res.Note = "interval 模式：只跑了水位增量（整表重搬仅发生在第一次或没有水位列的表）"
+		return nil
+	}
+	if r.mode() == "full_interval" {
+		if err := r.drain(ctx, ExitOK, "全量周期重跑本轮完成"); err != nil {
+			return err
+		}
+		res.Note = "full_interval 模式：本轮整表重跑；下一轮由调度器（--watch）触发"
 		return nil
 	}
 
@@ -502,6 +515,9 @@ func (r *runner) preflight(ctx context.Context) error {
 		BatchRows:    r.batchRows(),
 		SnapshotConn: r.snapshotConns(),
 		Lookback:     r.doc.Mode.Lookback,
+		// 水位列必须交给预检：interval 模式靠它判断「哪些是新数据」，
+		// 漏传会让预检永远报「缺水位列」（这条曾经真的漏过）。
+		Incremental: r.doc.Mode.IncrementalColumn,
 	}
 	if v, err := srcConn.Version(ctx); err != nil {
 		in.SourceErr = err.Error()
@@ -628,6 +644,11 @@ func (r *runner) prepare(ctx context.Context) error {
 		return err
 	}
 	r.src = src
+	// interval 模式不做逻辑复制（没有书签、没有发布），只要一条普通读连接；
+	// 少建一个 slot 就等于少一份磁盘占用与一项权限要求。
+	if r.mode() == "interval" {
+		return nil
+	}
 	// 全量要不要做，看 _jl_meta 的阶段而不是位点：快照期间每块都会写位点，
 	// 所以「有位点」不等于「存量搬完了」。只有到过 catchup/streaming 才算完。
 	phaseInTarget, posInTarget, err := sink.State(ctx)
@@ -637,8 +658,10 @@ func (r *runner) prepare(ctx context.Context) error {
 	r.priorPhase = phaseInTarget
 	// once = 「搬一次」：再跑一次就应该再搬一次（upsert 幂等），不能因为上次跑完过
 	// 就什么都不做然后假装成功。只有 continuous+initial 才按「上次到哪了」续跑。
-	r.needSnapshot = r.mode() != "continuous" &&
-		(r.mode() == "once" || !initialCopyDone(phaseInTarget, posInTarget))
+	// once / full_interval = 「每次都要重搬」；continuous+initial 才按上次到哪了续跑。
+	alwaysCopy := r.mode() == "once" || r.mode() == "full_interval"
+	r.needSnapshot = r.mode() != "continuous" && r.mode() != "interval" &&
+		(alwaysCopy || !initialCopyDone(phaseInTarget, posInTarget))
 	prep, err := src.Prepare(ctx, pgsource.PrepareOptions{Snapshot: r.needSnapshot})
 	if err != nil {
 		return fmt.Errorf("准备源端对象失败: %w", err)

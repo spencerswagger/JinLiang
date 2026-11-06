@@ -28,7 +28,11 @@ const (
 	ActionJobExport  = "job.export"
 	ActionJobRun     = "job.run"
 	ActionRunStub    = "run.stub"
-	ActionAdminSet   = "admin.set"
+	// ActionRunRejected：run 被接受（HTTP 202）但引擎在「还没建出 run 行」之前就失败。
+	// 这条必须落控制库——事件只活在环形缓冲里，进程一重启就查不到了，而用户回来
+	// 第一个问题正是「它说已接受，为什么什么都没发生」。
+	ActionRunRejected = "job.run.rejected"
+	ActionAdminSet    = "admin.set"
 )
 
 // AuditEntry is one row of the audit trail.
@@ -69,6 +73,34 @@ func (s *Store) ListAudit(ctx context.Context, limit int) ([]AuditEntry, error) 
 	}
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT id, at, actor, action, COALESCE(detail_json,'') FROM audit ORDER BY at DESC, id DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []AuditEntry
+	for rows.Next() {
+		var a AuditEntry
+		if err := rows.Scan(&a.ID, &a.At, &a.Actor, &a.Action, &a.Detail); err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
+// ListAuditByAction 按 action 过滤取最近的审计记录。
+//
+// 为什么必须有这个方法：诊断页原来取「最近 50 条 audit」再在页面里筛 rejected。
+// 忙时一小时的运行/登录就能把窗口填满，拒绝记录会掉出去——用户点开诊断页看到
+// 「没有被拒绝的记录」，而实际刚刚发生过。那和「没有痕迹」是同一个后果，
+// 所以过滤必须下推到 SQL。
+func (s *Store) ListAuditByAction(ctx context.Context, action string, limit int) ([]AuditEntry, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 10
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, at, actor, action, COALESCE(detail_json,'') FROM audit
+		 WHERE action = ? ORDER BY at DESC, id DESC LIMIT ?`, action, limit)
 	if err != nil {
 		return nil, err
 	}

@@ -41,19 +41,27 @@ func mustExec(t *testing.T, db *runtime.DB, query string, args ...any) {
 	}
 }
 
-const verifyTable = "jl_verify_orders"
+const (
+	verifyTable  = "jl_verify_orders"
+	verifySchema = "jl_test_verify" // 每包独立 schema：不再依赖 go test -p 1
+)
+
+var pgVerifyTable = verifySchema + "." + verifyTable
 
 func TestPGVerifyIntegration(t *testing.T) {
 	src := openDSN(t, "JINLIANG_TEST_PG_SRC_DSN")
 	tgt := openDSN(t, "JINLIANG_TEST_PG_DSN")
 	ctx := context.Background()
 
+	for _, db := range []*runtime.DB{src, tgt} {
+		mustExec(t, db, `CREATE SCHEMA IF NOT EXISTS `+verifySchema)
+	}
 	setupPG(t, src, tgt, true)
 	t.Cleanup(func() {
-		mustExec(t, src, `DROP TABLE IF EXISTS `+verifyTable)
-		mustExec(t, tgt, `DROP TABLE IF EXISTS `+verifyTable)
-		mustExec(t, tgt, `DELETE FROM _jl_meta WHERE job_key = 'verifytest'`)
+		mustExec(t, src, `DROP SCHEMA IF EXISTS `+verifySchema+` CASCADE`)
+		mustExec(t, tgt, `DROP SCHEMA IF EXISTS `+verifySchema+` CASCADE`)
 	})
+	srcS, tgtS := src.WithSchema(verifySchema), tgt.WithSchema(verifySchema)
 
 	// 位点：源端当前 WAL 与目标端 _jl_meta.position 对得上（正例）。
 	var lsn string
@@ -65,12 +73,12 @@ func TestPGVerifyIntegration(t *testing.T) {
 	setPGPosition(t, tgt, lsn)
 
 	opts := verify.Options{
-		Source: src, Target: tgt,
-		SourceSchema: "public", TargetSchema: "public",
+		Source: srcS, Target: tgtS,
+		SourceSchema: verifySchema, TargetSchema: verifySchema,
 		Tables: []string{verifyTable}, Level: verify.LevelAll, JobKey: "verifytest",
 		SourcePosition: func(context.Context) (string, error) { return lsn, nil },
 		TargetPosition: func(ctx context.Context) (string, error) {
-			return verify.DBTargetPosition(ctx, tgt, "verifytest")
+			return verify.DBTargetPosition(ctx, tgtS, "verifytest")
 		},
 	}
 	rep, err := verify.Run(ctx, opts)
@@ -82,8 +90,8 @@ func TestPGVerifyIntegration(t *testing.T) {
 	}
 
 	// 数据级反例：改一行、删一行 → 必须报出来。
-	mustExec(t, tgt, `UPDATE `+verifyTable+` SET amount = amount + 1 WHERE id = 2`)
-	mustExec(t, tgt, `DELETE FROM `+verifyTable+` WHERE id = 5`)
+	mustExec(t, tgt, `UPDATE `+pgVerifyTable+` SET amount = amount + 1 WHERE id = 2`)
+	mustExec(t, tgt, `DELETE FROM `+pgVerifyTable+` WHERE id = 5`)
 	opts.Level = verify.LevelData
 	rep, err = verify.Run(ctx, opts)
 	if err != nil {
@@ -95,7 +103,7 @@ func TestPGVerifyIntegration(t *testing.T) {
 
 	// 恢复数据，再破坏结构（删一列）→ 结构级必须红。
 	setupPG(t, src, tgt, false)
-	mustExec(t, tgt, `ALTER TABLE `+verifyTable+` DROP COLUMN name`)
+	mustExec(t, tgt, `ALTER TABLE `+pgVerifyTable+` DROP COLUMN name`)
 	opts.Level = verify.LevelStructure
 	rep, err = verify.Run(ctx, opts)
 	if err != nil {
@@ -128,14 +136,14 @@ func TestPGVerifyIntegration(t *testing.T) {
 
 func setupPG(t *testing.T, src, tgt *runtime.DB, createMeta bool) {
 	t.Helper()
-	mustExec(t, src, `DROP TABLE IF EXISTS `+verifyTable)
-	mustExec(t, tgt, `DROP TABLE IF EXISTS `+verifyTable)
+	mustExec(t, src, `DROP TABLE IF EXISTS `+pgVerifyTable)
+	mustExec(t, tgt, `DROP TABLE IF EXISTS `+pgVerifyTable)
 	for _, db := range []*runtime.DB{src, tgt} {
-		mustExec(t, db, `CREATE TABLE `+verifyTable+` (id bigint PRIMARY KEY, name text, amount numeric(12,2))`)
-		mustExec(t, db, `INSERT INTO `+verifyTable+` VALUES (1,'alice',10.00),(2,'bob',20.00),(3,NULL,30.00),(4,'dave',40.00),(5,'eve',50.00)`)
+		mustExec(t, db, `CREATE TABLE `+pgVerifyTable+` (id bigint PRIMARY KEY, name text, amount numeric(12,2))`)
+		mustExec(t, db, `INSERT INTO `+pgVerifyTable+` VALUES (1,'alice',10.00),(2,'bob',20.00),(3,NULL,30.00),(4,'dave',40.00),(5,'eve',50.00)`)
 	}
 	if createMeta {
-		mustExec(t, tgt, `CREATE TABLE IF NOT EXISTS _jl_meta (
+		mustExec(t, tgt, `CREATE TABLE IF NOT EXISTS `+verifySchema+`._jl_meta (
 			job_key text PRIMARY KEY, name text NOT NULL, instance_id text NOT NULL DEFAULT '',
 			schema_version int NOT NULL DEFAULT 1, job_hash text NOT NULL DEFAULT '',
 			schema_hash text, phase text NOT NULL DEFAULT 'streaming', position text,
@@ -146,7 +154,7 @@ func setupPG(t *testing.T, src, tgt *runtime.DB, createMeta bool) {
 
 func setPGPosition(t *testing.T, tgt *runtime.DB, pos string) {
 	t.Helper()
-	mustExec(t, tgt, `INSERT INTO _jl_meta (job_key, name, instance_id, position, phase)
+	mustExec(t, tgt, `INSERT INTO `+verifySchema+`._jl_meta (job_key, name, instance_id, position, phase)
 		VALUES ('verifytest','verify','integration-test','`+pos+`','streaming')
 		ON CONFLICT (job_key) DO UPDATE SET position = EXCLUDED.position`)
 }

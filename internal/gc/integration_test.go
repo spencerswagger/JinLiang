@@ -58,15 +58,19 @@ func find(plan gc.Plan, name string) gc.Decision {
 	return gc.Decision{}
 }
 
+const gcSchema = "jl_test_gc" // 每包独立 schema：不再依赖 go test -p 1
+
 func TestGCIntegrationOtherInstanceSlotIsNeverTouched(t *testing.T) {
 	src := openDSN(t, "JINLIANG_TEST_PG_SRC_DSN")
 	tgt := openDSN(t, "JINLIANG_TEST_PG_DSN")
 	ctx := context.Background()
 
-	mustExec(t, tgt, `CREATE TABLE IF NOT EXISTS _jl_object (
+	mustExec(t, tgt, `CREATE SCHEMA IF NOT EXISTS `+gcSchema)
+	tgtS := tgt.WithSchema(gcSchema)
+	mustExec(t, tgt, `CREATE TABLE IF NOT EXISTS `+gcSchema+`._jl_object (
 		object_name text PRIMARY KEY, object_kind text NOT NULL, job_key text NOT NULL,
 		instance_id text NOT NULL, created_at timestamptz NOT NULL DEFAULT now(), dropped_at timestamptz)`)
-	mustExec(t, tgt, `CREATE TABLE IF NOT EXISTS _jl_lease (
+	mustExec(t, tgt, `CREATE TABLE IF NOT EXISTS `+gcSchema+`._jl_lease (
 		job_key text PRIMARY KEY, instance_id text NOT NULL, label text, expires_at timestamptz NOT NULL)`)
 
 	// 造三个真实 slot：别人的（在用）、我的（空闲）、未登记的（无法判定）。
@@ -78,20 +82,19 @@ func TestGCIntegrationOtherInstanceSlotIsNeverTouched(t *testing.T) {
 		for _, s := range []string{"jl_gctest_1", "jl_gctest_2", "jl_gctest_3"} {
 			_, _ = src.Exec(context.Background(), `SELECT pg_drop_replication_slot($1)`, s)
 		}
-		_, _ = tgt.Exec(context.Background(), `DELETE FROM _jl_object WHERE object_name LIKE 'jl_gctest%'`)
-		_, _ = tgt.Exec(context.Background(), `DELETE FROM _jl_lease WHERE job_key LIKE 'gctest%'`)
+		_, _ = tgt.Exec(context.Background(), `DROP SCHEMA IF EXISTS `+gcSchema+` CASCADE`)
 	})
 
-	mustExec(t, tgt, `INSERT INTO _jl_object (object_name, object_kind, job_key, instance_id)
+	mustExec(t, tgt, `INSERT INTO `+gcSchema+`._jl_object (object_name, object_kind, job_key, instance_id)
 		VALUES ('jl_gctest_1','slot','gctestaaaa','other-instance'),
 		       ('jl_gctest_2','slot','gctestbbbb','me')
 		ON CONFLICT (object_name) DO UPDATE SET instance_id = EXCLUDED.instance_id, dropped_at = NULL`)
 	// 对方实例持有有效租约 = 「其他实例在用」。
-	mustExec(t, tgt, `INSERT INTO _jl_lease (job_key, instance_id, expires_at)
+	mustExec(t, tgt, `INSERT INTO `+gcSchema+`._jl_lease (job_key, instance_id, expires_at)
 		VALUES ('gctestaaaa','other-instance', now() + interval '5 minutes')
 		ON CONFLICT (job_key) DO UPDATE SET expires_at = EXCLUDED.expires_at`)
 
-	plan, err := gc.Load(ctx, src, tgt, "me", gc.Options{DryRun: true})
+	plan, err := gc.Load(ctx, src, tgtS, "me", gc.Options{DryRun: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -135,7 +138,7 @@ func TestGCIntegrationOtherInstanceSlotIsNeverTouched(t *testing.T) {
 	}
 
 	// --force 也不能碰仍然被其他实例租用的对象。
-	forced, err := gc.Load(ctx, src, tgt, "me", gc.Options{DryRun: false, AllowOtherInstances: true})
+	forced, err := gc.Load(ctx, src, tgtS, "me", gc.Options{DryRun: false, AllowOtherInstances: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -146,12 +149,12 @@ func TestGCIntegrationOtherInstanceSlotIsNeverTouched(t *testing.T) {
 	// publication 的真库用例：登记为本实例、空闲 → 可清；真删后应从源端消失。
 	_, _ = src.Exec(ctx, `DROP PUBLICATION IF EXISTS jl_gctestpub`)
 	mustExec(t, src, `CREATE PUBLICATION jl_gctestpub FOR ALL TABLES`)
-	mustExec(t, tgt, `INSERT INTO _jl_object (object_name, object_kind, job_key, instance_id)
+	mustExec(t, tgt, `INSERT INTO `+gcSchema+`._jl_object (object_name, object_kind, job_key, instance_id)
 		VALUES ('jl_gctestpub','publication','gctestpub','me')
 		ON CONFLICT (object_name) DO UPDATE SET dropped_at = NULL`)
 	t.Cleanup(func() { _, _ = src.Exec(context.Background(), `DROP PUBLICATION IF EXISTS jl_gctestpub`) })
 
-	pubPlan, err := gc.Load(ctx, src, tgt, "me", gc.Options{DryRun: false})
+	pubPlan, err := gc.Load(ctx, src, tgtS, "me", gc.Options{DryRun: false})
 	if err != nil {
 		t.Fatal(err)
 	}

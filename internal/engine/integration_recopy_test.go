@@ -10,6 +10,7 @@ package engine_test
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -317,5 +318,234 @@ func TestLeaseNotStolenBySameInstance(t *testing.T) {
 	}
 	if ok, _ := second.RenewLease(ctx, time.Minute); ok {
 		t.Fatal("没拿到租约的句柄不该续租成功")
+	}
+}
+
+// B5：interval 模式只搬「水位之后」的行，且第一次先整表搬完并把水位对齐到表尾。
+// 断言的是行数变化（不是「跑通了」）：第二轮必须只搬 4 行，不是 1000 行。
+func TestIntervalCopiesOnlyRowsAfterWatermark(t *testing.T) {
+	srcDSN, dstDSN := dsns(t)
+	srcDB := mustConn(t, srcDSN)
+	dstDB := mustConn(t, dstDSN)
+	table := "wm_it"
+	ctx := context.Background()
+
+	exec(t, srcDB, "DROP TABLE IF EXISTS "+table)
+	exec(t, srcDB, "CREATE TABLE "+table+" (id bigint PRIMARY KEY, payload text, updated_at timestamptz)")
+	// 时间戳**逐行递增**（跨 2 小时），否则「同一时刻的行全在水位窗口内」，
+	// 回看窗口会合理地重读整表，断言「只搬 N 行」就没有意义了。
+	exec(t, srcDB, "INSERT INTO "+table+
+		" SELECT g, 'row-'||g, now() - interval '2 hours' + (g||' seconds')::interval FROM generate_series(1,1000) g")
+	exec(t, dstDB, "DROP TABLE IF EXISTS "+table)
+	exec(t, dstDB, "DROP TABLE IF EXISTS _jl_meta, _jl_chunk, _jl_lease, _jl_object, _jl_instance")
+
+	dir := t.TempDir()
+	store, err := control.Open(control.Options{DataDir: dir, Autogen: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	sc, err := store.CreateConnection(ctx, control.ConnectionInput{
+		Name: "src", Kind: "postgres", Host: "127.0.0.1", Port: portOf(t, srcDSN),
+		Database: dbOf(t, srcDSN), Username: userOf(t, srcDSN), Password: passOf(t, srcDSN),
+		Params: map[string]string{"sslmode": "disable"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tc, err := store.CreateConnection(ctx, control.ConnectionInput{
+		Name: "dst", Kind: "postgres", Host: "127.0.0.1", Port: portOf(t, dstDSN),
+		Database: dbOf(t, dstDSN), Username: userOf(t, dstDSN), Password: passOf(t, dstDSN),
+		Params: map[string]string{"sslmode": "disable"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, err := store.CreateJob(ctx, control.JobInput{
+		Name: "wm-it", SourceID: sc.ID, TargetID: tc.ID,
+		Spec: control.JobDoc{
+			Version: 1, Job: "wm-it",
+			Source: control.SourceDoc{Kind: "postgres", Scope: &control.ScopeDoc{Schema: "public"}},
+			Target: control.TargetDoc{Kind: "postgres", Schema: "public", OnExists: "append"},
+			Mode: control.ModeDoc{Frequency: "interval", Interval: "1s",
+				IncrementalColumn: "updated_at", Lookback: "1s"},
+			Content: &control.ContentDoc{Tables: map[string]control.TableDoc{table: {}}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("建任务失败: %v", err)
+	}
+
+	// 第一轮：整表 1000 行 + 水位对齐表尾
+	if _, err := engine.Run(ctx, engine.Options{Store: store, JobID: job.ID}); err != nil {
+		t.Fatalf("第一轮失败: %v", err)
+	}
+	var n int
+	if err := dstDB.QueryRow(ctx, "SELECT count(*) FROM "+table).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1000 {
+		t.Fatalf("第一轮应整表搬 1000 行，得到 %d", n)
+	}
+
+	// 第二轮前：3 条新行 + 1 条老行被更新（水位之后的变更）
+	exec(t, srcDB, "INSERT INTO "+table+" VALUES (1001,'new-1',now()),(1002,'new-2',now()),(1003,'new-3',now())")
+	exec(t, srcDB, "UPDATE "+table+" SET payload='touched', updated_at=now() WHERE id=5")
+
+	res, err := engine.Run(ctx, engine.Options{Store: store, JobID: job.ID})
+	if err != nil {
+		t.Fatalf("第二轮失败: %v", err)
+	}
+	// 回看窗口（1m）会重读水位附近的一小段，这是「宁重不漏」的设计代价；
+	// 断言的是「没重扫整表」+「新增/更新都到了」，而不是精确 4 行。
+	if res.RowsStream < 4 {
+		t.Fatalf("第二轮应至少搬 4 行（3 新增 + 1 更新），实际 %d", res.RowsStream)
+	}
+	// 上界收到 20：回看窗口正常时合法重读就是这 4 行（测试数据确定性很强），
+	// 留 200 会连「回退窗口被误设成 10 分钟」这种形态都发现不了。
+	if res.RowsStream > 20 {
+		t.Fatalf("第二轮搬了 %d 行（合法应只有 4 行左右），说明回退窗口设错了或水位没生效", res.RowsStream)
+	}
+	var touched int
+	if err := dstDB.QueryRow(ctx, "SELECT count(*) FROM "+table+" WHERE payload='touched'").Scan(&touched); err != nil {
+		t.Fatal(err)
+	}
+	if touched != 1 {
+		t.Fatalf("更新应被搬过去，得到 %d 行", touched)
+	}
+}
+
+// Owl 要的那条：**lookback 必须真的生效**。
+//
+// 场景模拟「长事务 / 复制延迟」：一行在事务里很早就写好了（updated_at 很早），
+// 但它在本轮水位推进之后才可见。若回退窗口没生效（曾经 cursor 没清空 PK，
+// lookback 一次都用不上），这条行会永久读不到——漏读是重跑也补不回来的错误。
+func TestIntervalLookbackCatchesLateCommittedRows(t *testing.T) {
+	srcDSN, dstDSN := dsns(t)
+	srcDB := mustConn(t, srcDSN)
+	dstDB := mustConn(t, dstDSN)
+	table := "wm_late"
+	ctx := context.Background()
+
+	exec(t, srcDB, "DROP TABLE IF EXISTS "+table)
+	exec(t, srcDB, "CREATE TABLE "+table+" (id bigint PRIMARY KEY, payload text, updated_at timestamptz)")
+	exec(t, srcDB, "INSERT INTO "+table+
+		" SELECT g, 'row-'||g, now() - interval '2 hours' FROM generate_series(1,10) g")
+	exec(t, dstDB, "DROP TABLE IF EXISTS "+table)
+	exec(t, dstDB, "DROP TABLE IF EXISTS _jl_meta, _jl_chunk, _jl_lease, _jl_object, _jl_instance")
+
+	store, jobID := intervalJob(t, srcDSN, dstDSN, "wm-late", table, "1h")
+	if _, err := engine.Run(ctx, engine.Options{Store: store, JobID: jobID}); err != nil {
+		t.Fatalf("第一轮失败: %v", err)
+	}
+	var wm string
+	if err := dstDB.QueryRow(ctx, "SELECT COALESCE(watermark,'') FROM _jl_meta").Scan(&wm); err != nil {
+		t.Fatal(err)
+	}
+	if wm == "" {
+		t.Fatal("第一轮之后应有水位")
+	}
+
+	// 模拟长事务：这一行的 updated_at **比水位更早**（到达时水位已越过它），但此刻才可见。
+	// 只有「水位 − lookback」的回退窗口能读到它；没有回退就永久漏读。
+	exec(t, srcDB, "INSERT INTO "+table+
+		" VALUES (999,'late-commit', now() - interval '2 hours' - interval '30 seconds')")
+
+	res, err := engine.Run(ctx, engine.Options{Store: store, JobID: jobID})
+	if err != nil {
+		t.Fatalf("第二轮失败: %v", err)
+	}
+	if res.RowsStream == 0 {
+		t.Fatal("回退窗口内的晚提交行没被读到——lookback 没生效（正是 Owl 指出的漏读 bug）")
+	}
+	var got int
+	if err := dstDB.QueryRow(ctx, "SELECT count(*) FROM "+table+" WHERE id=999").Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got != 1 {
+		t.Fatal("晚提交的那一行必须出现在目标端")
+	}
+}
+
+// intervalJob 建一条 interval 任务（lookback 可指定），返回 store 与 job id。
+func intervalJob(t *testing.T, srcDSN, dstDSN, name, table, lookback string) (*control.Store, string) {
+	t.Helper()
+	ctx := context.Background()
+	store, err := control.Open(control.Options{DataDir: t.TempDir(), Autogen: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
+	mk := func(nm string, port int, db, user, pass string) string {
+		c, err := store.CreateConnection(ctx, control.ConnectionInput{
+			Name: nm, Kind: "postgres", Host: "127.0.0.1", Port: port,
+			Database: db, Username: user, Password: pass,
+			Params: map[string]string{"sslmode": "disable"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c.ID
+	}
+	srcID := mk("src", portOf(t, srcDSN), dbOf(t, srcDSN), userOf(t, srcDSN), passOf(t, srcDSN))
+	dstID := mk("dst", portOf(t, dstDSN), dbOf(t, dstDSN), userOf(t, dstDSN), passOf(t, dstDSN))
+	job, err := store.CreateJob(ctx, control.JobInput{
+		Name: name, SourceID: srcID, TargetID: dstID,
+		Spec: control.JobDoc{
+			Version: 1, Job: name,
+			Source: control.SourceDoc{Kind: "postgres", Scope: &control.ScopeDoc{Schema: "public"}},
+			Target: control.TargetDoc{Kind: "postgres", Schema: "public", OnExists: "append"},
+			Mode: control.ModeDoc{Frequency: "interval", Interval: "1s",
+				IncrementalColumn: "updated_at", Lookback: lookback},
+			Content: &control.ContentDoc{Tables: map[string]control.TableDoc{table: {}}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("建任务失败: %v", err)
+	}
+	return store, job.ID
+}
+
+// Owl 的坑：PG 默认 `autovacuum_analyze_threshold = 50` 行，**几行的小维表永远不会被自动
+// analyze**（reltuples 长期 -1）。若把「统计信息未知」一律拦死，这种表会让整条 interval
+// 任务起不来——用户得先去 ANALYZE 一张 3 行的表。物理大小 < 8 MiB 时必须放行。
+func TestTinyTableWithoutStatsIsAllowed(t *testing.T) {
+	srcDSN, dstDSN := dsns(t)
+	srcDB := mustConn(t, srcDSN)
+	dstDB := mustConn(t, dstDSN)
+	// 唯一表名：新建表一定是 reltuples=-1（从没 ANALYZE 过），前提可靠；
+	// 也避免上一次运行留下的表被别人 analyze 过。
+	table := fmt.Sprintf("wm_tiny_%d", time.Now().UnixNano()%1e9)
+	ctx := context.Background()
+
+	exec(t, srcDB, "DROP TABLE IF EXISTS "+table)
+	exec(t, srcDB, "CREATE TABLE "+table+" (id bigint PRIMARY KEY, name text)")
+	exec(t, srcDB, "INSERT INTO "+table+" VALUES (1,'a'),(2,'b'),(3,'c')")
+	exec(t, dstDB, "DROP TABLE IF EXISTS "+table)
+	exec(t, dstDB, "DROP TABLE IF EXISTS _jl_meta, _jl_chunk, _jl_lease, _jl_object, _jl_instance")
+
+	// 关键前提：新表且只有 3 行 → reltuples = -1（不会被自动 analyze）
+	var est int64
+	if err := srcDB.QueryRow(ctx,
+		`SELECT c.reltuples::bigint FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+		 WHERE n.nspname='public' AND c.relname=$1`, table).Scan(&est); err != nil {
+		t.Fatal(err)
+	}
+	if est >= 0 {
+		// 不 Skip：一条会静默跳过的守护用例等于没有（今晚已经栽过「没跑到却报绿」）。
+		t.Fatalf("构造不出「统计信息未知」前提：新建表 %s 的 reltuples=%d。"+
+			"要么这台机器的 autovacuum 提前 analyze 了它，要么表名复用了旧表——请查清后再跑", table, est)
+	}
+
+	store, jobID := intervalJob(t, srcDSN, dstDSN, "wm-tiny", table, "1m")
+	if _, err := engine.Run(ctx, engine.Options{Store: store, JobID: jobID}); err != nil {
+		t.Fatalf("3 行的小表不该被拦（统计信息未知但物理很小）：%v", err)
+	}
+	var n int
+	if err := dstDB.QueryRow(ctx, "SELECT count(*) FROM "+table).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 3 {
+		t.Fatalf("小表应整表搬过去，得到 %d 行", n)
 	}
 }

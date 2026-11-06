@@ -5,12 +5,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -19,6 +21,7 @@ import (
 	"github.com/spencerswagger/jinliang/internal/core"
 	"github.com/spencerswagger/jinliang/internal/engine"
 	"github.com/spencerswagger/jinliang/internal/jobrun"
+	"github.com/spencerswagger/jinliang/internal/state"
 )
 
 const testPassword = "test-admin-password"
@@ -1299,5 +1302,358 @@ func TestCodesEndpointIsCacheable(t *testing.T) {
 	defer res.Body.Close()
 	if cc := res.Header.Get("Cache-Control"); cc != "private, max-age=300" {
 		t.Fatalf("Cache-Control = %q，期望 private, max-age=300", cc)
+	}
+}
+
+// 两种 409 必须分开说：本进程在跑（不要去控制库找 run 行），vs 控制库里确有
+// 一条上次没结束的 run（这才是能去查 run 的情形）。
+func TestRunConflictCopyDistinguishesCause(t *testing.T) {
+	store, err := control.Open(control.Options{DataDir: t.TempDir(), Autogen: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	srv, err := New(Options{Store: store, Version: "test", Listen: "127.0.0.1:0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	block := make(chan struct{})
+	srv.runFn = func(ctx context.Context, _ *control.Store, _ control.Job, _ jobrun.Options) (engine.Result, error) {
+		<-block
+		return engine.Result{}, nil
+	}
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	token := setupAdmin(t, ts)
+	conn := createPGConn(t, ts, token, "src")
+	code, created := doJSON(t, http.MethodPost, ts.URL+"/api/jobs", token, map[string]any{
+		"name": "conflict-copy", "source_id": conn, "target_id": conn,
+		"spec": map[string]any{
+			"source":  map[string]any{"scope": map[string]any{"schema": "public", "include": []string{"orders"}}},
+			"target":  map[string]any{"schema": "report"},
+			"mode":    map[string]any{"frequency": "once"},
+			"content": map[string]any{"tables": map[string]any{"orders": map[string]any{}}},
+		},
+	})
+	if code != http.StatusCreated {
+		t.Fatalf("create job = %d %v", code, created)
+	}
+	jobID, _ := created["id"].(string)
+
+	if code, _ := doJSON(t, http.MethodPost, ts.URL+"/api/jobs/"+jobID+"/run", token, nil); code != http.StatusAccepted {
+		t.Fatalf("第一次 run 应为 202")
+	}
+	// 本进程在跑：文案要说「已经开始了」，且**不许**指向控制库里的 run
+	code, body := doJSON(t, http.MethodPost, ts.URL+"/api/jobs/"+jobID+"/run", token, nil)
+	if code != http.StatusConflict {
+		t.Fatalf("并发第二次 run = %d，期望 409", code)
+	}
+	errObj, _ := body["error"].(map[string]any)
+	msg, _ := errObj["message"].(string)
+	if !strings.Contains(msg, "已经开始在跑了") {
+		t.Fatalf("本进程在跑时文案应说「已经开始在跑了」，实际 %q", msg)
+	}
+	if strings.Contains(msg, "控制库里") {
+		t.Fatalf("本进程在跑时不该把人指向控制库的 run 行（那里可能是空的），实际 %q", msg)
+	}
+	close(block)
+}
+
+// 409 的两个「库里那条 run」方向都必须有用例钉住（Owl：#29 的哨兵只钉了一个方向，
+// 接反了照样绿）。这里直接造一条 ended_at IS NULL 的 run（不注入 runFn、不启动任何东西），
+// 再看 /run 报的是哪一种。
+//
+// 关键区别在**心跳**：新鲜 = 另一个实例正在写（不能建议重启 serve）；
+// 过期 = 上个进程被强杀留下的尸体（这时才谈「等收尾 / 重启」）。
+func TestRunConflictFromControlDBSplitsByHeartbeat(t *testing.T) {
+	cases := []struct {
+		name        string
+		heartbeat   time.Duration // 多久以前的心跳
+		wantMsg     string
+		mustNotHave string
+		wantNext    string
+		wantOwner   bool
+	}{
+		{
+			name:      "心跳新鲜：另一个实例正在跑",
+			heartbeat: 1 * time.Second, // 1 秒前还有心跳
+			wantMsg:   "另一个实例正在跑",
+			// 这条最重要：不能**建议**重启（文案里可以提醒「别在本机重启」，
+			// 但不能把「重启一次 serve」当解药），否则用户会把别人的同步打断
+			mustNotHave: "重启一次",
+			wantNext:    "POST /api/jobs/{id}/stop",
+			wantOwner:   true,
+		},
+		{
+			name:        "心跳过期：上次没结束的运行",
+			heartbeat:   10 * time.Minute, // 10 分钟前的心跳（> StaleAfter 90s）
+			wantMsg:     "控制库里还有一条上次没结束的运行",
+			mustNotHave: "已经在跑了",
+			wantNext:    "重启",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			store, err := control.Open(control.Options{DataDir: t.TempDir(), Autogen: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			srv, err := New(Options{Store: store, Version: "test"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			srv.runFn = func(context.Context, *control.Store, control.Job, jobrun.Options) (engine.Result, error) {
+				t.Fatal("这条路径不该真的开跑：库里已经有未结束的 run")
+				return engine.Result{}, nil
+			}
+			ts := httptest.NewServer(srv.Handler())
+			defer ts.Close()
+			token := setupAdmin(t, ts)
+			conn := createPGConn(t, ts, token, "src")
+			code, created := doJSON(t, http.MethodPost, ts.URL+"/api/jobs", token, map[string]any{
+				"name": "stale-job", "source_id": conn, "target_id": conn,
+				"spec": map[string]any{
+					"source":  map[string]any{"scope": map[string]any{"schema": "public", "include": []string{"orders"}}},
+					"target":  map[string]any{"schema": "report"},
+					"mode":    map[string]any{"frequency": "once"},
+					"content": map[string]any{"tables": map[string]any{"orders": map[string]any{}}},
+				},
+			})
+			if code != http.StatusCreated {
+				t.Fatalf("create job = %d %v", code, created)
+			}
+			jobID, _ := created["id"].(string)
+
+			// 直接造一条未结束的 sync run，并把心跳钉在指定时刻
+			run, err := store.StartRun(context.Background(), jobID, state.Preflight, control.RunKindSync)
+			if err != nil {
+				t.Fatal(err)
+			}
+			at := time.Now().Add(-c.heartbeat).UTC().Format(time.RFC3339)
+			if _, err := store.DB().Exec(`UPDATE runs SET heartbeat_at = ?, owner_instance = ? WHERE id = ?`,
+				at, run.OwnerInstance, run.ID); err != nil {
+				t.Fatalf("钉心跳失败: %v", err)
+			}
+
+			code, body := doJSON(t, http.MethodPost, ts.URL+"/api/jobs/"+jobID+"/run", token, nil)
+			if code != http.StatusConflict {
+				t.Fatalf("POST /run = %d，期望 409", code)
+			}
+			errObj, _ := body["error"].(map[string]any)
+			msg, _ := errObj["message"].(string)
+			why, _ := errObj["why"].(string)
+			var nextStr string
+			if list, ok := errObj["next"].([]any); ok {
+				for _, n := range list {
+					if s, ok := n.(string); ok {
+						nextStr += s + " "
+					}
+				}
+			}
+			if !strings.Contains(msg, c.wantMsg) {
+				t.Fatalf("message = %q，期望含 %q", msg, c.wantMsg)
+			}
+			all := msg + " " + why + " " + nextStr
+			if strings.Contains(all, c.mustNotHave) {
+				t.Fatalf("文案里不该出现 %q（整段：%s）", c.mustNotHave, all)
+			}
+			if !strings.Contains(nextStr, c.wantNext) {
+				t.Fatalf("next 应含 %q，实际 %q", c.wantNext, nextStr)
+			}
+			// 「到那台机器上 stop」必须可执行：界面上要有那台机器的标识。
+			// 跨实例那条要从结构化错误里取（errors.As），不许靠正则解析错误文本。
+			if c.wantOwner {
+				owner, _ := store.InstanceID(context.Background())
+				if owner == "" {
+					t.Fatal("测试环境拿不到 instance id")
+				}
+				if !strings.Contains(all, owner) {
+					t.Fatalf("文案里应出现实例标识 %q（用户要据此去那台机器 stop），实际：%s", owner, all)
+				}
+			}
+		})
+	}
+}
+
+// P3（必修级）：202 之后失败、且引擎还没建出 run 行时，痕迹必须**落在控制库**里。
+// 事件只活在环形缓冲里，进程一重启就查不到——用户回头只能记得「它说已接受，
+// 然后什么都没发生」。这里用「换一个 Server 实例」（内存登记与 bus 都是新的）
+// 来模拟重启，断言 audit 里仍有这条拒绝，且**每条都有可执行的下一步**。
+//
+// 两种失败都覆盖：冲突（有码 E1005 + 码表里的 next）与无码（权限/schema/连不上，
+// 这是最常见的一种，next 必须来自兜底，否则审计里就是一个 null）。
+func TestRejectedRunLeavesDurableAuditTrace(t *testing.T) {
+	cases := []struct {
+		name       string
+		runErr     error
+		wantCode   string
+		wantNextIn string
+	}{
+		{
+			name:       "有码：另一个进程持有活跃 run",
+			runErr:     fmt.Errorf("%w：这个任务已经有一条未结束的运行", control.ErrConflict),
+			wantCode:   string(core.CodeJobRunningElsewhere),
+			wantNextIn: "",
+		},
+		{
+			name:       "无码：源端表读不到（最常见的失败）",
+			runErr:     errors.New("没读到源端的表清单（权限不足或 schema 写错）"),
+			wantCode:   "",
+			wantNextIn: "摘要", // 无码时兜底第一条要指向「摘要里的原始报错」，不是 /api/runs
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			store, err := control.Open(control.Options{DataDir: t.TempDir(), Autogen: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+
+			srv1, err := New(Options{Store: store, Version: "test"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			rerErr := c.runErr
+			srv1.runFn = func(context.Context, *control.Store, control.Job, jobrun.Options) (engine.Result, error) {
+				return engine.Result{}, rerErr
+			}
+			ts1 := httptest.NewServer(srv1.Handler())
+			token := setupAdmin(t, ts1)
+			conn := createPGConn(t, ts1, token, "src")
+			code, created := doJSON(t, http.MethodPost, ts1.URL+"/api/jobs", token, map[string]any{
+				"name": "trace-job", "source_id": conn, "target_id": conn,
+				"spec": map[string]any{
+					"source":  map[string]any{"scope": map[string]any{"schema": "public", "include": []string{"orders"}}},
+					"target":  map[string]any{"schema": "report"},
+					"mode":    map[string]any{"frequency": "once"},
+					"content": map[string]any{"tables": map[string]any{"orders": map[string]any{}}},
+				},
+			})
+			if code != http.StatusCreated {
+				t.Fatalf("create job = %d %v", code, created)
+			}
+			jobID, _ := created["id"].(string)
+			if code, _ := doJSON(t, http.MethodPost, ts1.URL+"/api/jobs/"+jobID+"/run", token, nil); code != http.StatusAccepted {
+				t.Fatalf("run 应为 202")
+			}
+			deadline := time.Now().Add(5 * time.Second)
+			for srv1.runs.active(jobID) {
+				if time.Now().After(deadline) {
+					t.Fatal("run 没有结束")
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
+			ts1.Close()
+
+			// 「重启」：同一控制库、全新的 Server（内存登记与事件环形缓冲都是空的）
+			srv2, err := New(Options{Store: store, Version: "test"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			ts2 := httptest.NewServer(srv2.Handler())
+			defer ts2.Close()
+			tok2 := setupAdminExisting(t, ts2)
+
+			code, audit := doJSON(t, http.MethodGet, ts2.URL+"/api/audit?limit=50", tok2, nil)
+			if code != http.StatusOK {
+				t.Fatalf("audit = %d", code)
+			}
+			entries, _ := audit["audit"].([]any)
+			var found map[string]any
+			for _, raw := range entries {
+				e, _ := raw.(map[string]any)
+				if e["action"] == control.ActionRunRejected {
+					found = e
+					break
+				}
+			}
+			if found == nil {
+				t.Fatal("重启后查不到「run 被拒绝」的痕迹：用户会以为它从没被接受过")
+			}
+			detail, _ := found["detail_json"].(string)
+			if !strings.Contains(detail, jobID) {
+				t.Fatalf("痕迹里应带 job_id，实际 %s", detail)
+			}
+			var det struct {
+				Code  string   `json:"code"`
+				Next  []string `json:"next"`
+				Actor string   `json:"actor"`
+			}
+			if err := json.Unmarshal([]byte(detail), &det); err != nil {
+				t.Fatalf("detail 不是合法 JSON: %v", err)
+			}
+			if det.Code != c.wantCode {
+				t.Fatalf("code = %q，期望 %q", det.Code, c.wantCode)
+			}
+			// 每一条都必须有「现在做什么」：没有码的那些不能留 null。
+			if len(det.Next) == 0 {
+				t.Fatalf("审计里 next 为空：只写了「发生了什么」，没写「现在做什么」（code=%q）", det.Code)
+			}
+			if c.wantNextIn != "" && !strings.Contains(strings.Join(det.Next, " "), c.wantNextIn) {
+				t.Fatalf("兜底 next 应提到 %q，实际 %v", c.wantNextIn, det.Next)
+			}
+			if det.Actor != control.ActorAPI {
+				t.Fatalf("审计 actor 应为真实发起者 %q，实际 %q", control.ActorAPI, det.Actor)
+			}
+			// 审计行本身的「谁」也要是真实发起者，否则按 actor 过滤看不到这次被拒绝
+			if got, _ := found["actor"].(string); got != control.ActorAPI {
+				t.Fatalf("audit 行的 actor 应为 %q，实际 %q", control.ActorAPI, got)
+			}
+		})
+	}
+}
+
+// setupAdminExisting 给「已经有管理员口令」的库拿一个 token（不走 /api/setup）。
+func setupAdminExisting(t *testing.T, ts *httptest.Server) string {
+	t.Helper()
+	code, body := doJSON(t, http.MethodPost, ts.URL+"/api/login", "", map[string]string{"password": testPassword})
+	if code != http.StatusOK {
+		t.Fatalf("login = %d %v", code, body)
+	}
+	token, _ := body["token"].(string)
+	if token == "" {
+		t.Fatalf("login 没有返回 token: %v", body)
+	}
+	return token
+}
+
+// 兜底文案必须在这条路径上真的可用（Owl 实测「无码」显示后提的两点）：
+// ① 不能让人「去看最近一次运行」——这条 audit 多是还没开跑的场景，没有 run 行；
+// ② 不能只说「发给维护者」——自托管场景里用户往往就是维护者。
+func TestFallbackNextIsUsableBeforeAnyRunExists(t *testing.T) {
+	joined := strings.Join(fallbackNext, " ")
+	if strings.Contains(joined, "打开任务页 →「最近一次运行」") {
+		t.Fatal("兜底第 1 条把人引向「最近一次运行」，而这条路径常常没有 run 行")
+	}
+	if !strings.Contains(joined, "摘要") {
+		t.Fatal("兜底第 1 条应说明「原始报错就在摘要里」")
+	}
+	if !strings.Contains(joined, "DBA") || !strings.Contains(joined, "issue") {
+		t.Fatal("兜底最后一条应区分「自建部署发给 DBA/运维」与「用上游就提 issue」")
+	}
+	if len(fallbackNext) < 2 || len(fallbackNext) > 3 {
+		t.Fatalf("兜底应是 2–3 条可执行动作，实际 %d 条", len(fallbackNext))
+	}
+}
+
+// 前端脚本的两条不变量（纯文本断言，避免为几行 JS 引入构建链）：
+// ① 事件给过 rows_done 之后，轮询回来的旧值不许覆盖它（进度不能往回跳）；
+// ② 未知 finish_reason 直接显示原值，不能静默当成「已完成」。
+func TestAppJSProgressNeverGoesBackwards(t *testing.T) {
+	raw, err := os.ReadFile("web/static/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	js := string(raw)
+	if !strings.Contains(js, "rowsFromEventSeen") {
+		t.Fatal("缺少「事件已更新」标记：在途轮询会把旧值写回去，进度会往回跳")
+	}
+	if !strings.Contains(js, "if (rowsFromEventSeen) return;") {
+		t.Fatal("轮询回调里必须丢弃已被事件更新的情况")
+	}
+	if !strings.Contains(js, ": fr;") {
+		t.Fatal("未知 finish_reason 必须原样显示（`: fr` 兜底），不能静默成「已完成」")
 	}
 }

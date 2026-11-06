@@ -31,6 +31,15 @@ type Event struct {
 	Message    string      `json:"message,omitempty"`
 	Code       string      `json:"code,omitempty"`
 	Next       []string    `json:"next,omitempty"`
+	// RowsDone / LagBytes 是 progress 的结构化数字：前端不该再去解析 message 里
+	// 的中文（那是给人读的，格式随时会改）。指针 + omitempty 是为了区分
+	// 「值是 0」与「没给」——0 行是合法结果，缺省表示这一帧没带这个数。
+	RowsDone *int64 `json:"rows_done,omitempty"`
+	LagBytes *int64 `json:"lag_bytes,omitempty"`
+	// FinishReason 只在 done 事件上有意义：completed / failed / stopped / interrupted。
+	// 有了它，前端才能分清「跑完了」与「被停止」——徽章（runs 行）早就分开了，
+	// 事件流此前没有。
+	FinishReason string `json:"finish_reason,omitempty"`
 	// Stub marks events from a B0 skeleton run: nothing was actually moved.
 	// The UI shows a badge so nobody mistakes this for a real sync.
 	Stub bool `json:"stub,omitempty"`
