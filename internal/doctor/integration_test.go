@@ -42,8 +42,8 @@ func TestDoctorIntegrationPG(t *testing.T) {
 	tgt := openDSN(t, "JINLIANG_TEST_PG_DSN")
 
 	rep := doctor.Run(context.Background(), doctor.Options{
-		Source: src, Target: tgt,
-		SourceSchema: "public", TargetSchema: "public",
+		Source: src, Target: tgt.WithSchema("jl_test_doctor"),
+		SourceSchema: "public", TargetSchema: "jl_test_doctor",
 		JobKey: "doctorintegration",
 		// 没有控制库：控制区应明确警告，而不是假装正常。
 	})

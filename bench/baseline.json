@@ -1,0 +1,74 @@
+{
+  "metric": "b6-baseline",
+  "rows": 100000,
+  "batch_rows": 500,
+  "warmup_batches": 2,
+  "snapshot_rows_per_sec": 82501.0,
+  "bulk_apply_rows_per_sec": 82501.0,
+  "bulk_apply_p99_ms": 103.31,
+  "reference": {
+    "raw_copy_ceiling_rows_per_sec": 150380.0,
+    "note": "仅目标端 COPY 上限参考，不进门禁；门禁量的是 BulkApply"
+  },
+  "rows_per_sec": 10265.0,
+  "apply_runs": [
+    {
+      "rows_per_sec": 10418.64374757412,
+      "p50_ms": 45.38,
+      "p99_ms": 75.147,
+      "raw_copy_ceiling_rows_per_sec": 150494.69532686038
+    },
+    {
+      "rows_per_sec": 10053.938851088116,
+      "p50_ms": 46.353,
+      "p99_ms": 82.165,
+      "raw_copy_ceiling_rows_per_sec": 150379.98789799
+    },
+    {
+      "rows_per_sec": 10264.77036757862,
+      "p50_ms": 45.602,
+      "p99_ms": 71.913,
+      "raw_copy_ceiling_rows_per_sec": 132443.82120502662
+    }
+  ],
+  "bulk_runs": [
+    {
+      "rows_per_sec": 82500.54417152684,
+      "p50_ms": 49.655,
+      "p99_ms": 116.82
+    },
+    {
+      "rows_per_sec": 81029.53114456084,
+      "p50_ms": 52.973,
+      "p99_ms": 103.315
+    },
+    {
+      "rows_per_sec": 100394.60279338223,
+      "p50_ms": 45.461,
+      "p99_ms": 80.34
+    }
+  ],
+  "p50_ms": 45.6,
+  "p99_ms": 75.15,
+  "idle_mb": 15.4,
+  "cold_start_ms": 29,
+  "binary_mb": 19.13,
+  "binary_bytes": 20054176,
+  "cpu_model": "AMD Ryzen 5 1500X Quad-Core Processor",
+  "num_cpu": 8,
+  "thresholds": {
+    "rows_per_sec_min": 20000,
+    "p99_ms_max": 100,
+    "idle_mb_max": 80,
+    "cold_start_ms_max": 200,
+    "binary_mb_max": 25
+  },
+  "verdict": {
+    "snapshot_rows_per_sec": "PASS",
+    "bulk_apply_rows_per_sec": "PASS",
+    "p99_ms": "PASS",
+    "idle_mb": "PASS",
+    "cold_start_ms": "PASS",
+    "binary_mb": "PASS"
+  }
+}
