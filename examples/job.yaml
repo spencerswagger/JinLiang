@@ -51,6 +51,7 @@ reliability:
   batch_rows: 500
   batch_delay: 1ms                 # group commit 窗口：先到者触发
   retry: { max: 3, backoff: [5s, 20s, 60s] }
+  tx_oversize: fail                # 旧写法（字符串）：spill（默认）| fail；对象写法见 job-tx-oversize.yaml
   dead_letter:
     max_rows: 100000               # 超上限暂停任务，不静默丢
     on_error_ratio: 0.05
