@@ -51,3 +51,36 @@ func TestCapabilityErrorsAreFourPart(t *testing.T) {
 		t.Fatalf("错误要是四段式: %v", err)
 	}
 }
+
+func TestEarlierThanOrdersBinlogPositions(t *testing.T) {
+	// 二进制文件名必须按数字段比较：mysql-bin.000009 早于 mysql-bin.000010。
+	// 直接比字符串在这两位上是巧合正确的，换成 .0000099 就会错——所以要有这条用例。
+	a, err := ParsePosition("mysql:v1:file=mysql-bin.000009;pos=900;coord=mysql_file_pos")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := ParsePosition("mysql:v1:file=mysql-bin.000010;pos=4;coord=mysql_file_pos")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !a.EarlierThan(b) {
+		t.Fatal("a 应早于 b")
+	}
+	if b.EarlierThan(a) {
+		t.Fatal("b 不该早于 a（位点会回退）")
+	}
+	if a.EarlierThan(a) {
+		t.Fatal("同一位置不该算「更早」")
+	}
+	// 同一个文件里比偏移。
+	c, _ := ParsePosition("mysql:v1:file=mysql-bin.000010;pos=100;coord=mysql_file_pos")
+	if !b.EarlierThan(c) {
+		t.Fatal("同文件应比偏移")
+	}
+
+	// 不认识的对端串：保守返回 false（宁可不动位点）。
+	foreign, _ := ParsePosition("postgres:v1:0/16B6C50")
+	if a.EarlierThan(foreign) {
+		t.Fatal("解析不了的对端不该被判成「更早」")
+	}
+}

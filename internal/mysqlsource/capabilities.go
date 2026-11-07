@@ -413,3 +413,31 @@ func (s *Source) schemaOf(ref source.TableRef) string {
 func (s *Source) qualifiedOn(ref source.TableRef) string {
 	return quoteIdent(s.schemaOf(ref)) + "." + quoteIdent(ref.Table)
 }
+
+// EarlierThan 比较两个位点的先后（引擎的 batcher 用它避免位点回退）。
+//
+// 为什么需要它：`source.Position` 契约只保证「可判等」，而 batcher 里有两处
+// `Compare(...) > 0` growth：不引入全序就只能靠 String 比，二进制文件名会出错。
+// 这里用「自己解析对端串」的方式实现：位点串是自描述的（契约要求），所以不需要
+// 对端也是 Position 具体类型——不认识/解析失败就返回 false（当成「不是更早」，
+// 保守：宁可不动位点）。
+func (p Position) EarlierThan(other source.Position) bool {
+	if other == nil {
+		return false
+	}
+	q, err := ParsePosition(other.String())
+	if err != nil {
+		return false
+	}
+	return p.Compare(q) < 0
+}
+
+// CurrentPosition 返回源端**此刻**的位点（引擎用它判断「增量追到哪儿算追平」）。
+// PG 侧对应的是 CurrentLSN；MySQL 侧没有 LSN，只有文件+偏移/GTID。
+func (s *Source) CurrentPosition(ctx context.Context) (source.Position, error) {
+	p, err := s.Status(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return p, nil
+}
