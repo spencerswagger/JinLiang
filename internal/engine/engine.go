@@ -284,6 +284,9 @@ type runner struct {
 	gsink  targetSink
 	cat    source.Catalog
 	tables []source.TableRef
+	// pausedTables 记录本轮遇到「结构对不上」的表（表名 → 原因码），
+	// 只用于事件流里告诉用户「哪张表出的问题」——**不用于跳过写入**（位点会越过被跳过的事件）。
+	pausedTables sync.Map
 	// emitHook 只在单测里用（数事件条数），生产路径为 nil。
 	emitHook func(control.Event)
 
@@ -717,6 +720,10 @@ func (r *runner) prepare(ctx context.Context) error {
 	if err := sink.EnsureMeta(ctx, hashOf(r.doc), "", "", ""); err != nil {
 		return fmt.Errorf("写入任务状态行失败: %w", err)
 	}
+	// 上一轮被暂停的表要延续：暂停是**跨轮**的事实，不能每轮重新踩一遍。
+	if err := sink.LoadPausedTables(ctx); err != nil {
+		return fmt.Errorf("读回暂停表失败: %w", err)
+	}
 	actions, err := sink.EnsureSchema(ctx, r.cat)
 	if err != nil {
 		return fmt.Errorf("准备目标表失败: %w", err)
@@ -971,6 +978,19 @@ func (r *runner) stream(ctx context.Context, res *Result) error {
 		r.lastPos = pos
 		r.mu.Unlock()
 	})
+	// 「这张表结构对不上」→ 暂停它、发 note、其它表继续；**不是**整任务失败。
+	b.onPause = func(c context.Context, pe pauser) error {
+		if err := r.sink.PauseTable(c, source.TableRef{Schema: r.targetSchema(), Table: pe.Table()},
+			pe.Reason(), pe.Error()); err != nil {
+			return fmt.Errorf("登记暂停表 %s 失败: %w", pe.Table(), err)
+		}
+		r.emit(c, control.Event{Type: "note",
+			Message: fmt.Sprintf("表 %s 结构对不上（原因码 %s）：**本轮会以失败收尾**——"+
+				"位点没有推进，所以一条变更都不会丢。在目标端对齐结构后重跑即可继续（不用重搬历史）",
+				pe.Table(), pe.Reason())})
+		r.pausedTables.Store(pe.Table(), pe.Reason())
+		return nil
+	}
 	b.onFlush = func(applied int64, pos pgsource.Position) {
 		r.progress(ctx, fmt.Sprintf("增量：已应用 %d 行，位点 %s", applied, pos.String()))
 		if pos.Compare(target) >= 0 && r.phase == state.Catchup {

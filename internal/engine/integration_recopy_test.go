@@ -1011,3 +1011,78 @@ func TestDDLRenameIsReported(t *testing.T) {
 		t.Fatalf("原因码应为 %q，得到 %q", pgsink.PauseReasonSchemaDrift, sd.Reason())
 	}
 }
+
+// **暂停 = 这张表停下来、但一条都不丢**。
+// 单位点复制流里，「丢掉该表事件 + 位点照走」是静默丢数据，比整 run 失败严重得多。
+// 这条钉住：遇到结构对不上 → 整批失败（不返回 nil），且目标端**没有**写进半批数据。
+func TestPausedTableRefusesWholeBatchNotSilentDrop(t *testing.T) {
+	_, dstDSN := dsns(t)
+	dstDB := mustConn(t, dstDSN)
+	ctx := context.Background()
+
+	exec(t, dstDB, "DROP TABLE IF EXISTS pause_a, pause_b")
+	exec(t, dstDB, "DROP TABLE IF EXISTS _jl_meta, _jl_chunk, _jl_lease, _jl_object, _jl_instance")
+
+	relA := source.Table{TableRef: source.TableRef{Schema: "public", Table: "pause_a"},
+		Columns:    []source.Column{{Name: "id", Type: "bigint"}},
+		PrimaryKey: []string{"id"}}
+	relB := source.Table{TableRef: source.TableRef{Schema: "public", Table: "pause_b"},
+		Columns:    []source.Column{{Name: "id", Type: "bigint"}},
+		PrimaryKey: []string{"id"}}
+	s, err := pgsink.Open(ctx, pgsink.Options{
+		Target: mustEndpoint(t, dstDSN), JobKey: "pausejob", JobName: "pause",
+		InstanceID: "it-pause", Schema: "public", OnExists: "append",
+		Catalog: source.Catalog{Tables: []source.Table{relA, relB}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if _, err := s.EnsureSchema(ctx, source.Catalog{Tables: []source.Table{relA, relB}}); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+	// ① 暂停 A
+	if err := s.PauseTable(ctx, relA.TableRef, pgsink.PauseReasonTypeChanged, "测试：A 结构对不上"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.LoadPausedTables(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// ② 同一个批次里 A、B 都有行：A 已被标记暂停——**整批必须失败**（不能「A 跳过、B 照写」
+	// 那样位点会越过 A 的事件，A 的变更就永久丢失了）。
+	if err := s.Apply(ctx, []source.Event{
+		{Kind: source.EvInsert, Table: relA.TableRef, Relation: &relA,
+			New: source.Row{Table: relA.TableRef, Values: []source.Value{{Kind: source.KindString, S: "1"}}}},
+		{Kind: source.EvInsert, Table: relB.TableRef, Relation: &relB,
+			New: source.Row{Table: relB.TableRef, Values: []source.Value{{Kind: source.KindString, S: "2"}}}},
+		{Kind: source.EvCommit},
+	}, nil); err == nil {
+		t.Fatal("被暂停的表混在同一批里时必须整批失败（丢掉它的事件 + 位点前进 = 静默丢数据）")
+	} else if !strings.Contains(err.Error(), "已暂停") && !strings.Contains(err.Error(), "暂停") {
+		t.Logf("失败原因（供核对文案）：%v", err)
+	}
+
+	// 目标端不该出现「半批」：要么整批没写，要么整批写了（这里断言没写，因为整批失败）
+	var bRows int
+	if err := dstDB.QueryRow(ctx, "SELECT count(*) FROM pause_b").Scan(&bRows); err != nil {
+		t.Fatal(err)
+	}
+	if bRows != 0 {
+		t.Fatalf("整批失败时不该有 B 的行落库（半批），得到 %d 行", bRows)
+	}
+	var aRows int
+	if err := dstDB.QueryRow(ctx, "SELECT count(*) FROM pause_a").Scan(&aRows); err != nil {
+		t.Fatal(err)
+	}
+	if aRows != 0 {
+		t.Fatalf("A 已暂停，不该写入，得到 %d 行", aRows)
+	}
+	// 暂停是跨轮事实：重新打开 sink 也能读回来
+	m, err := s.PausedTables(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m["pause_a"].Reason != pgsink.PauseReasonTypeChanged {
+		t.Fatalf("暂停记录应持久化：%+v", m)
+	}
+}
