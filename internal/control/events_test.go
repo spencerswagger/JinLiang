@@ -189,3 +189,38 @@ func TestEventProgressFieldsAreOptionalButDistinguishableFromZero(t *testing.T) 
 		t.Fatalf("finish_reason 丢了：%s", withFields)
 	}
 }
+
+// 结构化进度字段的四条契约（主持人点名的那条「默认值不能表示没有值」）：
+// ① 未知一律 omit（JSON 里不能出现该键，尤其不能是 0）
+// ② 0 是合法值，必须出现
+// ③ 单调性由前端保证，后端只保证「给了就是真的」
+func TestProgressFieldsOmitUnknownButKeepZero(t *testing.T) {
+	raw, err := json.Marshal(Event{Type: "progress", Message: "全量：第 1 块"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range []string{"rows_done", "rows_total", "tables_done", "tables_total", "bytes_done"} {
+		if strings.Contains(string(raw), k) {
+			t.Fatalf("未知的 %s 必须 omit（不能拿 0 冒充）：%s", k, raw)
+		}
+	}
+
+	zero := int64(0)
+	total := int64(1000)
+	withFields, err := json.Marshal(Event{
+		Type: "progress", RowsDone: &zero, RowsTotal: &total,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back map[string]any
+	if err := json.Unmarshal(withFields, &back); err != nil {
+		t.Fatal(err)
+	}
+	if v, ok := back["rows_done"]; !ok || v.(float64) != 0 {
+		t.Fatalf("rows_done=0 必须出现（0 行是合法结果）：%s", withFields)
+	}
+	if back["rows_total"].(float64) != 1000 {
+		t.Fatalf("rows_total 丢了：%s", withFields)
+	}
+}

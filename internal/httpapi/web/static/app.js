@@ -96,19 +96,45 @@
   // 不能只写死一种（引擎与前端不是同一次发版的）。
   // 轮询仍然节流：snapshot 每块一条 progress，10M 会上百条，最多 1 秒一次、单飞。
   var rowsEl = document.getElementById("live-rows");
+  var barEl = document.getElementById("live-progress");
   var lastRowsAt = 0;
   var rowsInflight = false;
+  var lastRows = -1;      // 进度条不回退：只接受单调不减的数字
+  var lastTotal = null;   // 总数只在「估得出」时才有；不要用 0 冒充未知
+
   function setRows(n) {
-    if (!rowsEl) return;
-    rowsEl.textContent = "已处理 " + n + " 行";
+    var num = typeof n === "number" ? n : parseInt(n, 10);
+    if (isNaN(num)) return;
+    if (num < lastRows) return; // 回退的一律丢弃（在途轮询/乱序事件）
+    lastRows = num;
+    if (rowsEl) {
+      var txt = "已处理 " + num + " 行";
+      if (lastTotal && lastTotal > 0) {
+        var pct = Math.min(100, Math.floor((num * 100) / lastTotal));
+        txt += " / 约 " + lastTotal + " 行（" + pct + "%）";
+      }
+      rowsEl.textContent = txt;
+    }
+    if (barEl && lastTotal && lastTotal > 0) {
+      barEl.max = lastTotal;
+      barEl.value = Math.min(num, lastTotal); // 超了也别画出 110%
+      barEl.hidden = false;
+    }
   }
 
   // 事件里带了 rows_done 就直接用（0 也是合法值，所以用 typeof 判存在）
   var rowsFromEventSeen = false; // 事件已经给过数字之后，就不许轮询把旧值写回来
   function rowsFromEvent(ev) {
+    // rows_total 只在估得出时才有；缺省（不是 0）表示「未知」，此时不画进度条
+    if (typeof ev.rows_total === "number" && ev.rows_total > 0) {
+      lastTotal = ev.rows_total;
+    }
     if (typeof ev.rows_done === "number") {
       rowsFromEventSeen = true;
       setRows(ev.rows_done);
+      if (typeof ev.tables_done === "number" && typeof ev.tables_total === "number" && rowsEl) {
+        rowsEl.textContent += " · 表 " + ev.tables_done + "/" + ev.tables_total;
+      }
       return true;
     }
     return false;

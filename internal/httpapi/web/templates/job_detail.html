@@ -27,6 +27,10 @@
     <strong id="live-phase">{{if .Active}}{{phaseLabel .Active.Phase}}{{else}}未在运行{{end}}</strong>
   </div>
   <p class="hint" id="live-hint">{{if .Active}}{{phaseHint .Active.Phase}}{{else}}点下面的「开始」会走：预检 → 准备 → 全量 → 追增量 → 实时 → 收尾{{end}}</p>
+  <!-- 结构化进度：数字来自事件里的 rows_done/rows_total（缺省 = 未知，不画条）。
+       没有字段时 JS 退回轮询 last_run，再没有就只显示文本。 -->
+  <progress id="live-progress" max="100" value="0" hidden></progress>
+  <p class="hint" id="live-rows">已处理 0 行</p>
 
   <div class="row">
     <form class="inline" method="post" action="/jobs/{{.Summary.ID}}/run" data-once>
