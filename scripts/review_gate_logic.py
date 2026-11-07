@@ -46,7 +46,8 @@ def compute_anchor(review, head, pr_files, cwd="."):
     """
     out = {"ancestor": False, "touched": [], "production_touched": [],
            "test_touched": [], "test_disallowed": [], "pr_files_missing": False,
-           "compare_files_missing": False, "compare_files_truncated": False, "error": ""}
+           "compare_files_missing": False, "compare_files_truncated": False,
+           "changed_count": 0, "error": ""}
     if not review or not head:
         out["error"] = "缺少 review 或 head"
         return out
@@ -79,11 +80,11 @@ def compute_anchor(review, head, pr_files, cwd="."):
         # /compare 300 上限截断也会表现成「文件清单为空」，同类风险一并堵。
         out["compare_files_missing"] = True
         return out
+    out["changed_count"] = len(changed)
     if len(changed) >= 300:
-        # /compare 上限 300 且不分页；git diff 没有上限，但差异大到 300 时
-        # 仍按「可能被截断」拒绝，绝不把「交集为空」当「只 merge 了 main」。
+        # 本地 git diff 没有截断：≥300 只说明「这次改动面很大」，不是数据缺失。
+        # 警告可以宽，拒绝必须准——不拒绝，只在通过消息里提示人工确认。
         out["compare_files_truncated"] = True
-        return out
     touched = sorted(changed & owned)
     out["touched"] = touched
 
@@ -144,10 +145,8 @@ def decide_review(pr, pr2, reviews, anchor=None):
                 "默认拒绝而不是放行"
             ), "compare_files_missing"
         if anchor.get("compare_files_truncated"):
-            return False, (
-                "review..head 的差异文件数 ≥300（/compare 上限且不分页，列表可能被截断）；"
-                "默认拒绝而不是放行"
-            ), "compare_files_truncated"
+            anchor_note = (f"（本次锚定覆盖 {anchor.get('changed_count', 0)} 个文件的差异，"
+                           "请人工确认是 merge main 所致；不拒绝）")
         if anchor.get("error"):
             return False, f"锚定计算失败：{anchor['error']}；按纪律拒绝", "anchor_error"
         if not anchor.get("ancestor"):
@@ -168,7 +167,7 @@ def decide_review(pr, pr2, reviews, anchor=None):
             ), "stale_conclusion"
         if anchor.get("test_touched"):
             anchor_note = "（仅合并冲突解决：生产代码零改动，测试新增行均来自 origin/main）"
-        else:
+        elif not anchor_note:
             anchor_note = "（head 前进仅来自 merge main / 别人已合的改动，未触及本 PR 文件）"
 
     if not APPROVE.search(body):
@@ -216,6 +215,7 @@ def selftest():
         return {
             "ancestor": ancestor, "pr_files_missing": missing,
             "compare_files_missing": no_changes, "compare_files_truncated": truncated,
+            "changed_count": 400 if truncated else 0,
             "production_touched": production or [], "test_touched": test or [],
             "test_disallowed": disallowed or [], "touched": touched or [],
         }
@@ -240,8 +240,8 @@ def selftest():
          anchor(ancestor=False), False, "head_mismatch"),
         ("missing-compare-files", {"body": "**可合并（必改 0）**", "state": "COMMENTED", "commit_id": old},
          anchor(no_changes=True), False, "compare_files_missing"),
-        ("compare-files-truncated", {"body": "**可合并（必改 0）**", "state": "COMMENTED", "commit_id": old},
-         anchor(truncated=True), False, "compare_files_truncated"),
+        ("compare-files-truncated-warn", {"body": "**可合并（必改 0）**", "state": "COMMENTED", "commit_id": old},
+         anchor(truncated=True), True, "pass"),
         # 真实 compute_anchor 早退时 ancestor=False；用例必须喂这个形状，
         # 否则测的是真实代码走不到的世界。
         ("pr-files-missing", {"body": "**可合并（必改 0）**", "state": "COMMENTED", "commit_id": old},
