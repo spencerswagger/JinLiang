@@ -12,9 +12,12 @@ import (
 // red — a verifier that only ever prints green is worse than none.
 type fakeSide struct {
 	kind   string
+	scope  string
 	tables map[string]*fakeTable
 	order  []string
 }
+
+func (f *fakeSide) FingerprintScope() string { return f.scope }
 
 type fakeTable struct {
 	table source.Table

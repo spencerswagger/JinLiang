@@ -67,3 +67,88 @@ func TestSchemaMismatchCoversBothReasons(t *testing.T) {
 		t.Error("E1015 的 Risk 不该写「数据会不一致」——它是「这张表停止更新」，不是数据错了")
 	}
 }
+
+// TestObjectMissingNextIsLayeredByCase：E1013 同时承担四种情形，Next 必须一一对应。
+//
+// 判据来自一次真实的误判：第一版把「3F000 建 schema」顶在最前面，于是**表名拼错**的人
+// 会先去建一个已经存在的 schema——方向正好相反。这条用例把四种情形钉在各自的 step 上。
+func TestObjectMissingNextIsLayeredByCase(t *testing.T) {
+	spec, ok := Lookup(CodeObjectMissing)
+	if !ok {
+		t.Fatal("E1013 必须在码表里")
+	}
+	if len(spec.Next) != 3 {
+		t.Fatalf("E1013 的 Next 应为 3 步（按情形分层），实际 %d 步", len(spec.Next))
+	}
+	cases := []struct {
+		step int
+		want []string
+		desc string
+	}{
+		{0, []string{"3F000", "schema"}, "缺 schema 的动作"},
+		{1, []string{"42P01", "别去建 schema"}, "缺表 / 表名写错的动作用"},
+		{2, []string{"42703", "预检"}, "缺列的动作"},
+	}
+	for _, c := range cases {
+		for _, w := range c.want {
+			if !strings.Contains(spec.Next[c.step], w) {
+				t.Errorf("%s：Next[%d] 应含 %q，实际 %q", c.desc, c.step, w, spec.Next[c.step])
+			}
+		}
+	}
+	// 名字写错这一情形：Why 与 Next 都要提到，否则用户看到「缺表」只会去改库
+	if !strings.Contains(spec.Why, "写错") {
+		t.Error("Why 必须提到「名字写错」这种情形")
+	}
+	if !strings.Contains(spec.Next[1], "写错") {
+		t.Error("Next[1] 必须把「表名写错」并进去（动作与缺表相同）")
+	}
+	// 「位点不动、不会重搬」是**陈述事实**，放 Why 而不是 Risk——
+	// Risk 里出现让人安心的话，会让「风险」这个词贬值（Owl 在 #66 上提的）。
+	if !strings.Contains(spec.Why, "位点没有推进") {
+		t.Error("Why 必须陈述「位点没有推进」这个事实")
+	}
+	if strings.Contains(spec.Risk, "不会重搬") || strings.Contains(spec.Risk, "位点不动") {
+		t.Error("Risk 里不该出现安抚性表述（「位点不动/不会重搬」应放在 Why）")
+	}
+	// Risk 只放真风险：改错方向的后果 + 换 schema 的代价
+	if !strings.Contains(spec.Risk, "继续失败") {
+		t.Error("Risk 必须写清「改错方向会继续失败」")
+	}
+	if !strings.Contains(spec.Risk, "不会自动搬过去") {
+		t.Error("Risk 必须保留「换 schema = 另一套表」的代价")
+	}
+}
+
+// TestSchemaMismatchPauseCaveatInAllThreePlaces：括注「若当前版本已支持按表暂停」在
+// Why / Next / Risk 三处**同生同灭**。
+//
+// 这次真实的错：Why 与 Next 都加了括注，唯独 Risk 漏了——而 Risk 是唯一陈述后果的那句，
+// 于是文案变成「其它表不受影响」，用户据此不管，实际整轮 run 会失败。
+// 第③步上线后三处要一起删：只删一处时这条用例会红，逼你三处一起动。
+func TestSchemaMismatchPauseCaveatInAllThreePlaces(t *testing.T) {
+	const caveat = "若当前版本已支持按表暂停"
+	spec, ok := Lookup(CodeSchemaMismatch)
+	if !ok {
+		t.Fatal("E1015 必须在码表里")
+	}
+	if !strings.Contains(spec.Why, caveat) {
+		t.Errorf("Why 缺括注 %q", caveat)
+	}
+	found := false
+	for _, n := range spec.Next {
+		if strings.Contains(n, caveat) {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("Next 里缺括注 %q（按表暂停还没实现，不能让用户以为会暂停）", caveat)
+	}
+	if !strings.Contains(spec.Risk, caveat) {
+		t.Errorf("Risk 缺括注 %q —— Risk 是唯一陈述后果的那句，漏了会诱导用户不管", caveat)
+	}
+	// 同一份事实的当前真相：第③步未实现时整轮会失败。这句必须写在 Risk 里。
+	if !strings.Contains(spec.Risk, "整轮 run 会失败") {
+		t.Error("Risk 必须写明「在此之前整轮 run 会失败」——这才是今天实际发生的事")
+	}
+}

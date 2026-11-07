@@ -95,7 +95,10 @@ type Report struct {
 	// Conclusion is the exact one-line human conclusion, also emitted in JSON
 	// so CI/AI consumers do not re-implement (and drift from) the CLI wording.
 	Conclusion string `json:"conclusion,omitempty"`
-	OK         bool   `json:"ok"`
+	// Fingerprint says whether the two sides' fingerprints are comparable at
+	// all (cross-engine fingerprints never are).
+	Fingerprint FingerprintInfo `json:"fingerprint"`
+	OK          bool            `json:"ok"`
 }
 
 // Side is the read-only view verify needs from one endpoint. *runtime.DB
@@ -172,6 +175,7 @@ func Run(ctx context.Context, opts Options) (Report, error) {
 		JobKey:      opts.JobKey,
 		OK:          true,
 		Mode:        string(level),
+		Fingerprint: FingerprintComparable(opts.Source, opts.Target),
 	}
 
 	type tier struct {
@@ -269,21 +273,37 @@ func Conclusion(rep Report) string {
 			full := statInt(lr, "tables_full_scan")
 			agg := statInt(lr, "tables_aggregate_only")
 			noPK := statInt(lr, "tables_no_pk")
+			note := ""
 			switch {
 			case full == 0 && agg > 0:
-				part += "（仅聚合，未做行级全表比对"
+				note = "仅聚合，未做行级全表比对"
 				if noPK > 0 {
-					part += "；无主键表只能聚合"
+					note += "；无主键表只能聚合"
 				}
-				part += "）"
 			case agg > 0:
-				part += fmt.Sprintf("（行级全表比对 %d 表；%d 表仅聚合", full, agg)
+				note = fmt.Sprintf("行级全表比对 %d 表；%d 表仅聚合", full, agg)
 				if noPK > 0 {
-					part += "（无主键）"
+					note += "（无主键）"
 				}
-				part += "）"
 			case full > 0:
-				part += fmt.Sprintf("（行级全表比对 %d 表）", full)
+				note = fmt.Sprintf("行级全表比对 %d 表", full)
+			}
+			// 指纹不可比与「跑了几张表」无关：聚合级、混合级也要说。
+			// 但措辞不能自相矛盾：只跑聚合时不能说「已改用逐行比对」。
+			if v, ok := lr.Stats["fingerprint_comparable"]; ok {
+				if b, ok := v.(bool); ok && !b {
+					fpNote := "跨端指纹不可比，已改用逐行比对"
+					if full == 0 && agg > 0 {
+						fpNote = "聚合级不涉及指纹比对"
+					}
+					if note != "" {
+						note += "；"
+					}
+					note += fpNote
+				}
+			}
+			if note != "" {
+				part += "（" + note + "）"
 			}
 		}
 		parts = append(parts, part)
@@ -436,6 +456,12 @@ func checkPrimaryKey(lr *LevelReport, srcT, tgtT source.Table) {
 func runData(ctx context.Context, opts Options) LevelReport {
 	lr := newLevel(LevelData)
 	fullScanTables, aggregateOnlyTables, noPKTables := 0, 0, 0
+	fp := FingerprintComparable(opts.Source, opts.Target)
+	lr.stat("fingerprint_comparable", fp.Comparable)
+	if !fp.Comparable {
+		lr.add(SeverityWarn, "fingerprint_scope_mismatch", "", "", fp.Reason, fp.SourceScope, fp.TargetScope,
+			"不需要处理：verify 已自动改用逐行全表比对；这条只是告诉你不要拿两端指纹直接比")
+	}
 	for _, name := range opts.Tables {
 		lr.Tables++
 		srcT, ok, err := opts.Source.Table(ctx, opts.SourceSchema, name)
@@ -537,12 +563,12 @@ func runSampling(ctx context.Context, lr *LevelReport, opts Options, name string
 			continue
 		}
 		matched++
-		numCols := newTableAgg(srcT, commonCols).numeric
-		srcCanon := canonicalRowNumeric(commonCols, srcRow, numCols)
-		tgtCanon := canonicalRowNumeric(commonCols, tgtRow, numCols)
+		agg := newTableAgg(srcT, commonCols)
+		srcCanon := canonicalRowNumeric(commonCols, srcRow, agg.numeric, agg.textual)
+		tgtCanon := canonicalRowNumeric(commonCols, tgtRow, agg.numeric, agg.textual)
 		digest.Write([]byte(rowDigest(srcCanon)))
 		if srcCanon != tgtCanon {
-			col, sv, tv := firstDiffNumeric(commonCols, srcRow, tgtRow, numCols)
+			col, sv, tv := firstDiffNumeric(commonCols, srcRow, tgtRow, agg.numeric, agg.textual)
 			lr.add(SeverityError, "row_mismatch", name, col,
 				"抽样行的内容不一致（全表扫描后又被改？）", trunc(sv, 80), trunc(tv, 80),
 				"确认是否有并发写入；按主键重放该行")
@@ -730,14 +756,14 @@ func commonColumns(srcT, tgtT source.Table) []string {
 // canonicalRow renders values the same way on both sides, then joins them with
 // a separator that cannot appear in the escaped form.
 func canonicalRow(cols []string, vals []any) string {
-	return canonicalRowNumeric(cols, vals, nil)
+	return canonicalRowNumeric(cols, vals, nil, nil)
 }
 
 // canonicalRowNumeric is canonicalRow with the numeric-column set applied.
 // numeric/decimal come back from database/sql as strings ("1.0000", "1.00");
 // comparing those as text makes every cross-scale pair look different even
 // though L1's big.Rat says equal. Numeric columns must use RatString().
-func canonicalRowNumeric(cols []string, vals []any, numeric map[string]bool) string {
+func canonicalRowNumeric(cols []string, vals []any, numeric, textual map[string]bool) string {
 	var b strings.Builder
 	for i, v := range vals {
 		if i > 0 {
@@ -747,16 +773,24 @@ func canonicalRowNumeric(cols []string, vals []any, numeric map[string]bool) str
 		if i < len(cols) {
 			name = cols[i]
 		}
-		b.WriteString(canonicalValueFor(name, v, numeric))
+		b.WriteString(canonicalValueFor(name, v, numeric, textual))
 	}
 	return b.String()
 }
 
-func canonicalValueFor(col string, v any, numeric map[string]bool) string {
+func canonicalValueFor(col string, v any, numeric, textual map[string]bool) string {
 	key := strings.ToLower(col)
 	if numeric[key] || numeric[col] {
 		if r, ok := toRat(v); ok {
 			return "n" + r.RatString()
+		}
+	}
+	if textual[key] || textual[col] {
+		switch x := v.(type) {
+		case []byte:
+			return "s" + string(x)
+		case string:
+			return "s" + x
 		}
 	}
 	return canonicalValue(v)
@@ -800,10 +834,10 @@ func rowDigest(canon string) string {
 }
 
 func firstDiff(cols []string, a, b []any) (string, string, string) {
-	return firstDiffNumeric(cols, a, b, nil)
+	return firstDiffNumeric(cols, a, b, nil, nil)
 }
 
-func firstDiffNumeric(cols []string, a, b []any, numeric map[string]bool) (string, string, string) {
+func firstDiffNumeric(cols []string, a, b []any, numeric, textual map[string]bool) (string, string, string) {
 	n := len(cols)
 	if len(a) < n {
 		n = len(a)
@@ -812,8 +846,8 @@ func firstDiffNumeric(cols []string, a, b []any, numeric map[string]bool) (strin
 		n = len(b)
 	}
 	for i := 0; i < n; i++ {
-		av := canonicalValueFor(cols[i], a[i], numeric)
-		bv := canonicalValueFor(cols[i], b[i], numeric)
+		av := canonicalValueFor(cols[i], a[i], numeric, textual)
+		bv := canonicalValueFor(cols[i], b[i], numeric, textual)
 		if av != bv {
 			return cols[i], av, bv
 		}
