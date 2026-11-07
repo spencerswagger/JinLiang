@@ -11,7 +11,6 @@ import (
 	"errors"
 	"fmt"
 	"path"
-	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -285,7 +284,8 @@ type runner struct {
 	gsink  targetSink
 	cat    source.Catalog
 	tables []source.TableRef
-	// pausedTables 记录本轮被暂停的表（表名 → 原因码），供「全停」判定用。
+	// pausedTables 记录本轮遇到「结构对不上」的表（表名 → 原因码），
+	// 只用于事件流里告诉用户「哪张表出的问题」——**不用于跳过写入**（位点会越过被跳过的事件）。
 	pausedTables sync.Map
 	// emitHook 只在单测里用（数事件条数），生产路径为 nil。
 	emitHook func(control.Event)
@@ -985,8 +985,9 @@ func (r *runner) stream(ctx context.Context, res *Result) error {
 			return fmt.Errorf("登记暂停表 %s 失败: %w", pe.Table(), err)
 		}
 		r.emit(c, control.Event{Type: "note",
-			Message: fmt.Sprintf("表 %s 已暂停（原因码 %s）：该表的变更不再写入，其它表继续；"+
-				"对齐结构后重跑即可恢复（位点未推进）", pe.Table(), pe.Reason())})
+			Message: fmt.Sprintf("表 %s 结构对不上（原因码 %s）：**本轮会以失败收尾**——"+
+				"位点没有推进，所以一条变更都不会丢。在目标端对齐结构后重跑即可继续（不用重搬历史）",
+				pe.Table(), pe.Reason())})
 		r.pausedTables.Store(pe.Table(), pe.Reason())
 		return nil
 	}
@@ -1093,11 +1094,6 @@ func (r *runner) stream(ctx context.Context, res *Result) error {
 	if err := b.Flush(context.Background()); err != nil {
 		return err
 	}
-	// **上界规则**：本轮至少一张表实际写入，任务才算 running；
-	// 全部表都被暂停 → 整体失败并说清「N 张表被暂停」，不允许「心跳正常、数据没动」。
-	if err := r.allTablesPaused(); err != nil {
-		return err
-	}
 	if streamErr != nil {
 		var stopped *stoppedError
 		if errors.As(streamErr, &stopped) {
@@ -1202,30 +1198,6 @@ func classifyError(err error) (code core.Code, classified bool) {
 		return core.CodePositionGap, true
 	}
 	return "", false
-}
-
-// allTablesPaused 报告「选中的表是否全被暂停」，并给出原因码清单。
-//
-// 这不是「一个表失败」的放大器：**只暂停该表只有在还有别的表在跑时才是改进**；
-// 所有表都停了，那就是整体失败，只是换了个安静的说法。
-func (r *runner) allTablesPaused() error {
-	if len(r.tables) == 0 {
-		return nil
-	}
-	var paused []string
-	for _, ref := range r.tables {
-		reason, ok := r.pausedTables.Load(ref.Table)
-		if !ok {
-			return nil // 还有表在跑
-		}
-		paused = append(paused, fmt.Sprintf("%s(%v)", ref.Table, reason))
-	}
-	sort.Strings(paused)
-	return &notImplementedError{fmt.Sprintf(
-		"本轮没有任何表能继续：%d 张表都被暂停（%s）。"+
-			"你能做什么：看 last_error 里点名的表与列，在目标端对齐结构后重跑（位点未推进）。"+
-			"风险：这些表的后续变更不会被写入——**这不算「同步中」，是整体失败**",
-		len(paused), strings.Join(paused, "、"))}
 }
 
 // heartbeatLoop 周期刷新本条 run 的存活心跳；只在 run 未结束时可写（TouchRun 自己带条件）。

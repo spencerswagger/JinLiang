@@ -263,15 +263,18 @@ func (b *batcher) flushLocked(ctx context.Context) error {
 	}
 	// 数据与位点同事务提交（pgsink.Apply 内部保证）。
 	if err := b.sink.Apply(ctx, b.pending, pos); err != nil {
-		// 「这张表的结构对不上」不该打死整个任务：暂停它、丢掉它的事件、其它表继续写。
-		// 其它错误照旧上抛（真跑不了的事不能装作处理了）。
+		// 「这张表的结构对不上」→ 登记暂停（给用户看、给下一轮 prepare 用），
+		// 然后**照旧把这个错误上抛**。
+		//
+		// 为什么不能「丢掉这张表的事件、返回 nil」：整条任务只有**一个位点**，
+		// 一旦返回 nil，位点就会越过这些被丢掉的事件 → **这些变更永久丢失**。
+		// 那不是「暂停该表」，那是数据静默缺失（失败会有人看，缺数据不会）。
+		// 所以：暂停 = 这张表停下来**但一条都不丢**（位点不推进，重跑幂等补上）。
 		var pe pauser
 		if errors.As(err, &pe) && b.onPause != nil {
 			if perr := b.onPause(ctx, pe); perr != nil {
 				return perr
 			}
-			b.dropTableEvents(pe.Table())
-			return nil
 		}
 		return err
 	}

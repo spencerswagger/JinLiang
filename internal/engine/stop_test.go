@@ -13,7 +13,6 @@ import (
 	"github.com/spencerswagger/jinliang/internal/control"
 	"github.com/spencerswagger/jinliang/internal/core"
 	"github.com/spencerswagger/jinliang/internal/dsn"
-	"github.com/spencerswagger/jinliang/internal/source"
 	"github.com/spencerswagger/jinliang/internal/state"
 )
 
@@ -553,33 +552,5 @@ func TestStopJobTimeoutIsNotSilent(t *testing.T) {
 	}
 	if !strings.Contains(serr.Error(), "没有退出") {
 		t.Fatalf("错误要写清「没有停干净」：%v", serr)
-	}
-}
-
-// 第③步上界②：**全部表被暂停 → 整体失败**，不许「心跳正常、数据没动」。
-func TestAllTablesPausedIsNotRunning(t *testing.T) {
-	mk := func(paused ...string) *runner {
-		r := &runner{tables: []source.TableRef{
-			{Schema: "public", Table: "a"}, {Schema: "public", Table: "b"},
-		}}
-		for _, p := range paused {
-			r.pausedTables.Store(p, "type_changed")
-		}
-		return r
-	}
-	// 一张暂停、一张没停 → 还有表在跑，不报错
-	if err := mk("a").allTablesPaused(); err != nil {
-		t.Fatalf("还有表在跑时不该判成全停：%v", err)
-	}
-	// 全停 → 报错，且消息里要有表名与数量（用户要知道停了哪些）
-	err := mk("a", "b").allTablesPaused()
-	if err == nil {
-		t.Fatal("全部表暂停时必须整体失败")
-	}
-	msg := err.Error()
-	for _, want := range []string{"2 张表", "a(", "b(", "不算「同步中」"} {
-		if !strings.Contains(msg, want) {
-			t.Fatalf("错误里应包含 %q：%s", want, msg)
-		}
 	}
 }

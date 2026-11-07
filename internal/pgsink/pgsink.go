@@ -879,6 +879,15 @@ func (s *Sink) Apply(ctx context.Context, evs []source.Event, pos source.Positio
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// 已被暂停的表：**整批拒绝**，而不是「跳过它、让位点前进」。
+	// 位点只有一个，跳过就等于把这张表的变更永久丢掉——那是数据静默缺失，
+	// 比整 run 失败严重得多（失败会有人看，缺数据不会）。
+	for _, ev := range evs {
+		if s.isPausedLocked(ev.Table) {
+			return &TablePausedError{TableName: ev.Table.Table}
+		}
+	}
+
 	tx, err := s.conn.Begin(ctx)
 	if err != nil {
 		return err
@@ -892,11 +901,6 @@ func (s *Sink) Apply(ctx context.Context, evs []source.Event, pos source.Positio
 		ev := evs[i]
 		switch ev.Kind {
 		case source.EvInsert, source.EvUpdate:
-			// 已暂停的表直接跳过：**只暂停该表、其它表继续**是这一步的全部意义。
-			if s.isPausedLocked(ev.Table) {
-				i++
-				continue
-			}
 			// 加列竞态：源端 DDL 之后的行带着**新的 Relation**，而目标端可能还没有那一列。
 			// 先对齐列再写行——否则这一批整体失败，一张表的 DDL 把整个任务打死。
 			if err := s.alignRelationTx(ctx, tx, ev); err != nil {
@@ -1179,6 +1183,22 @@ const (
 	PauseReasonTypeChanged = "type_changed" // 源端改了列类型
 	PauseReasonSchemaDrift = "schema_drift" // 改名 / 删列
 )
+
+// TablePausedError 表示「这张表已被标记暂停」——整批拒绝，位点不推进。
+// 与 TypeChangedError 同族（PausableError）：要能按表识别、要能挂码。
+type TablePausedError struct {
+	TableName string
+}
+
+func (e *TablePausedError) Error() string {
+	return fmt.Sprintf("表 %s 已被暂停（结构未对齐），本批不写入、位点未推进", e.TableName)
+}
+
+// Reason 实现 PausableError。
+func (e *TablePausedError) Reason() string { return PauseReasonTypeChanged }
+
+// Table 实现 PausableError。
+func (e *TablePausedError) Table() string { return e.TableName }
 
 // TypeChangedError 表示源端改了列类型——本版不跟随（会截断或静默变更语义）。
 // 单独成类型，方便第③步把它降级成「只暂停这张表」而不是整个任务。
