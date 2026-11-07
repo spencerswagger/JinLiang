@@ -281,7 +281,10 @@ type runner struct {
 	sink *pgsink.Sink
 	// gsink 是「按接口」的目标端：PG 用 pgsink（COPY 快路径），MySQL 用 mysqlsink
 	// （走契约的 Apply）。构造阶段确定，之后引擎只用接口。
-	gsink  targetSink
+	gsink targetSink
+	// state 是目标端的状态表能力（租约/位点/块/对象登记）。PG 与 MySQL 都满足；
+	// 增量路径必须有它，全量路径不需要。
+	state  stateCapable
 	cat    source.Catalog
 	tables []source.TableRef
 	// emitHook 只在单测里用（数事件条数），生产路径为 nil。
@@ -343,7 +346,14 @@ func (r *runner) execute(parent context.Context, res *Result) error {
 			return r.fail(ctx, err)
 		}
 		defer r.teardown()
-		if err := r.executeGenericFullCopy(ctx, res); err != nil {
+		// 增量模式且目标端有状态表能力 → 走增量（全量 + 持续流）；否则只搬一次。
+		runErr := error(nil)
+		if isIncrementalMode(r.doc.Mode.Frequency) && r.state != nil {
+			runErr = r.executeGenericIncremental(ctx, res)
+		} else {
+			runErr = r.executeGenericFullCopy(ctx, res)
+		}
+		if err := runErr; err != nil {
 			if r.leaseLost.Load() {
 				return r.fail(ctx, r.leaseLostError())
 			}
@@ -927,6 +937,17 @@ func (r *runner) snapshot(ctx context.Context) error {
 	return nil
 }
 
+// isIncrementalMode 判断这个频率档位是否需要持续流。
+//
+// once / full_interval 只搬一次（每轮整表重搬）；continuous* 才需要租约+位点。
+func isIncrementalMode(freq string) bool {
+	switch freq {
+	case "continuous", "continuous+initial":
+		return true
+	}
+	return false
+}
+
 // ── 阶段：追赶 + 增量 ────────────────────────────────────────
 
 func (r *runner) stream(ctx context.Context, res *Result) error {
@@ -1382,8 +1403,13 @@ func (r *runner) phaseTo(ctx context.Context, to state.Phase) error {
 		return err
 	}
 	r.phase = to
-	if r.sink != nil {
+	// 阶段写进目标端 `_jl_meta`：PG 走 r.sink，MySQL 目标端 r.sink 是 nil，
+	// 必须走状态能力接口（否则「阶段」只在内存里，重启就丢）。
+	switch {
+	case r.sink != nil:
 		_ = r.sink.SetPhase(ctx, string(to))
+	case r.state != nil:
+		_ = r.state.SetPhase(ctx, string(to))
 	}
 	r.emit(ctx, control.Event{Type: "phase", Phase: to, Message: control.PhaseLabel(to)})
 	return nil

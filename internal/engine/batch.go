@@ -92,6 +92,12 @@ type batcher struct {
 	onFlush func(applied int64, pos pgsource.Position)
 	// onApplied reports rows/position to the runner.
 	onApplied func(rows int64, pos pgsource.Position)
+
+	// ackGuard 在**向源端确认位点之前**调用（PG 源上 ack = 允许丢弃 WAL）。
+	// 目标端是 staged_phases（MySQL 含 DDL 的批次有多个提交点）时，引擎在这里
+	// 读回目标端位点校验：不是 durable 就不许 ack——否则源端会清掉还能重放的流水。
+	// 返回错误即整轮停止（不静默跳过）。
+	ackGuard func(ctx context.Context, pos pgsource.Position) error
 }
 
 func newBatcher(sink applier, src acker, doc control.JobDoc, batchRows int, delay time.Duration,
@@ -123,6 +129,11 @@ func (b *batcher) AdvanceTo(ctx context.Context, pos pgsource.Position) error {
 	}
 	if err := b.sink.Apply(ctx, nil, pos); err != nil {
 		return err
+	}
+	if b.ackGuard != nil {
+		if err := b.ackGuard(ctx, pos); err != nil {
+			return err
+		}
 	}
 	b.src.Ack(pos)
 	b.lastPos = pos
@@ -262,6 +273,11 @@ func (b *batcher) flushLocked(ctx context.Context) error {
 		return err
 	}
 	// 只有提交成功后才把位点告诉源端：先告诉它会丢数据。
+	if b.ackGuard != nil {
+		if err := b.ackGuard(ctx, pos); err != nil {
+			return err
+		}
+	}
 	b.src.Ack(pos)
 	b.applied += rows
 	b.lastPos = pos
