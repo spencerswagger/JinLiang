@@ -953,9 +953,9 @@ func TestDDLTypeChangeIsRefusedNotSilent(t *testing.T) {
 	if !errors.As(err, &te) {
 		t.Fatalf("应返回 TypeChangedError（第③步要按类型降级成「只暂停该表」），得到 %T: %v", err, err)
 	}
-	// ① 方向必须无歧义：标出两端各是什么，而不是一个可能读反的箭头
-	if !strings.Contains(err.Error(), "目标端当前是 bigint") || !strings.Contains(err.Error(), "源端是 text") {
-		t.Fatalf("错误里要标清「目标端当前」与「源端」各是什么：%v", err)
+	// ① 方向必须无歧义。这条路（streaming）两端都是**源端**类型：旧 → 新。
+	if !strings.Contains(err.Error(), "源端原来是 bigint") || !strings.Contains(err.Error(), "现在是 text") {
+		t.Fatalf("streaming 路要标清「源端原来/现在」各是什么：%v", err)
 	}
 	// ② typed error 只带事实：动作与风险交给码表（否则同一条错误两段动作）
 	for _, unwanted := range []string{"你能做什么", "风险"} {
@@ -1007,9 +1007,14 @@ func TestDDLRenameIsReported(t *testing.T) {
 	if err == nil {
 		t.Fatal("列改名必须报错")
 	}
-	// 明细里必须有「原来那一列」的名字；同时新列也要出现（否则用户不知道改成了什么）
-	if !strings.Contains(err.Error(), "原 a 已不存在") || !strings.Contains(err.Error(), "新增 b") {
-		t.Fatalf("错误里要带上的新旧列名：%v", err)
+	// 改名只输出「原→现」配对，不再重复两条单边说法
+	if !strings.Contains(err.Error(), "原 a → 现 b") {
+		t.Fatalf("错误里要有「原 a → 现 b」这种配对：%v", err)
+	}
+	for _, dup := range []string{"原 a 已不存在", "新增 b"} {
+		if strings.Contains(err.Error(), dup) {
+			t.Fatalf("有配对时不该再重复单边说法 %q：%v", dup, err)
+		}
 	}
 	var sd *pgsink.SchemaDriftError
 	if !errors.As(err, &sd) {
