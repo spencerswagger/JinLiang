@@ -152,3 +152,30 @@ func TestSchemaMismatchPauseCaveatInAllThreePlaces(t *testing.T) {
 		t.Error("Risk 必须写明「在此之前整轮 run 会失败」——这才是今天实际发生的事")
 	}
 }
+
+// TestSchemaMismatchReasonTimingNotOneToOne：原因码与发现时机**不是一一对应**。
+//
+// 真实错例：第一版写「prepare = type_changed，跑起来后改类型/改名/删列 = schema_drift」，
+// 而实现里 streaming 的**改类型**也返回 TypeChangedError。于是「跑起来后改了类型」
+// 被码表错标成 schema_drift，用户按它去查「列是不是被改名了」，方向反了。
+func TestSchemaMismatchReasonTimingNotOneToOne(t *testing.T) {
+	spec, ok := Lookup(CodeSchemaMismatch)
+	if !ok {
+		t.Fatal("E1015 必须在码表里")
+	}
+	// type_changed 必须同时挂在「prepare」与「跑起来后改类型」两处语境上
+	if !strings.Contains(spec.Why, "prepare") {
+		t.Error("Why 必须提到 prepare 这条时机（EnsureSchema 补列时就会撞）")
+	}
+	if !strings.Contains(spec.Why, "跑起来后源端把列类型改了") {
+		t.Error("Why 必须说明 streaming 的改类型也是 type_changed —— 第一版正是把这里错标成 schema_drift")
+	}
+	// schema_drift 只对应改名/删列
+	if !strings.Contains(spec.Why, "改名") || !strings.Contains(spec.Why, "删掉") {
+		t.Error("Why 必须说明 schema_drift 是改名/删列")
+	}
+	// 不许再出现「跑起来后改类型 / 改名 / 删列」被绑成一组的旧表述
+	if strings.Contains(spec.Why, "改类型 / 改名 / 删列") {
+		t.Error("Why 里不能再把「改类型」与「改名/删列」绑成同一原因码")
+	}
+}
