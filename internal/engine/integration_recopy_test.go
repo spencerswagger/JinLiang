@@ -1011,3 +1011,73 @@ func TestDDLRenameIsReported(t *testing.T) {
 		t.Fatalf("原因码应为 %q，得到 %q", pgsink.PauseReasonSchemaDrift, sd.Reason())
 	}
 }
+
+// 第③步上界①：**一张表暂停、其它表继续写**。
+// 「只暂停该表」只有在还有别的表在跑时才是改进——这条钉住「其它表的数据真的进了目标端」。
+func TestOneTablePausedOthersKeepRunning(t *testing.T) {
+	_, dstDSN := dsns(t)
+	dstDB := mustConn(t, dstDSN)
+	ctx := context.Background()
+
+	exec(t, dstDB, "DROP TABLE IF EXISTS pause_a, pause_b")
+	exec(t, dstDB, "DROP TABLE IF EXISTS _jl_meta, _jl_chunk, _jl_lease, _jl_object, _jl_instance")
+
+	relA := source.Table{TableRef: source.TableRef{Schema: "public", Table: "pause_a"},
+		Columns:    []source.Column{{Name: "id", Type: "bigint"}},
+		PrimaryKey: []string{"id"}}
+	relB := source.Table{TableRef: source.TableRef{Schema: "public", Table: "pause_b"},
+		Columns:    []source.Column{{Name: "id", Type: "bigint"}},
+		PrimaryKey: []string{"id"}}
+	s, err := pgsink.Open(ctx, pgsink.Options{
+		Target: mustEndpoint(t, dstDSN), JobKey: "pausejob", JobName: "pause",
+		InstanceID: "it-pause", Schema: "public", OnExists: "append",
+		Catalog: source.Catalog{Tables: []source.Table{relA, relB}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if _, err := s.EnsureSchema(ctx, source.Catalog{Tables: []source.Table{relA, relB}}); err != nil {
+		t.Fatalf("EnsureSchema: %v", err)
+	}
+	// ① 暂停 A
+	if err := s.PauseTable(ctx, relA.TableRef, pgsink.PauseReasonTypeChanged, "测试：A 结构对不上"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.LoadPausedTables(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// ② 同一个批次里 A、B 都有行：A 跳过、B 照写
+	if err := s.Apply(ctx, []source.Event{
+		{Kind: source.EvInsert, Table: relA.TableRef, Relation: &relA,
+			New: source.Row{Table: relA.TableRef, Values: []source.Value{{Kind: source.KindString, S: "1"}}}},
+		{Kind: source.EvInsert, Table: relB.TableRef, Relation: &relB,
+			New: source.Row{Table: relB.TableRef, Values: []source.Value{{Kind: source.KindString, S: "2"}}}},
+		{Kind: source.EvCommit},
+	}, nil); err != nil {
+		t.Fatalf("有表被暂停时其它表应照写，不该整批失败：%v", err)
+	}
+
+	var bRows int
+	if err := dstDB.QueryRow(ctx, "SELECT count(*) FROM pause_b").Scan(&bRows); err != nil {
+		t.Fatal(err)
+	}
+	if bRows != 1 {
+		t.Fatalf("B 的行必须写进去（其它表继续），得到 %d 行", bRows)
+	}
+	var aRows int
+	if err := dstDB.QueryRow(ctx, "SELECT count(*) FROM pause_a").Scan(&aRows); err != nil {
+		t.Fatal(err)
+	}
+	if aRows != 0 {
+		t.Fatalf("A 已暂停，不该写入，得到 %d 行", aRows)
+	}
+	// 暂停是跨轮事实：重新打开 sink 也能读回来
+	m, err := s.PausedTables(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m["pause_a"].Reason != pgsink.PauseReasonTypeChanged {
+		t.Fatalf("暂停记录应持久化：%+v", m)
+	}
+}

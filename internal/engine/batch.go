@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -66,6 +67,9 @@ type batcher struct {
 	src       acker
 	batchRows int
 	delay     time.Duration
+	// onPause 在「这张表结构对不上」时被调用：登记暂停、发 note，然后**其它表继续写**。
+	// 为 nil 表示这个 batcher 不支持按表暂停（行为与以前一致：错误上抛）。
+	onPause func(ctx context.Context, pe pauser) error
 
 	mu      sync.Mutex
 	cur     []source.Event // 当前源事务（还没 COMMIT），首元素是 EvBegin
@@ -259,6 +263,16 @@ func (b *batcher) flushLocked(ctx context.Context) error {
 	}
 	// 数据与位点同事务提交（pgsink.Apply 内部保证）。
 	if err := b.sink.Apply(ctx, b.pending, pos); err != nil {
+		// 「这张表的结构对不上」不该打死整个任务：暂停它、丢掉它的事件、其它表继续写。
+		// 其它错误照旧上抛（真跑不了的事不能装作处理了）。
+		var pe pauser
+		if errors.As(err, &pe) && b.onPause != nil {
+			if perr := b.onPause(ctx, pe); perr != nil {
+				return perr
+			}
+			b.dropTableEvents(pe.Table())
+			return nil
+		}
 		return err
 	}
 	// 只有提交成功后才把位点告诉源端：先告诉它会丢数据。
@@ -323,4 +337,28 @@ func (b *batcher) Applied() (int64, pgsource.Position) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.applied, b.lastPos
+}
+
+// pauser 是「这张表不能继续跟，但其它表可以」的错误（pgsink.PausableError 的同形状）。
+// 定义成接口而不是 import pgsink 的具体类型：batcher 只依赖形状。
+type pauser interface {
+	error
+	Reason() string
+	Table() string
+}
+
+// dropTableEvents 把这张表尚未落库的事件丢掉（已暂停的表再写只会一直失败）。
+// 位点照旧推进：这些事件确实被「处理过」——处理方式是不写，并已登记原因。
+func (b *batcher) dropTableEvents(table string) {
+	if len(b.pending) == 0 {
+		return
+	}
+	kept := b.pending[:0]
+	for _, ev := range b.pending {
+		if ev.Table.Table == table {
+			continue
+		}
+		kept = append(kept, ev)
+	}
+	b.pending = kept
 }

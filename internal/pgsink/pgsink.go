@@ -11,6 +11,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -90,6 +91,8 @@ type Sink struct {
 	mu     sync.Mutex
 	tables map[string]*tableInfo
 	order  []string
+	// pausedCache 是「这张表已暂停」的内存镜像（写行前每批都要判，不能每批查库）。
+	pausedCache map[string]PausedTable
 
 	// ownerToken 让「同一个进程里的两个 Sink」也彼此可分（否则它们同 pid、
 	// 同 instance_id，第二个会把第一个的租约抢走）。
@@ -227,10 +230,15 @@ func (s *Sink) ensureStateTables(ctx context.Context) error {
 			phase          text NOT NULL,
 			position       text,
 			watermark      text,
+			-- paused_tables 存「表名 → 原因码 + 时间」的 JSON：DDL 只暂停该表、其它表继续。
+			paused_tables  text,
 			snapshot_id    text,
 			started_at     timestamptz NOT NULL DEFAULT now(),
 			updated_at     timestamptz NOT NULL DEFAULT now()
 		)`, s.stateTable("_jl_meta"), SchemaVersion),
+		// 老库补列：CREATE TABLE IF NOT EXISTS 不会给已存在的表加列。
+		fmt.Sprintf(`ALTER TABLE %s ADD COLUMN IF NOT EXISTS paused_tables text`,
+			s.stateTable("_jl_meta")),
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
 			job_key     text PRIMARY KEY,
 			instance_id text NOT NULL,
@@ -884,6 +892,11 @@ func (s *Sink) Apply(ctx context.Context, evs []source.Event, pos source.Positio
 		ev := evs[i]
 		switch ev.Kind {
 		case source.EvInsert, source.EvUpdate:
+			// 已暂停的表直接跳过：**只暂停该表、其它表继续**是这一步的全部意义。
+			if s.isPausedLocked(ev.Table) {
+				i++
+				continue
+			}
 			// 加列竞态：源端 DDL 之后的行带着**新的 Relation**，而目标端可能还没有那一列。
 			// 先对齐列再写行——否则这一批整体失败，一张表的 DDL 把整个任务打死。
 			if err := s.alignRelationTx(ctx, tx, ev); err != nil {
@@ -1860,4 +1873,134 @@ func nullStr(s string) any {
 		return nil
 	}
 	return s
+}
+
+// isPausedLocked 是写路径上的快速判定（调用方已持锁；缓存懒加载）。
+func (s *Sink) isPausedLocked(ref source.TableRef) bool {
+	if s.pausedCache == nil {
+		return false
+	}
+	_, ok := s.pausedCache[ref.Table]
+	return ok
+}
+
+// LoadPausedTables 把库里已记录的暂停表读进内存缓存（引擎在 prepare 之后调用一次）。
+func (s *Sink) LoadPausedTables(ctx context.Context) error {
+	m, err := s.PausedTables(ctx)
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.pausedCache = m
+	s.mu.Unlock()
+	return nil
+}
+
+// ── 按表暂停（DDL 只影响一张表时，其它表继续跑） ────────────────
+
+// PausedTable 是「这张表停了」的运行时记录。
+type PausedTable struct {
+	Reason string `json:"reason"` // 稳定原因码（PauseReason*）
+	At     string `json:"at"`     // 什么时候停的（RFC3339）
+	Detail string `json:"detail,omitempty"`
+}
+
+// PausedTables 读回 `_jl_meta.paused_tables`（表名 → 暂停信息）。
+// 读不到/解析不了按「没有暂停」处理：暂停是「少写」而不是「多写」，缺省不影响安全。
+func (s *Sink) PausedTables(ctx context.Context) (map[string]PausedTable, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	q := fmt.Sprintf(`SELECT COALESCE(paused_tables,'') FROM %s WHERE job_key=$1`, s.stateTable("_jl_meta"))
+	var raw string
+	err := s.conn.QueryRow(ctx, q, s.opt.JobKey).Scan(&raw)
+	if err != nil {
+		if strings.Contains(err.Error(), "no rows") {
+			return map[string]PausedTable{}, nil
+		}
+		return nil, err
+	}
+	if strings.TrimSpace(raw) == "" {
+		return map[string]PausedTable{}, nil
+	}
+	out := map[string]PausedTable{}
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		return map[string]PausedTable{}, nil
+	}
+	return out, nil
+}
+
+// PauseTable 把一张表记成「暂停」并留原因码；已暂停的表不重复写（保留第一次的时间与原因）。
+func (s *Sink) PauseTable(ctx context.Context, ref source.TableRef, reason, detail string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// 状态行不存在时先建：否则 UPDATE 影响 0 行，暂停**静默丢失**（写行照旧写）。
+	// 这正是今晚反复出现的那类「看起来记下了、其实没落库」。
+	if err := s.ensureMetaLocked(ctx); err != nil {
+		return err
+	}
+	cur, err := s.pausedTablesLocked(ctx)
+	if err != nil {
+		return err
+	}
+	if _, ok := cur[ref.Table]; ok {
+		return nil // 第一次的原因更有价值，别被后来的覆盖
+	}
+	cur[ref.Table] = PausedTable{Reason: reason, At: time.Now().UTC().Format(time.RFC3339), Detail: detail}
+	b, err := json.Marshal(cur)
+	if err != nil {
+		return err
+	}
+	q := fmt.Sprintf(`UPDATE %s SET paused_tables=$1, updated_at=now() WHERE job_key=$2`, s.stateTable("_jl_meta"))
+	if _, err := s.conn.Exec(ctx, q, string(b), s.opt.JobKey); err != nil {
+		return err
+	}
+	// 缓存：写行时直接跳过这些表，不用每批都查库。
+	if s.pausedCache == nil {
+		s.pausedCache = map[string]PausedTable{}
+	}
+	s.pausedCache[ref.Table] = cur[ref.Table]
+	return nil
+}
+
+// ensureMetaLocked 保证 `_jl_meta` 有这一行（调用方已持锁）。
+func (s *Sink) ensureMetaLocked(ctx context.Context) error {
+	q := fmt.Sprintf(`INSERT INTO %s (job_key, name, instance_id, schema_version, job_hash, phase)
+		VALUES ($1,$2,$3,$4,'','prepare') ON CONFLICT (job_key) DO NOTHING`, s.stateTable("_jl_meta"))
+	_, err := s.conn.Exec(ctx, q, s.opt.JobKey, s.opt.JobName, s.opt.InstanceID, SchemaVersion)
+	return err
+}
+
+// pausedTablesLocked 是 PausedTables 的内部版（调用方已持锁）。
+func (s *Sink) pausedTablesLocked(ctx context.Context) (map[string]PausedTable, error) {
+	q := fmt.Sprintf(`SELECT COALESCE(paused_tables,'') FROM %s WHERE job_key=$1`, s.stateTable("_jl_meta"))
+	var raw string
+	if err := s.conn.QueryRow(ctx, q, s.opt.JobKey).Scan(&raw); err != nil {
+		if strings.Contains(err.Error(), "no rows") {
+			return map[string]PausedTable{}, nil
+		}
+		return nil, err
+	}
+	out := map[string]PausedTable{}
+	if raw != "" {
+		_ = json.Unmarshal([]byte(raw), &out)
+	}
+	return out, nil
+}
+
+// IsPaused 报告这张表是否已被暂停（写行前用它跳过）。
+func (s *Sink) IsPaused(ctx context.Context, ref source.TableRef) bool {
+	s.mu.Lock()
+	if s.pausedCache != nil {
+		if _, ok := s.pausedCache[ref.Table]; ok {
+			s.mu.Unlock()
+			return true
+		}
+	}
+	s.mu.Unlock()
+	m, err := s.PausedTables(ctx)
+	if err != nil {
+		return false
+	}
+	_, ok := m[ref.Table]
+	return ok
 }
