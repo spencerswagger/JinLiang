@@ -188,6 +188,34 @@ jobs:
             if [ "$ok" != 1 ]; then echo "--- $c 没起来 ---"; docker logs "$c"; exit 1; fi
             docker exec "$c" psql -U jinliang -d postgres -tAc "select current_setting('wal_level')"
           done
+      - name: 起 MySQL 目标端（PG → MySQL 全量 + 增量用）
+        # MySQL 官方镜像默认就开 binlog（ROW/FULL），但这里只是目标端，不需要 binlog；
+        # 单独一个库 `jinliang_mysql` 当目标，避免与源库同名表混在一起。
+        run: |
+          set -e
+          docker run -d --name my-dst \
+            -e MYSQL_ROOT_PASSWORD=root -e MYSQL_DATABASE=jinliang_test \
+            -e MYSQL_USER=jinliang -e MYSQL_PASSWORD=jinliang \
+            -p 3307:3306 mysql:8.0
+          for i in $(seq 1 90); do
+            if docker exec my-dst mysqladmin ping -h 127.0.0.1 -ujinliang -pjinliang --silent >/dev/null 2>&1; then
+              echo "mysql 就绪"; break
+            fi
+            sleep 2
+          done
+          docker exec my-dst mysql -h127.0.0.1 -ujinliang -pjinliang -e "SELECT VERSION()"
+
+      - name: PG → MySQL 全量 + 增量（行数 + md5 对账）
+        env:
+          JINLIANG_TEST_PG_SRC_DSN: postgres://jinliang:jinliang@127.0.0.1:55432/jinliang_src?sslmode=disable
+          JINLIANG_TEST_MYSQL_DSN: mysql://jinliang:jinliang@127.0.0.1:3307/jinliang_test
+          ROWS: "20000"
+        run: |
+          set -e
+          mkdir -p dist
+          CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o dist/jinliang ./cmd/jinliang
+          scripts/b1_pg_to_mysql.sh ./dist/jinliang
+
       - name: 引擎单元测试（位点 / 事务组装 / 阶段机 / DDL 生成）
         run: go test ./internal/engine/ ./internal/pgsink/ ./internal/pgsource/ ./internal/pgwire/
       - name: 引擎真库集成测试（重搬不清用户表 / 同机租约 / 状态机）

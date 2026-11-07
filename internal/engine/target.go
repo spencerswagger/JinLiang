@@ -4,9 +4,11 @@ import (
 	"context"
 	"database/sql/driver"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/spencerswagger/jinliang/internal/catalog"
@@ -58,6 +60,9 @@ type stateCapable interface {
 	RecordObject(ctx context.Context, name, kind string) error
 	MarkObjectDropped(ctx context.Context, name string) error
 	Count(ctx context.Context, ref source.TableRef) (int64, error)
+	// Position 读回已落库的位点（续跑与 ack 前校验都要它）。
+	// 引擎一直在调 `r.sink.Position`，但之前只是靠具体类型——写进接口才有编译期保证。
+	Position(ctx context.Context) (string, error)
 }
 
 // 编译期保证：两个目标端都满足状态能力接口（签名不一致会直接编译失败）。
@@ -114,10 +119,15 @@ func (r *runner) prepareGeneric(ctx context.Context) error {
 		return err
 	}
 	r.gsink = gs
-	if r.tgtEP.Kind == dsn.KindMySQL {
-		r.note(ctx, "目标端是 MySQL：本版只支持全量（不建同步书签、不写位点、不记块进度）。"+
-			"崩溃/中断后重跑会**从头重搬**；幂等靠目标表有主键/唯一键（没有唯一键会在写入前直接报错，不会插重复），"+
-			"所以恢复时间按「整表重搬」估，而不是 PG 那边的「从断点续搬」")
+	// 状态表能力（租约/位点/块/对象登记）：MySQL 侧 #50 已具备，PG 的 pgsink 也满足。
+	// 全量路径不需要它；增量路径必须有，缺了在 incrementalGate 里明确拒绝。
+	if st, ok := gs.(stateCapable); ok {
+		r.state = st
+	}
+	// 增量支持取决于「有没有状态表能力」而不是目标端类型：MySQL 侧 #50 已具备，
+	// 所以首次搬完全量后会续增量；once / full_interval 仍然只搬一次。
+	if r.state == nil {
+		r.note(ctx, "目标端没有租约/位点能力：本版只能搬一次全量（崩溃后重跑会从头重搬）")
 	}
 	src, err := r.openSource(ctx)
 	if err != nil {
@@ -253,14 +263,9 @@ func (r *runner) incrementalGate() error {
 				"2) 需要周期性重跑就用 full_interval；3) 或者换 PostgreSQL 目标端跑真增量。"+
 				"风险：没有（本次没有写入任何数据）", r.tgtEP.Kind)}
 	}
-	// 注意：**不要建议用户改 interval**——非 PG 目标端在 Run 里提前返回、走
-	// executeGenericFullCopy，而它第一步就是本函数，interval 会撞回这同一句拒绝
-	//（engine.go 的 interval 分派对 MySQL 不可达）。给的建议必须是走得通的。
-	return &notImplementedError{fmt.Sprintf(
-		"目标端（%s）的状态表已经就绪，但本版引擎的非 PG 增量路径还没接上：目前只搬全量。"+
-			"你现在能做什么：1) 把 mode.frequency 改成 once 先搬存量；"+
-			"2) 需要周期性重跑就用 full_interval（每轮整表重搬，明确接受这个代价）。"+
-			"风险：没有（本次没有写入任何数据）", r.tgtEP.Kind)}
+	// 状态表就绪 → 允许增量。非 PG 目标端的增量走 executeGenericIncremental：
+	// 租约 + 位点都在目标端状态表里，写路径只走契约的 sink.Apply。
+	return nil
 }
 
 // relationOf 给出这张表这一版的列定义（引擎据此告诉目标端「值按什么列序」）。
@@ -371,4 +376,361 @@ func catalogEngine(kind string) catalog.Engine {
 		return catalog.MySQL
 	}
 	return catalog.Postgres
+}
+
+// executeGenericIncremental 跑「非 PG 目标端」的增量：全量 + 持续流。
+//
+// 与 PG 路径的差别只有一处：**目标端能力不一样**。写路径仍然只走契约的
+// `sink.Apply`（目标端自己决定 upsert 方言），租约/位点在目标端状态表里。
+//
+// 下单顺序（与 PG 路径同一套安全规则）：
+//  1. 先拿租约（拿不到就停，不写任何数据）；
+//  2. **先取起点位点、再做全量**：全量期间的变更会在后面被重放，靠 upsert 幂等吸收；
+//     反过来（先搬后取位点）会漏掉整个搬期间的变化；
+//  3. 全量按页喂 `Apply`（每 500 行一批，避免一条超大 INSERT 撞 max_allowed_packet）；
+//  4. 流式：batcher 每批 `Apply(数据 + 位点)`，成功后**先过 ackGuard 再 ack**；
+//  5. 收尾：flush → 写 done 阶段 → 释放租约。
+func (r *runner) executeGenericIncremental(ctx context.Context, res *Result) error {
+	if r.state == nil {
+		return &notImplementedError{"目标端没有租约/位点能力，只能跑全量"}
+	}
+	if err := r.phaseTo(ctx, state.Prepare); err != nil {
+		return err
+	}
+	ok, why, err := r.state.AcquireLease(ctx, r.leaseTTL)
+	if err != nil {
+		return fmt.Errorf("拿租约失败: %w", err)
+	}
+	if !ok {
+		return &notImplementedError{fmt.Sprintf(
+			"另一个进程正在跑这个任务（%s）：等它结束，或在那边先停掉。"+
+				"你现在能做什么：1) 等一会儿重试；2) 确认那个进程是否还活着（`jinliang status`）；"+
+				"3) 确实要接管就等租约过期（30 秒）再跑。风险：强抢会让两个进程同时写同一张目标表", why)}
+	}
+	defer func() { _ = r.state.ReleaseLease(context.WithoutCancel(ctx)) }()
+
+	if err := r.state.EnsureMeta(ctx, hashOf(r.doc), string(state.Prepare), "", ""); err != nil {
+		return fmt.Errorf("写入任务状态行失败: %w", err)
+	}
+
+	// 续跑：目标端已有位点就从那儿接；没有就是首次，要搬全量。
+	raw, err := r.state.Position(ctx)
+	if err != nil {
+		return fmt.Errorf("读目标端位点失败: %w", err)
+	}
+	fresh := raw == ""
+
+	// **只有首次才建表/按 on_exists 处理**：续跑时再走一遍 `recreate` 会把目标表
+	// 清空（我 e2e 第一次就是在这里把 20000 行清成 0 的）。续跑只要求表在。
+	if fresh {
+		actions, err := r.gsink.EnsureSchema(ctx, r.targetCatalog())
+		if err != nil {
+			return fmt.Errorf("在 %s 目标端建表失败: %w", r.tgtEP.Kind, err)
+		}
+		for _, a := range actions {
+			r.emit(ctx, control.Event{Type: "note", Message: a.What})
+		}
+	}
+
+	// **源端也要准备**：PG 的逻辑复制需要书签（slot）+ 发布（publication）。
+	// 非 PG 目标端的增量同样是 PG 源在供流，所以这一步与 PG 路径一样不能省
+	//（省了会拿到「replication slot ... does not exist」）。
+	prep, err := r.src.Prepare(ctx, pgsource.PrepareOptions{Snapshot: fresh})
+	if err != nil {
+		return fmt.Errorf("准备源端对象失败: %w", err)
+	}
+	for _, a := range prep.Actions {
+		r.emit(ctx, control.Event{Type: "note", Message: a.What})
+	}
+	r.snapshotName = prep.SnapshotName
+	r.consistentPoint = prep.ConsistentPoint
+	r.reusedSlot = !fresh
+	r.src.SetSnapshotName(prep.SnapshotName)
+
+	from := prep.ConsistentPoint
+	if !fresh {
+		if from, err = r.resumePosition(ctx); err != nil {
+			return err
+		}
+		// 续跑前确认目标表还在：`_jl_meta.position` 说「搬过」，但表被删了/换库了，
+		// 继续流会把变更写进不存在的表——宁可停下并说清，也不静默空转。
+		for _, ref := range r.tables {
+			tref := r.targetRef(ref)
+			if _, cerr := r.state.Count(ctx, tref); cerr != nil {
+				return fmt.Errorf("目标表 %s 不存在但位点还在（%s）：状态表与目标表不一致。"+
+					"你能做的：① 用 `jinliang run --job %s --resync` 重新初始化；"+
+					"② 或确认目标库是不是被切换/删过。风险：直接继续流会把变更写进不存在的表，看起来“在跑”实际什么都没写",
+					qualifiedTarget(tref), from.String(), r.job.Name)
+			}
+		}
+	}
+	r.mu.Lock()
+	r.lastPos = from
+	r.mu.Unlock()
+
+	// 首次跑（目标端没有位点）才搬全量；有位置说明上次已经搬过，直接续增量。
+	if fresh {
+		if err := r.phaseTo(ctx, state.Snapshot); err != nil {
+			return err
+		}
+		if err := r.copyAllGeneric(ctx); err != nil {
+			return err
+		}
+		r.src.EndSnapshot()
+		// 全量结束把**起点位点**写进目标端：不写的话下次跑会认为是首次、
+		// 又整表重搬一遍（我 e2e 第一次就是这么重复搬了 20003 行）。
+		// 用空批 Apply 写位点，与 batcher.AdvanceTo 是同一个机制，不需要新方法。
+		if err := r.gsink.Apply(ctx, nil, from); err != nil {
+			return fmt.Errorf("写入全量起点位点失败: %w", err)
+		}
+		// 状态机不允许 snapshot → streaming 直跳：与 PG 路径一样先到 catchup（追赶）。
+		if err := r.phaseTo(ctx, state.Catchup); err != nil {
+			return err
+		}
+	}
+	if r.phase == state.Snapshot || r.phase == state.Catchup {
+		if err := r.phaseTo(ctx, state.Streaming); err != nil {
+			return err
+		}
+	}
+
+	b := newBatcher(r.gsink, r.src, r.doc, r.batchRows(), r.batchDelay(), from, func(rows int64, pos pgsource.Position) {
+		r.rowsStream += rows
+		r.mu.Lock()
+		r.lastPos = pos
+		r.mu.Unlock()
+	})
+	b.onFlush = func(applied int64, pos pgsource.Position) {
+		r.progress(ctx, fmt.Sprintf("增量：已应用 %d 行，位点 %s", applied, pos.String()))
+	}
+	// **staged_phases 才需要 ack 前校验**：MySQL 目标端含 DDL 的批次有三个提交点，
+	// 「Apply 返回 nil」不等于「位点已落盘」——读回确认，才允许向 PG 源 ack（清 WAL）。
+	if d, ok := r.gsink.(interface{ PositionDurability() string }); ok && d.PositionDurability() == "staged_phases" {
+		b.ackGuard = func(c context.Context, pos pgsource.Position) error {
+			got, err := r.state.Position(c)
+			if err != nil {
+				return fmt.Errorf("ack 前读回位点失败: %w", err)
+			}
+			if got != pos.String() {
+				return fmt.Errorf("拒绝向源端确认位点 %s：目标端实际是 %q——位点还没落盘就开始 ack，"+
+					"源端会清掉还能重放的流水。风险：继续跑会永久缺数据；已停下，什么都没丢",
+					pos.String(), got)
+			}
+			return nil
+		}
+	}
+
+	streamCtx, cancelStream := context.WithCancel(ctx)
+	defer cancelStream()
+	go b.flushLoop(streamCtx)
+
+	var stopHit, idleHit atomic.Bool
+	if r.opt.StopAfter > 0 {
+		go func() {
+			select {
+			case <-streamCtx.Done():
+			case <-time.After(r.opt.StopAfter):
+				stopHit.Store(true)
+				cancelStream()
+			}
+		}()
+	}
+	if r.opt.IdleAfter > 0 {
+		go func() {
+			t := time.NewTicker(300 * time.Millisecond)
+			defer t.Stop()
+			idleSince := time.Now()
+			for {
+				select {
+				case <-streamCtx.Done():
+					return
+				case <-t.C:
+					rows, inTx := b.Pending()
+					if rows == 0 && !inTx {
+						if time.Since(idleSince) > r.opt.IdleAfter {
+							// 追平后收尾是**成功完成**（不是用户按停），历史页别记成 stopped。
+							idleHit.Store(true)
+							stopHit.Store(true)
+							cancelStream()
+							return
+						}
+					} else {
+						idleSince = time.Now()
+					}
+				}
+			}
+		}()
+	}
+
+	streamErr := r.src.Stream(streamCtx, from, func(c context.Context, ev source.Event) error {
+		if stopHit.Load() {
+			return &stoppedError{msg: fmt.Sprintf("到达本次运行的时间上限（%s），已收尾", r.opt.StopAfter)}
+		}
+		// **事件里的表名是源端 schema（public.xxx），必须换成目标端的**：
+		// 不换的话 mysqlsink 会去查 `public`.`my_orders`（不存在），报「没有唯一键」——
+		// 这条错误看起来像目标表问题，实际是引擎没做 schema 映射。
+		ev.Table = r.targetRef(ev.Table)
+		if ev.Relation != nil {
+			rel := *ev.Relation
+			rel.TableRef = ev.Table
+			ev.Relation = &rel
+		}
+		// 时间类列：PG 发的是带时区后缀的文本，MySQL 的 datetime 不接受，先转成 time.Time。
+		normalizeTemporal(&ev)
+		return b.Add(c, ev)
+	})
+	cancelStream()
+	if err := b.Flush(context.Background()); err != nil {
+		return err
+	}
+	if streamErr != nil {
+		var stopped *stoppedError
+		code := ExitStopped
+		if idleHit.Load() {
+			code = ExitOK // 追平后收尾 = 正常完成
+		}
+		if errors.As(streamErr, &stopped) {
+			return r.finishGeneric(context.Background(), code)
+		}
+		if errors.Is(streamErr, context.Canceled) || isUserStop(ctx, streamErr) {
+			return r.finishGeneric(context.Background(), code)
+		}
+		return streamErr
+	}
+	return r.finishGeneric(context.Background(), ExitOK)
+}
+
+// finishGeneric 收尾：状态机只允许 streaming → draining → done，不能直跳 done。
+//
+// 注意必须走 `r.drain`：它除了改阶段，还会 `Store.FinishRun` 写 ended_at +
+// finish_reason。少了这一步，run 行会永远「未结束」——下一次跑会被自己的残留
+// 挡成 409（我第一次跑 e2e 就是这么撞上的）。drain 里 `r.sink` 是 nil 时安全跳过
+// `SetPhase`，MySQL 目标端的阶段由 `phaseTo` 通过 `r.state` 写。
+func (r *runner) finishGeneric(ctx context.Context, code int) error {
+	msg := "已完成"
+	if code == ExitStopped {
+		msg = "已手动停止"
+	}
+	if err := r.drain(ctx, code, msg); err != nil {
+		return err
+	}
+	return nil
+}
+
+// resumePosition 读目标端已落库的位点；没有就取「此刻」作为起点（先取位点再做全量）。
+func (r *runner) resumePosition(ctx context.Context) (pgsource.Position, error) {
+	raw, err := r.state.Position(ctx)
+	if err != nil {
+		return pgsource.Position{}, fmt.Errorf("读目标端位点失败: %w", err)
+	}
+	if raw == "" {
+		return r.src.CurrentLSN(ctx)
+	}
+	parsed, err := r.src.ParsePosition(raw)
+	if err != nil {
+		return pgsource.Position{}, err
+	}
+	if err := assertPositionKind(parsed, r.src.Kind()); err != nil {
+		return pgsource.Position{}, err
+	}
+	p, ok := parsed.(pgsource.Position)
+	if !ok {
+		return pgsource.Position{}, fmt.Errorf("%w：这个源给出的位点类型是 %T", source.ErrPositionMalformed, parsed)
+	}
+	return p, nil
+}
+
+// copyAllGeneric 把选中的表按页搬到非 PG 目标端（不写位点：全量期间的变更靠后续重放吸收）。
+func (r *runner) copyAllGeneric(ctx context.Context) error {
+	chunkRows := r.chunkRows()
+	_, err := r.src.SnapshotChunks(ctx, source.SnapshotOpt{ChunkRows: chunkRows, Conns: 1},
+		func(c context.Context, ch pgsource.Chunk) error {
+			const perBatch = 500
+			ref := r.targetRef(ch.Table)
+			rel := r.relationOf(ch.Table)
+			for i := 0; i < len(ch.Rows); i += perBatch {
+				end := i + perBatch
+				if end > len(ch.Rows) {
+					end = len(ch.Rows)
+				}
+				evs := make([]source.Event, 0, end-i)
+				for _, row := range ch.Rows[i:end] {
+					vals, verr := toValues(row)
+					if verr != nil {
+						return fmt.Errorf("转换 %s 的一行失败（宁可停下也不写错数据）: %w", ch.Table.Table, verr)
+					}
+					evs = append(evs, source.Event{
+						Kind:     source.EvInsert,
+						Table:    ref,
+						Relation: rel,
+						New:      source.Row{Table: ref, Values: vals},
+					})
+				}
+				if err := r.gsink.Apply(c, evs, nil); err != nil {
+					return err
+				}
+			}
+			r.rowsCopied += int64(len(ch.Rows))
+			r.progress(c, fmt.Sprintf("全量：%s 第 %d 块，%d 行", ch.Table.Table, ch.No, len(ch.Rows)))
+			return nil
+		})
+	return err
+}
+
+// qualifiedTarget 只用于错误信息里显示表名。
+func qualifiedTarget(ref source.TableRef) string {
+	if ref.Schema == "" {
+		return ref.Table
+	}
+	return ref.Schema + "." + ref.Table
+}
+
+// normalizeTemporal 把源端「时间类列的文本值」转成 time.Time。
+//
+// 为什么需要：PG 的逻辑复制（pgoutput）把 timestamptz 发成文本
+// `2026-11-07 03:17:34.117788+00`，而 MySQL 的 datetime 列不接受带时区后缀的字面量
+// （Error 1292）。全量走的是驱动值（已经是 time.Time），所以只有增量这条路径会撞上——
+// 转成 time.Time 后由驱动按列类型格式化，两端才对得上。
+func normalizeTemporal(ev *source.Event) {
+	if ev.Relation == nil || len(ev.New.Values) == 0 {
+		return
+	}
+	for i, col := range ev.Relation.Columns {
+		if i >= len(ev.New.Values) {
+			break
+		}
+		if !isTemporalType(col.Type) {
+			continue
+		}
+		v := ev.New.Values[i]
+		if v.Kind != source.KindString || v.S == "" {
+			continue
+		}
+		if t, ok := parsePGTime(v.S); ok {
+			ev.New.Values[i] = source.Value{Kind: source.KindTime, T: t}
+		}
+	}
+}
+
+func isTemporalType(t string) bool {
+	lt := strings.ToLower(t)
+	return strings.HasPrefix(lt, "timestamp") || lt == "date" || strings.HasPrefix(lt, "time ")
+}
+
+// parsePGTime 接受 pgoutput 的时间文本；解析不出来就返回 false（保持原值，由目标端报错）。
+func parsePGTime(s string) (time.Time, bool) {
+	layouts := []string{
+		"2006-01-02 15:04:05.999999-07",
+		"2006-01-02 15:04:05.999999-07:00",
+		"2006-01-02 15:04:05.999999",
+		"2006-01-02 15:04:05",
+		"2006-01-02",
+		time.RFC3339Nano,
+	}
+	for _, l := range layouts {
+		if t, err := time.Parse(l, s); err == nil {
+			return t.UTC(), true
+		}
+	}
+	return time.Time{}, false
 }

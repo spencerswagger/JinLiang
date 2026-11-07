@@ -782,23 +782,21 @@ func TestIncrementalGateExplainsWhatIsMissing(t *testing.T) {
 		t.Fatalf("PG 目标端不该被拦：%v", err)
 	}
 
-	// MySQL 目标端 + 状态能力已就绪（mysqlsink 满足 stateCapable）：
+	// MySQL 目标端 + 状态能力已就绪（mysqlsink 满足 stateCapable）：放行。
+	// 这一步从「显式拒绝」改成「放行」是因为 `executeGenericIncremental` 接上了：
+	// 租约/位点都在目标端状态表里，写路径只走契约的 sink.Apply。
 	m := &runner{tgtEP: dsn.Endpoint{Kind: dsn.KindMySQL}, gsink: mustMySQLSink(t)}
 	m.doc.Mode.Frequency = "continuous+initial"
-	err := m.incrementalGate()
-	if err == nil {
-		t.Fatal("非 PG 增量本版还没接，必须显式拒绝")
-	}
-	if !strings.Contains(err.Error(), "状态表已经就绪") {
-		t.Fatalf("有状态能力时应说「能力有了、路径没接」，得到：%v", err)
+	if err := m.incrementalGate(); err != nil {
+		t.Fatalf("状态能力就绪时 MySQL 目标端应允许增量，拿到：%v", err)
 	}
 
 	// 只有全量的目标端（不满足 stateCapable）：说「没有状态能力」
 	only := &runner{tgtEP: dsn.Endpoint{Kind: dsn.KindMySQL}, gsink: sinkOnly{}}
 	only.doc.Mode.Frequency = "continuous+initial"
-	err = only.incrementalGate()
-	if err == nil || !strings.Contains(err.Error(), "还没有租约/位点能力") {
-		t.Fatalf("缺状态能力时应说清缺什么，得到：%v", err)
+	onlyErr := only.incrementalGate()
+	if onlyErr == nil || !strings.Contains(onlyErr.Error(), "还没有租约/位点能力") {
+		t.Fatalf("缺状态能力时应说清缺什么，得到：%v", onlyErr)
 	}
 
 	// full_interval / once 不受影响
@@ -829,4 +827,47 @@ func TestMySQLIntervalIsRejectedWithUsableAdvice(t *testing.T) {
 			t.Fatalf("%s 的建议应给 once 与 full_interval 两条真正走得通的路：%s", mode, msg)
 		}
 	}
+}
+
+// ackGuard：目标端是 staged_phases 时，「位点还没落盘就不许向源端 ack」。
+// 这条守的是全部安全性：提前 ack = 源端可以清掉还能重放的流水。
+func TestBatcherRefusesAckWhenGuardFails(t *testing.T) {
+	acked := 0
+	src := &fakeSource{}
+	_ = src
+	b := newBatcher(&countingSink{}, ackCounter{&acked}, control.JobDoc{}, 100, time.Millisecond,
+		pgsource.Position{}, nil)
+	b.ackGuard = func(ctx context.Context, pos pgsource.Position) error {
+		return errors.New("目标端位点还没落盘")
+	}
+	err := b.AdvanceTo(context.Background(), mustLSN(t, "0/200"))
+	if err == nil {
+		t.Fatal("guard 失败时必须把错误抛出去（整轮停下），不能静默 ack")
+	}
+	if acked != 0 {
+		t.Fatalf("guard 失败后不许 ack，实际 ack 了 %d 次", acked)
+	}
+}
+
+// ackCounter 是只记账的 acker。
+type ackCounter struct{ n *int }
+
+func (a ackCounter) Ack(pgsource.Position)         { *a.n++ }
+func (a ackCounter) LastCommit() pgsource.Position { return pgsource.Position{} }
+
+// countingSink 记录 Apply 调用（不需要真库）。
+type countingSink struct{ applies int }
+
+func (c *countingSink) Apply(ctx context.Context, evs []source.Event, pos source.Position) error {
+	c.applies++
+	return nil
+}
+
+func mustLSN(t *testing.T, s string) pgsource.Position {
+	t.Helper()
+	p, err := pgsource.ParsePayload(s)
+	if err != nil {
+		t.Fatalf("位点 %q: %v", s, err)
+	}
+	return p
 }
