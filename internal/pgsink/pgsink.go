@@ -1132,26 +1132,37 @@ func relationMatches(ti *tableInfo, rel *source.Table) (sameNames, sameTypes, ke
 		}
 	}
 	sameTypes, keptAll = true, true
-	var tparts, nparts []string
+	var tparts, nparts, renames []string
 	for i, name := range ti.cols {
 		typ, ok := byName[name]
 		if !ok {
+			// 可能只是改名（位置上的新名字）。先记下来，等循环末尾判断要不要输出单边说法。
 			keptAll = false
-			nparts = append(nparts, fmt.Sprintf("原 %s 已不存在", name))
+			if i < len(rel.Columns) && rel.Columns[i].Name != name {
+				renames = append(renames, fmt.Sprintf("第 %d 列：原 %s → 现 %s", i+1, name, rel.Columns[i].Name))
+			} else {
+				nparts = append(nparts, fmt.Sprintf("原 %s 已不存在", name))
+			}
 			continue
 		}
 		if i < len(ti.types) && typ != ti.types[i] {
 			sameTypes = false
-			tparts = append(tparts, fmt.Sprintf("列 %s：目标端当前是 %s，源端是 %s", name, ti.types[i], typ))
+			// 这条路两端都是**源端**类型：ti.types = 建表时从源端 catalog 拿到的旧类型，
+			// typ = 事件里 Relation 带来的新类型。写成「目标端」会把用户引去改错的一端。
+			tparts = append(tparts, fmt.Sprintf("列 %s：源端原来是 %s，现在是 %s", name, ti.types[i], typ))
 		}
 		if i < len(rel.Columns) && rel.Columns[i].Name != name {
-			nparts = append(nparts, fmt.Sprintf("第 %d 列 原 %s → 现 %s", i+1, name, rel.Columns[i].Name))
+			renames = append(renames, fmt.Sprintf("第 %d 列：原 %s → 现 %s", i+1, name, rel.Columns[i].Name))
 		}
 	}
-	// 「新增」与列数是否变化无关：改名时也是「一个没了、一个多了」，两边都要说清。
-	for _, c := range rel.Columns {
-		if _, ok := ti.colIndex[c.Name]; !ok {
-			nparts = append(nparts, "新增 "+c.Name)
+	// 有「原→现」配对时，那两个单边说法（「原 X 已不存在」「新增 Y」）就是同一件事的重复，
+	// 不再输出——用户只需要知道「第 N 列 原 a → 现 b」。
+	nparts = append(renames, nparts...)
+	if len(renames) == 0 {
+		for _, c := range rel.Columns {
+			if _, ok := ti.colIndex[c.Name]; !ok {
+				nparts = append(nparts, "新增 "+c.Name)
+			}
 		}
 	}
 	typeDiff = strings.Join(tparts, "；")
