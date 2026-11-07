@@ -20,6 +20,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/spencerswagger/jinliang/internal/control"
+	"github.com/spencerswagger/jinliang/internal/core"
 	"github.com/spencerswagger/jinliang/internal/dsn"
 	"github.com/spencerswagger/jinliang/internal/engine"
 	"github.com/spencerswagger/jinliang/internal/pgsink"
@@ -952,8 +953,15 @@ func TestDDLTypeChangeIsRefusedNotSilent(t *testing.T) {
 	if !errors.As(err, &te) {
 		t.Fatalf("应返回 TypeChangedError（第③步要按类型降级成「只暂停该表」），得到 %T: %v", err, err)
 	}
-	if !strings.Contains(err.Error(), "bigint → text") {
-		t.Fatalf("错误里要指明哪一列、从什么变成什么：%v", err)
+	// ① 方向必须无歧义。这条路（streaming）两端都是**源端**类型：旧 → 新。
+	if !strings.Contains(err.Error(), "源端原来是 bigint") || !strings.Contains(err.Error(), "现在是 text") {
+		t.Fatalf("streaming 路要标清「源端原来/现在」各是什么：%v", err)
+	}
+	// ② typed error 只带事实：动作与风险交给码表（否则同一条错误两段动作）
+	for _, unwanted := range []string{"你能做什么", "风险"} {
+		if strings.Contains(err.Error(), unwanted) {
+			t.Fatalf("动作/风险应由码表给，typed error 里不该有 %q：%v", unwanted, err)
+		}
 	}
 }
 
@@ -999,9 +1007,14 @@ func TestDDLRenameIsReported(t *testing.T) {
 	if err == nil {
 		t.Fatal("列改名必须报错")
 	}
-	// 明细里必须有「原来那一列」的名字；同时新列也要出现（否则用户不知道改成了什么）
-	if !strings.Contains(err.Error(), "原 a 已不存在") || !strings.Contains(err.Error(), "新增 b") {
-		t.Fatalf("错误里要带上的新旧列名：%v", err)
+	// 改名只输出「原→现」配对，不再重复两条单边说法
+	if !strings.Contains(err.Error(), "原 a → 现 b") {
+		t.Fatalf("错误里要有「原 a → 现 b」这种配对：%v", err)
+	}
+	for _, dup := range []string{"原 a 已不存在", "新增 b"} {
+		if strings.Contains(err.Error(), dup) {
+			t.Fatalf("有配对时不该再重复单边说法 %q：%v", dup, err)
+		}
 	}
 	var sd *pgsink.SchemaDriftError
 	if !errors.As(err, &sd) {
@@ -1010,4 +1023,128 @@ func TestDDLRenameIsReported(t *testing.T) {
 	if sd.Reason() != pgsink.PauseReasonSchemaDrift {
 		t.Fatalf("原因码应为 %q，得到 %q", pgsink.PauseReasonSchemaDrift, sd.Reason())
 	}
+}
+
+// 同一件事的两个时机必须给同一个原因码：ensureSchema（prepare 时）发现目标列类型与源端
+// 不一致，和跑起来时发现类型变了，都是「这张表的类型对不上」。
+// 以前前者是裸哨兵 ErrTypeMismatch → 整任务死，后者是 TypeChangedError → 暂停该表，
+// 用户会当成两个 bug。
+func TestEnsureSchemaTypeMismatchIsPausable(t *testing.T) {
+	srcDSN, dstDSN := dsns(t)
+	srcDB := mustConn(t, srcDSN)
+	dstDB := mustConn(t, dstDSN)
+	table := "type_mismatch_prep"
+	ctx := context.Background()
+
+	exec(t, srcDB, "DROP TABLE IF EXISTS "+table)
+	exec(t, srcDB, "CREATE TABLE "+table+" (id bigint PRIMARY KEY, v bigint)")
+	// 目标端故意建一张「列名同、类型不同」的表
+	exec(t, dstDB, "DROP TABLE IF EXISTS "+table)
+	exec(t, dstDB, "CREATE TABLE "+table+" (id bigint PRIMARY KEY, v text)")
+	exec(t, dstDB, "DROP TABLE IF EXISTS _jl_meta, _jl_chunk, _jl_lease, _jl_object, _jl_instance")
+
+	ref := source.TableRef{Schema: "public", Table: table}
+	rel := source.Table{TableRef: ref,
+		Columns:    []source.Column{{Name: "id", Type: "bigint"}, {Name: "v", Type: "bigint"}},
+		PrimaryKey: []string{"id"}}
+	s, err := pgsink.Open(ctx, pgsink.Options{
+		Target: mustEndpoint(t, dstDSN), JobKey: "typemismatchprep", JobName: "tm",
+		InstanceID: "it-tm", Schema: "public", OnExists: "append",
+		Catalog: source.Catalog{Tables: []source.Table{rel}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	_, err = s.EnsureSchema(ctx, source.Catalog{Tables: []source.Table{rel}})
+	if err == nil {
+		t.Fatal("目标列类型与源端不一致时必须报错")
+	}
+	var pe pgsink.PausableError
+	if !errors.As(err, &pe) {
+		t.Fatalf("必须是 PausableError（第③步按表暂停），得到 %T: %v", err, err)
+	}
+	if pe.Table() != table {
+		t.Fatalf("要能直接拿到表名，得到 %q", pe.Table())
+	}
+	if pe.Reason() != pgsink.PauseReasonTypeChanged {
+		t.Fatalf("原因码应与「跑起来时发现类型变了」一致（%q），得到 %q",
+			pgsink.PauseReasonTypeChanged, pe.Reason())
+	}
+}
+
+// E1015 落地后的端到端：目标列类型与源端不一致 → `runs.code` 必须是 E1015（不再留空）。
+// 这是 #64 那条必改的最终验收：机器能判等（Reason/Table）→ **人也看得到码**。
+func TestSchemaMismatchRunGetsE1015(t *testing.T) {
+	srcDSN, dstDSN := dsns(t)
+	srcDB := mustConn(t, srcDSN)
+	dstDB := mustConn(t, dstDSN)
+	table := "type_change_run"
+	ctx := context.Background()
+
+	exec(t, srcDB, "DROP TABLE IF EXISTS "+table)
+	exec(t, srcDB, "CREATE TABLE "+table+" (id bigint PRIMARY KEY, v bigint)")
+	// 目标端故意建「列名同、类型不同」的表：EnsureSchema 会撞上类型不一致
+	exec(t, dstDB, "DROP TABLE IF EXISTS "+table)
+	exec(t, dstDB, "CREATE TABLE "+table+" (id bigint PRIMARY KEY, v text)")
+	exec(t, dstDB, "DROP TABLE IF EXISTS _jl_meta, _jl_chunk, _jl_lease, _jl_object, _jl_instance")
+
+	store, jobID := onceJobSingleTable(t, srcDSN, dstDSN, "typechange", table)
+	res, err := engine.Run(ctx, engine.Options{Store: store, JobID: jobID, SnapshotOnly: true})
+	if err == nil {
+		t.Fatal("目标列类型不一致必须失败")
+	}
+	run, gerr := store.GetRun(ctx, res.RunID)
+	if gerr != nil {
+		t.Fatal(gerr)
+	}
+	if run.Code != string(core.CodeSchemaMismatch) {
+		t.Fatalf("runs.code 应为 %s，得到 %q；last_error=%s",
+			core.CodeSchemaMismatch, run.Code, run.LastError)
+	}
+	// 具体是哪张表、哪种情况，由运行时写进 last_error（码表只给类别）
+	for _, want := range []string{table, pgsink.PauseReasonTypeChanged} {
+		if !strings.Contains(run.LastError, want) {
+			t.Fatalf("last_error 应含 %q（表名与原因码），得到：%s", want, run.LastError)
+		}
+	}
+}
+
+// onceJobSingleTable 建一条 mode=once、只选一张表的任务（本文件的用例自用）。
+func onceJobSingleTable(t *testing.T, srcDSN, dstDSN, name, table string) (*control.Store, string) {
+	t.Helper()
+	ctx := context.Background()
+	store, err := control.Open(control.Options{DataDir: t.TempDir(), Autogen: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
+	mk := func(nm string, port int, db, user, pass string) string {
+		c, err := store.CreateConnection(ctx, control.ConnectionInput{
+			Name: nm, Kind: "postgres", Host: "127.0.0.1", Port: port,
+			Database: db, Username: user, Password: pass,
+			Params: map[string]string{"sslmode": "disable"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c.ID
+	}
+	srcID := mk("src", portOf(t, srcDSN), dbOf(t, srcDSN), userOf(t, srcDSN), passOf(t, srcDSN))
+	dstID := mk("dst", portOf(t, dstDSN), dbOf(t, dstDSN), userOf(t, dstDSN), passOf(t, dstDSN))
+	job, err := store.CreateJob(ctx, control.JobInput{
+		Name: name, SourceID: srcID, TargetID: dstID,
+		Spec: control.JobDoc{
+			Version: 1, Job: name,
+			Source:  control.SourceDoc{Kind: "postgres", Scope: &control.ScopeDoc{Schema: "public"}},
+			Target:  control.TargetDoc{Kind: "postgres", Schema: "public", OnExists: "append"},
+			Mode:    control.ModeDoc{Frequency: "once"},
+			Content: &control.ContentDoc{Tables: map[string]control.TableDoc{table: {}}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("建任务失败: %v", err)
+	}
+	return store, job.ID
 }

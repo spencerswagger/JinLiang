@@ -1164,6 +1164,11 @@ func classifyError(err error) (code core.Code, classified bool) {
 		return core.CodePositionKindMismatch, true
 	case errors.As(err, &tooBig):
 		return core.CodeTxTooLarge, true
+	case errors.As(err, new(pgsink.PausableError)):
+		// 「这张表的结构对不上」：prepare 补列时类型不一致，或跑起来后源端改类型/改名/删列。
+		// 目标写成**接口指针**（不是 *TypeChangedError）：将来第三个实现也能匹配上。
+		// 具体是哪一种、哪张表哪一列由 fail() 拼进 last_error——**码表说类别，运行时说具体**。
+		return core.CodeSchemaMismatch, true
 	case pgsource.IsNoPrivilege(err):
 		// 42501：源端 SELECT 或目标端 DDL/DML 被拒——用户要做的事都是「去要授权」。
 		return core.CodeNoPrivilege, true
@@ -1316,8 +1321,16 @@ func (r *runner) fail(ctx context.Context, err error) error {
 		// 有码也要把方向写进 last_error：历史页在 code 为空时只有这条字符串。
 		// 不写的话，「该怎么处理」只活在事件流里（进程一重启就没了）。
 		if spec, ok := core.Lookup(code); ok {
+			// 「按表暂停」这一族要额外把**表名与原因码**写进去，而且放在**开头**：
+			// 用户拿到这条错误，第一件要问的是「哪张表」，其次才是「怎么办」。
+			// 码表说类别，运行时说具体——这条边界由 Ark 给 E1015 时定下。
+			head := spec.Message
+			var pe pgsink.PausableError
+			if errors.As(err, &pe) {
+				head = fmt.Sprintf("%s（表 %s，原因码 %s）", head, pe.Table(), pe.Reason())
+			}
 			lastError = fmt.Sprintf("[%s] %s：%s 下一步：%s",
-				code, spec.Message, err.Error(), strings.Join(spec.Next, "；"))
+				code, head, err.Error(), strings.Join(spec.Next, "；"))
 		} else {
 			lastError = fmt.Sprintf("[%s] %s", code, err.Error())
 		}
