@@ -1,0 +1,73 @@
+name: review-gate
+
+# 合并门禁（advisory）：PR 的最新 review 必须针对当前 head，且明确「必改 0/可合并」。
+# 真实事故：Owl 的结论异步到达、锚在旧 head，#53 就是带着必改合进了 main。
+#
+# 现在是 advisory：continue-on-error 让失败只留 warning 注解，不挡合并
+# （还没看的 PR 不该被锁死）。job 名从第一天起就是稳定的 `review-gate` /
+# `admin-merge-audit`；转 required 时只删 continue-on-error，不改名——
+# 改名与加 required 之间会有一段「旧检查挡死 / 新检查不受保护」的窗口。
+on:
+  pull_request:
+    types: [synchronize, reopened, edited, closed]
+  pull_request_review:
+    types: [submitted, edited, dismissed]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "PR number"
+        required: true
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  review-gate:
+    name: review-gate
+    # closed 事件交给下面的 admin-merge-audit，不在这里重复跑 review 检查
+    if: github.event.action != 'closed'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # 锚定要跑 git merge-base/diff 与 origin/main 行集合
+      - name: 判定逻辑自测（否决词/state/锚定）
+        run: scripts/check_review_gate.sh selftest
+      - name: 最新 review 是否针对当前 head 且放行
+        id: gate
+        # advisory：失败不把 job 判红，只留 warning 注解；转 required 时删掉这一行。
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr }}
+        run: |
+          set -e
+          if [ -z "$PR_NUMBER" ]; then
+            echo "review-gate: 没有 PR number（workflow_dispatch 需要填 pr）" >&2
+            exit 2
+          fi
+          scripts/check_review_gate.sh "$PR_NUMBER"
+      - name: 失败时的提示
+        if: steps.gate.outcome == 'failure'
+        run: |
+          echo "::warning::review-gate 未通过（advisory，不挡合并）。四类原因：① 检查期间 head 变了（重跑）；② 最新 review 不是 DISMISSED/CHANGES_REQUESTED 之外的放行；③ 正文含否决词（不可合并/不通过/必改 N）；④ 最新结论锚在旧 head（旧 head 的通过不算）。"
+
+  admin-merge-audit:
+    name: admin-merge-audit
+    # 合并后审计：base 在合并时已前进（疑似 --admin 绕过）就必须有说明 comment。
+    if: github.event.action == 'closed' && github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: --admin 绕过是否留痕
+        id: admin
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: scripts/check_review_gate.sh admin "$PR_NUMBER"
+      - name: 失败时的提示
+        if: steps.admin.outcome == 'failure'
+        run: |
+          echo "::warning::疑似 --admin 合并但没有说明理由的 comment（需写 --admin 与原因）。后门是救红 main 的，不是赶时间的。"
