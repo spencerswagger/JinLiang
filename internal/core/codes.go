@@ -214,8 +214,13 @@ var specs = []Spec{
 	{
 		Code: CodeSchemaMismatch, Class: UserAction,
 		Message: "表结构不一致",
-		Why: "目标表与源端的结构对不上：prepare 补列时发现目标列类型不一致（type_changed），" +
-			"或跑起来后源端改类型 / 改名 / 删列（schema_drift）。两种情况含义相同——这张表没法继续跟。" +
+		// 原因码与时机**不是一一对应**：type_changed 在 prepare（目标列类型与源端不一致）
+		// 和 streaming（源端把列类型改了）两处都会出现；schema_drift 只出现在 streaming
+		// （改名/删列）。第一版写成「prepare=type_changed，跑起来后改类型/改名/删列=schema_drift」，
+		// 于是「跑起来后改了类型」被错标成 schema_drift——码表与实现不符。
+		Why: "目标表与源端的结构对不上，有两种原因码：**type_changed**（列类型变了——" +
+			"prepare 补列时发现目标端与源端类型不一致，或跑起来后源端把列类型改了）、" +
+			"**schema_drift**（列被改名或删掉，只在跑起来后发现）。两种情况含义相同——这张表没法继续跟。" +
 			"具体是哪一种、哪张表哪一列，last_error 里会写明；该表会被暂停（若当前版本已支持按表暂停），其它表继续跑",
 		Next: []string{
 			"看 last_error 里点名的表与列：新旧类型或新旧列名都在里面",
