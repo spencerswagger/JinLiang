@@ -549,6 +549,7 @@ const (
 	recopyGap                          // 上次搬完了，但书签追不回位点，那段变更补不回来
 	recopyNoPK                         // 无主键表，只能整表重来
 	recopyOnce                         // once / full_interval：每轮整轮重搬，必须清空重建
+	recopyNoPos                        // 搬过，但目标端没留下位点（一块都没搬完）
 )
 
 func (w recopyReason) sentence() string {
@@ -560,6 +561,8 @@ func (w recopyReason) sentence() string {
 		return "这张表没有稳定的主键，没法按块续跑，只能整表重来"
 	case recopyOnce:
 		return "这个任务是 once / full_interval 模式，每一轮都整轮重搬（目标端结果要等于源端当前状态）"
+	case recopyNoPos:
+		return "之前搬过但目标端没留下一致性位点（很可能一块都没搬完就断了）"
 	default:
 		return "上次全量搬到一半就断了"
 	}

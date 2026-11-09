@@ -320,6 +320,12 @@ func TestPlanCopy(t *testing.T) {
 			if got.Clean != tc.clean {
 				t.Fatalf("Clean 错：想要 %v，得到 %v", tc.clean, got.Clean)
 			}
+			if got.Clean == cleanNone && len(got.CleanNames) > 0 {
+				t.Fatalf("Clean=cleanNone 却点了名要清：%v（首次搬一行都不许清）", got.CleanNames)
+			}
+			if got.Clean == cleanAll && len(got.CleanNames) == 0 {
+				t.Fatalf("Clean=cleanAll 却没点名任何表：前后矛盾")
+			}
 			if got.Kind == copyFresh && len(got.Skip) > 0 {
 				// 从头搬却把表标成「已搬完」→ 收尾不会给它盖完成标记 → 下一轮空跑补章。
 				t.Fatalf("从头搬不该带 Skip（会漏盖完成标记）：%v", got.Skip)

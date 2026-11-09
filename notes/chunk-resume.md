@@ -170,6 +170,10 @@ if Capable && unreplayable { copyFresh + cleanAll }   // ① 三个出口合一
   （append 复用用户表，清了就是删用户数据）。「老状态」整本块账缺失但有位点/阶段证据时整批清。
   **判据不能是「phase 非空」**：EnsureMeta 在读状态之前就写了 `phase='prepare'`，拿它当
   「搬过」会把第一次搬判成要清表（append 用户表被直接拒）——这个坑我踩过一次。
+  兜底那格最终收窄成 `StoredCP != "" || PriorPhase == snapshot`（`copiedBefore`），
+  并单测钉住 `{StoredCP:"", PriorPhase:"prepare"}` → `cleanNone` 且 `CleanNames` 为空。
+- 缺位点（一块都没搬完）单独一个理由 `recopyNoPos`，不借「书签追不回」，也不会让
+  continuous+initial 的用户看到「once / full_interval」这种不相干的话。
 - `interval` 仍不追 delete：完成信息里写明「水位增量只补新增与更新，不同步删除」，
   并指向 continuous+initial / 定期 once。
 - 清不动（用户自己的表）**不许静默降级**：`reusedTableRecopyError` 给三条都做得到的路

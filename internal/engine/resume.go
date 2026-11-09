@@ -208,7 +208,10 @@ func planCopy(in copyInputs) chunkPlan {
 		p.Kind = copyFresh
 		why := recopyHalfCopy
 		if !interrupted {
-			why = recopyGap // 搬过、有块标记没有？不到位点时按「追不回来」说
+			// 搬过但一块都没落地（所以没有位点）：既不是「字签追不回」，也不是
+			// once/full_interval 的模式语义 —— 单独说清，别让 continuous+initial 的
+			// 用户看到「once / full_interval」这种不相干的话。
+			why = recopyNoPos
 		}
 		p.markClean(in, why)
 		p.Why = "目标端没有可用的一致性位点（_jl_meta.position 为空），这一轮从头搬"
@@ -258,8 +261,8 @@ func (p *chunkPlan) markClean(in copyInputs, why recopyReason) {
 			p.CleanNames = append(p.CleanNames, t.Table)
 		}
 	}
-	if len(p.CleanNames) == 0 && hasCopiedBefore(in.PriorPhase, in.StoredCP) {
-		// 老状态（升级前跑过）：整本块账都没有，但位点/阶段说明「确实搬过」。
+	if len(p.CleanNames) == 0 && copiedBefore(in) {
+		// 老状态（升级前跑过）：整本块账都没有，但目标端留下了「搬过」的证据。
 		// 这时无从分辨哪张表有我们的行，只能整批清——不清就补不掉这段时间的删除。
 		for _, t := range in.Tables {
 			p.CleanNames = append(p.CleanNames, t.Table)
@@ -272,21 +275,18 @@ func (p *chunkPlan) markClean(in copyInputs, why recopyReason) {
 	}
 }
 
-// hasCopiedBefore 判断「这个任务以前真的往目标端搬过东西」。
+// copiedBefore 判断「目标端有没有『这个任务搬过』的证据」——只用于兜底那格
+// （块账整本缺失的老状态）。判据刻意窄：
 //
-// 不能用「phase 非空」：EnsureMeta 在读状态**之前**就写了 phase='prepare'，
-// 所以首次跑时 phase 也非空 —— 拿它当证据会把第一次搬也判成「要清表」，
-// append 模式复用用户表时会直接被拒（这是我自己踩过的坑，别再退回去）。
-func hasCopiedBefore(phase, pos string) bool {
-	if pos != "" {
-		return true // 有权威位点 = 一定搬过（位点只在块/批次提交时写）
-	}
-	switch phase {
-	case string(state.Snapshot), string(state.Catchup), string(state.Streaming),
-		string(state.Draining), string(state.Done), string(state.Paused):
-		return true
-	}
-	return false
+//   - 有位点：搬过（位点随块/批次提交写入）。注意 prepare 也会先写一个起点位点，
+//     所以它的含义是「可能搬过」，真正能不能删仍由 DidCreateTable 把关；
+//   - 没有位点但阶段已经是 snapshot：说明至少进过全量的读阶段。
+//
+// **不能用「phase 非空」**：EnsureMeta 在读状态之前就写了 phase='prepare'，首次跑
+// phase 也非空 —— 拿它当证据会把第一次搬判成「要清表」，append 复用用户表时首个
+// 轮次就被拒（踩过一次，别再退回去）。
+func copiedBefore(in copyInputs) bool {
+	return in.StoredCP != "" || in.PriorPhase == string(state.Snapshot)
 }
 
 // allSkip marks every selected table as "already done" (used only when this run
