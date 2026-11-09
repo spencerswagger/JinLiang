@@ -301,6 +301,8 @@ type runner struct {
 	reusedSlot      bool
 	needSnapshot    bool
 	priorPhase      string
+	// plan 是这次全量「接着搬 / 从头搬 / 不用搬」的结论（见 resume.go）。
+	plan chunkPlan
 
 	rowsCopied int64
 	rowsStream int64
@@ -735,27 +737,46 @@ func (r *runner) prepare(ctx context.Context) error {
 	if r.mode() == "interval" {
 		return nil
 	}
-	// 全量要不要做，看 _jl_meta 的阶段而不是位点：快照期间每块都会写位点，
-	// 所以「有位点」不等于「存量搬完了」。只有到过 catchup/streaming 才算完。
+	// 全量要不要做、要怎么做，看目标端的**块进度**（_jl_chunk），不靠阶段猜：
+	// 快照期间每块都会写位点，所以「有位点」不等于「存量搬完了」；而「跑到过 catchup」
+	// 又说不清「上次是被打断的还是搬完的」。块标记（含表完成标记）才回答得了。
 	phaseInTarget, posInTarget, err := sink.State(ctx)
 	if err != nil {
 		return err
 	}
 	r.priorPhase = phaseInTarget
-	// once = 「搬一次」：再跑一次就应该再搬一次（upsert 幂等），不能因为上次跑完过
-	// 就什么都不做然后假装成功。只有 continuous+initial 才按「上次到哪了」续跑。
-	// once / full_interval = 「每次都要重搬」；continuous+initial 才按上次到哪了续跑。
-	alwaysCopy := r.mode() == "once" || r.mode() == "full_interval"
-	r.needSnapshot = r.mode() != "continuous" && r.mode() != "interval" &&
-		(alwaysCopy || !initialCopyDone(phaseInTarget, posInTarget))
-	prep, err := src.Prepare(ctx, pgsource.PrepareOptions{Snapshot: r.needSnapshot})
+	plan, err := r.decideCopyPlan(ctx, src, phaseInTarget, posInTarget)
+	if err != nil {
+		return err
+	}
+	r.plan = plan
+	r.needSnapshot = plan.Kind != copySkip
+	// 续跑时**不重建书签、不导出视图**：书签得留着才能从原来的位点重放变更。
+	prep, err := src.Prepare(ctx, pgsource.PrepareOptions{
+		Snapshot: r.needSnapshot && plan.Kind != copyResume,
+	})
 	if err != nil {
 		return fmt.Errorf("准备源端对象失败: %w", err)
 	}
-	r.reusedSlot = !r.needSnapshot
-	src.SetSnapshotName(prep.SnapshotName)
-	r.snapshotName = prep.SnapshotName
-	r.consistentPoint = prep.ConsistentPoint
+	switch plan.Kind {
+	case copyResume:
+		// 位点不许往前挪：续跑剩下的块读的是更晚的视图，靠「增量从原来那个位点重放」
+		// 把这段时间的变更再盖一遍。挪了位点，就会丢「已搬块区间里新增的行」。
+		r.consistentPoint = parsedCP(src, posInTarget)
+		r.snapshotName = ""
+		src.SetSnapshotName("")
+		r.reusedSlot = false
+		r.note(ctx, plan.Why)
+	default:
+		if plan.Why != "" {
+			// 「为什么重搬」必须说出来（docs/SNAPSHOT.md §4）：不然用户只看到又搬了一遍。
+			r.note(ctx, plan.Why)
+		}
+		r.reusedSlot = !r.needSnapshot
+		src.SetSnapshotName(prep.SnapshotName)
+		r.snapshotName = prep.SnapshotName
+		r.consistentPoint = prep.ConsistentPoint
+	}
 	for _, a := range prep.Actions {
 		r.emit(ctx, control.Event{Type: "note", Message: a.What})
 		_ = r.sink.RecordObject(ctx, objectOf(a), objectKind(a))
@@ -857,40 +878,63 @@ func (r *runner) snapshot(ctx context.Context) error {
 	if err := r.phaseTo(ctx, state.Snapshot); err != nil {
 		return err
 	}
-	// 上一次全量没搬完就断了：目标端留着「上次搬到一半的行」。新的全量用的是新
-	// 视图，那些行既不全也过期（源端期间可能删过行），必须先清掉，否则搬完会多出
-	// 源端已经没有的行 —— 那就是「重」。
-	//
-	// 但「清」只能清**本任务自己建的表**：append 模式会复用用户已有的表，那张表
-	// 里的行不全是我们的，清了就是删用户数据（Owl 审出来的 P0）。
-	if r.priorPhase == string(state.Snapshot) {
-		done, err := r.sink.DoneChunks(ctx)
-		if err != nil {
-			return err
-		}
-		for name := range done {
-			ref, ok := r.tableByName(name)
-			if !ok {
-				continue
-			}
-			truncate, err := r.recopyAction(ctx, ref)
+	if r.plan.Kind == copyResume {
+		// 续跑：**不清表、不清块标记**。已提交的块就是已完成的工作，重读它们既慢又
+		// 会把已经收敛的数据再写一遍。唯一要重来的是不能块级续跑的表（无主键）。
+		for _, ref := range r.plan.Recopy {
+			ours, err := r.recopyAction(ctx, ref)
 			if err != nil {
 				return err
 			}
-			if !truncate {
+			if !ours {
 				continue
 			}
-			if err := r.sink.TruncateTable(ctx, ref); err != nil {
-				return fmt.Errorf("清空上次没搬完的 %s 失败: %w", name, err)
+			if err := r.sink.ResetTableChunks(ctx, ref); err != nil {
+				return fmt.Errorf("清空 %s 准备整表重来时失败: %w", ref.Table, err)
 			}
-			r.note(ctx, "清空了上次没搬完的 "+name+"（重搬全量，避免留下源端已删除的行）")
+			r.note(ctx, ref.Table+" 没有稳定的主键，只能整表重来（不清其它表）")
+		}
+	} else {
+		if r.plan.Interrupted {
+			// 从头搬，而上一次是搬到一半断的：目标端留着「上次搬到一半的行」，这次用的
+			// 是新视图，那些行既不全也可能过期（源端期间删过行），必须先清掉，否则搬完
+			// 会多出源端已经没有的行。
+			//
+			// 但「清」只能清**本任务自己建的表**：append 模式会复用用户已有的表，那张表
+			// 里的行不全是我们的，清了就是删用户数据（Owl 审出来的 P0）。
+			done, err := r.sink.DoneChunks(ctx)
+			if err != nil {
+				return err
+			}
+			for name := range done {
+				ref, ok := r.tableByName(name)
+				if !ok {
+					continue
+				}
+				truncate, err := r.recopyAction(ctx, ref)
+				if err != nil {
+					return err
+				}
+				if !truncate {
+					continue
+				}
+				// 清数据和清标记**必须同一个事务**：中间崩在「数据清了、标记还在」
+				// 那种状态，重启会把空的表当成「这几块已经搬完」——静默丢行。
+				if err := r.sink.ResetTableChunks(ctx, ref); err != nil {
+					return fmt.Errorf("清空上次没搬完的 %s 失败: %w", name, err)
+				}
+				r.note(ctx, "清空了上次没搬完的 "+name+"（重搬全量，避免留下源端已删除的行）")
+			}
+		}
+		// 从头搬就是一次新的搬：块标记只描述**这一次**。不在这里清，上一次留下的
+		// 「搬完了」章会替这一次撒谎（新搬只搬了 5 块，状态却写着整表已搬完）。
+		if err := r.sink.ResetChunks(ctx); err != nil {
+			return err
 		}
 	}
-	// 新的一次全量用的是一个新导出视图，旧的块进度标记没有意义。
-	if err := r.sink.ResetChunks(ctx); err != nil {
-		return err
-	}
-	if r.snapshotName == "" {
+	// 续跑时没有导出的视图（视图随上个进程一起没了），靠新的 REPEATABLE READ；
+	// 从头搬时必须有一个导出的视图，否则「读到的数据」和「增量起点」之间会漏一段。
+	if r.snapshotName == "" && r.plan.Kind != copyResume {
 		return errors.New("拿不到一致性视图（书签已存在但导出失败）：请用 --resync 重新初始化")
 	}
 	opt := source.SnapshotOpt{ChunkRows: r.chunkRows(), Conns: r.snapshotConns()}
@@ -899,14 +943,14 @@ func (r *runner) snapshot(ctx context.Context) error {
 	}
 
 	start := time.Now()
-	var tables int
-	_, err := r.src.SnapshotChunks(ctx, opt, func(c context.Context, ch pgsource.Chunk) error {
+	var chunks, tables int
+	_, err := r.src.SnapshotChunksFrom(ctx, opt, r.plan.From, func(c context.Context, ch pgsource.Chunk) error {
 		pos := r.consistentPoint.String()
 		if err := r.sink.BulkApply(c, r.sink.Table(ch.Table), ch.No, ch.Rows, pos, ch.From, ch.To); err != nil {
 			return err
 		}
 		r.rowsCopied += int64(len(ch.Rows))
-		tables++
+		chunks++
 		r.progress(c, fmt.Sprintf("全量：%s 第 %d 块，%d 行", ch.Table.Table, ch.No, len(ch.Rows)))
 		return nil
 	})
@@ -914,6 +958,17 @@ func (r *runner) snapshot(ctx context.Context) error {
 		return err
 	}
 	r.src.EndSnapshot()
+	// 给「这次搬过的每张表」盖完成标记。放在所有块之后做，崩在盖章之前也不会丢数据：
+	// 下次续跑从上次的游标往后读只会拿到 0 行，然后重新盖章。
+	for _, t := range r.selectedTables() {
+		if r.plan.Skip[t.Table] {
+			continue
+		}
+		if err := r.sink.MarkTableDone(ctx, source.TableRef{Schema: t.Schema, Table: t.Table}); err != nil {
+			return fmt.Errorf("记录 %s 的搬完标记失败: %w", t.Table, err)
+		}
+		tables++
+	}
 	// 先把「存量已搬完」写进 _jl_meta，再离开 snapshot 阶段：崩在这之后不会
 	// 重搬全量；崩在这之前会重扫一遍（upsert 幂等），方向是安全的。
 	if err := r.sink.SetPhase(ctx, string(state.Catchup)); err != nil {
@@ -922,8 +977,8 @@ func (r *runner) snapshot(ctx context.Context) error {
 	elapsed := time.Since(start)
 	rate := float64(r.rowsCopied) / elapsed.Seconds()
 	r.emit(ctx, control.Event{Type: "note",
-		Message: fmt.Sprintf("全量完成：%d 行，%d 块，用时 %s（%.0f 行/秒）",
-			r.rowsCopied, tables, elapsed.Truncate(time.Millisecond), rate)})
+		Message: fmt.Sprintf("全量完成：%d 行，%d 块，%d 张表，用时 %s（%.0f 行/秒）",
+			r.rowsCopied, chunks, tables, elapsed.Truncate(time.Millisecond), rate)})
 	return nil
 }
 

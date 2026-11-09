@@ -383,6 +383,25 @@ func (s *Source) slotPosition(ctx context.Context) (string, bool, error) {
 	return *lsn, true, nil
 }
 
+// SlotConfirmed reports the slot's confirmed position, i.e. how far the source
+// has already been acknowledged. ok=false means the slot is gone (dropped,
+// expired, or the whole cluster was rebuilt) — in that case a checkpoint older
+// than the slot cannot be replayed any more.
+func (s *Source) SlotConfirmed(ctx context.Context) (Position, bool, error) {
+	raw, exists, err := s.slotPosition(ctx)
+	if err != nil || !exists {
+		return Position{}, false, err
+	}
+	if raw == "" {
+		return Position{}, true, nil // 书签在，但还没确认过任何位点
+	}
+	pos, err := ParsePayload(raw)
+	if err != nil {
+		return Position{}, true, err
+	}
+	return pos, true, nil
+}
+
 // SlotLagBytes reports how much WAL the slot is holding back (guard metric).
 func (s *Source) SlotLagBytes(ctx context.Context) (int64, error) {
 	var n int64
@@ -406,17 +425,41 @@ type Chunk struct {
 	Table source.TableRef
 	No    int
 	Rows  [][]any
-	From  string // 本块起止（keyset 边界，供人核对；块进度标记的依据，不是断点续传）
-	To    string
+	From  string // 本块起（不含）的 keyset 游标
+	To    string // 本块止（含）的 keyset 游标 = 下一块的 From，也是续跑的锚点
 }
 
 // ChunkHandler consumes one chunk; returning an error aborts the snapshot.
 type ChunkHandler func(ctx context.Context, c Chunk) error
 
+// ChunkResume is where one table continues reading.
+//
+// 它全部来自目标库的块标记（`_jl_chunk.range_to` + `chunk_no`），源端不存任何进度：
+// 换一台机器、换一个进程，只要连到同一个目标库就能接着搬。
+type ChunkResume struct {
+	// Cursor is the right edge of the last committed chunk (exclusive).
+	// 空 = 从表头读。
+	Cursor string
+	// LastNo is the last committed chunk number; the next chunk is LastNo+1.
+	// 编号必须接着往上排，否则块标记会在主键上撞车、把旧块的边界覆盖掉。
+	LastNo int
+}
+
 // SnapshotChunks reads the selected tables through the exported snapshot and
 // hands them over chunk by chunk. Every chunk carries a stable boundary so a
 // restart can tell where it stopped (docs/SNAPSHOT.md §4).
 func (s *Source) SnapshotChunks(ctx context.Context, opt source.SnapshotOpt, fn ChunkHandler) (Position, error) {
+	return s.SnapshotChunksFrom(ctx, opt, nil, fn)
+}
+
+// SnapshotChunksFrom is SnapshotChunks with a per-table resume point.
+//
+// resume 里没有的表从头读；有的话就从那一块之后接着读，块号接着旧编号往上排。
+// 两种情况用的是**本事务自己的**一致性读视图：续跑时导出的快照早已随进程消失，
+// 剩下的块读的是一个更晚的视图——这不会丢变更，因为增量仍然从原来的位点重放
+// （见 engine.planCopy 与本文件上层说明）。
+func (s *Source) SnapshotChunksFrom(ctx context.Context, opt source.SnapshotOpt,
+	resume map[string]ChunkResume, fn ChunkHandler) (Position, error) {
 	if opt.ChunkRows <= 0 {
 		opt.ChunkRows = 100000
 	}
@@ -440,8 +483,9 @@ func (s *Source) SnapshotChunks(ctx context.Context, opt source.SnapshotOpt, fn 
 	var pos Position
 	for _, key := range s.order {
 		ti := s.tables[key]
-		no := 0
-		cursor := ""
+		from := resume[ti.ref.Table]
+		no := from.LastNo
+		cursor := from.Cursor
 		for {
 			if err := ctx.Err(); err != nil {
 				return pos, err

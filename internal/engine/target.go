@@ -54,7 +54,8 @@ type stateCapable interface {
 	DoneChunks(ctx context.Context) (map[string]map[int]bool, error)
 	ResetChunks(ctx context.Context) error
 	DidCreateTable(ctx context.Context, ref source.TableRef) (bool, error)
-	TruncateTable(ctx context.Context, ref source.TableRef) error
+	// 清空目标表不走单独的能力：清数据与清块标记必须在同一个事务里
+	// （pgsink.ResetTableChunks），否则崩在中间会让「空的表 + 已搬完的块标记」同时存在。
 	RecordObject(ctx context.Context, name, kind string) error
 	MarkObjectDropped(ctx context.Context, name string) error
 	Count(ctx context.Context, ref source.TableRef) (int64, error)
