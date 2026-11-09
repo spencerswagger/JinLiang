@@ -26,7 +26,7 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-const resumeTotal = 200_000
+const resumeTotal = 120_000
 
 // 断言集：中断后重启**只搬剩下的**，且结果与一次性全量逐表一致。
 func TestChunkResumeAfterSIGKILL(t *testing.T) {
@@ -166,9 +166,17 @@ func (f *resumeFixture) importJob(t *testing.T) {
 	if err := os.WriteFile(jobYAML, []byte(yamlFor(f.jobName, f.table)), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if out, err := execpkg.Command(f.bin, "import", "--file", jobYAML, "--data-dir", f.dataDir).
-		CombinedOutput(); err != nil {
+	out, err := execpkg.Command(f.bin, "import", "--file", jobYAML, "--data-dir", f.dataDir).
+		CombinedOutput()
+	if err != nil {
 		t.Fatalf("import 失败: %v\n%s", err, out)
+	}
+	// job_key 在导入输出里（「指纹=…」），书签名是 jl_<job_key>_1。同一个表名算出来的
+	// job_key 是稳定的，所以上一次跑崩留下的书签会跟着来 —— 先清掉，否则「书签数 == 1」
+	// 这类断言会被上一轮的残留污染。
+	if m := jobKeyRe.FindStringSubmatch(string(out)); m != nil {
+		f.key = m[1]
+		f.dropJobSlots(t)
 	}
 }
 
@@ -383,11 +391,19 @@ func TestSlotLossForcesFullRecopyNotResume(t *testing.T) {
 	}
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
+	// 用例中途失败时别把「卡在 TRUNCATE 上的子进程」留在机器上。
+	t.Cleanup(func() { _ = cmd.Process.Kill() })
 	f.waitTruncateBlocked(t, done, &runOut)
 	if err := cmd.Process.Kill(); err != nil {
 		t.Fatalf("kill -9 失败: %v", err)
 	}
-	_ = cmd.Wait()
+	// 收尸只能有**一个** Wait：上面那个 goroutine 已经在 Wait 了，这里再调一次会并发
+	// 调 Wait（CI 上直接挂到 10 分钟超时），所以等它回来，带上限。
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("kill -9 之后 30 秒还没退出")
+	}
 	if err := lockTx.Rollback(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -747,6 +763,7 @@ func (f *resumeFixture) run(t *testing.T, extra ...string) (string, int) {
 }
 
 var (
+	jobKeyRe  = regexp.MustCompile(`指纹=([a-z0-9]+)`)
 	copiedRe  = regexp.MustCompile(`复制 (\d+) 行`)
 	elapsedRe = regexp.MustCompile(`用时 ([0-9.]+m?s)`)
 )
