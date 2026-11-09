@@ -27,8 +27,8 @@ func TestPlanCopy(t *testing.T) {
 		skip  []string
 		recpy []string
 		why   string // Why 里应出现的片段（空 = 不检查）
-		// interrupted：「上次搬到一半就断了」（决定从头搬之前要不要先清表）
-		interrupted bool
+		// clean：重搬之前必须清哪些表（决定会不会留下源端已删除的脏行）
+		clean cleanScope
 	}{
 		{
 			name: "首次全量：什么都没有，从头搬",
@@ -51,10 +51,10 @@ func TestPlanCopy(t *testing.T) {
 				Progress: map[string]pgsink.ChunkProgress{
 					"a": {LastNo: 3, Cursor: "3000", Rows: 3000},
 				}},
-			kind:        copyResume,
-			from:        map[string]pgsource.ChunkResume{"a": {Cursor: "3000", LastNo: 3}},
-			why:         "续跑",
-			interrupted: true,
+			kind:  copyResume,
+			from:  map[string]pgsource.ChunkResume{"a": {Cursor: "3000", LastNo: 3}},
+			why:   "续跑",
+			clean: cleanMarked,
 		},
 		{
 			// 一张表搬完了（有完成标记），另一张半截：搬完的不许重读。
@@ -66,11 +66,11 @@ func TestPlanCopy(t *testing.T) {
 					"a": {Done: true, LastNo: 7, Cursor: "7000"},
 					"b": {LastNo: 2, Cursor: "2000"},
 				}},
-			kind:        copyResume,
-			from:        map[string]pgsource.ChunkResume{"b": {Cursor: "2000", LastNo: 2}},
-			skip:        []string{"a"},
-			why:         "1 张表已经搬完",
-			interrupted: true,
+			kind:  copyResume,
+			from:  map[string]pgsource.ChunkResume{"b": {Cursor: "2000", LastNo: 2}},
+			skip:  []string{"a"},
+			why:   "1 张表已经搬完",
+			clean: cleanMarked,
 		},
 		{
 			// 书签没了 = 中间那段变更源端已经不保留，续跑会漏行，只能整轮重搬。
@@ -79,9 +79,9 @@ func TestPlanCopy(t *testing.T) {
 				Tables:   []source.Table{pkA},
 				StoredCP: "postgres:v1:0/1A2B3C", SlotReplayable: false,
 				Progress: map[string]pgsink.ChunkProgress{"a": {LastNo: 1, Cursor: "10"}}},
-			kind:        copyFresh,
-			why:         "书签已经不在了",
-			interrupted: true, // 断在半截 → 清表之后再搬
+			kind:  copyFresh,
+			why:   "书签已经不在了",
+			clean: cleanMarked, // 断在半截 → 清表之后再搬
 		},
 		{
 			name: "书签越过位点：整轮重搬",
@@ -89,18 +89,18 @@ func TestPlanCopy(t *testing.T) {
 				Tables:   []source.Table{pkA},
 				StoredCP: "postgres:v1:0/1A2B3C", SlotReplayable: true, SlotAhead: true,
 				Progress: map[string]pgsink.ChunkProgress{"a": {LastNo: 1, Cursor: "10"}}},
-			kind:        copyFresh,
-			why:         "越过目标端的位点",
-			interrupted: true,
+			kind:  copyFresh,
+			why:   "越过目标端的位点",
+			clean: cleanMarked,
 		},
 		{
 			name: "没有位点：整轮重搬",
 			in: copyInputs{Mode: "", Capable: true,
 				Tables: []source.Table{pkA}, SlotReplayable: true,
 				Progress: map[string]pgsink.ChunkProgress{"a": {LastNo: 1, Cursor: "10"}}},
-			kind:        copyFresh,
-			why:         "没有可用的一致性位点",
-			interrupted: true,
+			kind:  copyFresh,
+			why:   "没有可用的一致性位点",
+			clean: cleanMarked,
 		},
 		{
 			// 「存量都在目标端」不等于「已经同步到位」：书签追不回位点，中间那段变更
@@ -110,8 +110,9 @@ func TestPlanCopy(t *testing.T) {
 				Tables:   []source.Table{pkA},
 				StoredCP: "postgres:v1:0/1A2B3C", SlotReplayable: false, PriorPhase: "streaming",
 				Progress: map[string]pgsink.ChunkProgress{"a": {Done: true, LastNo: 9, Cursor: "90"}}},
-			kind: copyFresh,
-			why:  "重放不出来",
+			kind:  copyFresh,
+			why:   "重放不出来",
+			clean: cleanAll, // 上次「搬完」了，但那段变更补不回来 → 整批清干净再搬
 		},
 		{
 			name: "全部搬完 + 书签越过位点：整轮重搬",
@@ -120,8 +121,9 @@ func TestPlanCopy(t *testing.T) {
 				StoredCP: "postgres:v1:0/1A2B3C", SlotReplayable: true, SlotAhead: true,
 				SlotCP: "postgres:v1:0/2FFFFFF", PriorPhase: "streaming",
 				Progress: map[string]pgsink.ChunkProgress{"a": {Done: true, LastNo: 9, Cursor: "90"}}},
-			kind: copyFresh,
-			why:  "越过位点",
+			kind:  copyFresh,
+			why:   "越过位点",
+			clean: cleanAll,
 		},
 		{
 			// 无主键表的游标是 ctid，续跑可能漏读/读重 → 只重来这一张表。
@@ -135,11 +137,11 @@ func TestPlanCopy(t *testing.T) {
 					"b":    {},
 					"pkA2": {},
 				}},
-			kind:        copyResume,
-			from:        map[string]pgsource.ChunkResume{"a": {Cursor: "10", LastNo: 1}},
-			recpy:       []string{"c"},
-			why:         "无主键表整表重来",
-			interrupted: true,
+			kind:  copyResume,
+			from:  map[string]pgsource.ChunkResume{"a": {Cursor: "10", LastNo: 1}},
+			recpy: []string{"c"},
+			why:   "无主键表整表重来",
+			clean: cleanMarked,
 		},
 		{
 			// once 的语义没变：上一次**搬完了**，这一轮就该重搬一轮。
@@ -170,6 +172,27 @@ func TestPlanCopy(t *testing.T) {
 			why:  "旧版本没有块进度记录",
 		},
 		{
+			// 同一个洞的另一个出口：升级路径（没有块标记、只有 phase）也要看可重放性，
+			// 否则 Prepare 会重建书签、位点跳到今天，那段变更永不重放。
+			name: "老状态（无块标记）+ 书签追不回位点：整轮重搬且清表",
+			in: copyInputs{Mode: "", Capable: true,
+				Tables: []source.Table{pkA}, StoredCP: "postgres:v1:0/1A2B3C",
+				SlotReplayable: false, PriorPhase: "streaming"},
+			kind:  copyFresh,
+			why:   "重放不出来",
+			clean: cleanAll,
+		},
+		{
+			name: "老状态（无块标记）+ 书签越过位点：整轮重搬且清表",
+			in: copyInputs{Mode: "", Capable: true,
+				Tables: []source.Table{pkA}, StoredCP: "postgres:v1:0/1A2B3C",
+				SlotReplayable: true, SlotAhead: true, SlotCP: "postgres:v1:0/2FFFFFF",
+				PriorPhase: "streaming"},
+			kind:  copyFresh,
+			why:   "越过位点",
+			clean: cleanAll,
+		},
+		{
 			name: "老状态（无块标记，phase=streaming）+ once：重搬",
 			in: copyInputs{Mode: "once", AlwaysCopy: true, Capable: true,
 				Tables: []source.Table{pkA}, StoredCP: "postgres:v1:0/1A2B3C",
@@ -183,9 +206,9 @@ func TestPlanCopy(t *testing.T) {
 				Tables:   []source.Table{pkA},
 				StoredCP: "postgres:v1:0/1A2B3C", SlotReplayable: true, PriorPhase: "snapshot",
 				Progress: map[string]pgsink.ChunkProgress{"a": {LastNo: 1, Cursor: "10"}}},
-			kind:        copyFresh,
-			why:         "不记块进度",
-			interrupted: true,
+			kind:  copyFresh,
+			why:   "不记块进度",
+			clean: cleanMarked,
 		},
 		{
 			name: "interval / continuous 模式不做初始全量",
@@ -235,8 +258,8 @@ func TestPlanCopy(t *testing.T) {
 					t.Fatalf("%s 既要整表重来又给了续跑起点：两者不能同时成立", ref.Table)
 				}
 			}
-			if got.Interrupted != tc.interrupted {
-				t.Fatalf("Interrupted 错：想要 %v，得到 %v", tc.interrupted, got.Interrupted)
+			if got.Clean != tc.clean {
+				t.Fatalf("Clean 错：想要 %v，得到 %v", tc.clean, got.Clean)
 			}
 			if got.Kind != copyResume && len(got.From) > 0 {
 				t.Fatalf("非续跑却给了续跑起点：%v", got.From)

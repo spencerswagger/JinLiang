@@ -108,7 +108,31 @@ reuse，直接建书签，PG 报 `slot already exists` → **每次 run 都失�
 变异验证（把 lost 塞回 `exists=false`）：立刻红，报
 `replication slot "jl_…_1" already exists`。
 
-## 7. 留给 Ark 的口径（我没自己改文档）
+## 7. 必改 3：重搬不清表 = 退出 0 + 脏行
+
+两条同源的洞，症状都是「退出码 0 + 位点悄悄前跳 / 脏行留下」：
+
+1. `allDone + 追不回位点 → copyFresh` 当时没置「要清表」，而 `BulkApply` 只有 upsert、
+   没有 delete：书签丢失那段里源端删掉的行永远留在目标端，日志还写着「整轮重搬」。
+2. 老状态兜底（没有块标记、只有 phase）直接 `copySkip`：`Prepare` 会 drop+recreate 书签，
+   位点跳到当前，那段变更永不重放。
+
+现在 `chunkPlan.Clean` 是三态而不是 bool：
+
+- `cleanNone`：首次搬，或上次搬完之后没有空洞；
+- `cleanMarked`：半截拷贝 —— 只清「上次写过块」的表；
+- `cleanAll`：上次「搬完」了但位点/书签追不回来 —— 选中表整批清（那批行整批都可能过期）。
+
+`snapshot()` 里统一走 `cleanBeforeRecopy`：只清本任务建的表，清不动就停在
+`reusedTableRecopyError`，且文案按原因分叉（`recopyHalfCopy` / `recopyGap` / `recopyNoPK`，
+以前一律说「上次搬到一半就断了」，在 gap 场景是错的）。老状态兜底也补了
+`SlotReplayable && !SlotAhead`，continuous 的四段式同样补了 `SlotAhead`。
+
+新用例 `TestLostSlotAfterCompletedCopyDropsDeletedRows`：完整搬一次 → 造 lost →
+源端删 3 行 → 重跑。改前红（`目标端 200200 行、源端 200197 行：源端删掉的行没被带走`），
+改后绿（重搬 200197 行、目标端 200197 行、md5 与源端一致）。
+
+## 8. 留给 Ark 的口径（我没自己改文档）
 
 1. `docs/SNAPSHOT.md §4` 现在写「快照 id 已失效 → 整段重来」。实测：导出的视图**必然**
    随进程失效（kill -9 之后一定失效），真正的判据是**书签还能不能从原位点重放**。

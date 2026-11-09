@@ -40,6 +40,15 @@ func (k copyKind) String() string {
 	return "unknown"
 }
 
+// cleanScope says which tables must be emptied before this run copies again.
+type cleanScope int
+
+const (
+	cleanNone   cleanScope = iota // 什么都不用清（首次搬，或上次搬完之后没有空洞）
+	cleanMarked                   // 只清上次写过块的表（半截拷贝）
+	cleanAll                      // 选中表整批清（上次「搬完」了，但那段变更再也拿不回来）
+)
+
 // chunkPlan is the decision plus everything the snapshot phase needs to execute it.
 type chunkPlan struct {
 	Kind copyKind
@@ -49,10 +58,14 @@ type chunkPlan struct {
 	Skip map[string]bool
 	// Recopy 是不能块级续跑、必须整表重来的表（无主键表：keyset 游标不稳）。
 	Recopy []source.TableRef
-	// Interrupted 表示「上次的全量搬到一半就断了」：目标端里那些行既不全也可能过期，
-	// 从头搬之前必须先清掉（只清本任务建的表）。上次已经搬完的那种「重搬」不清——
-	// 那属于 once 的语义，清不清结果都一样，不清少一次删数据的窗口。
-	Interrupted bool
+	// Clean 表示「重搬之前必须先清掉目标端哪些行」——只清本任务建的表。
+	//
+	// 为什么不是 bool：只清「上次写过块」的表，和「整批选中表都得清」是两种情形，
+	// 混成一个开关会留脏行 ——
+	//   - 半截拷贝：只有写过块的表有我们写的行，别的表干净；
+	//   - 位点追不回来（书签没了 / WAL 被丢 / 书签越过位点）：上次是**搬完**了的，
+	//     那些行整批都可能已经过期（源端期间删过的行只留在目标端），只 upsert 补不回来。
+	Clean cleanScope
 	// Why 是给人看的一句话：为什么续跑 / 为什么重搬。
 	Why string
 }
@@ -123,7 +136,9 @@ func planCopy(in copyInputs) chunkPlan {
 			p.Kind = copyFresh
 			p.Why = "目标端不记块进度：这一轮从头搬"
 		}
-		p.Interrupted = interrupted
+		if interrupted {
+			p.Clean = cleanMarked
+		}
 		return p
 	}
 
@@ -138,6 +153,9 @@ func planCopy(in copyInputs) chunkPlan {
 		// 这时说「不用搬」就是静默丢数据，只能整轮重搬（新视图重新对齐一次）。
 		if in.StoredCP != "" && (!in.SlotReplayable || in.SlotAhead) {
 			p.Kind = copyFresh
+			// 关键：重搬必须先把上次搬进去的行清掉。BulkApply 只 upsert、不 delete，
+			// 不clean = 源端在这段空洞里删掉的行永远留在目标端，还以退出码 0 收尾。
+			p.Clean = cleanAll
 			if !in.SlotReplayable {
 				p.Why = "存量的行都在目标端，但源端书签追不回位点（书签不在了，或 WAL 已被 " +
 					"max_slot_wal_keep_size 丢掉）：位点 " + in.StoredCP +
@@ -155,20 +173,35 @@ func planCopy(in copyInputs) chunkPlan {
 	// 到这儿：至少有一张表没搬完。
 	if !anyMarker && initialCopyDone(in.PriorPhase, in.StoredCP) {
 		// 老状态（升级前跑的）：没有块标记，只能按阶段认「存量已经搬完」。
-		if !in.AlwaysCopy {
+		//
+		// 但「搬完」不等于「能接着同步」：书签追不回位点时，Prepare 会 drop+recreate，
+		// 位点随即跳到当前 —— 中间那段变更永不重放。这条判据在 allDone 分支上是对的，
+		// 这里（升级路径的出口）同样是它，不能漏。
+		unreplayable := in.StoredCP != "" && (!in.SlotReplayable || in.SlotAhead)
+		switch {
+		case !in.AlwaysCopy && !unreplayable:
 			p.Kind = copySkip
 			p.Why = "旧版本没有块进度记录，按阶段（" + in.PriorPhase + "）认定存量已搬完"
 			return p
+		case !in.AlwaysCopy && unreplayable:
+			p.Kind = copyFresh
+			p.Clean = cleanAll
+			p.Why = legacyUnreplayableWhy(in)
+			return p
 		}
 		p.Kind = copyFresh
-		p.Interrupted = interrupted
+		if interrupted {
+			p.Clean = cleanMarked
+		}
 		p.Why = "旧版本没有块进度记录，这一轮整轮重搬"
 		return p
 	}
 
 	if in.StoredCP == "" || !in.SlotReplayable || in.SlotAhead {
 		p.Kind = copyFresh
-		p.Interrupted = interrupted
+		if interrupted {
+			p.Clean = cleanMarked
+		}
 		switch {
 		case in.StoredCP == "":
 			p.Why = "目标端没有可用的一致性位点（_jl_meta.position 为空），这一轮从头搬"
@@ -203,13 +236,30 @@ func planCopy(in copyInputs) chunkPlan {
 		}
 	}
 	p.Kind = copyResume
-	p.Interrupted = interrupted
+	if interrupted {
+		p.Clean = cleanMarked
+	}
 	p.Why = fmt.Sprintf("上次的全量没搬完：%d 张表从已提交的块边界续跑，%d 张表已经搬完",
 		len(p.From), len(p.Skip))
 	if len(p.Recopy) > 0 {
 		p.Why += fmt.Sprintf("，%d 张无主键表整表重来", len(p.Recopy))
 	}
 	return p
+}
+
+// legacyUnreplayableWhy explains the upgrade-path case: no chunk markers (old
+// version), but the checkpoint can no longer be replayed, so the rows already in
+// the target cannot be trusted to be current.
+func legacyUnreplayableWhy(in copyInputs) string {
+	switch {
+	case !in.SlotReplayable:
+		return "旧版本没有块进度记录，而且源端书签追不回位点（书签不在了，或 WAL 已被 " +
+			"max_slot_wal_keep_size 丢掉）：位点 " + in.StoredCP +
+			" 之后那段变更重放不出来，只能整轮重搬"
+	default:
+		return "旧版本没有块进度记录，而且源端书签已经越过位点（书签确认到 " + in.SlotCP +
+			"，目标位点是 " + in.StoredCP + "，中间那段变更被清理了）：只能整轮重搬"
+	}
 }
 
 // decideCopyPlan reads the two facts a decision needs from outside: the target's
@@ -259,7 +309,7 @@ func (r *runner) decideCopyPlan(ctx context.Context, src *pgsource.Source,
 	plan := planCopy(in)
 	// 只剩一种组合会落到「不搬 + 重放不了」：continuous 模式（它本来就不搬存量）。
 	// 这时硬着头皮从新书签开始流，等于把中间那段变更静默扔掉——不如说清楚停下。
-	if plan.Kind == copySkip && !in.SlotReplayable && in.Mode == "continuous" {
+	if plan.Kind == copySkip && (!in.SlotReplayable || in.SlotAhead) && in.Mode == "continuous" {
 		return plan, &unreplayableSlotError{stored: pos}
 	}
 	return plan, nil

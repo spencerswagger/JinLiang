@@ -99,6 +99,8 @@ type resumeFixture struct {
 	baseline string // 一次性全量的内容 md5（基准）
 	// interrupted 是中断那一刻的事实（块号/行数/位点）。
 	interrupted interruption
+	// key 是 job_key（读到就缓存，teardown 用它清书签）。
+	key string
 }
 
 // newResumeFixture 造数据，并先跑一次**不中断**的全量当基准（逐表 md5 的对照）。
@@ -122,6 +124,8 @@ func newResumeFixture(t *testing.T, name string) *resumeFixture {
 		strconv.Itoa(resumeTotal)+") g")
 	f.resetTarget(t)
 	f.importJob(t)
+	// teardown：本任务名下的书签不留给本机（lost 的书签会一直占着 max_replication_slots）。
+	t.Cleanup(func() { f.dropJobSlots(t) })
 
 	// 基准：同一条源数据、同一个目标表，一次性搬完。
 	out, code := f.run(t, "--snapshot-only")
@@ -439,26 +443,7 @@ func TestLostSlotSelfHealsByFullRecopy(t *testing.T) {
 	ctx := context.Background()
 	slot := slotNameFor(f.jobKey(t))
 
-	f.requireSuperuser(t)
-	restore := f.setMaxSlotWALKeepSize(t, "64kB")
-	defer restore()
-
-	// 灌 WAL 并让检查点把超额的 WAL 回收掉 —— 书签的 restart 点被甩在后面就成了 lost。
-	for round := 0; round < 40; round++ {
-		exec(t, f.srcDB, "INSERT INTO "+f.table+" SELECT g, repeat('w',2000) FROM generate_series("+
-			strconv.Itoa(resumeTotal+1000+round*200)+","+strconv.Itoa(resumeTotal+1199+round*200)+") g")
-		exec(t, f.srcDB, "SELECT pg_switch_wal()")
-		exec(t, f.srcDB, "CHECKPOINT")
-		if f.walStatus(t, slot) == "lost" {
-			break
-		}
-	}
-	if st := f.walStatus(t, slot); st != "lost" {
-		t.Fatalf("造不出 wal_status=lost（当前 %q）：这个用例要的是「书签在、WAL 没了」", st)
-	}
-	t.Logf("书签 %s 已变成 wal_status=lost（书签还在，WAL 被丢掉）", slot)
-	// 先把集群参数恢复回去：后面还要跑一次正常全量，别让它继续把 WAL 丢掉。
-	restore()
+	f.makeSlotLost(t, slot)
 
 	// 重跑一次：必须能自愈（drop lost 书签 → 重建 → 整轮重搬），而不是每次报 already exists。
 	out, code := f.run(t, "--snapshot-only")
@@ -506,6 +491,86 @@ func TestLostSlotSelfHealsByFullRecopy(t *testing.T) {
 	}
 	t.Logf("lost → 整轮重搬：%d 行（源端 %d 行），md5 %s == 源端；书签数 %d",
 		dstN, srcN, f.md5(t, f.dstDB, f.table), slots)
+}
+
+// 全量**搬完之后**书签才丢（wal_status=lost），而停机期间源端删了行：
+// 重跑必须整轮重搬**并且先把上次搬进去的行清掉**。
+//
+// 为什么这条非有不可：BulkApply 只有 upsert，没有 delete。只把 bump 位点的重搬做对、
+// 不清表的话，源端删掉的行会永远留在目标端——退出码 0、日志写「整轮重搬」，数据却是脏的，
+// 而且 continuous+initial 之后也不会自愈（块标记说搬完了）。
+func TestLostSlotAfterCompletedCopyDropsDeletedRows(t *testing.T) {
+	f := newResumeFixture(t, "resume_lost_done")
+	ctx := context.Background()
+
+	// ① 先完整搬一次：表完成标记齐了（allDone），位点 P1，书签在。
+	out, code := f.run(t, "--snapshot-only")
+	if code != 0 {
+		t.Fatalf("第一次全量失败（退出码 %d）：\n%s", code, out)
+	}
+	var before int
+	if err := f.dstDB.QueryRow(ctx, "SELECT count(*) FROM "+f.table).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	if before != resumeTotal {
+		t.Fatalf("第一次全量后目标端应有 %d 行，实际 %d", resumeTotal, before)
+	}
+
+	// ② 书签被打成 lost：这之后的变更再也重放不出来。
+	f.makeSlotLost(t, slotNameFor(f.jobKey(t)))
+
+	// ③ 停机期间源端删掉 3 行——只有「重搬前清表」能把它们从目标端带走。
+	exec(t, f.srcDB, "DELETE FROM "+f.table+" WHERE id IN (10, 5000, "+strconv.Itoa(resumeTotal-1)+")")
+
+	// ④ 重跑：整轮重搬 + 清掉上次的行。
+	out, code = f.run(t, "--snapshot-only")
+	if code != 0 {
+		t.Fatalf("lost 之后重跑必须自愈，实际退出码 %d：\n%s", code, out)
+	}
+	var srcN, dstN int
+	if err := f.srcDB.QueryRow(ctx, "SELECT count(*) FROM "+f.table).Scan(&srcN); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.dstDB.QueryRow(ctx, "SELECT count(*) FROM "+f.table).Scan(&dstN); err != nil {
+		t.Fatal(err)
+	}
+	if copied := copiedRows(t, out); copied != srcN {
+		t.Fatalf("应整轮重搬 %d 行（源端当前行数），实际 %d 行\n%s", srcN, copied, out)
+	}
+	if dstN != srcN {
+		t.Fatalf("目标端 %d 行、源端 %d 行：源端删掉的行没被带走（重搬只 upsert、不 delete）\n%s",
+			dstN, srcN, out)
+	}
+	if s, d := f.md5(t, f.srcDB, f.table), f.md5(t, f.dstDB, f.table); s != d {
+		t.Fatalf("整轮重搬后内容不一致：源 %s / 目标 %s；差异 %s", s, d, f.diff(t))
+	}
+	t.Logf("搬完之后书签才 lost：源端停机期间删 3 行 → 重跑整轮重搬 %d 行（原 %d 行），"+
+		"目标端 %d 行，md5 %s == 源端", copiedRows(t, out), before, dstN, f.md5(t, f.dstDB, f.table))
+}
+
+// makeSlotLost 把书签造成真 lost（书签还在、WAL 没了），造不出来就失败。
+//
+// 不是靠 sleep 碰运气：把 max_slot_wal_keep_size 调到最小 → reload → 灌 WAL →
+// pg_switch_wal + CHECKPOINT → 轮询 pg_replication_slots.wal_status 直到 'lost'。
+func (f *resumeFixture) makeSlotLost(t *testing.T, slot string) {
+	t.Helper()
+	f.requireSuperuser(t)
+	restore := f.setMaxSlotWALKeepSize(t, "64kB")
+	// 参数在断言之后立刻恢复：后面的用例还要正常跑全量，别让它继续把 WAL 丢掉。
+	defer restore()
+	for round := 0; round < 40; round++ {
+		exec(t, f.srcDB, "INSERT INTO "+f.table+" SELECT g, repeat('w',2000) FROM generate_series("+
+			strconv.Itoa(resumeTotal+10000+round*200)+","+strconv.Itoa(resumeTotal+10199+round*200)+") g")
+		exec(t, f.srcDB, "SELECT pg_switch_wal()")
+		exec(t, f.srcDB, "CHECKPOINT")
+		if f.walStatus(t, slot) == "lost" {
+			break
+		}
+	}
+	if st := f.walStatus(t, slot); st != "lost" {
+		t.Fatalf("造不出 wal_status=lost（当前 %q）：这个用例要的是「书签在、WAL 没了」", st)
+	}
+	t.Logf("书签 %s 已变成 wal_status=lost（书签还在，WAL 被丢掉）", slot)
 }
 
 // requireSuperuser：造 lost 要改 max_slot_wal_keep_size（superuser 才能改）。
@@ -599,15 +664,47 @@ func (f *resumeFixture) waitTruncateBlocked(t *testing.T, done <-chan error, out
 		out.String(), f.sessions(t))
 }
 
-// jobKey 读目标端状态行里的 job_key（书签名是 jl_<job_key>_1）。
+// jobKey 读目标端状态行里的 job_key（书签名是 jl_<job_key>_1），读到就缓存。
 func (f *resumeFixture) jobKey(t *testing.T) string {
 	t.Helper()
+	if f.key != "" {
+		return f.key
+	}
 	var k string
 	if err := f.dstDB.QueryRow(context.Background(),
 		"SELECT job_key FROM _jl_meta LIMIT 1").Scan(&k); err != nil {
 		t.Fatalf("读 job_key 失败: %v", err)
 	}
+	f.key = k
 	return k
+}
+
+// dropJobSlots 删掉本任务名下的书签（teardown 用）。尽力而为：连不上就算了，
+// 不能让清理把用例的结论搅乱。
+func (f *resumeFixture) dropJobSlots(t *testing.T) {
+	t.Helper()
+	if f.key == "" || f.srcDB == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	rows, err := f.srcDB.Query(ctx,
+		"SELECT slot_name FROM pg_replication_slots WHERE slot_name LIKE $1 AND NOT active",
+		"jl_"+f.key+"%")
+	if err != nil {
+		return
+	}
+	var names []string
+	for rows.Next() {
+		var n string
+		if rows.Scan(&n) == nil {
+			names = append(names, n)
+		}
+	}
+	rows.Close()
+	for _, n := range names {
+		_, _ = f.srcDB.Exec(context.Background(), "SELECT pg_drop_replication_slot($1)", n)
+	}
 }
 
 func slotNameFor(jobKey string) string { return "jl_" + jobKey + "_1" }
