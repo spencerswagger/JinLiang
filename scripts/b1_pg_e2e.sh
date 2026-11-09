@@ -114,18 +114,25 @@ if [ "$MODE" = "append" ]; then
   BEFORE=$(psql_dst "SELECT count(*) FROM orders WHERE id BETWEEN 900001 AND 900003")
   echo "   已 kill -9（快照进行中）；用户自己的行还有 $BEFORE 行"
   timeout 300 "$BIN" run --job b1-orders --data-dir "$DATA" --stop-when-idle 5s > "$WORK/run2.log" 2>&1 || true
-  grep -E "是你自己的表" "$WORK/run2.log" | head -2 || true
+  grep -E "续跑|是你自己的表" "$WORK/run2.log" | head -2 || true
   AFTER=$(psql_dst "SELECT count(*) FROM orders WHERE id BETWEEN 900001 AND 900003")
   echo "   重启后用户行数：$AFTER"
   if [ "$AFTER" != "3" ]; then
     echo "FAIL: 重搬把用户原有的行删掉了（$AFTER/3）——这正是 Owl 必改 1"
     exit 1
   fi
-  if ! grep -q "是你自己的表" "$WORK/run2.log"; then
-    echo "FAIL: 没有明确拒绝，用户不知道发生了什么"
+  # 能块级续跑就不需要清空用户的表，所以这里**不该**再出现「是你自己的表」那句拒绝：
+  # 它只说明「必须整轮重搬」（书签追不回来时才会走到）。
+  if grep -q "是你自己的表" "$WORK/run2.log"; then
+    echo "FAIL: 本次能块级续跑，不该要求清空用户表（拒绝文案见上）"
     exit 1
   fi
-  echo "PASS: append + 中途 kill：拒绝清空用户表，3 行完好"
+  TOTAL=$(psql_dst "SELECT count(*) FROM orders")
+  if [ "$TOTAL" != "$((ROWS+3))" ]; then
+    echo "FAIL: 续跑后目标端应为 $((ROWS+3)) 行（源 $ROWS + 用户 3），实际 $TOTAL"
+    exit 1
+  fi
+  echo "PASS: append + 中途 kill：块级续跑接上（只搬剩下的），用户 3 行完好，共 $TOTAL 行"
   exit 0
 fi
 
@@ -156,11 +163,11 @@ elif [ "$MODE" = "kill" ]; then
   wait "$PID" 2>/dev/null || true
   echo "   已 kill -9（快照进行中）；目标端此刻行数 $(psql_dst 'SELECT count(*) FROM orders' 2>/dev/null || echo 0)"
   echo "   残留状态：$(psql_dst "SELECT phase||' '||COALESCE(position,'(无位点)') FROM _jl_meta" 2>/dev/null || echo '无')"
-  # 停机期间源端删掉一行（这一行已经在第 1 块里搬过去了）：
-  # 重搬全量必须先清掉「上次搬到一半的行」，否则会留下源端已经没有的行。
+  # 停机期间源端删掉一行（这一行已经在第 1 块里搬过去了）：续跑不会重读那一段，
+  # 这一行只能靠「增量从原来的位点重放」删除。位点一旦被挪到续跑时刻，它就留下了。
   psql_src "DELETE FROM orders WHERE id=5" >/dev/null
-  echo "   停机期间源端删除了 id=5（重搬时必须消失）"
-  echo "== 5. 重启：应当识别「全量没搬完」并重搬 =="
+  echo "   停机期间源端删除了 id=5（重启后必须消失）"
+  echo "== 5. 重启：识别「全量没搬完」，从已提交的块边界续跑 =="
   timeout 600 "$BIN" run --job b1-orders --data-dir "$DATA" --stop-when-idle 5s > "$WORK/run2.log" 2>&1 || true
   grep -E "全量完成|跳过全量|重建了同步书签|清空了上次" "$WORK/run2.log" || true
 else

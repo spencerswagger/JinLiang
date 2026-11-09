@@ -715,9 +715,13 @@ func TypeMapLoss(col source.Column) (catalog.Mapping, bool) {
 
 // ── 全量：一块一个事务（数据 + 块进度标记 + 位点） ─────────────────
 //
-// 说清楚一件事：这些块标记**不是「断点续传」**。恢复时是把整张表重搬一遍
-// （新的导出一致性视图），块标记只用来回答两件事：这张表上次是不是我们写的、
-// 写到第几块了（给人看进度）。跨进程复用同一个快照视图是不成立的。
+// 块标记**就是断点续跑的凭据**：它和数据、位点在同一个事务里提交，所以
+// 「已提交的块」永远完整（正在写的那一块被 kill -9 时整个回滚），重启可以从
+// 最后一块的右边界接着读（见 chunk.go 与 engine.planCopy）。
+//
+// 导出的快照视图随进程消失，续跑剩下的块用的是**新的**一致性读视图：这不丢变更，
+// 因为增量仍然从**原来那个位点**重放（续跑不许把位点往前挪）；续跑读到的更新值
+// 会被同一条变更再盖一遍，删掉的行也会被重放出来。
 
 // BulkApply writes one snapshot chunk: data, chunk marker and position commit
 // together. The stage table + INSERT ... SELECT gives upsert semantics, so a
@@ -764,8 +768,7 @@ func (s *Sink) BulkApply(ctx context.Context, ti *tableInfo, chunkNo int, rows [
 		}
 	}
 
-	// 块进度：重启时能看出「哪些块落地过」，也让人能核对进度。
-	// 注意：恢复走的是整表重搬，不是从这里接着搬（见本节开头说明）。
+	// 块进度：这条记录就是续跑起点（和数据同一个事务，见 chunk.go）。
 	ck := fmt.Sprintf(`INSERT INTO %s (job_key, table_name, chunk_no, range_from, range_to, done, rows)
 		VALUES ($1,$2,$3,$4,$5,true,$6)
 		ON CONFLICT (job_key, table_name, chunk_no) DO UPDATE SET done=true, rows=EXCLUDED.rows`,
@@ -1578,7 +1581,8 @@ func (s *Sink) Info(ref source.TableRef) (TableInfo, bool) {
 	return TableInfo{Ref: ti.ref, Cols: ti.cols, PK: ti.pk, HasPK: ti.hasPK}, true
 }
 
-// DoneChunks returns the finished chunk numbers per table (restart diagnostics).
+// DoneChunks returns the finished chunk numbers per table (which tables a
+// previous run touched at all — the fresh-recopy path needs exactly this).
 func (s *Sink) DoneChunks(ctx context.Context) (map[string]map[int]bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1602,17 +1606,6 @@ func (s *Sink) DoneChunks(ctx context.Context) (map[string]map[int]bool, error) 
 		out[t][n] = true
 	}
 	return out, rows.Err()
-}
-
-// ResetChunks clears chunk markers: a new snapshot cannot reuse an old
-// snapshot id, so the copy restarts (upsert keeps it idempotent).
-func (s *Sink) ResetChunks(ctx context.Context) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	q := fmt.Sprintf(`DELETE FROM %s WHERE job_key=$1`, s.stateTable("_jl_chunk"))
-	_, err := s.conn.Exec(ctx, q, s.opt.JobKey)
-	return err
 }
 
 // TruncateTable empties a target table. It is only used when we know the rows
