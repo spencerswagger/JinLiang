@@ -273,20 +273,29 @@ func (s *Source) Prepare(ctx context.Context, popt PrepareOptions) (PrepareResul
 		})
 	}
 
-	slotLSN, slotExists, err := s.slotPosition(ctx)
+	slot, err := s.slotState(ctx)
 	if err != nil {
 		return res, err
 	}
-	if slotExists && popt.Snapshot {
-		// 上一次全量没读完就断了：导出的视图跟着那个进程一起没了，只能重来。
-		// 重建书签比「续用旧书签 + 全量重读」更诚实：变更流反正要从头追。
+	slotLSN, slotExists := slot.LSN, slot.Exists
+	// 要重建书签的两种情形，判据不同但动作一样：
+	//   1) 这次要导出一致性视图（全量）：上次的导出视图随进程消失，旧的不能再导；
+	//   2) 书签已经 wal_status=lost：WAL 被 max_slot_wal_keep_size 丢掉了，从任何旧位点
+	//      都重放不出来。这种书签**仍在 pg_replication_slots 里占着名字**，不先 drop
+	//      就建会报 already exists —— 那样每次 run 都失败，重跑也治不好。
+	if slotExists && (popt.Snapshot || !slot.Replayable()) {
 		if _, err := s.conn.Exec(ctx, `SELECT pg_drop_replication_slot($1)`, s.opt.Slot); err != nil {
 			return res, fmt.Errorf("重建书签前删除旧书签 %s 失败（可能还有进程连着它）: %w", s.opt.Slot, err)
+		}
+		reason := "上次全量没读完，导出的读视图随进程消失；重搬全量比在半截数据上续跑安全"
+		if !slot.Replayable() {
+			reason = "书签的 WAL 已经被 max_slot_wal_keep_size 丢掉（wal_status=lost），" +
+				"从旧位点再也重放不出来；保留它只会让下一次建书签报「已存在」"
 		}
 		res.Actions = append(res.Actions, source.Action{
 			ID: "drop-slot:" + s.opt.Slot, What: "重建了同步书签 " + s.opt.Slot,
 			SQL: "SELECT pg_drop_replication_slot('" + s.opt.Slot + "')", Applied: true,
-			Reason: "上次全量没读完，导出的读视图随进程消失；重搬全量比在半截数据上续跑安全",
+			Reason: reason,
 		})
 		slotExists = false
 	}
@@ -330,7 +339,12 @@ func (s *Source) Prepare(ctx context.Context, popt PrepareOptions) (PrepareResul
 			Mode:           pglogrepl.LogicalReplication,
 		})
 	if err != nil {
-		return res, fmt.Errorf("建同步书签 %s 失败（账号需要 REPLICATION 权限，或书签数已满）: %w", s.opt.Slot, err)
+		return res, fmt.Errorf("建同步书签 %s 失败。常见原因只有三个，按可能性排："+
+			"1) 源库里已经有同名书签（pg_replication_slots 查得到，包括 wal_status=lost 的），"+
+			"先 SELECT pg_drop_replication_slot('%s') 再重试；"+
+			"2) 账号缺 REPLICATION 权限（ALTER ROLE … WITH REPLICATION）；"+
+			"3) 书签数已满（max_replication_slots）。原始错误：%w",
+			s.opt.Slot, s.opt.Slot, err)
 	}
 	pos, err := ParsePayload(created.ConsistentPoint)
 	if err != nil {
@@ -364,45 +378,71 @@ func (s *Source) publicationTargets() string {
 	return strings.Join(parts, ", ")
 }
 
-// slotPosition returns the slot's confirmed position ("" when it exists but has
-// never been confirmed). 书签的 WAL 已经被 max_slot_wal_keep_size 丢掉时也当成不存在：
-// 那种书签还在，但**从任何旧位点都重放不了**，当「还能续」会让增量静默丢一段。
-func (s *Source) slotPosition(ctx context.Context) (string, bool, error) {
-	var lsn *string
-	var walStatus *string
-	// wal_status 是 PG 13+ 的列：老版本用 to_jsonb 取，取不到就是 NULL（不写版本号分支）。
+// slotState is what the source can tell us about the slot. 「存在」与「能不能重放」
+// 是**两件不同的事**，混成一个 bool 会出人命：
+//   - 建/删书签只看「存在」：已经 wal_status=lost 的书签仍然占着名字，不先 drop 就
+//     pg_create_logical_replication_slot 会报 already exists —— 于是每次 run 都失败，
+//     而且不能靠重跑自愈；
+//   - 决定「能不能从旧位点续」才看 wal_status：lost 表示 WAL 已被
+//     max_slot_wal_keep_size 丢掉，从任何旧位点都重放不了。
+type slotState struct {
+	// LSN 是 confirmed_flush_lsn 原文（空 = 书签还没确认过任何位点）。
+	LSN string
+	// Exists 表示 pg_replication_slots 里有这个书签（lost 也算存在）。
+	Exists bool
+	// WalStatus 是 PG 13+ 的 wal_status（reserved / extended / unreserved / lost）。
+	// 老版本取不到，留空——那时它也没有「丢 WAL」这个状态。
+	WalStatus string
+}
+
+// Replayable reports whether changes can still be replayed from an old checkpoint.
+func (st slotState) Replayable() bool { return st.Exists && st.WalStatus != "lost" }
+
+// slotState reads the slot's raw state.
+func (s *Source) slotState(ctx context.Context) (slotState, error) {
+	var lsn, walStatus *string
+	// wal_status 是 PG 13+ 的列：用 to_jsonb 取，老版本取不到就是 NULL（不写版本号分支）。
 	err := s.conn.QueryRow(ctx,
 		`SELECT confirmed_flush_lsn::text, to_jsonb(s)->>'wal_status'
 		   FROM pg_replication_slots s WHERE slot_name=$1`,
 		s.opt.Slot).Scan(&lsn, &walStatus)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return "", false, nil
+		return slotState{}, nil
 	}
 	if err != nil {
-		return "", false, err
+		return slotState{}, err
 	}
-	if walStatus != nil && *walStatus == "lost" {
-		return "", false, nil
+	st := slotState{Exists: true}
+	if lsn != nil {
+		st.LSN = *lsn
 	}
-	if lsn == nil {
-		return "", true, nil
+	if walStatus != nil {
+		st.WalStatus = *walStatus
 	}
-	return *lsn, true, nil
+	return st, nil
+}
+
+// slotPosition keeps the two-value shape for callers that only care about
+// existence (建/删书签), not about replayability.
+func (s *Source) slotPosition(ctx context.Context) (string, bool, error) {
+	st, err := s.slotState(ctx)
+	return st.LSN, st.Exists, err
 }
 
 // SlotConfirmed reports the slot's confirmed position, i.e. how far the source
-// has already been acknowledged. ok=false means the slot cannot be replayed from
-// any old checkpoint any more: it was dropped, the whole cluster was rebuilt, or
-// `max_slot_wal_keep_size` already threw its WAL away (wal_status='lost').
+// has already been acknowledged. ok=false 表示「重放不了」——书签没了、或者
+// wal_status=lost（WAL 已被 max_slot_wal_keep_size 丢掉），从任何旧位点都追不回来。
+//
+// 注意这**不是**「书签不存在」：判断存在与否请用 slotState（建/删书签要用它）。
 func (s *Source) SlotConfirmed(ctx context.Context) (Position, bool, error) {
-	raw, exists, err := s.slotPosition(ctx)
-	if err != nil || !exists {
+	st, err := s.slotState(ctx)
+	if err != nil || !st.Replayable() {
 		return Position{}, false, err
 	}
-	if raw == "" {
+	if st.LSN == "" {
 		return Position{}, true, nil // 书签在，但还没确认过任何位点
 	}
-	pos, err := ParsePayload(raw)
+	pos, err := ParsePayload(st.LSN)
 	if err != nil {
 		return Position{}, true, err
 	}
@@ -1102,10 +1142,13 @@ func (s *Source) Advance(ctx context.Context, to Position) error {
 // deleted — stopping a run keeps the slot so the next run can resume.
 func (s *Source) Cleanup(ctx context.Context) ([]source.Action, error) {
 	var actions []source.Action
-	_, slotExists, err := s.slotPosition(ctx)
+	// 只要书签在就删，**不看**能不能重放：lost 的书签同样占着
+	// max_replication_slots 的名额，留着就是孤儿，只能人工清理。
+	st, err := s.slotState(ctx)
 	if err != nil {
 		return actions, err
 	}
+	slotExists := st.Exists
 	if slotExists {
 		if _, err := s.conn.Exec(ctx, `SELECT pg_drop_replication_slot($1)`, s.opt.Slot); err != nil {
 			return actions, fmt.Errorf("删除书签 %s 失败（可能还有进程连着它）: %w", s.opt.Slot, err)
@@ -1113,7 +1156,7 @@ func (s *Source) Cleanup(ctx context.Context) ([]source.Action, error) {
 		actions = append(actions, source.Action{
 			ID: "drop-slot:" + s.opt.Slot, What: "删了同步书签 " + s.opt.Slot,
 			SQL: "SELECT pg_drop_replication_slot('" + s.opt.Slot + "')", Applied: true,
-			Reason: "任务已被删除，书签继续保留只会白占磁盘",
+			Reason: "任务已被删除，书签继续保留只会白占磁盘与 max_replication_slots 名额",
 		})
 	}
 	exists, err := s.publicationExists(ctx)

@@ -1608,17 +1608,6 @@ func (s *Sink) DoneChunks(ctx context.Context) (map[string]map[int]bool, error) 
 	return out, rows.Err()
 }
 
-// ResetChunks clears every chunk marker: used when this run deliberately starts
-// a whole new copy (once / full_interval / 断点不可用), never when resuming.
-func (s *Sink) ResetChunks(ctx context.Context) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	q := fmt.Sprintf(`DELETE FROM %s WHERE job_key=$1`, s.stateTable("_jl_chunk"))
-	_, err := s.conn.Exec(ctx, q, s.opt.JobKey)
-	return err
-}
-
 // TruncateTable empties a target table. It is only used when we know the rows
 // in it came from half-finished initial copy of this job (chunk markers exist),
 // never on a table the user filled.

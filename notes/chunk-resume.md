@@ -83,7 +83,32 @@ phase 写成 `done`（drain 的既有语义），于是「取消过的半截全�
 断言**位点没被提前推**，再跑一次必须整轮重搬且内容 md5 与源端一致。
 变异验证（把位点改回 prepare 推）：立刻红——「从头搬的窗口里位点被提前推了……」。
 
-## 6. 留给 Ark 的口径（我没自己改文档）
+## 6. 必改 2（新 P0）：`wal_status` 不能混进「书签在不在」
+
+上一版把「存在」和「能不能重放」压进 `slotPosition` 的一个 `exists` 返回值：lost 时返回
+`exists=false`，而 `Prepare` 正是靠 `exists` 决定 drop / reuse / 新建 → lost 时既不 drop 也不
+reuse，直接建书签，PG 报 `slot already exists` → **每次 run 都失败、重跑也治不好**（`--resync`
+只在文案里）；`Cleanup` 同样不 drop lost 书签 → 孤儿占 `max_replication_slots`。
+
+现在拆成两件事：
+
+- `pgsource.slotState` → `{LSN, Exists, WalStatus}`，`Replayable() = Exists && WalStatus != "lost"`；
+- `Prepare`：`Exists && (Snapshot || !Replayable())` → drop + recreate（lost 也算），
+  理由分别写进动作清单；建书签失败的提示把「同名书签还在」列成第一条；
+- `Cleanup`：只要 `Exists` 就 drop，不看可重放；
+- `decision`：`SlotConfirmed` 仍以「可重放」为准（lost = 续不了）；`planCopy` 的 `allDone`
+  分支也看这一条——存量都搬完但书签追不回位点，不再报「不用搬」，而是整轮重搬；
+  continuous 模式（本来就不搬存量）遇到这种情况直接停下，四段式说清能做什么，不悄悄挪位点。
+- `stateCapable` 里零调用者的 `ResetChunks` 删掉（`pgsink.ResetChunks` 一并删）：
+  单独一个「只清标记」的方法等于把必改 1 的窗口重新交给调用方。
+
+新用例 `TestLostSlotSelfHealsByFullRecopy`：真造 lost（`max_slot_wal_keep_size='64kB'`
+→ reload → 灌 WAL + `pg_switch_wal()` + `CHECKPOINT` → 轮询到 `wal_status='lost'`，轮不到
+直接失败）→ 重跑一次必须自愈：整轮重搬 200200 行、md5 与源端一致、该任务名下书签数 = 1。
+变异验证（把 lost 塞回 `exists=false`）：立刻红，报
+`replication slot "jl_…_1" already exists`。
+
+## 7. 留给 Ark 的口径（我没自己改文档）
 
 1. `docs/SNAPSHOT.md §4` 现在写「快照 id 已失效 → 整段重来」。实测：导出的视图**必然**
    随进程失效（kill -9 之后一定失效），真正的判据是**书签还能不能从原位点重放**。

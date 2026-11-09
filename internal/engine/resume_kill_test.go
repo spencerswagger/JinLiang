@@ -422,6 +422,158 @@ func TestSlotLossForcesFullRecopyNotResume(t *testing.T) {
 		afterCrash.position, resumeTotal+200, dstN, f.md5(t, f.dstDB, f.table))
 }
 
+// 书签被 max_slot_wal_keep_size 打成 wal_status='lost'（书签**还在**、WAL 没了）时，
+// 重跑一次必须能自愈：整轮重搬成功，且书签不堆积。
+//
+// 这和「书签被 drop」是两个不同状态，判据也不同：
+//   - 「存在」决定建/删书签（lost 的书签还占着名字，不先 drop 就报 already exists，
+//     于是每次 run 都失败、重跑也治不好）；
+//   - 「能重放」才决定能不能续跑。
+//
+// 真 lost 是造出来的，不是假设出来的：把 max_slot_wal_keep_size 调到最小 → reload →
+// 灌 WAL → CHECKPOINT → **轮询**到 wal_status 真的变成 lost（轮不到就失败，不靠 sleep）。
+func TestLostSlotSelfHealsByFullRecopy(t *testing.T) {
+	f := newResumeFixture(t, "resume_lost")
+	f.killDuringCopy(t)
+
+	ctx := context.Background()
+	slot := slotNameFor(f.jobKey(t))
+
+	f.requireSuperuser(t)
+	restore := f.setMaxSlotWALKeepSize(t, "64kB")
+	defer restore()
+
+	// 灌 WAL 并让检查点把超额的 WAL 回收掉 —— 书签的 restart 点被甩在后面就成了 lost。
+	for round := 0; round < 40; round++ {
+		exec(t, f.srcDB, "INSERT INTO "+f.table+" SELECT g, repeat('w',2000) FROM generate_series("+
+			strconv.Itoa(resumeTotal+1000+round*200)+","+strconv.Itoa(resumeTotal+1199+round*200)+") g")
+		exec(t, f.srcDB, "SELECT pg_switch_wal()")
+		exec(t, f.srcDB, "CHECKPOINT")
+		if f.walStatus(t, slot) == "lost" {
+			break
+		}
+	}
+	if st := f.walStatus(t, slot); st != "lost" {
+		t.Fatalf("造不出 wal_status=lost（当前 %q）：这个用例要的是「书签在、WAL 没了」", st)
+	}
+	t.Logf("书签 %s 已变成 wal_status=lost（书签还在，WAL 被丢掉）", slot)
+	// 先把集群参数恢复回去：后面还要跑一次正常全量，别让它继续把 WAL 丢掉。
+	restore()
+
+	// 重跑一次：必须能自愈（drop lost 书签 → 重建 → 整轮重搬），而不是每次报 already exists。
+	out, code := f.run(t, "--snapshot-only")
+	if code != 0 {
+		t.Fatalf("lost 书签后重跑必须自愈，实际退出码 %d：\n%s", code, out)
+	}
+
+	var srcN, dstN int
+	if err := f.srcDB.QueryRow(ctx, "SELECT count(*) FROM "+f.table).Scan(&srcN); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.dstDB.QueryRow(ctx, "SELECT count(*) FROM "+f.table).Scan(&dstN); err != nil {
+		t.Fatal(err)
+	}
+	if copied := copiedRows(t, out); copied != srcN {
+		t.Fatalf("lost 之后应整轮重搬 %d 行（源端当前行数），实际 %d 行\n%s", srcN, copied, out)
+	}
+	if srcN != dstN {
+		t.Fatalf("整轮重搬后行数不一致：源 %d / 目标 %d", srcN, dstN)
+	}
+	if s, d := f.md5(t, f.srcDB, f.table), f.md5(t, f.dstDB, f.table); s != d {
+		t.Fatalf("整轮重搬后内容不一致：源 %s / 目标 %s；差异 %s", s, d, f.diff(t))
+	}
+
+	// 不许留孤儿：这个任务名下只能有 1 个书签。
+	var slots int
+	if err := f.srcDB.QueryRow(ctx,
+		"SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE $1", "jl_"+f.jobKey(t)+"%").
+		Scan(&slots); err != nil {
+		t.Fatal(err)
+	}
+	if slots != 1 {
+		var names []string
+		rows, _ := f.srcDB.Query(ctx, "SELECT slot_name FROM pg_replication_slots WHERE slot_name LIKE $1",
+			"jl_"+f.jobKey(t)+"%")
+		if rows != nil {
+			defer rows.Close()
+			for rows.Next() {
+				var n string
+				_ = rows.Scan(&n)
+				names = append(names, n)
+			}
+		}
+		t.Fatalf("重跑后这个任务名下应剩 1 个书签，实际 %d 个：%v", slots, names)
+	}
+	t.Logf("lost → 整轮重搬：%d 行（源端 %d 行），md5 %s == 源端；书签数 %d",
+		dstN, srcN, f.md5(t, f.dstDB, f.table), slots)
+}
+
+// requireSuperuser：造 lost 要改 max_slot_wal_keep_size（superuser 才能改）。
+// 改不了就直说失败，别静默跳过——跳过等于这条用例从来没跑过。
+func (f *resumeFixture) requireSuperuser(t *testing.T) {
+	t.Helper()
+	var super bool
+	if err := f.srcDB.QueryRow(context.Background(),
+		"SELECT rolsuper FROM pg_roles WHERE rolname = current_user").Scan(&super); err != nil {
+		t.Fatalf("查不到当前账号是不是 superuser: %v", err)
+	}
+	if !super {
+		t.Fatalf("这个用例要制造 wal_status=lost，需要 superuser 改 max_slot_wal_keep_size；" +
+			"当前账号不是 superuser —— 换一个能改的账号跑，别把它改成 skip")
+	}
+}
+
+// setMaxSlotWALKeepSize 改集群参数并 reload，返回恢复函数（cleanup 里必须调）。
+func (f *resumeFixture) setMaxSlotWALKeepSize(t *testing.T, v string) func() {
+	t.Helper()
+	ctx := context.Background()
+	exec(t, f.srcDB, "ALTER SYSTEM SET max_slot_wal_keep_size='"+v+"'")
+	exec(t, f.srcDB, "SELECT pg_reload_conf()")
+	// 先把参数归到已知状态（-1 = 不限），再设成很小的值 —— 这样断言不依赖上一次跑完留了什么。
+	showParam := func() string {
+		var cur string
+		if err := f.srcDB.QueryRow(ctx, "SHOW max_slot_wal_keep_size").Scan(&cur); err != nil {
+			return ""
+		}
+		return cur
+	}
+	_, _ = f.srcDB.Exec(ctx, "ALTER SYSTEM RESET max_slot_wal_keep_size")
+	_, _ = f.srcDB.Exec(ctx, "SELECT pg_reload_conf()")
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) && showParam() != "-1" {
+		time.Sleep(50 * time.Millisecond)
+	}
+	// 这个参数的单位是 MB：写 64kB 会被取整成 0（= 一点 WAL 都不留，正好用来造 lost）。
+	exec(t, f.srcDB, "ALTER SYSTEM SET max_slot_wal_keep_size='"+v+"'")
+	exec(t, f.srcDB, "SELECT pg_reload_conf()")
+	deadline = time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) && showParam() == "-1" {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if cur := showParam(); cur == "-1" || cur == "" {
+		t.Fatalf("max_slot_wal_keep_size 没生效（设了 %s，实际 %q）", v, cur)
+	} else {
+		t.Logf("max_slot_wal_keep_size = %s（PG 按 MB 取整，0 表示一点 WAL 都不留）", cur)
+	}
+	return func() {
+		// 恢复成默认值并 reload：这个参数是集群级的，留着会污染后面的用例。
+		_, _ = f.srcDB.Exec(context.Background(), "ALTER SYSTEM RESET max_slot_wal_keep_size")
+		_, _ = f.srcDB.Exec(context.Background(), "SELECT pg_reload_conf()")
+	}
+}
+
+// walStatus 读一个书签的 wal_status（书签不存在时返回空串）。
+func (f *resumeFixture) walStatus(t *testing.T, slot string) string {
+	t.Helper()
+	var st string
+	err := f.srcDB.QueryRow(context.Background(),
+		"SELECT COALESCE(wal_status,'') FROM pg_replication_slots WHERE slot_name=$1", slot).Scan(&st)
+	if err != nil {
+		return ""
+	}
+	return st
+}
+
 // waitTruncateBlocked 等到「有 TRUNCATE 卡在锁上」——那就是新一轮全量的窗口。
 // 进程提前结束就直接报错（否则「等不到」会被误读成「窗口没构造出来」）。
 func (f *resumeFixture) waitTruncateBlocked(t *testing.T, done <-chan error, out *bytes.Buffer) {

@@ -70,8 +70,10 @@ type copyInputs struct {
 	Progress map[string]pgsink.ChunkProgress
 	// StoredCP 是 _jl_meta.position（上次定下的一致性起点）。
 	StoredCP string
-	// SlotOK 表示源端书签还在（不在就追不回旧位点之后的变更）。
-	SlotOK bool
+	// SlotReplayable 表示源端书签还能从旧位点重放（书签在、且没被
+	// max_slot_wal_keep_size 丢掉 WAL）。注意它**不等于**「书签存在」：
+	// wal_status=lost 的书签还在，但一段变更都放不出来。
+	SlotReplayable bool
 	// SlotAhead 表示书签已确认的位点**越过了** StoredCP：中间那段变更已被丢弃。
 	SlotAhead bool
 	// SlotCP 是书签已确认位点的原文（只用于把「哪一条不成立」写清楚）。
@@ -131,6 +133,21 @@ func planCopy(in copyInputs) chunkPlan {
 			p.Why = "这一轮按模式重搬全量（上次已经搬完）"
 			return p
 		}
+		// 「存量的行都在目标端」不等于「已经同步到位」：还要能把这之后的变更重放出来。
+		// 书签没了 / WAL 被丢了 / 书签已经越过位点 → 中间那段变更永远补不回来，
+		// 这时说「不用搬」就是静默丢数据，只能整轮重搬（新视图重新对齐一次）。
+		if in.StoredCP != "" && (!in.SlotReplayable || in.SlotAhead) {
+			p.Kind = copyFresh
+			if !in.SlotReplayable {
+				p.Why = "存量的行都在目标端，但源端书签追不回位点（书签不在了，或 WAL 已被 " +
+					"max_slot_wal_keep_size 丢掉）：位点 " + in.StoredCP +
+					" 之后那段变更重放不出来，只能整轮重搬"
+			} else {
+				p.Why = "存量的行都在目标端，但源端书签已经越过位点（书签确认到 " + in.SlotCP +
+					"，目标位点是 " + in.StoredCP + "，中间那段变更被清理了）：只能整轮重搬"
+			}
+			return p
+		}
 		p.Kind = copySkip
 		return p
 	}
@@ -149,13 +166,13 @@ func planCopy(in copyInputs) chunkPlan {
 		return p
 	}
 
-	if in.StoredCP == "" || !in.SlotOK || in.SlotAhead {
+	if in.StoredCP == "" || !in.SlotReplayable || in.SlotAhead {
 		p.Kind = copyFresh
 		p.Interrupted = interrupted
 		switch {
 		case in.StoredCP == "":
 			p.Why = "目标端没有可用的一致性位点（_jl_meta.position 为空），这一轮从头搬"
-		case !in.SlotOK:
+		case !in.SlotReplayable:
 			p.Why = "源端书签已经不在了（被清理，或 WAL 已被 max_slot_wal_keep_size 丢掉）：" +
 				"从目标位点 " + in.StoredCP + " 往后那段变更重放不出来，这一轮从头搬"
 		default:
@@ -235,11 +252,31 @@ func (r *runner) decideCopyPlan(ctx context.Context, src *pgsource.Source,
 	if err != nil {
 		return chunkPlan{}, fmt.Errorf("读源端书签的确认位点失败: %w", err)
 	}
-	in.SlotOK = ok
+	in.SlotReplayable = ok
 	in.SlotCP = slot.String()
 	// 书签确认位点**越过**目标位点：中间那段变更已经被源端清理，追不回来了。
 	in.SlotAhead = ok && !slot.IsZero() && slot.Compare(pgPos) > 0
-	return planCopy(in), nil
+	plan := planCopy(in)
+	// 只剩一种组合会落到「不搬 + 重放不了」：continuous 模式（它本来就不搬存量）。
+	// 这时硬着头皮从新书签开始流，等于把中间那段变更静默扔掉——不如说清楚停下。
+	if plan.Kind == copySkip && !in.SlotReplayable && in.Mode == "continuous" {
+		return plan, &unreplayableSlotError{stored: pos}
+	}
+	return plan, nil
+}
+
+// unreplayableSlotError 是「已经同步过，但源端那段变更再也拿不到了」。
+//
+// 它不是我们能自己修好的事：要么整轮重搬，要么接受一段空洞。所以它必须停下来
+// 让用户选，而不是把位点悄悄往前挪——那是最坏的一种「看起来成功」。
+type unreplayableSlotError struct{ stored string }
+
+func (e *unreplayableSlotError) Error() string {
+	return "源端书签追不回目标端的位点了（书签不在了，或 WAL 已被 max_slot_wal_keep_size 丢掉）：" +
+		"位点 " + e.stored + " 之后那段变更重放不出来，而这个任务只接增量、不搬存量。\n" +
+		"你现在能做什么：1) 让它整轮重搬一次（把 mode.frequency 改成 once 跑一轮，再改回 continuous）；" +
+		"2) 确认这段空洞可以接受后重建任务。\n" +
+		"风险：整轮重搬期间目标端会短暂与源端不一致；放着不管则会永久缺这一段变更。"
 }
 
 // parsedCP is the stored checkpoint as a source position (used by the resume
