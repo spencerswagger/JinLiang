@@ -732,6 +732,73 @@ func (f *resumeFixture) phase(t *testing.T) string {
 	return p
 }
 
+// once 模式每轮都是整轮重搬 → 每轮都必须清表，否则源端两轮之间删掉的行永远补不掉。
+// 这条是 Ark 口径（清不清由「是不是整轮重搬」决定，不由「位点坏没坏」决定）的直接判据：
+// 位点好着，但删除照样要追上。
+func TestOnceRerunDropsRowsDeletedBetweenRuns(t *testing.T) {
+	f := newResumeFixture(t, "resume_once") // fixture 的 yaml 是 continuous+initial
+	ctx := context.Background()
+
+	// 换成 once 模式：同一个任务，同样的连接与范围。
+	onceYAML := filepath.Join(filepath.Dir(f.dataDir), "job-once.yaml")
+	if err := os.WriteFile(onceYAML, []byte(yamlForMode(f.jobName+"-once", f.table, "once")), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := execpkg.Command(f.bin, "import", "--file", onceYAML, "--data-dir", f.dataDir).
+		CombinedOutput(); err != nil {
+		t.Fatalf("import once 任务失败: %v\n%s", err, out)
+	}
+	jobName := f.jobName + "-once"
+
+	run := func() (string, int) {
+		cmd := execpkg.Command(f.bin, "run", "--job", jobName, "--data-dir", f.dataDir, "--snapshot-only")
+		cmd.Env = os.Environ()
+		out, err := cmd.CombinedOutput()
+		code := 0
+		var exitErr *execpkg.ExitError
+		if errors.As(err, &exitErr) {
+			code = exitErr.ExitCode()
+		} else if err != nil {
+			t.Fatalf("执行失败: %v\n%s", err, out)
+		}
+		return string(out), code
+	}
+
+	out, code := run()
+	if code != 0 {
+		t.Fatalf("第一次 once 失败（退出码 %d）：\n%s", code, out)
+	}
+	if copied := copiedRows(t, out); copied != resumeTotal {
+		t.Fatalf("第一次 once 应搬 %d 行，实际 %d", resumeTotal, copied)
+	}
+
+	// 位点好着（没有 lost、没有越过），源端删 2 行 —— 下一轮 once 必须把删掉的行带走。
+	exec(t, f.srcDB, "DELETE FROM "+f.table+" WHERE id IN (13, 5003)")
+
+	out, code = run()
+	if code != 0 {
+		t.Fatalf("第二次 once 失败（退出码 %d）：\n%s", code, out)
+	}
+	if cleaned := strings.Count(out, "清空了"); cleaned == 0 {
+		t.Fatalf("once 每轮整轮重搬，必须清表（否则删除追不回来）：\n%s", out)
+	}
+	var srcN, dstN int
+	if err := f.srcDB.QueryRow(ctx, "SELECT count(*) FROM "+f.table).Scan(&srcN); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.dstDB.QueryRow(ctx, "SELECT count(*) FROM "+f.table).Scan(&dstN); err != nil {
+		t.Fatal(err)
+	}
+	if dstN != srcN || srcN != resumeTotal-2 {
+		t.Fatalf("目标端 %d 行、源端 %d 行（应 %d）：once 重跑没把删除追上", dstN, srcN, resumeTotal-2)
+	}
+	if s, d := f.md5(t, f.srcDB, f.table), f.md5(t, f.dstDB, f.table); s != d {
+		t.Fatalf("内容不一致：源 %s / 目标 %s；差异 %s", s, d, f.diff(t))
+	}
+	t.Logf("once 两轮：第二轮清了 %d 次表、重搬 %d 行；目标端 %d 行 == 源端，md5 %s",
+		strings.Count(out, "清空了"), copiedRows(t, out), dstN, f.md5(t, f.dstDB, f.table))
+}
+
 // makeSlotLost 把书签造成真 lost（书签还在、WAL 没了），造不出来就失败。
 //
 // 不是靠 sleep 碰运气：把 max_slot_wal_keep_size 调到最小 → reload → 灌 WAL →
@@ -1049,7 +1116,9 @@ func repoRoot(t *testing.T) string {
 	return filepath.Dir(filepath.Dir(wd)) // internal/engine → repo root
 }
 
-func yamlFor(name, table string) string {
+func yamlFor(name, table string) string { return yamlForMode(name, table, "continuous+initial") }
+
+func yamlForMode(name, table, freq string) string {
 	return "version: 1\njob: " + name + "\n" +
 		"source:\n  kind: postgres\n  dsn: env:JINLIANG_TEST_PG_SRC_DSN\n  scope:\n    schema: public\n" +
 		"  snapshot:\n    chunk_rows: 1000\n" +
@@ -1057,5 +1126,5 @@ func yamlFor(name, table string) string {
 		"content:\n  tables:\n    " + table + ": {}\n" +
 		// continuous+initial：全量 + 追平 + 常态增量。搬存量的用例都带 --snapshot-only，
 		// 只有「中断期间的改动能不能追平」那条会真的进增量。
-		"mode:\n  frequency: continuous+initial\n"
+		"mode:\n  frequency: " + freq + "\n"
 }

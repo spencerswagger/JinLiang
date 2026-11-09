@@ -7,6 +7,7 @@ import (
 	"github.com/spencerswagger/jinliang/internal/pgsink"
 	"github.com/spencerswagger/jinliang/internal/pgsource"
 	"github.com/spencerswagger/jinliang/internal/source"
+	"github.com/spencerswagger/jinliang/internal/state"
 )
 
 // 块级续跑（docs/SNAPSHOT.md §4、docs/RUNTIME.md §2）。
@@ -44,9 +45,11 @@ func (k copyKind) String() string {
 type cleanScope int
 
 const (
-	cleanNone   cleanScope = iota // 什么都不用清（首次搬，或上次搬完之后没有空洞）
-	cleanMarked                   // 只清上次写过块的表（半截拷贝）
-	cleanAll                      // 选中表整批清（上次「搬完」了，但那段变更再也拿不回来）
+	cleanNone cleanScope = iota // 不搬，或这次搬的是空表（没有我们写过的行）
+	// cleanAll：**凡是从头搬就清**（Ark 口径 2026-11-10）。理由不是「位点坏了」，
+	// 而是「BulkApply 只有 upsert、没有 delete」：要让本轮结果等于源端当前状态，
+	// 清空重建是唯一实现。清哪些表由 CleanNames 决定（只清我们写过的表）。
+	cleanAll
 )
 
 // chunkPlan is the decision plus everything the snapshot phase needs to execute it.
@@ -58,14 +61,18 @@ type chunkPlan struct {
 	Skip map[string]bool
 	// Recopy 是不能块级续跑、必须整表重来的表（无主键表：keyset 游标不稳）。
 	Recopy []source.TableRef
-	// Clean 表示「重搬之前必须先清掉目标端哪些行」——只清本任务建的表。
+	// Clean 表示「从头搬之前要先清掉目标端里我们上次写进去的行」。
 	//
-	// 为什么不是 bool：只清「上次写过块」的表，和「整批选中表都得清」是两种情形，
-	// 混成一个开关会留脏行 ——
-	//   - 半截拷贝：只有写过块的表有我们写的行，别的表干净；
-	//   - 位点追不回来（书签没了 / WAL 被丢 / 书签越过位点）：上次是**搬完**了的，
-	//     那些行整批都可能已经过期（源端期间删过的行只留在目标端），只 upsert 补不回来。
-	Clean cleanScope
+	// Ark 口径（2026-11-10）：判据是**这一轮是不是从头搬**，不是「位点坏没坏」——
+	// BulkApply 只有 upsert、没有 delete，要让「本轮结果 = 源端当前状态」，只能清空重建。
+	// 绑在位点状态上会让同一模式因位点不同而对 delete 表现不同（第 4 轮那个病）。
+	//
+	// 清哪些表看 CleanNames：只清**我们写过的**表（有块标记）。没写过的表没有脏行，
+	// 也不能清——append 模式复用的用户表里全是用户自己的行。
+	Clean      cleanScope
+	CleanNames []string
+	// CleanWhy 决定「为什么必须清」的说法（用户照这句话决定下一步）。
+	CleanWhy recopyReason
 	// Why 是给人看的一句话：为什么续跑 / 为什么重搬。
 	Why string
 }
@@ -145,7 +152,7 @@ func planCopy(in copyInputs) chunkPlan {
 	unreplayable := in.StoredCP != "" && (!in.SlotReplayable || in.SlotAhead)
 	if in.Capable && unreplayable {
 		p.Kind = copyFresh
-		p.Clean = cleanAll
+		p.markClean(in, recopyGap)
 		p.Why = unreplayableWhy(in)
 		return p
 	}
@@ -161,17 +168,17 @@ func planCopy(in copyInputs) chunkPlan {
 			p.Kind = copyFresh
 			p.Why = "目标端不记块进度：这一轮从头搬"
 		}
-		if interrupted {
-			p.Clean = cleanMarked
-		}
 		return p
 	}
 
 	// ② 存量与位点对得上：看要不要搬。
 	if allDone {
 		if in.AlwaysCopy {
+			// once / full_interval：每轮都是整轮重搬 → 每轮都清（否则源端删掉的行永远补不掉，
+			// 同一模式还会因位点状态不同而对 delete 表现不同）。
 			p.Kind = copyFresh
-			p.Why = "这一轮按模式重搬全量（上次已经搬完）"
+			p.markClean(in, recopyOnce)
+			p.Why = "这一轮按模式整轮重搬（once / full_interval 每轮重建，目标端结果等于源端当前状态）"
 			return p
 		}
 		p.Kind = copySkip
@@ -191,6 +198,7 @@ func planCopy(in copyInputs) chunkPlan {
 		// once / full_interval：这一轮本来就要重搬，别让它落到「续跑」上——
 		// 那样既没有新视图也没有新书签，语义和「从头搬」不一样。
 		p.Kind = copyFresh
+		p.markClean(in, recopyOnce)
 		p.Why = "旧版本没有块进度记录，这一轮整轮重搬"
 		return p
 	}
@@ -198,9 +206,11 @@ func planCopy(in copyInputs) chunkPlan {
 	// ④ 位点缺失（书签那两种情况已在 ① 处理）：只能从头搬。
 	if in.StoredCP == "" {
 		p.Kind = copyFresh
-		if interrupted {
-			p.Clean = cleanMarked
+		why := recopyHalfCopy
+		if !interrupted {
+			why = recopyGap // 搬过、有块标记没有？不到位点时按「追不回来」说
 		}
+		p.markClean(in, why)
 		p.Why = "目标端没有可用的一致性位点（_jl_meta.position 为空），这一轮从头搬"
 		return p
 	}
@@ -234,6 +244,49 @@ func planCopy(in copyInputs) chunkPlan {
 		p.Why += fmt.Sprintf("，%d 张无主键表整表重来", len(p.Recopy))
 	}
 	return p
+}
+
+// markClean 给「从头搬」这一轮挂上清表信息：清哪些表（我们写过的）与为什么清。
+// 没有标记的表格子不进去——那些表里没有我们的行，清了就是删用户数据。
+func (p *chunkPlan) markClean(in copyInputs, why recopyReason) {
+	p.Clean = cleanAll
+	p.CleanWhy = why
+	p.CleanNames = nil
+	for _, t := range in.Tables {
+		pr := in.Progress[t.Table]
+		if pr.Done || pr.LastNo > 0 {
+			p.CleanNames = append(p.CleanNames, t.Table)
+		}
+	}
+	if len(p.CleanNames) == 0 && hasCopiedBefore(in.PriorPhase, in.StoredCP) {
+		// 老状态（升级前跑过）：整本块账都没有，但位点/阶段说明「确实搬过」。
+		// 这时无从分辨哪张表有我们的行，只能整批清——不清就补不掉这段时间的删除。
+		for _, t := range in.Tables {
+			p.CleanNames = append(p.CleanNames, t.Table)
+		}
+	}
+	if len(p.CleanNames) == 0 {
+		// 这个任务从没往目标端写过东西（首次搬）：没有可清的行。
+		// 也不能清——append 模式复用的用户表里全是用户自己的行。
+		p.Clean = cleanNone
+	}
+}
+
+// hasCopiedBefore 判断「这个任务以前真的往目标端搬过东西」。
+//
+// 不能用「phase 非空」：EnsureMeta 在读状态**之前**就写了 phase='prepare'，
+// 所以首次跑时 phase 也非空 —— 拿它当证据会把第一次搬也判成「要清表」，
+// append 模式复用用户表时会直接被拒（这是我自己踩过的坑，别再退回去）。
+func hasCopiedBefore(phase, pos string) bool {
+	if pos != "" {
+		return true // 有权威位点 = 一定搬过（位点只在块/批次提交时写）
+	}
+	switch phase {
+	case string(state.Snapshot), string(state.Catchup), string(state.Streaming),
+		string(state.Draining), string(state.Done), string(state.Paused):
+		return true
+	}
+	return false
 }
 
 // allSkip marks every selected table as "already done" (used only when this run

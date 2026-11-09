@@ -158,7 +158,32 @@ if Capable && unreplayable { copyFresh + cleanAll }   // ① 三个出口合一
 `TestRecopyDoesNotRepeatCleaning`（连续两轮：第二轮清 0 次、搬 0 行、不再进全量阶段，且上一轮
 必须留下 1 条完成标记；改前红「应有 1 条完成标记，实际 0 条」）。
 
-## 9. 留给 Ark 的口径（我没自己改文档）
+## 9. Ark 口径（2026-11-10）：清不清由「是不是整轮重搬」决定
+
+不再是「位点坏没坏才清」，而是**凡是从头搬就清**：`planCopy` 每个 `copyFresh` 出口都挂
+`cleanAll`，`unreplayable` 只回答「为什么这轮必须整轮重搬」。
+
+- 于是 `once` / `full_interval` 每轮整轮重搬也清表：这两种模式没有变更流承载 delete，
+  清空重建是「本轮结果 = 源端当前状态」的唯一实现；绑在位点上会让同一模式因位点不同
+  而对 delete 表现不同。
+- 清哪些表：只清**我们写过的**（有块标记）；一张都没写过（首次搬）→ 一行都不清
+  （append 复用用户表，清了就是删用户数据）。「老状态」整本块账缺失但有位点/阶段证据时整批清。
+  **判据不能是「phase 非空」**：EnsureMeta 在读状态之前就写了 `phase='prepare'`，拿它当
+  「搬过」会把第一次搬判成要清表（append 用户表被直接拒）——这个坑我踩过一次。
+- `interval` 仍不追 delete：完成信息里写明「水位增量只补新增与更新，不同步删除」，
+  并指向 continuous+initial / 定期 once。
+- 清不动（用户自己的表）**不许静默降级**：`reusedTableRecopyError` 给三条都做得到的路
+  （recreate / 换空 schema / 手动删掉我们写的行），并说明 `verify` 会逐条报「目标端多出一行」、
+  本版还没有按块补 delete 的自动修正。
+- 清表时的 note 讲明维护窗口：「从这一刻到这张表搬完之前，目标端是部分数据，不是旧但完整的快照」。
+
+用例四格齐：①搬完+源端删行→重跑一致（`TestLostSlotAfterCompletedCopyDropsDeletedRows`）
+②崩在清表中间再重跑（`TestCleanCrashMidwayRerunsCleanAll`）③连续两轮不重复清表
+（`TestRecopyDoesNotRepeatCleaning`）④once 两轮之间删行→第二轮清表重搬后一致
+（`TestOnceRerunDropsRowsDeletedBetweenRuns`）；另有「首次搬不许清表」两条单测
+（含 `phase=prepare` 那条真实首次态）。
+
+## 10. 留给 Ark 的口径（我没自己改文档）
 
 1. `docs/SNAPSHOT.md §4` 现在写「快照 id 已失效 → 整段重来」。实测：导出的视图**必然**
    随进程失效（kill -9 之后一定失效），真正的判据是**书签还能不能从原位点重放**。

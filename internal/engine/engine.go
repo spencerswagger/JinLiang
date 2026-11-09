@@ -407,7 +407,11 @@ func (r *runner) execute(parent context.Context, res *Result) error {
 		if err := r.drain(ctx, ExitOK, "定时增量本轮完成（水位列 "+r.doc.Mode.IncrementalColumn+"）"); err != nil {
 			return err
 		}
-		res.Note = "interval 模式：只跑了水位增量（整表重搬仅发生在第一次或没有水位列的表）"
+		// 说清这条路的取舍（Ark 口径 2026-11-10）：水位增量只补新增/更新，
+		// **不同步删除**。文案里不许暗示我们追 delete，否则用户会以为已经一致。
+		res.Note = "interval 模式：只跑了水位增量（整表重搬仅发生在第一次或没有水位列的表）；" +
+			"水位增量只补新增与更新，**不同步删除**——源端删掉的行会留在目标端，" +
+			"需要连删除一起同步请用 continuous+initial，或定期用 once 整轮重搬"
 		return nil
 	}
 	if r.mode() == "full_interval" {
@@ -544,6 +548,7 @@ const (
 	recopyHalfCopy recopyReason = iota // 上次全量搬到一半就断了
 	recopyGap                          // 上次搬完了，但书签追不回位点，那段变更补不回来
 	recopyNoPK                         // 无主键表，只能整表重来
+	recopyOnce                         // once / full_interval：每轮整轮重搬，必须清空重建
 )
 
 func (w recopyReason) sentence() string {
@@ -553,6 +558,8 @@ func (w recopyReason) sentence() string {
 			"这段时间源端删掉的行只会留在目标端，所以必须整轮重搬"
 	case recopyNoPK:
 		return "这张表没有稳定的主键，没法按块续跑，只能整表重来"
+	case recopyOnce:
+		return "这个任务是 once / full_interval 模式，每一轮都整轮重搬（目标端结果要等于源端当前状态）"
 	default:
 		return "上次全量搬到一半就断了"
 	}
@@ -561,6 +568,9 @@ func (w recopyReason) sentence() string {
 // reusedTableRecopyError stops a recopy that would have to delete rows this job
 // did not write. It is E1002-ish (目标表已存在/不覆盖) but the situation is
 // specific, so it carries its own sentence.
+//
+// 为什么必须停：不清表跑完算「成功」是最坏的结果 —— 源端删掉的行留在目标端，
+// 界面上一切正常，用户以为已经一致。所以这里把选择权交回去，并给三条都做得到的路。
 type reusedTableRecopyError struct {
 	table  string
 	jobKey string
@@ -569,12 +579,15 @@ type reusedTableRecopyError struct {
 }
 
 func (e *reusedTableRecopyError) Error() string {
-	return fmt.Sprintf("%s，而目标表 %s 是你自己的表（不是本任务建的）："+
-		"重搬会先清空它，那会连你原有的行一起删掉，所以我停在这里。\n"+
-		"你现在能做什么：1) 想让我们重建：把 target.on_exists 改成 recreate（会清空这张表）；"+
-		"2) 想保留原表：手动删掉本任务写进去的行后重跑（进度表 %s._jl_chunk 里有 job_key=%s 与块范围）；"+
-		"3) 换一个空的 target.schema。\n"+
-		"风险：选 1 会清空这张表。", e.why.sentence(), e.table, e.schema, e.jobKey)
+	return fmt.Sprintf("%s，而目标表 %s 是你自己的表（不是本任务建的）：要重搬就得先清空它，"+
+		"那会连你原有的行一起删掉，所以我停在这里，不替你决定。\n"+
+		"你现在能做什么（三选一）：1) 想让我们重建：把 target.on_exists 改成 recreate（会清空这张表）；"+
+		"2) 想保留原表：换一个空的 target.schema 重新初始化；"+
+		"3) 手动删掉本任务写进去的行后重跑（进度表 %s._jl_chunk 里有 job_key=%s 与块范围）。\n"+
+		"想先看清差多少：jinliang verify 会逐条报「目标端多出一行（源端没有这个主键 …）」——"+
+		"这一版还没有按块补 delete 的自动修正，所以补齐要靠上面三条之一。\n"+
+		"风险：选 1 会清空这张表；放着不管，源端已删除的行会一直留在目标端。",
+		e.why.sentence(), e.table, e.schema, e.jobKey)
 }
 
 // initialCopyDone reports whether a previous run finished the initial copy.
@@ -983,44 +996,27 @@ func (r *runner) snapshot(ctx context.Context) error {
 	return nil
 }
 
-// cleanBeforeRecopy empties what a previous attempt wrote, before this run copies
-// again. 清谁由 plan.Clean 决定，两种情形不能混：
+// cleanBeforeRecopy empties the rows this job wrote before, before copying again.
 //
-//	cleanMarked：上次搬到一半就断了 —— 只有写过块的表里有我们的行；
-//	cleanAll：上次是搬完了，但位点/书签追不回来 —— 那批行整批都可能已经过期
-//	          （源端在这段空洞里删掉的行只留在目标端），只 upsert 补不回来。
+// Ark 口径（2026-11-10）：**凡是从头搬就清**（不是「位点坏了才清」）。BulkApply 只有
+// upsert、没有 delete，不清空就永远补不上源端删掉的行；绑在位点状态上还会让同一个模式
+// 因位点不同而对 delete 表现不同。
 //
-// 无论哪种，**只能清本任务自己建的表**：append 模式会复用用户已有的表，那张表里的
-// 行不全是我们的，清了就是删用户数据（Owl 审出来的 P0）。清不动就停下来让他选。
+// 清哪些表由 plan.CleanNames 决定（只清我们写过的表），顺序就是 selectedTables() 的顺序：
+// 崩在中间时「清过哪几张」要能对上，用例也才稳定。
+//
+// 清不动就停下要一个显式决定（用户自己的表）：不能静默降级成「不清表跑完算成功」——
+// 那等于把删除追不回来的事实藏起来。
 func (r *runner) cleanBeforeRecopy(ctx context.Context) error {
-	if r.plan.Clean == cleanNone {
+	if r.plan.Clean == cleanNone || len(r.plan.CleanNames) == 0 {
 		return nil
 	}
-	// 按 selectedTables() 的顺序走，不用 map 迭代：清表顺序必须可复现
-	// （崩在中间时「清过哪几张」要能对上，用例也才稳定）。
-	marked := map[string]bool{}
-	wholeBatch := r.plan.Clean == cleanAll
-	if !wholeBatch {
-		done, err := r.sink.DoneChunks(ctx)
-		if err != nil {
-			return err
-		}
-		for name := range done {
-			marked[name] = true
-		}
-	}
-	for _, t := range r.selectedTables() {
-		if !wholeBatch && !marked[t.Table] {
+	for _, name := range r.plan.CleanNames {
+		ref, ok := r.tableByName(name)
+		if !ok {
 			continue
 		}
-		ref := source.TableRef{Schema: t.Schema, Table: t.Table}
-		name := t.Table
-		// 两种来源的「为什么必须清」不同，文案要跟着走（不能一律说「上次搬到一半」）。
-		why := recopyHalfCopy
-		if wholeBatch {
-			why = recopyGap
-		}
-		if err := r.recopyAction(ctx, ref, why); err != nil {
+		if err := r.recopyAction(ctx, ref, r.plan.CleanWhy); err != nil {
 			return err
 		}
 		// 清数据和清标记**必须同一个事务**：中间崩在「数据清了、标记还在」那种
@@ -1028,7 +1024,9 @@ func (r *runner) cleanBeforeRecopy(ctx context.Context) error {
 		if err := r.sink.ResetTableChunks(ctx, ref); err != nil {
 			return fmt.Errorf("清空 %s 准备重搬失败: %w", name, err)
 		}
-		r.note(ctx, "清空了 "+name+" 里上次搬进去的行（重搬全量，避免留下源端已删除的行）")
+		// 说清维护窗口的形状：清完到搬完之间，目标端是**部分数据**，不是「旧但完整」。
+		r.note(ctx, "清空了 "+name+" 里上次搬进去的行（重搬全量，避免留下源端已删除的行）；"+
+			"从这一刻到这张表搬完之前，目标端是部分数据，不是旧但完整的快照")
 	}
 	return nil
 }

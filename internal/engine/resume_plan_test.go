@@ -98,10 +98,9 @@ func TestPlanCopy(t *testing.T) {
 			in: copyInputs{Mode: "", Capable: true,
 				Tables: []source.Table{pkA}, SlotReplayable: true,
 				Progress: map[string]pgsink.ChunkProgress{"a": {LastNo: 1, Cursor: "10"}}},
-			kind: copyFresh,
-			why:  "没有可用的一致性位点",
-			// 只清「写下过块」的表：没写过的表本来就没有我们的行。
-			clean: cleanMarked,
+			kind:  copyFresh,
+			why:   "没有可用的一致性位点",
+			clean: cleanAll,
 		},
 		{
 			// 「存量都在目标端」不等于「已经同步到位」：书签追不回位点，中间那段变更
@@ -136,6 +135,18 @@ func TestPlanCopy(t *testing.T) {
 				Tables: []source.Table{pkA}, StoredCP: "postgres:v1:0/1A2B3C",
 				SlotReplayable: true, SlotAhead: true, SlotCP: "postgres:v1:0/2FFFFFF",
 				PriorPhase: "snapshot", Progress: map[string]pgsink.ChunkProgress{}},
+			kind:  copyFresh,
+			why:   "越过目标端的位点",
+			clean: cleanAll,
+		},
+		{
+			// 老状态（升级前没有块账）但位点/阶段说明「确实搬过」：无从分辨哪张表有我们的行，
+			// 只能整批清，否则补不掉这段时间源端的删除。
+			name: "老状态（无块标记、有位点）追不回位点：整批清",
+			in: copyInputs{Mode: "", Capable: true,
+				Tables: []source.Table{pkA, pkB}, StoredCP: "postgres:v1:0/1A2B3C",
+				SlotReplayable: true, SlotAhead: true, SlotCP: "postgres:v1:0/2FFFFFF",
+				PriorPhase: "streaming", Progress: map[string]pgsink.ChunkProgress{}},
 			kind:  copyFresh,
 			why:   "越过目标端的位点",
 			clean: cleanAll,
@@ -177,8 +188,10 @@ func TestPlanCopy(t *testing.T) {
 				StoredCP: "postgres:v1:0/1A2B3C", SlotReplayable: true, PriorPhase: "done",
 				Progress: map[string]pgsink.ChunkProgress{"a": {Done: true, LastNo: 9, Cursor: "90"}}},
 			kind: copyFresh,
-			why:  "按模式重搬全量",
-			// 上次搬完了：不清表，直接 upsert 重搬（once 的语义，清不清结果一样）
+			why:  "按模式整轮重搬",
+			// Ark 口径（2026-11-10）：once / full_interval 每轮整轮重搬 → 每轮都清。
+			// 不清的话，源端在这两轮之间删掉的行永远补不掉（BulkApply 只有 upsert）。
+			clean: cleanAll,
 		},
 		{
 			name: "continuous+initial + 上次搬完：不搬",
@@ -219,11 +232,12 @@ func TestPlanCopy(t *testing.T) {
 			clean: cleanAll,
 		},
 		{
-			name: "老状态（无块标记，phase=streaming）+ once：重搬",
+			name: "老状态（无块标记，phase=streaming）+ once：重搬且整批清",
 			in: copyInputs{Mode: "once", AlwaysCopy: true, Capable: true,
 				Tables: []source.Table{pkA}, StoredCP: "postgres:v1:0/1A2B3C",
 				SlotReplayable: true, PriorPhase: "streaming"},
-			kind: copyFresh,
+			kind:  copyFresh,
+			clean: cleanAll, // 块账没有，但位点说明搬过 → 整批清
 		},
 		{
 			// 目标端不记块进度（MySQL 全量路径）：回到「整轮重搬」，不假装能续。
@@ -232,15 +246,34 @@ func TestPlanCopy(t *testing.T) {
 				Tables:   []source.Table{pkA},
 				StoredCP: "postgres:v1:0/1A2B3C", SlotReplayable: true, PriorPhase: "snapshot",
 				Progress: map[string]pgsink.ChunkProgress{"a": {LastNo: 1, Cursor: "10"}}},
-			kind:  copyFresh,
-			why:   "不记块进度",
-			clean: cleanMarked,
+			kind: copyFresh,
+			why:  "不记块进度",
+			// 目标端不记块进度（MySQL 全量路径），这一版不消费 Clean。
+			clean: cleanNone,
 		},
 		{
 			name: "interval / continuous 模式不做初始全量",
 			in: copyInputs{Mode: "interval", Capable: true,
 				Tables: []source.Table{pkA}, Progress: map[string]pgsink.ChunkProgress{}},
 			kind: copySkip,
+		},
+		{
+			// 首次搬：目标端的行全是用户自己的（append 复用用户表）→ 一行都不能清。
+			name: "首次搬（无标记、无位点、无阶段）：搬但不许清表",
+			in: copyInputs{Mode: "", Capable: true,
+				Tables: []source.Table{pkA}, Progress: map[string]pgsink.ChunkProgress{}},
+			kind:  copyFresh,
+			clean: cleanNone,
+		},
+		{
+			// 真实首次跑的样子：EnsureMeta 在读状态之前就写了 phase='prepare'。
+			// 拿「phase 非空」当「搬过」会把第一次搬也判成要清表 → append 用户表被拒。
+			name: "首次搬（phase=prepare 是 EnsureMeta 刚写的）：搬但不许清表",
+			in: copyInputs{Mode: "", Capable: true,
+				Tables: []source.Table{pkA}, PriorPhase: "prepare",
+				Progress: map[string]pgsink.ChunkProgress{}},
+			kind:  copyFresh,
+			clean: cleanNone,
 		},
 		{
 			name: "没有选中表",
