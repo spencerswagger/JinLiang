@@ -64,9 +64,10 @@ type Source struct {
 	snap   *snapshotSession
 
 	// known / enriched：binlog_row_metadata=MINIMAL 时按 catalog 补列名（见 enrichRelation）。
-	knownMu  sync.Mutex
-	known    map[string]source.Table
-	enriched map[*source.Table]*source.Table
+	knownMu   sync.Mutex
+	known     map[string]source.Table
+	knownList []source.Table
+	enriched  map[*source.Table]*source.Table
 
 	// lastCommit 是「下游已经成功处理完的最后一笔事务位点」——引擎的
 	// SafeAckPoint 语义（MySQL 没有服务端 ack，但这个值仍要能读到）。

@@ -218,8 +218,19 @@ func (sess *snapshotSession) close() {
 	_ = sess.conn.Close()
 }
 
-// allTables 读整库的表清单（只在没有明确选表时用：SnapshotChunks 的旧入口）。
+// allTables 返回「这一轮要搬的表」。
+//
+// 优先用引擎交过来的选表（SetKnownTables）——续跑时引擎不会开新的快照会话
+// （Prepare(false)），这条路径如果去读整库 catalog，就会把**没选中的表**也搬一遍：
+// 目标端没有它们的定义，直接报「目标端没有这张表的定义」，而看起来像是引擎的 bug。
+// 只有调用方从没交过选表（SnapshotChunks 的旧入口）时才回落整库。
 func (s *Source) allTables(ctx context.Context) ([]source.Table, error) {
+	s.knownMu.Lock()
+	known := append([]source.Table(nil), s.knownList...)
+	s.knownMu.Unlock()
+	if len(known) > 0 {
+		return known, nil
+	}
 	cat, err := s.Catalog(ctx, source.Scope{})
 	if err != nil {
 		return nil, err

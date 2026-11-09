@@ -65,6 +65,7 @@ func (s *Source) SetKnownTables(tables []source.Table) {
 	s.knownMu.Lock()
 	defer s.knownMu.Unlock()
 	s.known = make(map[string]source.Table, len(tables))
+	s.knownList = append([]source.Table(nil), tables...)
 	for _, t := range tables {
 		s.known[t.Schema+"."+t.Table] = t
 	}

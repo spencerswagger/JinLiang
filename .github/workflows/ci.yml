@@ -194,8 +194,11 @@ jobs:
         env:
           JINLIANG_TEST_PG_SRC_DSN: postgres://jinliang:jinliang@127.0.0.1:55432/jinliang_src?sslmode=disable
           JINLIANG_TEST_PG_DSN: postgres://jinliang:jinliang@127.0.0.1:55433/jinliang_test?sslmode=disable
-        # -v：让 CI 日志里能看见用例名（评审要能确认它真的跑了，而不是被跳过）
-        run: go test -tags=integration -count=1 -v ./internal/engine/ ./internal/pgsink/
+        # -v：让 CI 日志里能看见用例名（评审要能确认它真的跑了，而不是被跳过）。
+        # -skip：MySQL 源那条用例要一个开了 binlog 的 MySQL 源库，本 job 没有——
+        # 它在 b4-mysql-source job 里跑（那边的 DSN 是齐的）。跳过的只是那一条，
+        # 其余用例照旧全跑；这条用例自己缺 DSN 时是**失败**，不是跳过。
+        run: go test -tags=integration -count=1 -v -skip 'TestMySQLSource' ./internal/engine/ ./internal/pgsink/
       - name: 目标端批量 upsert 吞吐（增量 ≥20k ops/s 峰值 / ≥10k 稳态的门禁依据）
         env:
           JINLIANG_TEST_PG_DSN: postgres://jinliang:jinliang@127.0.0.1:55433/jinliang_test?sslmode=disable
