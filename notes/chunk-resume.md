@@ -104,7 +104,7 @@ reuse，直接建书签，PG 报 `slot already exists` → **每次 run 都失�
 
 新用例 `TestLostSlotSelfHealsByFullRecopy`：真造 lost（`max_slot_wal_keep_size='64kB'`
 → reload → 灌 WAL + `pg_switch_wal()` + `CHECKPOINT` → 轮询到 `wal_status='lost'`，轮不到
-直接失败）→ 重跑一次必须自愈：整轮重搬 200200 行、md5 与源端一致、该任务名下书签数 = 1。
+直接失败）→ 重跑一次必须自愈：整轮重搬 120200 行、md5 与源端一致、该任务名下书签数 = 1。
 变异验证（把 lost 塞回 `exists=false`）：立刻红，报
 `replication slot "jl_…_1" already exists`。
 
@@ -129,10 +129,36 @@ reuse，直接建书签，PG 报 `slot already exists` → **每次 run 都失�
 `SlotReplayable && !SlotAhead`，continuous 的四段式同样补了 `SlotAhead`。
 
 新用例 `TestLostSlotAfterCompletedCopyDropsDeletedRows`：完整搬一次 → 造 lost →
-源端删 3 行 → 重跑。改前红（`目标端 200200 行、源端 200197 行：源端删掉的行没被带走`），
-改后绿（重搬 200197 行、目标端 200197 行、md5 与源端一致）。
+源端删 3 行 → 重跑。改前红（`目标端 120200 行、源端 120197 行：源端删掉的行没被带走`），
+改后绿（重搬 120197 行、目标端 120197 行、md5 与源端一致）。
 
-## 8. 留给 Ark 的口径（我没自己改文档）
+## 8. 必改 4：`cleanAll` 的判据不能踩在本轮会改写掉的状态上
+
+上一版把「整批清」判据挂在老状态分支里，而那条分支的证据是 `initialCopyDone(phase, …)`：
+`snapshot()` 一开始就 `phaseTo(Snapshot)`，所以只要清表清到一半崩了，下一轮 phase 就是
+`snapshot` → 判据假 → 退化成「只 upsert 重搬」→ 空洞期源端删掉的行全留下（退出 0）。
+
+现在把**每轮可重算的事实**提到最前面：
+
+```
+unreplayable := StoredCP != "" && (!SlotReplayable || SlotAhead)
+if Capable && unreplayable { copyFresh + cleanAll }   // ① 三个出口合一
+```
+
+顺序也定死了：`interval/continuous` 早退 → 可重算事实 → 块进度（allDone/续跑）→ 老状态兜底
+（只按 phase，且已经被 ① 挡在前面）。`once`/`full_interval` 遇追不回位点同样走 ①（按「要清」实现，
+等 Ark 口径）。幂等：重搬完成后 position 与书签确认位点相等 → `SlotAhead=false` → 不会反复清表。
+
+顺带：`copyFresh` 不再带 `Skip`（带了就不盖完成标记 → 下一轮以「续跑」名义空跑一次全量阶段）；
+`cleanBeforeRecopy` 按 `selectedTables()` 顺序遍历（原来 map 随机）；`recopyReason.sentence()`
+三支用单测钉住。
+
+两条新用例：`TestCleanCrashMidwayRerunsCleanAll`（崩在清表中间→重跑仍整批清：清 1 次、重搬
+120197 行、md5 一致；改前红「目标端 120200 行、源端 120197 行」）与
+`TestRecopyDoesNotRepeatCleaning`（连续两轮：第二轮清 0 次、搬 0 行、不再进全量阶段，且上一轮
+必须留下 1 条完成标记；改前红「应有 1 条完成标记，实际 0 条」）。
+
+## 9. 留给 Ark 的口径（我没自己改文档）
 
 1. `docs/SNAPSHOT.md §4` 现在写「快照 id 已失效 → 整段重来」。实测：导出的视图**必然**
    随进程失效（kill -9 之后一定失效），真正的判据是**书签还能不能从原位点重放**。

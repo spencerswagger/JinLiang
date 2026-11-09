@@ -564,6 +564,174 @@ func TestLostSlotAfterCompletedCopyDropsDeletedRows(t *testing.T) {
 		"目标端 %d 行，md5 %s == 源端", copiedRows(t, out), before, dstN, f.md5(t, f.dstDB, f.table))
 }
 
+// 清表清到一半就崩了：重跑必须**仍然整批清**，不能因为 phase 已经被自己改写成
+// snapshot、块标记也被清掉了，就退化成「不清表重搬」。
+//
+// 这条防的是「判据依赖自己会改写掉的状态」：老状态分支原来靠初始拷贝完成度（phase）判断，
+// 而 snapshot() 一开始就 phaseTo(Snapshot)，于是第二轮读到 phase=snapshot 就不认帐了。
+// 现在判据换成可重算的事实（位点还在、书签追不回它），崩多少次结论都一样。
+func TestCleanCrashMidwayRerunsCleanAll(t *testing.T) {
+	f := newResumeFixture(t, "resume_clean_crash")
+	ctx := context.Background()
+
+	// ① 先完整搬一次，再把状态改成「升级前」的样子：没有块标记，只有阶段。
+	out, code := f.run(t, "--snapshot-only")
+	if code != 0 {
+		t.Fatalf("第一次全量失败（退出码 %d）：\n%s", code, out)
+	}
+	f.simulateLegacy(t, "streaming")
+
+	// ② 书签打成 lost（位点追不回来），停机期间源端删 3 行。
+	f.makeSlotLost(t, slotNameFor(f.jobKey(t)))
+	exec(t, f.srcDB, "DELETE FROM "+f.table+" WHERE id IN (11, 5001, "+strconv.Itoa(resumeTotal-2)+")")
+
+	// ③ 第二轮：压住目标表的锁，让它卡在「清表」这一步，然后 kill -9。
+	//    此时 phase 已经被写成 snapshot、位置还是老的 —— 正是退化陷阱的入口。
+	lockConn, err := pgx.Connect(ctx, f.dstDSN)
+	if err != nil {
+		t.Fatalf("开锁会话失败: %v", err)
+	}
+	lockTx, err := lockConn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var held int
+	if err := lockTx.QueryRow(ctx, "SELECT count(*) FROM "+f.table).Scan(&held); err != nil {
+		t.Fatal(err)
+	}
+	var runOut bytes.Buffer
+	cmd := execpkg.Command(f.bin, "run", "--job", f.jobName, "--data-dir", f.dataDir, "--snapshot-only")
+	cmd.Env = os.Environ()
+	cmd.Stdout, cmd.Stderr = &runOut, &runOut
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("启动第二轮失败: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	t.Cleanup(func() { _ = cmd.Process.Kill() })
+	f.waitTruncateBlocked(t, done, &runOut)
+	if err := cmd.Process.Kill(); err != nil {
+		t.Fatalf("kill -9 失败: %v", err)
+	}
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("kill -9 之后 30 秒还没退出")
+	}
+	if err := lockTx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := lockConn.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	mid := f.readState(t)
+	t.Logf("崩在清表中间：phase=%s（已被自己改写），位置 %s，块进度 %d 条",
+		f.phase(t), mid.position, mid.chunks)
+
+	// ④ 重跑：必须整批清 + 整轮重搬，把停机期间删掉的行带走。
+	out, code = f.run(t, "--snapshot-only")
+	if code != 0 {
+		t.Fatalf("崩在清表中间后重跑失败（退出码 %d）：\n%s", code, out)
+	}
+	cleaned := strings.Count(out, "清空了")
+	if cleaned == 0 {
+		t.Fatalf("重跑必须清表（否则空洞期删除的行会留下），实际日志里一次都没清：\n%s", out)
+	}
+	var srcN, dstN int
+	if err := f.srcDB.QueryRow(ctx, "SELECT count(*) FROM "+f.table).Scan(&srcN); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.dstDB.QueryRow(ctx, "SELECT count(*) FROM "+f.table).Scan(&dstN); err != nil {
+		t.Fatal(err)
+	}
+	if dstN != srcN {
+		t.Fatalf("目标端 %d 行、源端 %d 行：崩在清表中间之后的这一轮没把脏行带走\n%s", dstN, srcN, out)
+	}
+	if s, d := f.md5(t, f.srcDB, f.table), f.md5(t, f.dstDB, f.table); s != d {
+		t.Fatalf("内容不一致：源 %s / 目标 %s；差异 %s", s, d, f.diff(t))
+	}
+	t.Logf("崩在清表中间 → 重跑：清了 %d 次表，重搬 %d 行，目标端 %d 行，md5 %s == 源端",
+		cleaned, copiedRows(t, out), dstN, f.md5(t, f.dstDB, f.table))
+}
+
+// 连续两轮重跑不能二次清表：重搬完成后位点与书签确认位点相等，判据必须回到「不用搬」。
+func TestRecopyDoesNotRepeatCleaning(t *testing.T) {
+	f := newResumeFixture(t, "resume_no_repeat")
+	ctx := context.Background()
+
+	// 完整搬一次 → 造 lost → 源端删 2 行 → 重跑（这一轮必然整批清 + 整轮重搬）。
+	if out, code := f.run(t, "--snapshot-only"); code != 0 {
+		t.Fatalf("第一次全量失败（退出码 %d）：\n%s", code, out)
+	}
+	f.makeSlotLost(t, slotNameFor(f.jobKey(t)))
+	exec(t, f.srcDB, "DELETE FROM "+f.table+" WHERE id IN (12, 5002)")
+	out, code := f.run(t, "--snapshot-only")
+	if code != 0 {
+		t.Fatalf("lost 后重跑失败（退出码 %d）：\n%s", code, out)
+	}
+	if first := strings.Count(out, "清空了"); first == 0 {
+		t.Fatalf("这一轮本来就该清表（位点追不回来），实际一次都没清：\n%s", out)
+	}
+	// 重搬这一轮必须把「这张表搬完了」的章盖上：漏盖的话下一轮会以「续跑」的名义
+	// 再进一次全量阶段（空跑补章），永远补不回来。
+	var doneMark int
+	if err := f.dstDB.QueryRow(ctx,
+		`SELECT count(*) FROM _jl_chunk WHERE job_key=$1 AND table_name=$2 AND chunk_no=0 AND done`,
+		f.jobKey(t), f.table).Scan(&doneMark); err != nil {
+		t.Fatal(err)
+	}
+	if doneMark != 1 {
+		t.Fatalf("重搬完成后应有 1 条「表已搬完」的标记，实际 %d 条（下一轮会空跑一次全量阶段）", doneMark)
+	}
+
+	// 再跑一轮：位点已经和书签对齐（没有空洞），不该再清表、也不该再搬。
+	out, code = f.run(t, "--snapshot-only")
+	if code != 0 {
+		t.Fatalf("第二次重跑失败（退出码 %d）：\n%s", code, out)
+	}
+	if again := strings.Count(out, "清空了"); again != 0 {
+		t.Fatalf("位点已经对齐，不该再清表（否则每轮都在删数据）：清了 %d 次\n%s", again, out)
+	}
+	if copied := copiedRows(t, out); copied != 0 {
+		t.Fatalf("存量已经在目标端，这一轮不该再搬，实际搬了 %d 行\n%s", copied, out)
+	}
+	if strings.Contains(out, "全量初始化") {
+		t.Fatalf("位点已经对齐，这一轮不该再进全量阶段（说明上一轮漏盖了完成标记）：\n%s", out)
+	}
+	var srcN, dstN int
+	if err := f.srcDB.QueryRow(ctx, "SELECT count(*) FROM "+f.table).Scan(&srcN); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.dstDB.QueryRow(ctx, "SELECT count(*) FROM "+f.table).Scan(&dstN); err != nil {
+		t.Fatal(err)
+	}
+	if s, d := f.md5(t, f.srcDB, f.table), f.md5(t, f.dstDB, f.table); s != d || srcN != dstN {
+		t.Fatalf("连跑两轮后两端不一致：源 %d 行 %s / 目标 %d 行 %s", srcN, s, dstN, d)
+	}
+	t.Logf("连续两轮：第一轮清表重搬，第二轮清 %d 次、搬 %d 行；两端都是 %d 行，md5 %s",
+		0, copiedRows(t, out), dstN, f.md5(t, f.dstDB, f.table))
+}
+
+// simulateLegacy 把目标端状态改成「升级前」的样子：没有块标记（也就没有完成标记），
+// 阶段与位点保留 —— Ark 说的老状态兜底路径就是这么来的。
+func (f *resumeFixture) simulateLegacy(t *testing.T, phase string) {
+	t.Helper()
+	key := f.jobKey(t)
+	exec(t, f.dstDB, "DELETE FROM _jl_chunk WHERE job_key=$1", key)
+	exec(t, f.dstDB, "UPDATE _jl_meta SET phase=$1 WHERE job_key=$2", phase, key)
+}
+
+// phase 读目标端记录的执行阶段（重跑时用来确认「自己把 phase 改写了」这件事）。
+func (f *resumeFixture) phase(t *testing.T) string {
+	t.Helper()
+	var p string
+	if err := f.dstDB.QueryRow(context.Background(),
+		"SELECT phase FROM _jl_meta LIMIT 1").Scan(&p); err != nil {
+		t.Fatalf("读 phase 失败: %v", err)
+	}
+	return p
+}
+
 // makeSlotLost 把书签造成真 lost（书签还在、WAL 没了），造不出来就失败。
 //
 // 不是靠 sleep 碰运气：把 max_slot_wal_keep_size 调到最小 → reload → 灌 WAL →

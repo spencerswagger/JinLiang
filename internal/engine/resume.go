@@ -98,6 +98,18 @@ type copyInputs struct {
 }
 
 // planCopy decides how this run copies the initial data.
+//
+// 判据是什么、从哪来，比结论本身重要：
+//   - 「可重算的事实」放在最前面（位点、书签能不能重放），它们只看库里的状态，
+//     和我们这一轮写过什么无关，所以崩多少次、重跑多少轮，答案都一样；
+//   - 「块进度」决定续跑还是重搬，证据是 _jl_chunk，也是库里的状态；
+//   - 唯一靠 _jl_meta.phase 的，是没有块标记的老状态（升级兼容），而且这一条
+//     **只在没有可重算事实可用时**才轮到它。
+//
+// 反过来做（先按 phase 判、再补可重放性）已经踩过一次：snapshot() 一开始就
+// phaseTo(Snapshot)，我们自己把 phase 改写了，于是「清表清到一半崩了」再重跑时
+// 阶段变成了 snapshot → initialCopyDone 假 → 退化成「不清表重搬」，空洞期里源端
+// 删掉的行就永远留在目标端（退出码 0）。所以 cleanAll 的判据必须是可重算的。
 func planCopy(in copyInputs) chunkPlan {
 	p := chunkPlan{From: map[string]pgsource.ChunkResume{}, Skip: map[string]bool{}}
 	if len(in.Tables) == 0 {
@@ -110,11 +122,13 @@ func planCopy(in copyInputs) chunkPlan {
 		return p
 	}
 
-	anyMarker, allDone := false, true
+	doneCount, anyMarker, allDone := 0, false, true
+	doneTables := map[string]bool{}
 	for _, t := range in.Tables {
 		pr := in.Progress[t.Table]
 		if pr.Done {
-			p.Skip[t.Table] = true
+			doneCount++
+			doneTables[t.Table] = true
 		} else {
 			allDone = false
 		}
@@ -122,8 +136,19 @@ func planCopy(in copyInputs) chunkPlan {
 			anyMarker = true
 		}
 	}
-
 	interrupted := !allDone && anyMarker
+
+	// ① 可重算的事实：位点还在，但书签追不回它 —— 中间那段变更永远补不回来。
+	// 这时无论上次是搬完、搬到一半、还是升级前根本没记块，结论都一样：
+	// 整轮重搬，**并且先把上次搬进去的行清掉**（BulkApply 只有 upsert，没有 delete，
+	// 不清就会把源端在这段空洞里删掉的行永远留在目标端）。
+	unreplayable := in.StoredCP != "" && (!in.SlotReplayable || in.SlotAhead)
+	if in.Capable && unreplayable {
+		p.Kind = copyFresh
+		p.Clean = cleanAll
+		p.Why = unreplayableWhy(in)
+		return p
+	}
 
 	if !in.Capable {
 		// 目标端不记块进度：只能整轮重搬（与接入块记账之前的行为一致）。
@@ -142,81 +167,47 @@ func planCopy(in copyInputs) chunkPlan {
 		return p
 	}
 
+	// ② 存量与位点对得上：看要不要搬。
 	if allDone {
 		if in.AlwaysCopy {
 			p.Kind = copyFresh
 			p.Why = "这一轮按模式重搬全量（上次已经搬完）"
 			return p
 		}
-		// 「存量的行都在目标端」不等于「已经同步到位」：还要能把这之后的变更重放出来。
-		// 书签没了 / WAL 被丢了 / 书签已经越过位点 → 中间那段变更永远补不回来，
-		// 这时说「不用搬」就是静默丢数据，只能整轮重搬（新视图重新对齐一次）。
-		if in.StoredCP != "" && (!in.SlotReplayable || in.SlotAhead) {
-			p.Kind = copyFresh
-			// 关键：重搬必须先把上次搬进去的行清掉。BulkApply 只 upsert、不 delete，
-			// 不clean = 源端在这段空洞里删掉的行永远留在目标端，还以退出码 0 收尾。
-			p.Clean = cleanAll
-			if !in.SlotReplayable {
-				p.Why = "存量的行都在目标端，但源端书签追不回位点（书签不在了，或 WAL 已被 " +
-					"max_slot_wal_keep_size 丢掉）：位点 " + in.StoredCP +
-					" 之后那段变更重放不出来，只能整轮重搬"
-			} else {
-				p.Why = "存量的行都在目标端，但源端书签已经越过位点（书签确认到 " + in.SlotCP +
-					"，目标位点是 " + in.StoredCP + "，中间那段变更被清理了）：只能整轮重搬"
-			}
-			return p
-		}
 		p.Kind = copySkip
+		p.Skip = allSkip(in.Tables)
 		return p
 	}
 
-	// 到这儿：至少有一张表没搬完。
+	// ③ 没有块标记的老状态（升级兼容）：只按阶段认「存量已经搬完」。
+	//    可重放的判断已经在 ① 做过了，这里不用再看一遍。
 	if !anyMarker && initialCopyDone(in.PriorPhase, in.StoredCP) {
-		// 老状态（升级前跑的）：没有块标记，只能按阶段认「存量已经搬完」。
-		//
-		// 但「搬完」不等于「能接着同步」：书签追不回位点时，Prepare 会 drop+recreate，
-		// 位点随即跳到当前 —— 中间那段变更永不重放。这条判据在 allDone 分支上是对的，
-		// 这里（升级路径的出口）同样是它，不能漏。
-		unreplayable := in.StoredCP != "" && (!in.SlotReplayable || in.SlotAhead)
-		switch {
-		case !in.AlwaysCopy && !unreplayable:
+		if !in.AlwaysCopy {
 			p.Kind = copySkip
+			p.Skip = allSkip(in.Tables)
 			p.Why = "旧版本没有块进度记录，按阶段（" + in.PriorPhase + "）认定存量已搬完"
 			return p
-		case !in.AlwaysCopy && unreplayable:
-			p.Kind = copyFresh
-			p.Clean = cleanAll
-			p.Why = legacyUnreplayableWhy(in)
-			return p
 		}
+		// once / full_interval：这一轮本来就要重搬，别让它落到「续跑」上——
+		// 那样既没有新视图也没有新书签，语义和「从头搬」不一样。
 		p.Kind = copyFresh
-		if interrupted {
-			p.Clean = cleanMarked
-		}
 		p.Why = "旧版本没有块进度记录，这一轮整轮重搬"
 		return p
 	}
 
-	if in.StoredCP == "" || !in.SlotReplayable || in.SlotAhead {
+	// ④ 位点缺失（书签那两种情况已在 ① 处理）：只能从头搬。
+	if in.StoredCP == "" {
 		p.Kind = copyFresh
 		if interrupted {
 			p.Clean = cleanMarked
 		}
-		switch {
-		case in.StoredCP == "":
-			p.Why = "目标端没有可用的一致性位点（_jl_meta.position 为空），这一轮从头搬"
-		case !in.SlotReplayable:
-			p.Why = "源端书签已经不在了（被清理，或 WAL 已被 max_slot_wal_keep_size 丢掉）：" +
-				"从目标位点 " + in.StoredCP + " 往后那段变更重放不出来，这一轮从头搬"
-		default:
-			p.Why = "源端书签已经越过目标端的位点（书签确认到 " + in.SlotCP +
-				"，目标位点是 " + in.StoredCP + "，中间那段变更已被清理）：这一轮从头搬"
-		}
+		p.Why = "目标端没有可用的一致性位点（_jl_meta.position 为空），这一轮从头搬"
 		return p
 	}
 
-	// 续跑：有主键的表从最后一块的右边界接着读；无主键表只能整表重来。
-	// 遍历顺序就是 in.Tables 的顺序（调用方给的是稳定的表顺序）。
+	// ⑤ 位点在、书签也能重放：从最后一块的右边界续跑。
+	// 无主键表的游标是 ctid，行被更新/整理过位置就变，续跑可能漏读或读重 →
+	// 只重来这一张表，不拖累别的表（docs/SNAPSHOT.md §1）。
 	for _, t := range in.Tables {
 		pr := in.Progress[t.Table]
 		if pr.Done {
@@ -224,8 +215,6 @@ func planCopy(in copyInputs) chunkPlan {
 		}
 		ref := source.TableRef{Schema: t.Schema, Table: t.Table}
 		if !t.HasStablePK {
-			// 无主键：游标是 ctid，行被更新/整理过位置就变，续跑可能漏读或读重。
-			// 只重来这一张表，不拖累别的表（docs/SNAPSHOT.md §1）。
 			if pr.LastNo > 0 {
 				p.Recopy = append(p.Recopy, ref)
 			}
@@ -236,28 +225,35 @@ func planCopy(in copyInputs) chunkPlan {
 		}
 	}
 	p.Kind = copyResume
-	if interrupted {
-		p.Clean = cleanMarked
-	}
+	// Skip 只影响「收尾时要不要给这张表盖完成标记」：续跑时已经搬完的表不必再盖一遍。
+	// 注意它**不影响清表**——Clean 只对「从头搬」有意义，续跑保持 cleanNone。
+	p.Skip = doneTables
 	p.Why = fmt.Sprintf("上次的全量没搬完：%d 张表从已提交的块边界续跑，%d 张表已经搬完",
-		len(p.From), len(p.Skip))
+		len(p.From), doneCount)
 	if len(p.Recopy) > 0 {
 		p.Why += fmt.Sprintf("，%d 张无主键表整表重来", len(p.Recopy))
 	}
 	return p
 }
 
-// legacyUnreplayableWhy explains the upgrade-path case: no chunk markers (old
-// version), but the checkpoint can no longer be replayed, so the rows already in
-// the target cannot be trusted to be current.
-func legacyUnreplayableWhy(in copyInputs) string {
+// allSkip marks every selected table as "already done" (used only when this run
+// copies nothing at all).
+func allSkip(tables []source.Table) map[string]bool {
+	out := make(map[string]bool, len(tables))
+	for _, t := range tables {
+		out[t.Table] = true
+	}
+	return out
+}
+
+// unreplayableWhy 说清「哪一条不成立」——它是用户唯一能拿去做决定的线索。
+func unreplayableWhy(in copyInputs) string {
 	switch {
 	case !in.SlotReplayable:
-		return "旧版本没有块进度记录，而且源端书签追不回位点（书签不在了，或 WAL 已被 " +
-			"max_slot_wal_keep_size 丢掉）：位点 " + in.StoredCP +
-			" 之后那段变更重放不出来，只能整轮重搬"
+		return "源端书签追不回目标端的位点（书签不在了，或 WAL 已被 max_slot_wal_keep_size " +
+			"丢掉）：位点 " + in.StoredCP + " 之后那段变更重放不出来，只能整轮重搬"
 	default:
-		return "旧版本没有块进度记录，而且源端书签已经越过位点（书签确认到 " + in.SlotCP +
+		return "源端书签已经越过目标端的位点（书签确认到 " + in.SlotCP +
 			"，目标位点是 " + in.StoredCP + "，中间那段变更被清理了）：只能整轮重搬"
 	}
 }

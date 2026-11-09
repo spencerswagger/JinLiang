@@ -54,7 +54,7 @@ func TestPlanCopy(t *testing.T) {
 			kind:  copyResume,
 			from:  map[string]pgsource.ChunkResume{"a": {Cursor: "3000", LastNo: 3}},
 			why:   "续跑",
-			clean: cleanMarked,
+			clean: cleanNone,
 		},
 		{
 			// 一张表搬完了（有完成标记），另一张半截：搬完的不许重读。
@@ -70,7 +70,7 @@ func TestPlanCopy(t *testing.T) {
 			from:  map[string]pgsource.ChunkResume{"b": {Cursor: "2000", LastNo: 2}},
 			skip:  []string{"a"},
 			why:   "1 张表已经搬完",
-			clean: cleanMarked,
+			clean: cleanNone,
 		},
 		{
 			// 书签没了 = 中间那段变更源端已经不保留，续跑会漏行，只能整轮重搬。
@@ -80,8 +80,8 @@ func TestPlanCopy(t *testing.T) {
 				StoredCP: "postgres:v1:0/1A2B3C", SlotReplayable: false,
 				Progress: map[string]pgsink.ChunkProgress{"a": {LastNo: 1, Cursor: "10"}}},
 			kind:  copyFresh,
-			why:   "书签已经不在了",
-			clean: cleanMarked, // 断在半截 → 清表之后再搬
+			why:   "书签追不回",
+			clean: cleanAll, // 断在半截 → 清表之后再搬
 		},
 		{
 			name: "书签越过位点：整轮重搬",
@@ -91,15 +91,16 @@ func TestPlanCopy(t *testing.T) {
 				Progress: map[string]pgsink.ChunkProgress{"a": {LastNo: 1, Cursor: "10"}}},
 			kind:  copyFresh,
 			why:   "越过目标端的位点",
-			clean: cleanMarked,
+			clean: cleanAll,
 		},
 		{
 			name: "没有位点：整轮重搬",
 			in: copyInputs{Mode: "", Capable: true,
 				Tables: []source.Table{pkA}, SlotReplayable: true,
 				Progress: map[string]pgsink.ChunkProgress{"a": {LastNo: 1, Cursor: "10"}}},
-			kind:  copyFresh,
-			why:   "没有可用的一致性位点",
+			kind: copyFresh,
+			why:  "没有可用的一致性位点",
+			// 只清「写下过块」的表：没写过的表本来就没有我们的行。
 			clean: cleanMarked,
 		},
 		{
@@ -122,11 +123,36 @@ func TestPlanCopy(t *testing.T) {
 				SlotCP: "postgres:v1:0/2FFFFFF", PriorPhase: "streaming",
 				Progress: map[string]pgsink.ChunkProgress{"a": {Done: true, LastNo: 9, Cursor: "90"}}},
 			kind:  copyFresh,
-			why:   "越过位点",
+			why:   "越过目标端的位点",
 			clean: cleanAll,
 		},
 		{
-			// 无主键表的游标是 ctid，续跑可能漏读/读重 → 只重来这一张表。
+			// 这条是「清表清到一半崩了再重跑」的判据：snapshot() 一开始就把 phase 写成
+			// snapshot，所以下一轮 initialCopyDone 必假、块标记也可能已经清掉。只要
+			// 「位点追不回来」这个事实还成立，就必须仍然整轮重搬 + 整批清，不能退化成
+			// 「不清表重搬」（那会把空洞期删掉的行永远留在目标端）。
+			name: "重跑退化陷阱：phase 已被改写成 snapshot + 无块标记 + 书签越过位点",
+			in: copyInputs{Mode: "", Capable: true,
+				Tables: []source.Table{pkA}, StoredCP: "postgres:v1:0/1A2B3C",
+				SlotReplayable: true, SlotAhead: true, SlotCP: "postgres:v1:0/2FFFFFF",
+				PriorPhase: "snapshot", Progress: map[string]pgsink.ChunkProgress{}},
+			kind:  copyFresh,
+			why:   "越过目标端的位点",
+			clean: cleanAll,
+		},
+		{
+			// once 也一样：模式要求重搬，而位点追不回来时那批行整批过期 → 整批清。
+			name: "once + 书签追不回位点：整轮重搬且整批清",
+			in: copyInputs{Mode: "once", AlwaysCopy: true, Capable: true,
+				Tables:   []source.Table{pkA, pkB},
+				StoredCP: "postgres:v1:0/1A2B3C", SlotReplayable: false, PriorPhase: "done",
+				Progress: map[string]pgsink.ChunkProgress{"a": {Done: true, LastNo: 9}, "b": {Done: true, LastNo: 9}}},
+			kind:  copyFresh,
+			why:   "重放不出来",
+			clean: cleanAll,
+		},
+		{
+			// 无主键表的游标是 ctid，续跑可能漏读或读重 → 只重来这一张表。
 			name: "无主键表半截：只整表重来它，别的表照续",
 			in: copyInputs{Mode: "", Capable: true,
 				Tables:   []source.Table{pkA, noPK},
@@ -141,7 +167,7 @@ func TestPlanCopy(t *testing.T) {
 			from:  map[string]pgsource.ChunkResume{"a": {Cursor: "10", LastNo: 1}},
 			recpy: []string{"c"},
 			why:   "无主键表整表重来",
-			clean: cleanMarked,
+			clean: cleanNone,
 		},
 		{
 			// once 的语义没变：上一次**搬完了**，这一轮就该重搬一轮。
@@ -189,7 +215,7 @@ func TestPlanCopy(t *testing.T) {
 				SlotReplayable: true, SlotAhead: true, SlotCP: "postgres:v1:0/2FFFFFF",
 				PriorPhase: "streaming"},
 			kind:  copyFresh,
-			why:   "越过位点",
+			why:   "越过目标端的位点",
 			clean: cleanAll,
 		},
 		{
@@ -261,6 +287,10 @@ func TestPlanCopy(t *testing.T) {
 			if got.Clean != tc.clean {
 				t.Fatalf("Clean 错：想要 %v，得到 %v", tc.clean, got.Clean)
 			}
+			if got.Kind == copyFresh && len(got.Skip) > 0 {
+				// 从头搬却把表标成「已搬完」→ 收尾不会给它盖完成标记 → 下一轮空跑补章。
+				t.Fatalf("从头搬不该带 Skip（会漏盖完成标记）：%v", got.Skip)
+			}
 			if got.Kind != copyResume && len(got.From) > 0 {
 				t.Fatalf("非续跑却给了续跑起点：%v", got.From)
 			}
@@ -296,5 +326,29 @@ func TestUnreplayableSlotErrorSaysWhatToDo(t *testing.T) {
 		if !strings.Contains(msg, want) {
 			t.Fatalf("文案缺 %q：\n%s", want, msg)
 		}
+	}
+}
+
+// 拒绝清表的三句理由必须各不相同、且各自说对：用户照着这句决定下一步做什么，
+// 一律说「上次搬到一半就断了」在「位点追不回来」的场景里是错的（会把他引向「再跑一次」）。
+func TestRecopyReasonSentences(t *testing.T) {
+	cases := []struct {
+		why  recopyReason
+		want string
+	}{
+		{recopyHalfCopy, "上次全量搬到一半就断了"},
+		{recopyGap, "追不回目标端的位点"},
+		{recopyNoPK, "没有稳定的主键"},
+	}
+	seen := map[string]bool{}
+	for _, c := range cases {
+		got := c.why.sentence()
+		if !strings.Contains(got, c.want) {
+			t.Fatalf("%d 的理由应含 %q，得到 %q", c.why, c.want, got)
+		}
+		if seen[got] {
+			t.Fatalf("不同原因必须给不同理由，%q 重复了", got)
+		}
+		seen[got] = true
 	}
 }

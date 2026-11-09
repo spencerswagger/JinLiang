@@ -996,28 +996,28 @@ func (r *runner) cleanBeforeRecopy(ctx context.Context) error {
 	if r.plan.Clean == cleanNone {
 		return nil
 	}
-	names := map[string]bool{}
-	if r.plan.Clean == cleanAll {
-		for _, t := range r.selectedTables() {
-			names[t.Table] = true
-		}
-	} else {
+	// 按 selectedTables() 的顺序走，不用 map 迭代：清表顺序必须可复现
+	// （崩在中间时「清过哪几张」要能对上，用例也才稳定）。
+	marked := map[string]bool{}
+	wholeBatch := r.plan.Clean == cleanAll
+	if !wholeBatch {
 		done, err := r.sink.DoneChunks(ctx)
 		if err != nil {
 			return err
 		}
 		for name := range done {
-			names[name] = true
+			marked[name] = true
 		}
 	}
-	for name := range names {
-		ref, ok := r.tableByName(name)
-		if !ok {
+	for _, t := range r.selectedTables() {
+		if !wholeBatch && !marked[t.Table] {
 			continue
 		}
+		ref := source.TableRef{Schema: t.Schema, Table: t.Table}
+		name := t.Table
 		// 两种来源的「为什么必须清」不同，文案要跟着走（不能一律说「上次搬到一半」）。
 		why := recopyHalfCopy
-		if r.plan.Clean == cleanAll {
+		if wholeBatch {
 			why = recopyGap
 		}
 		if err := r.recopyAction(ctx, ref, why); err != nil {
