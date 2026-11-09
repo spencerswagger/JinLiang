@@ -341,7 +341,7 @@ func TestIntegrationBatchDuplicatePKLastWins(t *testing.T) {
 
 // dedupeByPK 的纯逻辑单测（不需要数据库）。
 func TestDedupeByPKKKeepsLast(t *testing.T) {
-	tables, _ := buildTables(batchCatalog("t"))
+	tables, _ := buildTables(batchCatalog("t"), "")
 	ti := tables["public.t"]
 	mk := func(id, v string) source.Event {
 		return source.Event{Kind: source.EvInsert, New: source.Row{Values: []source.Value{

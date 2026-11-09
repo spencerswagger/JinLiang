@@ -13,6 +13,41 @@ import (
 	"github.com/spencerswagger/jinliang/internal/state"
 )
 
+// intervalSource 是「定时增量（水位轮询）」要的那几项能力。
+//
+// 这一版只有 PG 源实现：水位轮询的语义是「复合水位 + 重叠回看 + 每页同事务」，
+// MySQL 侧的 MaxWatermark / ReadWatermarkPage 形状不同（返回文本水位，没有复合游标），
+// 直接套过来会变成两套语义混在一个模式里。所以这里**显式**要求这组能力，
+// 没有就报四段式（见 intervalUnsupported），而不是悄悄退化成整表重搬。
+type intervalSource interface {
+	TableRowsEstimate(ctx context.Context, ref source.TableRef) (int64, bool, error)
+	TablePhysicalSize(ctx context.Context, ref source.TableRef) (int64, error)
+	MaxWatermark(ctx context.Context, ref source.TableRef, column string) (pgsource.Watermark, error)
+	ReadWatermarkPage(ctx context.Context, ref source.TableRef, column string,
+		from pgsource.Watermark, lookback string, limit int64) ([][]any, pgsource.Watermark, bool, error)
+	SnapshotChunks(ctx context.Context, opt source.SnapshotOpt, fn func(context.Context, pgsource.Chunk) error) (source.Position, error)
+}
+
+// intervalUnsupported 是「这种源这一版不支持 interval」的四段式说明。
+func (r *runner) intervalUnsupported() error {
+	return &notImplementedError{fmt.Sprintf(
+		"源端是 %s，这一版还不支持 interval（按水位列轮询增量）。"+
+			"发生了什么：interval 靠「水位列 + 重叠回看」自己判断哪些是新数据，MySQL 源的水位语义与 PG 不同，还没接。"+
+			"为什么：水位增量一旦漏读，重跑也补不回来，所以宁可明确报「没做」，也不做半套。"+
+			"你现在能做什么：把 mode.frequency 改成 continuous+initial（需要源端 log_bin=ON，走 binlog 增量，删除也能同步），"+
+			"或改成 once / full_interval（每轮整表重跑）。"+
+			"风险：改成 once / full_interval 后每轮都会重搬全量，大表要算好窗口；"+
+			"改成 continuous+initial 需要 binlog 权限（REPLICATION SLAVE/CLIENT）。", r.srcEP.Kind)}
+}
+
+// intervalSrc 取 interval 需要的能力；没有就给四段式错误（不是「因风险拒绝」）。
+func (r *runner) intervalSrc() (intervalSource, error) {
+	if s, ok := r.src.(intervalSource); ok {
+		return s, nil
+	}
+	return nil, r.intervalUnsupported()
+}
+
 // interval 模式的一轮：**没有变更流水，靠水位轮询**。
 //
 // 每张表：
@@ -24,6 +59,10 @@ import (
 //
 // 视图只能走 interval（源端不记录视图的变更），这条在预检里已经是 blocked。
 func (r *runner) runIntervalRound(ctx context.Context) error {
+	isrc, err := r.intervalSrc()
+	if err != nil {
+		return err
+	}
 	wmCol := strings.TrimSpace(r.doc.Mode.IncrementalColumn)
 	if wmCol == "" {
 		return fmt.Errorf("interval 模式必须有 mode.incremental_column（水位列）；预检里这条是 blocked")
@@ -61,7 +100,7 @@ func (r *runner) runIntervalRound(ctx context.Context) error {
 			// 一律拦死，这种表会让整条 interval 任务起不来。
 			// **不要用 relpages**：它和 reltuples 一样只在 VACUUM/ANALYZE 后更新，
 			// 对新导入的大表同样是 0，用它放行会把最危险的表重新放回来。
-			est, known, err := r.src.TableRowsEstimate(ctx, ref)
+			est, known, err := isrc.TableRowsEstimate(ctx, ref)
 			if err != nil {
 				return fmt.Errorf("读 %s 的行数估算失败: %w", ref.Table, err)
 			}
@@ -69,7 +108,7 @@ func (r *runner) runIntervalRound(ctx context.Context) error {
 			// （大表上 pg_total_relation_size 也不是免费的）。
 			var size int64
 			if !known {
-				s, serr := r.src.TablePhysicalSize(ctx, ref)
+				s, serr := isrc.TablePhysicalSize(ctx, ref)
 				if serr != nil {
 					return fmt.Errorf("读 %s 的物理大小失败（判断不了体量就不敢放行整表重搬）: %w", ref.Table, serr)
 				}
@@ -94,7 +133,7 @@ func (r *runner) runIntervalRound(ctx context.Context) error {
 			// 反过来（先搬再取表尾）会留一个永久漏读窗口：快照之后插入的行不在快照里，
 			// 而水位已经越过它们——如果水位列是业务时间、又有回填，`wm` 远早于
 			// `maxWm − lookback`，那条行就永远捞不回来了。宁重不漏：重复由 upsert 吸收。
-			maxWm, err := r.src.MaxWatermark(ctx, ref, wmCol)
+			maxWm, err := isrc.MaxWatermark(ctx, ref, wmCol)
 			if err != nil {
 				return err
 			}
@@ -132,17 +171,21 @@ func (r *runner) drainWatermark(ctx context.Context, ref source.TableRef, wmCol 
 
 	// 第一页把主键清空 → 触发「水位 − lookback」的回退窗口（吸收提交晚于写入的行），
 	// 之后按 (wm, pk) 前进。**不清空就等于 lookback 从未生效**（曾经就是这么错的）。
+	isrc, err := r.intervalSrc()
+	if err != nil {
+		return 0, from, err
+	}
 	cursor := pgsource.Watermark{Wm: from.Wm, PK: ""}
 	var total int64
 	for {
-		rows, next, done, err := r.src.ReadWatermarkPage(ctx, ref, wmCol, cursor, lookback, int64(r.batchRows()))
+		rows, next, done, err := isrc.ReadWatermarkPage(ctx, ref, wmCol, cursor, lookback, int64(r.batchRows()))
 		if err != nil {
 			return total, cursor, err
 		}
 		if len(rows) > 0 {
-			pos := r.consistentPoint.String()
+			pos := posString(r.consistentPoint)
 			if pos == "" {
-				pos = r.lastPos.String()
+				pos = posString(r.lastPos)
 			}
 			if err := r.sink.ApplyRowsRange(ctx, ref, rows, pos, ""); err != nil {
 				return total, cursor, err
@@ -186,13 +229,17 @@ func (r *runner) saveWatermark(ctx context.Context, ref source.TableRef, w pgsou
 // 与全量走同一个 pgsink 落地路径（临时表 + upsert），所以可重复执行。
 func (r *runner) copyOneTable(ctx context.Context, ref source.TableRef) (int64, error) {
 	var total int64
-	_, err := r.src.SnapshotChunks(ctx, source.SnapshotOpt{ChunkRows: r.chunkRows(), Conns: 1},
+	isrc, err := r.intervalSrc()
+	if err != nil {
+		return 0, err
+	}
+	_, err = isrc.SnapshotChunks(ctx, source.SnapshotOpt{ChunkRows: r.chunkRows(), Conns: 1},
 		func(c context.Context, ch pgsource.Chunk) error {
 			if ch.Table != ref {
 				return nil
 			}
-			if err := r.sink.BulkApply(c, r.sink.Table(ch.Table), ch.No, ch.Rows,
-				r.consistentPoint.String(), ch.From, ch.To); err != nil {
+			if err := r.sink.BulkApply(c, r.sink.Table(r.targetRef(ch.Table)), ch.No, ch.Rows,
+				posString(r.consistentPoint), ch.From, ch.To); err != nil {
 				return err
 			}
 			total += int64(len(ch.Rows))

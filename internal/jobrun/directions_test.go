@@ -16,8 +16,12 @@ func TestDirectionMatrixMatchesCatalogue(t *testing.T) {
 			t.Fatalf("矩阵自相矛盾：%v 不在支持列表里", d)
 		}
 	}
-	if DirectionSupported("mysql", "mysql") || DirectionSupported("mysql", "postgres") {
-		t.Fatal("mysql 源的两条方向当前不支持，矩阵写错了")
+	// MySQL 源 → PG 目标端已接通（binlog 读流 + 块级续跑）；MySQL → MySQL 还没接。
+	if !DirectionSupported("mysql", "postgres") {
+		t.Fatal("MySQL 源 → PG 目标端已接通，矩阵没跟上")
+	}
+	if DirectionSupported("mysql", "mysql") {
+		t.Fatal("MySQL → MySQL 还没接通，矩阵写错了")
 	}
 
 	// 码表条目从 `core.Lookup` 取**运行时**的 why，而不是 grep 源码：

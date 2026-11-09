@@ -51,12 +51,36 @@ func (f *fakeSink) Apply(ctx context.Context, evs []source.Event, pos source.Pos
 // 位点不从 Event 上取（共享契约里 Event 没有位点字段），而是 Flush 时向源端要。
 type fakeSource struct {
 	acked []string
-	last  pgsource.Position
+	last  source.Position
 }
 
-func (f *fakeSource) Ack(pos pgsource.Position) { f.acked = append(f.acked, pos.String()) }
+func (f *fakeSource) Ack(pos source.Position) {
+	if pos == nil {
+		f.acked = append(f.acked, "")
+		return
+	}
+	f.acked = append(f.acked, pos.String())
+}
 
-func (f *fakeSource) LastCommit() pgsource.Position { return f.last }
+func (f *fakeSource) LastCommit() source.Position { return f.last }
+
+// Before / IsZero 与连接器同一套语义：只有同类位点才比得出先后。
+func (f *fakeSource) Before(a, b source.Position) bool {
+	av, aok := a.(pgsource.Position)
+	bv, bok := b.(pgsource.Position)
+	if !aok || !bok {
+		return false
+	}
+	return av.Compare(bv) < 0
+}
+
+func (f *fakeSource) IsZero(p source.Position) bool {
+	if p == nil {
+		return true
+	}
+	v, ok := p.(pgsource.Position)
+	return ok && v.IsZero()
+}
 
 // commitEvent 模拟「源端提交了某个事务」，返回对应的 Commit 事件。
 func commitEvent(src *fakeSource, pos string) source.Event {

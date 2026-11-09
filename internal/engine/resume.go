@@ -5,7 +5,6 @@ import (
 	"fmt"
 
 	"github.com/spencerswagger/jinliang/internal/pgsink"
-	"github.com/spencerswagger/jinliang/internal/pgsource"
 	"github.com/spencerswagger/jinliang/internal/source"
 	"github.com/spencerswagger/jinliang/internal/state"
 )
@@ -56,7 +55,7 @@ const (
 type chunkPlan struct {
 	Kind copyKind
 	// From 是每张表的续跑起点（只有 copyResume 的未完成表才有条目）。
-	From map[string]pgsource.ChunkResume
+	From map[string]chunkFrom
 	// Skip 是「上次已经搬完、这次不用碰」的表。
 	Skip map[string]bool
 	// Recopy 是不能块级续跑、必须整表重来的表（无主键表：keyset 游标不稳）。
@@ -98,6 +97,9 @@ type copyInputs struct {
 	SlotAhead bool
 	// SlotCP 是书签已确认位点的原文（只用于把「哪一条不成立」写清楚）。
 	SlotCP string
+	// SlotWhy 是源端自己给的一句话（「位点所在的 binlog 已被清理」这种），
+	// 有就优先用它——比引擎猜的说法准。
+	SlotWhy string
 	// PriorPhase 是 _jl_meta.phase，只给「没有块标记的老状态」兜底用。
 	PriorPhase string
 	// Capable 表示目标端会记块进度（PG 目标端；MySQL 全量路径本版还没有块记账）。
@@ -118,7 +120,7 @@ type copyInputs struct {
 // 阶段变成了 snapshot → initialCopyDone 假 → 退化成「不清表重搬」，空洞期里源端
 // 删掉的行就永远留在目标端（退出码 0）。所以 cleanAll 的判据必须是可重算的。
 func planCopy(in copyInputs) chunkPlan {
-	p := chunkPlan{From: map[string]pgsource.ChunkResume{}, Skip: map[string]bool{}}
+	p := chunkPlan{From: map[string]chunkFrom{}, Skip: map[string]bool{}}
 	if len(in.Tables) == 0 {
 		p.Kind = copySkip
 		return p
@@ -234,7 +236,7 @@ func planCopy(in copyInputs) chunkPlan {
 			continue
 		}
 		if pr.LastNo > 0 {
-			p.From[t.Table] = pgsource.ChunkResume{Cursor: pr.Cursor, LastNo: pr.LastNo}
+			p.From[t.Table] = chunkFrom{Cursor: pr.Cursor, LastNo: pr.LastNo}
 		}
 	}
 	p.Kind = copyResume
@@ -301,6 +303,9 @@ func allSkip(tables []source.Table) map[string]bool {
 
 // unreplayableWhy 说清「哪一条不成立」——它是用户唯一能拿去做决定的线索。
 func unreplayableWhy(in copyInputs) string {
+	if in.SlotWhy != "" {
+		return in.SlotWhy + "：位点 " + in.StoredCP + " 之后那段变更重放不出来，只能整轮重搬"
+	}
 	switch {
 	case !in.SlotReplayable:
 		return "源端书签追不回目标端的位点（书签不在了，或 WAL 已被 max_slot_wal_keep_size " +
@@ -314,7 +319,7 @@ func unreplayableWhy(in copyInputs) string {
 // decideCopyPlan reads the two facts a decision needs from outside: the target's
 // chunk progress (our own truth) and the source slot's confirmed position (can
 // the old checkpoint still be replayed?). Everything else comes from the job doc.
-func (r *runner) decideCopyPlan(ctx context.Context, src *pgsource.Source,
+func (r *runner) decideCopyPlan(ctx context.Context, src runSource,
 	phase, pos string) (chunkPlan, error) {
 
 	prog, err := r.sink.ChunkProgress(ctx)
@@ -342,19 +347,15 @@ func (r *runner) decideCopyPlan(ctx context.Context, src *pgsource.Source,
 		r.note(ctx, "目标端的一致性位点读不懂（"+pos+"）：这一轮不会续跑。原因："+err.Error())
 		return planCopy(in), nil
 	}
-	pgPos, ok := cp.(pgsource.Position)
-	if !ok {
-		r.note(ctx, fmt.Sprintf("目标端位点的类型是 %T，不是 PG 位点：这一轮不会续跑", cp))
-		return planCopy(in), nil
-	}
-	slot, ok, err := src.SlotConfirmed(ctx)
+	st, err := src.Replay(ctx, cp)
 	if err != nil {
-		return chunkPlan{}, fmt.Errorf("读源端书签的确认位点失败: %w", err)
+		return chunkPlan{}, fmt.Errorf("读源端的可重放性失败: %w", err)
 	}
-	in.SlotReplayable = ok
-	in.SlotCP = slot.String()
-	// 书签确认位点**越过**目标位点：中间那段变更已经被源端清理，追不回来了。
-	in.SlotAhead = ok && !slot.IsZero() && slot.Compare(pgPos) > 0
+	in.SlotReplayable = st.OK
+	in.SlotCP = posString(st.Confirmed)
+	in.SlotWhy = st.Why
+	// 源端确认位点**越过**目标位点：中间那段变更已经被源端清理，追不回来了。
+	in.SlotAhead = st.Ahead
 	plan := planCopy(in)
 	// 只剩一种组合会落到「不搬 + 重放不了」：continuous 模式（它本来就不搬存量）。
 	// 这时硬着头皮从新书签开始流，等于把中间那段变更静默扔掉——不如说清楚停下。
@@ -380,13 +381,10 @@ func (e *unreplayableSlotError) Error() string {
 
 // parsedCP is the stored checkpoint as a source position (used by the resume
 // path, which deliberately keeps the old checkpoint instead of taking a new one).
-func parsedCP(src *pgsource.Source, raw string) pgsource.Position {
+func parsedCP(src runSource, raw string) source.Position {
 	cp, err := src.ParsePosition(raw)
 	if err != nil {
-		return pgsource.Position{}
+		return nil
 	}
-	if p, ok := cp.(pgsource.Position); ok {
-		return p
-	}
-	return pgsource.Position{}
+	return cp
 }

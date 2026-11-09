@@ -7,6 +7,70 @@ import (
 	"github.com/spencerswagger/jinliang/internal/source"
 )
 
+// enrichRelation 用**已知的 catalog** 补上 binlog 没给的列名。
+//
+// 为什么必须有：`binlog_row_metadata` 的默认值是 MINIMAL，此时 TABLE_MAP 里没有
+// 列名，只有列类型——行镜像仍然是「按表定义序」，但列名只能是 col_1..col_n 占位。
+// 目标端拿到这种 Relation 会判成「源端列改名/删列」并整轮失败（它比对的是列名），
+// 而真实原因只是元数据级别不够。这里按序号把 catalog 的名字补回去：
+//   - 列数与 catalog 一致 → 名字、类型都用 catalog（行镜像顺序 = 表定义序）；
+//   - 列数不一致（源端刚 DDL 过）→ 保留 binlog 的类型，名字能对上的按序号补，
+//     对不上的保留占位名，让上层照常报「结构不一致」。
+//
+// 同一版 Relation（同一个指针）只算一次：契约要求「指针相等即同一版」。
+func (s *Source) enrichRelation(rel *source.Table) *source.Table {
+	if rel == nil {
+		return nil
+	}
+	s.knownMu.Lock()
+	defer s.knownMu.Unlock()
+	if s.enriched == nil {
+		s.enriched = map[*source.Table]*source.Table{}
+	}
+	if cp, ok := s.enriched[rel]; ok {
+		return cp
+	}
+	known, has := s.known[rel.Schema+"."+rel.Table]
+	placeholder := true
+	for i, c := range rel.Columns {
+		if c.Name != fmt.Sprintf("col_%d", i+1) {
+			placeholder = false
+			break
+		}
+	}
+	if !has || !placeholder {
+		s.enriched[rel] = rel
+		return rel
+	}
+	cp := *rel
+	cp.Columns = append([]source.Column(nil), rel.Columns...)
+	if len(known.Columns) == len(cp.Columns) {
+		cp.Columns = append([]source.Column(nil), known.Columns...)
+		cp.PrimaryKey = append([]string(nil), known.PrimaryKey...)
+		cp.HasStablePK = known.HasStablePK
+	} else {
+		for i := range cp.Columns {
+			if i < len(known.Columns) && known.Columns[i].Name != "" {
+				cp.Columns[i].Name = known.Columns[i].Name
+			}
+		}
+	}
+	s.enriched[rel] = &cp
+	return &cp
+}
+
+// SetKnownTables 告诉连接器「本次同步的这些表长什么样」（来自 information_schema）。
+// 只用于补 binlog 缺失的列名，不改变行镜像的顺序或数量。
+func (s *Source) SetKnownTables(tables []source.Table) {
+	s.knownMu.Lock()
+	defer s.knownMu.Unlock()
+	s.known = make(map[string]source.Table, len(tables))
+	for _, t := range tables {
+		s.known[t.Schema+"."+t.Table] = t
+	}
+	s.enriched = map[*source.Table]*source.Table{}
+}
+
 // tableFromMap turns a TABLE_MAP event into the column definition the engine
 // aligns row images against (source.Event.Relation).
 //

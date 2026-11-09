@@ -113,10 +113,10 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 	if err != nil {
 		return res, fmt.Errorf("解不开目标连接的口令（key 文件换过？）: %w", err)
 	}
-	// 源端目前只有 PG 的读实现；目标端允许 PG 与 MySQL，其它类型在构造阶段报清楚。
-	if srcConn.Kind != dsn.KindPostgres {
-		return res, fmt.Errorf("源端类型 %q 还没有读实现（现在支持 postgres 源）。"+
-			"你现在能做什么：把源连接换成 PostgreSQL；MySQL 源在下个版本。"+
+	// 源端支持 PG（逻辑复制槽）与 MySQL（binlog/GTID）两种读实现，其它类型在构造阶段报清楚。
+	if srcConn.Kind != dsn.KindPostgres && srcConn.Kind != dsn.KindMySQL {
+		return res, fmt.Errorf("源端类型 %q 还没有读实现（现在支持 postgres / mysql 源）。"+
+			"你现在能做什么：把源连接的 kind 改成 postgres 或 mysql。"+
 			"风险：没有（什么都没动）", srcConn.Kind)
 	}
 	if tgtConn.Kind != dsn.KindPostgres && tgtConn.Kind != dsn.KindMySQL {
@@ -277,7 +277,7 @@ type runner struct {
 
 	leaseTTL time.Duration
 
-	src  *pgsource.Source
+	src  runSource
 	sink *pgsink.Sink
 	// gsink 是「按接口」的目标端：PG 用 pgsink（COPY 快路径），MySQL 用 mysqlsink
 	// （走契约的 Apply）。构造阶段确定，之后引擎只用接口。
@@ -297,7 +297,7 @@ type runner struct {
 	leaseTick time.Duration
 
 	snapshotName    string
-	consistentPoint pgsource.Position
+	consistentPoint source.Position
 	reusedSlot      bool
 	needSnapshot    bool
 	priorPhase      string
@@ -309,7 +309,7 @@ type runner struct {
 	exitCode   int
 
 	mu       sync.Mutex
-	lastPos  pgsource.Position
+	lastPos  source.Position
 	lastLagB int64
 }
 
@@ -332,12 +332,17 @@ func (r *runner) execute(parent context.Context, res *Result) error {
 		res.Phase = r.phase
 		res.RowsCopied = r.rowsCopied
 		res.RowsStream = r.rowsStream
-		res.Position = r.lastPos.String()
+		res.Position = posString(r.lastPos)
 		res.ExitCode = r.exitCode
 	}()
 
 	if err := r.preflight(ctx); err != nil {
 		return r.fail(ctx, err)
+	}
+	// interval（水位轮询）这一版只有 PG 源实现：在拿租约、建表之前就说清楚，
+	// 不留「跑到一半才发现这条路没做」的现场。
+	if r.mode() == "interval" && r.srcEP.Kind != dsn.KindPostgres {
+		return r.fail(ctx, r.intervalUnsupported())
 	}
 	// 目标端不是 PG：走「只做全量」的通用路径（用契约里的 sink 接口，不按类型分支）。
 	if r.tgtEP.Kind != dsn.KindPostgres {
@@ -507,15 +512,26 @@ func assertPositionKind(p source.Position, want string) error {
 // Using the server's WAL end (from keepalives) instead of "no events recently"
 // matters on a big backlog: replaying 2 GB of WAL emits no data events, and a
 // time-based guess would declare victory and silently leave lag behind.
-func caughtUpAt(applied, startupTarget, serverWALEnd pgsource.Position) bool {
+func (r *runner) caughtUpAt(applied, startupTarget, serverEnd source.Position) bool {
 	target := startupTarget
-	if serverWALEnd.Compare(target) > 0 {
-		target = serverWALEnd
+	if r.src != nil && !r.src.IsZero(serverEnd) && r.src.Before(target, serverEnd) {
+		target = serverEnd
 	}
-	if target.IsZero() {
+	if target == nil || (r.src != nil && r.src.IsZero(target)) {
 		return false
 	}
-	return applied.Compare(target) >= 0
+	if r.src == nil {
+		return false
+	}
+	return !r.src.Before(applied, target)
+}
+
+// posString 把位点安全地转成落库的文本（nil 接口直接 .String() 会 panic）。
+func posString(p source.Position) string {
+	if p == nil {
+		return ""
+	}
+	return p.String()
 }
 
 // recopyAction decides whether a half-copied table may be truncated before the
@@ -530,7 +546,8 @@ func caughtUpAt(applied, startupTarget, serverWALEnd pgsource.Position) bool {
 //
 // 返回 nil 表示可以清；返回错误表示必须停下（原因随 recopyReason 走）。
 func (r *runner) recopyAction(ctx context.Context, ref source.TableRef, why recopyReason) error {
-	ours, err := r.sink.DidCreateTable(ctx, ref)
+	// 查的是**目标端**的表（对象登记按目标 schema 记），报错里说源端表名。
+	ours, err := r.sink.DidCreateTable(ctx, r.targetRef(ref))
 	if err != nil {
 		return fmt.Errorf("查不到目标表 %s 是谁建的（读 _jl_object 失败）: %w", ref.Table, err)
 	}
@@ -657,7 +674,7 @@ func (r *runner) preflight(ctx context.Context) error {
 		if caps, err := srcConn.Probe(ctx); err == nil {
 			in.SourceCaps = caps
 		}
-		if cat, err := srcConn.Catalog(ctx, scopeOf(r.doc)); err == nil {
+		if cat, err := srcConn.Catalog(ctx, r.scope()); err == nil {
 			in.SourceCat = &cat
 			r.cat = cat
 		}
@@ -758,7 +775,9 @@ func (r *runner) prepare(ctx context.Context) error {
 	if err := sink.EnsureMeta(ctx, hashOf(r.doc), "", "", ""); err != nil {
 		return fmt.Errorf("写入任务状态行失败: %w", err)
 	}
-	actions, err := sink.EnsureSchema(ctx, r.cat)
+	// 建表要用**目标端**的表定义（schema 换成目标端的）：源端 catalog 里的
+	// schema 是源库名（MySQL 源就是库名），直接拿去建表会变成「目标端没有这个 schema」。
+	actions, err := sink.EnsureSchema(ctx, r.targetCatalog())
 	if err != nil {
 		return fmt.Errorf("准备目标表失败: %w", err)
 	}
@@ -791,9 +810,7 @@ func (r *runner) prepare(ctx context.Context) error {
 	r.plan = plan
 	r.needSnapshot = plan.Kind != copySkip
 	// 续跑时**不重建书签、不导出视图**：书签得留着才能从原来的位点重放变更。
-	prep, err := src.Prepare(ctx, pgsource.PrepareOptions{
-		Snapshot: r.needSnapshot && plan.Kind != copyResume,
-	})
+	prep, err := src.Prepare(ctx, r.needSnapshot && plan.Kind != copyResume)
 	if err != nil {
 		return fmt.Errorf("准备源端对象失败: %w", err)
 	}
@@ -807,7 +824,6 @@ func (r *runner) prepare(ctx context.Context) error {
 	case copyResume:
 		r.consistentPoint = parsedCP(src, posInTarget)
 		r.snapshotName = ""
-		src.SetSnapshotName("")
 		r.reusedSlot = false
 		writePos = posInTarget // 原样写回：不挪
 		r.note(ctx, plan.Why)
@@ -817,11 +833,18 @@ func (r *runner) prepare(ctx context.Context) error {
 			r.note(ctx, plan.Why)
 		}
 		r.reusedSlot = !r.needSnapshot
-		src.SetSnapshotName(prep.SnapshotName)
 		r.snapshotName = prep.SnapshotName
 		r.consistentPoint = prep.ConsistentPoint
 		if plan.Kind == copySkip {
-			writePos = prep.ConsistentPoint.String() // 沿用旧行为：书签已确认的位置就是消费到的位置
+			// 沿用旧行为：书签已确认的位置就是消费到的位置。
+			// MySQL 源没有「书签」这种东西（没有槽位），Prepare 不会给位点——
+			// 这时位点就是目标库里存着的那个，**原样写回**，不挪。
+			if src.IsZero(r.consistentPoint) {
+				r.consistentPoint = parsedCP(src, posInTarget)
+				writePos = posInTarget
+			} else {
+				writePos = posString(r.consistentPoint)
+			}
 		}
 	}
 	for _, a := range prep.Actions {
@@ -932,7 +955,7 @@ func (r *runner) snapshot(ctx context.Context) error {
 			if err := r.recopyAction(ctx, ref, recopyNoPK); err != nil {
 				return err
 			}
-			if err := r.sink.ResetTableChunks(ctx, ref); err != nil {
+			if err := r.sink.ResetTableChunks(ctx, r.targetRef(ref)); err != nil {
 				return fmt.Errorf("清空 %s 准备整表重来时失败: %w", ref.Table, err)
 			}
 			r.note(ctx, ref.Table+" 没有稳定的主键，只能整表重来（不清其它表）")
@@ -951,7 +974,7 @@ func (r *runner) snapshot(ctx context.Context) error {
 	}
 	// 续跑时没有导出的视图（视图随上个进程一起没了），靠新的 REPEATABLE READ；
 	// 从头搬时必须有一个导出的视图，否则「读到的数据」和「增量起点」之间会漏一段。
-	if r.snapshotName == "" && r.plan.Kind != copyResume {
+	if r.src.RequiresExportedSnapshot() && r.snapshotName == "" && r.plan.Kind != copyResume {
 		return errors.New("拿不到一致性视图（书签已存在但导出失败）：请用 --resync 重新初始化")
 	}
 	opt := source.SnapshotOpt{ChunkRows: r.chunkRows(), Conns: r.snapshotConns()}
@@ -961,16 +984,18 @@ func (r *runner) snapshot(ctx context.Context) error {
 
 	start := time.Now()
 	var chunks, tables int
-	_, err := r.src.SnapshotChunksFrom(ctx, opt, r.plan.From, func(c context.Context, ch pgsource.Chunk) error {
-		pos := r.consistentPoint.String()
-		if err := r.sink.BulkApply(c, r.sink.Table(ch.Table), ch.No, ch.Rows, pos, ch.From, ch.To); err != nil {
-			return err
-		}
-		r.rowsCopied += int64(len(ch.Rows))
-		chunks++
-		r.progress(c, fmt.Sprintf("全量：%s 第 %d 块，%d 行", ch.Table.Table, ch.No, len(ch.Rows)))
-		return nil
-	})
+	_, err := r.src.SnapshotChunksFrom(ctx, opt, r.plan.From,
+		func(c context.Context, ref source.TableRef, no int, rows [][]any, from, to string) error {
+			tref := r.targetRef(ref)
+			pos := posString(r.consistentPoint)
+			if err := r.sink.BulkApply(c, r.sink.Table(tref), no, rows, pos, from, to); err != nil {
+				return err
+			}
+			r.rowsCopied += int64(len(rows))
+			chunks++
+			r.progress(c, fmt.Sprintf("全量：%s 第 %d 块，%d 行", ref.Table, no, len(rows)))
+			return nil
+		})
 	if err != nil {
 		return err
 	}
@@ -981,7 +1006,7 @@ func (r *runner) snapshot(ctx context.Context) error {
 		if r.plan.Skip[t.Table] {
 			continue
 		}
-		if err := r.sink.MarkTableDone(ctx, source.TableRef{Schema: t.Schema, Table: t.Table}); err != nil {
+		if err := r.sink.MarkTableDone(ctx, r.targetRef(source.TableRef{Schema: t.Schema, Table: t.Table})); err != nil {
 			return fmt.Errorf("记录 %s 的搬完标记失败: %w", t.Table, err)
 		}
 		tables++
@@ -1024,7 +1049,7 @@ func (r *runner) cleanBeforeRecopy(ctx context.Context) error {
 		}
 		// 清数据和清标记**必须同一个事务**：中间崩在「数据清了、标记还在」那种
 		// 状态，重启会把空的表当成「这几块已经搬完」——静默丢行。
-		if err := r.sink.ResetTableChunks(ctx, ref); err != nil {
+		if err := r.sink.ResetTableChunks(ctx, r.targetRef(ref)); err != nil {
 			return fmt.Errorf("清空 %s 准备重搬失败: %w", name, err)
 		}
 		// 说清维护窗口的形状：清完到搬完之间，目标端是**部分数据**，不是「旧但完整」。
@@ -1056,14 +1081,10 @@ func (r *runner) stream(ctx context.Context, res *Result) error {
 			if err := assertPositionKind(parsed, r.src.Kind()); err != nil {
 				return err
 			}
-			p, ok := parsed.(pgsource.Position)
-			if !ok {
-				return fmt.Errorf("%w：这个源给出的位点类型是 %T，引擎不认识", source.ErrPositionMalformed, parsed)
-			}
-			from = p
+			from = parsed
 		}
 	}
-	target, err := r.src.CurrentLSN(ctx)
+	target, err := r.src.Now(ctx)
 	if err != nil {
 		return err
 	}
@@ -1072,15 +1093,16 @@ func (r *runner) stream(ctx context.Context, res *Result) error {
 	r.lastPos = from
 	r.mu.Unlock()
 
-	b := newBatcher(r.sink, r.src, r.doc, r.batchRows(), r.batchDelay(), from, func(rows int64, pos pgsource.Position) {
+	// 事件里的表名是源端的，目标端只认自己的 schema：这里统一换一次（恒等映射时无副作用）。
+	b := newBatcher(newRefMappedSink(r.sink, r.targetRef), r.src, r.doc, r.batchRows(), r.batchDelay(), from, func(rows int64, pos source.Position) {
 		r.rowsStream += rows
 		r.mu.Lock()
 		r.lastPos = pos
 		r.mu.Unlock()
 	})
-	b.onFlush = func(applied int64, pos pgsource.Position) {
-		r.progress(ctx, fmt.Sprintf("增量：已应用 %d 行，位点 %s", applied, pos.String()))
-		if pos.Compare(target) >= 0 && r.phase == state.Catchup {
+	b.onFlush = func(applied int64, pos source.Position) {
+		r.progress(ctx, fmt.Sprintf("增量：已应用 %d 行，位点 %s", applied, posString(pos)))
+		if !r.src.Before(pos, target) && r.phase == state.Catchup {
 			if err := r.phaseTo(context.Background(), state.Streaming); err == nil {
 				r.note(context.Background(), "已追平初始化期间的变更，转入常态增量")
 			}
@@ -1122,7 +1144,7 @@ func (r *runner) stream(ctx context.Context, res *Result) error {
 				idle := time.Since(time.Unix(0, lastEvent.Load()))
 				quiet := rows == 0 && !inTx
 
-				if quiet && caughtUpAt(pos, target, r.src.ServerWALEnd()) && r.phase == state.Catchup {
+				if quiet && r.caughtUpAt(pos, target, r.src.ServerEnd()) && r.phase == state.Catchup {
 					if err := r.phaseTo(context.Background(), state.Streaming); err == nil {
 						r.note(context.Background(), "已追平初始化期间的变更，转入常态增量")
 					}
@@ -1141,10 +1163,10 @@ func (r *runner) stream(ctx context.Context, res *Result) error {
 				var lag int64 = -1
 				if quiet && time.Since(lastLag) > lagEvery {
 					lastLag = time.Now()
-					if n, err := r.src.SlotLagBytes(context.Background()); err == nil {
+					if n, err := r.src.Backlog(context.Background(), pos); err == nil {
 						lag = n
 						if n > 0 {
-							r.note(context.Background(), fmt.Sprintf("落后 %s（位点 %s）", humanLag(n), pos.String()))
+							r.note(context.Background(), fmt.Sprintf("落后 %s（位点 %s）", humanLag(n), posString(pos)))
 						}
 					}
 				}
@@ -1223,7 +1245,7 @@ func (r *runner) drain(ctx context.Context, exit int, msg string) error {
 			return err
 		}
 	}
-	if r.src != nil && !r.lastPos.IsZero() {
+	if r.src != nil && !r.src.IsZero(r.lastPos) {
 		if err := r.src.Advance(dctx, r.lastPos); err != nil {
 			r.note(dctx, "把书签往前推时出错（不影响已提交的数据）："+err.Error())
 		}
@@ -1505,7 +1527,7 @@ func (r *runner) progress(ctx context.Context, msg string) {
 	rows := r.rowsCopied + r.rowsStream
 	var lagB *int64
 	if r.src != nil {
-		if n, err := r.src.SlotLagBytes(ctx); err == nil {
+		if n, err := r.src.Backlog(ctx, r.lastPos); err == nil {
 			lagB = &n
 			r.mu.Lock()
 			r.lastLagB = n
@@ -1649,8 +1671,22 @@ func scopeOf(doc control.JobDoc) source.Scope {
 		sc.Include = doc.Source.Scope.Include
 		sc.Exclude = doc.Source.Scope.Exclude
 	}
+	return sc
+}
+
+// scope 是「源端选表范围」的**唯一取值入口**：它必须知道源的种类。
+//
+// 默认 schema 不是常量：PG 的默认 schema 是 public，MySQL 的「schema」就是库名
+// （连接里那个）。一律回落 public 会让 MySQL 源读到 0 张表，而报出来的话是
+// 「没读到源端的表清单（权限不足或 schema 写错）」——把人引向权限，实际是名字错了。
+func (r *runner) scope() source.Scope {
+	sc := scopeOf(r.doc)
 	if sc.Schema == "" {
-		sc.Schema = "public"
+		if r.srcEP.Kind == dsn.KindMySQL {
+			sc.Schema = r.srcEP.Database
+		} else {
+			sc.Schema = "public"
+		}
 	}
 	return sc
 }
@@ -1670,14 +1706,14 @@ func (r *runner) selectTables() ([]source.TableRef, error) {
 		for name := range r.doc.Content.Tables {
 			t, ok := byName[name]
 			if !ok {
-				return nil, fmt.Errorf("源端找不到表 %s（可能改名了，或不在 %s 下）", name, scopeOf(r.doc).Schema)
+				return nil, fmt.Errorf("源端找不到表 %s（可能改名了，或不在 %s 下）", name, r.scope().Schema)
 			}
 			out = append(out, t.TableRef)
 		}
 		sortRefs(out)
 		return out, nil
 	}
-	sc := scopeOf(r.doc)
+	sc := r.scope()
 	for _, t := range r.cat.Tables {
 		if included(t.Table, sc.Include) && !excluded(t.Table, sc.Exclude) {
 			out = append(out, t.TableRef)

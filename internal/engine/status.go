@@ -6,7 +6,6 @@ import (
 
 	"github.com/spencerswagger/jinliang/internal/control"
 	"github.com/spencerswagger/jinliang/internal/pgsink"
-	"github.com/spencerswagger/jinliang/internal/pgsource"
 )
 
 // Status is one job's "where is it now", assembled from three places:
@@ -100,22 +99,17 @@ func StatusFor(ctx context.Context, opt Options) (Status, error) {
 			// 这种情况必须让人看见（以前这里直接忽略，看起来像「没有位点」）。
 			st.Note = "目标库里的进度标记解析失败：" + err.Error()
 		default:
-			pos, ok := parsed.(pgsource.Position)
-			if !ok {
-				st.Note = "目标库里的位点本工具不认识，可能被别的程序写过"
-				break
-			}
-			if !pos.IsZero() {
-				if cur, err := src.CurrentLSN(ctx); err == nil {
-					st.LagBytes = int64(cur.LSN) - int64(pos.LSN)
-					if st.LagBytes < 0 {
-						st.LagBytes = 0
-					}
+			if !src.IsZero(parsed) {
+				// 落后量由源端自己算（PG 是 LSN 差，MySQL 是 binlog 文件大小差）；
+				// 拿不到就不给数（0 会被当成「已经追平」）。
+				if n, err := src.Backlog(ctx, parsed); err == nil && n >= 0 {
+					st.LagBytes = n
 				}
 			}
 		}
 	}
-	if n, err := src.SlotLagBytes(ctx); err == nil {
+	// 源端侧积压（PG：槽位 WAL 差；MySQL：位点之后还剩多少 binlog）。
+	if n, err := src.Backlog(ctx, nil); err == nil && n >= 0 {
 		st.SlotBytes = n
 	}
 	return st, nil

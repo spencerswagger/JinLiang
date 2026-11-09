@@ -50,6 +50,13 @@ type Options struct {
 	// Catalog is the source table list the job selected; it defines the
 	// canonical column order every Row follows.
 	Catalog source.Catalog
+	// SourceKind 是源端的引擎类型（postgres / mysql）。
+	//
+	// 为什么目标端要知道：跨引擎时列类型文本是源端的（`datetime(6)`、
+	// `bigint unsigned`、`tinyint`），直接拼进 CREATE TABLE 会被 PG 拒掉
+	// （`type "datetime" does not exist`）。类型字典只有一份（internal/catalog），
+	// 这里按它翻成 PG 类型；同引擎（空或 postgres）原样使用，行为不变。
+	SourceKind catalog.Engine
 	// OnDDLSkipped 在「DDL 因目标端已有同名对象而被跳过」时回调（引擎用它发一条 note）。
 	// 跳过是最需要留痕的一类结果：失败会有人看，跳过不会。
 	OnDDLSkipped func(stmt string)
@@ -131,7 +138,7 @@ func Open(ctx context.Context, opt Options) (*Sink, error) {
 	if err := checkColumnBudget(opt.Catalog); err != nil {
 		return nil, err
 	}
-	tables, order := buildTables(opt.Catalog)
+	tables, order := buildTables(opt.Catalog, opt.SourceKind)
 	s := &Sink{opt: opt, tables: tables, order: order, ownerToken: newOwnerToken()}
 	conn, err := pgwire.Connect(ctx, opt.Target)
 	if err != nil {
@@ -164,7 +171,7 @@ func checkColumnBudget(cat source.Catalog) error {
 }
 
 // buildTables indexes the catalog by "schema.table" and keeps a stable order.
-func buildTables(cat source.Catalog) (map[string]*tableInfo, []string) {
+func buildTables(cat source.Catalog, srcKind catalog.Engine) (map[string]*tableInfo, []string) {
 	tables := map[string]*tableInfo{}
 	var order []string
 	for _, t := range cat.Tables {
@@ -177,7 +184,7 @@ func buildTables(cat source.Catalog) (map[string]*tableInfo, []string) {
 		for _, c := range t.Columns {
 			ti.colIndex[c.Name] = len(ti.cols)
 			ti.cols = append(ti.cols, c.Name)
-			ti.types = append(ti.types, c.Type)
+			ti.types = append(ti.types, targetType(srcKind, c.Type))
 			ti.collations = append(ti.collations, c.Collation)
 		}
 		for _, name := range ti.pk {
@@ -193,6 +200,18 @@ func buildTables(cat source.Catalog) (map[string]*tableInfo, []string) {
 		order = append(order, key)
 	}
 	return tables, order
+}
+
+// targetType 把源端列类型翻成 PG 类型（跨引擎时）；字典没覆盖的原样返回，
+// 让数据库自己报错——**不猜**一个可能更窄的类型把数据悄悄改掉。
+func targetType(src catalog.Engine, t string) string {
+	if src == "" || src == catalog.Postgres {
+		return t
+	}
+	if m, ok := catalog.Map(src, catalog.Postgres, t); ok && m.Target != "" {
+		return m.Target
+	}
+	return t
 }
 
 // Close releases the connection.
@@ -1040,7 +1059,10 @@ func (s *Sink) alignRelationTx(ctx context.Context, tx pgx.Tx, ev source.Event) 
 	// 早退会让它们走「一切正常」的路——缓存仍是旧类型/旧名字，写行时静默按旧口径编码，
 	// 或者报一个看起来像「数据问题」的编码错。原来「整批失败」至少是响亮的，
 	// 静默写错更坏。所以这里同时比名字与类型。
-	sameNames, sameTypes, keptAll, typeDiff, nameDiff := relationMatches(ti, ev.Relation)
+	// 比较前先把 Relation 的类型翻成目标端类型：跨引擎时 Relation 带的是源端类型文本
+	// （`varchar(64)` / `datetime(6)`），而缓存里是映射后的 PG 类型——直接比会把
+	// 「同一个类型」判成「改类型」，整轮失败（假红）。
+	sameNames, sameTypes, keptAll, typeDiff, nameDiff := relationMatches(ti, ev.Relation, s.opt.SourceKind)
 
 	switch {
 	case sameNames && sameTypes:
@@ -1097,7 +1119,7 @@ func (s *Sink) alignRelationTx(ctx context.Context, tx pgx.Tx, ev source.Event) 
 	for _, c := range ev.Relation.Columns {
 		ti.colIndex[c.Name] = len(ti.cols)
 		ti.cols = append(ti.cols, c.Name)
-		ti.types = append(ti.types, c.Type)
+		ti.types = append(ti.types, targetType(s.opt.SourceKind, c.Type))
 		ti.collations = append(ti.collations, c.Collation)
 	}
 	ti.pkIdx = ti.pkIdx[:0]
@@ -1120,10 +1142,10 @@ func (s *Sink) alignRelationTx(ctx context.Context, tx pgx.Tx, ev source.Event) 
 //   - 其余：改名 / 删列 / 改类型 → 本版不跟随，响亮拒绝（第③步再降级成只暂停该表）。
 //
 // 只比列数会把后两种悄悄放过——缓存留着旧类型/旧名字继续写，静默写错。
-func relationMatches(ti *tableInfo, rel *source.Table) (sameNames, sameTypes, keptAll bool, typeDiff, nameDiff string) {
+func relationMatches(ti *tableInfo, rel *source.Table, src catalog.Engine) (sameNames, sameTypes, keptAll bool, typeDiff, nameDiff string) {
 	byName := map[string]string{}
 	for _, c := range rel.Columns {
-		byName[c.Name] = c.Type
+		byName[c.Name] = targetType(src, c.Type)
 	}
 	sameNames = len(rel.Columns) == len(ti.cols)
 	if sameNames {
@@ -1356,7 +1378,7 @@ func (s *Sink) execUpsertChunk(ctx context.Context, tx pgx.Tx, ti *tableInfo, ev
 				ti.ref.Table, len(ev.New.Values), len(ti.cols))
 		}
 		for i := range ti.cols {
-			params = append(params, valueOf(ev.New.Values[i]))
+			params = append(params, s.param(ev.New.Values[i]))
 		}
 	}
 	// 用 SAVEPOINT 包住这条批量语句：失败后事务会进入 aborted 状态（后续语句全 25P02），
@@ -1464,7 +1486,7 @@ func (s *Sink) deleteTx(ctx context.Context, tx pgx.Tx, ev source.Event) error {
 		where = append(where, fmt.Sprintf("%s = $%d::text::%s", pgwire.Quote(ti.pk[i]), i+1, ti.types[idx]))
 		var v any
 		if idx < len(ev.Old.Values) {
-			v = valueOf(ev.Old.Values[idx])
+			v = s.param(ev.Old.Values[idx])
 		}
 		params = append(params, v)
 	}
@@ -1844,6 +1866,53 @@ func valueOf(v source.Value) any {
 		return v.T
 	case source.KindBool:
 		return v.I != 0
+	}
+	return nil
+}
+
+// param 是「占位符参数」的唯一出口：跨引擎时转文本（占位符就是 ::text::type），
+// 同引擎（PG→PG）保持原样，既有路径零改动。
+func (s *Sink) param(v source.Value) any {
+	if s.opt.SourceKind != "" && s.opt.SourceKind != catalog.Postgres {
+		return textValue(v)
+	}
+	return valueOf(v)
+}
+
+// textValue 把**带类型的**值转成「文本形态的参数」。
+//
+// 为什么需要：upsert/delete 的占位符是 `$n::text::<目标类型>`（参数一律按文本传，
+// 再让 PG 按目标列类型解析）——PG 源的变更流本身就是文本，天然合得上；而 MySQL 源
+// 交付的是解码后的类型值（int64 / time.Time / []byte），pgx 没法把 int64 编成
+// text 参数（`unable to encode 4444 into text format for text (OID 25)`），整批写入失败。
+// 这里按 SQL 的约定把它们写成文本，**不改变语义**：解析仍由目标列类型决定。
+//
+// 只有跨引擎（SourceKind=mysql）时用：PG→PG 的既有路径保持原样，不引入回归面。
+func textValue(v source.Value) any {
+	switch v.Kind {
+	case source.KindNull:
+		return nil
+	case source.KindInt:
+		return strconv.FormatInt(v.I, 10)
+	case source.KindUint:
+		return strconv.FormatUint(v.U, 10)
+	case source.KindFloat:
+		// -1 精度：不丢有效位（PG 自己按目标列类型再收一次）。
+		return strconv.FormatFloat(v.F, 'g', -1, 64)
+	case source.KindString, source.KindJSON:
+		return v.S
+	case source.KindBytes:
+		// `::text::bytea` 认的文本形态是反斜杠加 x 的十六进制；原样传 []byte 会被
+		// 当成普通文本再转 bytea，编码错或数据坏。
+		return "\\x" + hex.EncodeToString(v.B)
+	case source.KindTime:
+		// UTC + 微秒：目标列是 timestamp（无时区），与快照路径（time.Time → UTC）一致。
+		return v.T.UTC().Format("2006-01-02 15:04:05.999999")
+	case source.KindBool:
+		if v.I != 0 {
+			return "true"
+		}
+		return "false"
 	}
 	return nil
 }

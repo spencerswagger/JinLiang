@@ -47,7 +47,7 @@ func testCatalog() source.Catalog {
 }
 
 func TestBuildTablesIndexesAndPK(t *testing.T) {
-	tables, order := buildTables(testCatalog())
+	tables, order := buildTables(testCatalog(), "")
 	if len(order) != 3 {
 		t.Fatalf("应索引 3 张表，得到 %d", len(order))
 	}
@@ -71,14 +71,14 @@ func TestBuildTablesFallsBackWhenPKColumnMissing(t *testing.T) {
 		Columns:    []source.Column{{Name: "a", Type: "integer"}},
 		PrimaryKey: []string{"missing"},
 	}}}
-	tables, _ := buildTables(cat)
+	tables, _ := buildTables(cat, "")
 	if tables["public.t"].hasPK {
 		t.Fatal("主键列读不到时必须降级为无主键")
 	}
 }
 
 func TestConflictClause(t *testing.T) {
-	tables, _ := buildTables(testCatalog())
+	tables, _ := buildTables(testCatalog(), "")
 	if got := conflictClause(tables["public.orders"]); !strings.Contains(got, `ON CONFLICT ("id") DO UPDATE SET`) ||
 		!strings.Contains(got, `"payload" = EXCLUDED."payload"`) {
 		t.Fatalf("orders 的 upsert 尾句不对: %s", got)
@@ -95,7 +95,7 @@ func TestConflictClause(t *testing.T) {
 // 增量路径必须把参数显式转成列类型：pgoutput 给的是文本，
 // bytea / 数组 / json 只有经列类型的输入函数才能正确落地。
 func TestCastedHoldersUseColumnTypes(t *testing.T) {
-	tables, _ := buildTables(testCatalog())
+	tables, _ := buildTables(testCatalog(), "")
 	got := castedHoldersFor(tables["public.orders"], 1)
 	want := `($1::text::bigint, $2::text::text, $3::text::numeric(12,2))`
 	if got != want {
@@ -106,7 +106,7 @@ func TestCastedHoldersUseColumnTypes(t *testing.T) {
 // 多行占位必须**行优先**递增，且与参数追加顺序一一对应：错一位不会报错，
 // 只会把值写进别的列。
 func TestCastedHoldersForMultipleRows(t *testing.T) {
-	tables, _ := buildTables(testCatalog())
+	tables, _ := buildTables(testCatalog(), "")
 	ti := tables["public.kv"] // 两列：k, v
 	got := castedHoldersFor(ti, 3)
 	want := `($1::text::text, $2::text::text), ($3::text::text, $4::text::text), ($5::text::text, $6::text::text)`
@@ -140,7 +140,7 @@ func TestCompatibleTypeAcceptsAliases(t *testing.T) {
 }
 
 func TestCreateTableSQL(t *testing.T) {
-	tables, _ := buildTables(testCatalog())
+	tables, _ := buildTables(testCatalog(), "")
 	got := (&Sink{}).createTableSQL(tables["public.orders"])
 	want := `CREATE TABLE "public"."orders" ("id" bigint, "payload" text, "amount" numeric(12,2), PRIMARY KEY ("id"))`
 	if got != want {
@@ -160,7 +160,7 @@ func TestCreateTableCarriesCollation(t *testing.T) {
 		PrimaryKey:  []string{"id"},
 		HasStablePK: true,
 	}}}
-	tables, _ := buildTables(cat)
+	tables, _ := buildTables(cat, "")
 	got := (&Sink{}).createTableSQL(tables["public.t"])
 	want := `CREATE TABLE "public"."t" ("id" bigint, "name" text COLLATE "C", "note" text, PRIMARY KEY ("id"))`
 	if got != want {

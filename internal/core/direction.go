@@ -36,12 +36,15 @@ func (d Direction) Label() string { return name(d.Source) + " → " + name(d.Tar
 var supportedDirections = []Direction{
 	{Source: "postgres", Target: "postgres", Modes: "全量 + 增量"},
 	{Source: "postgres", Target: "mysql", Modes: "只全量"},
+	// MySQL 源接进引擎主路径（binlog/GTID 读流 + 块级续跑 + 位点与租约语义与 PG 源共用）。
+	// interval（水位轮询）这一版只有 PG 源实现，所以文案里写明——码表说支持、跑不了
+	// 比不支持更糟，这是本文件的规矩。
+	{Source: "mysql", Target: "postgres", Modes: "全量 + 增量（continuous / once / full_interval；interval 暂不支持）"},
 }
 
 // pendingDirections 是**路线图上但还没接通**的方向。写进来只是为了在同一条 `Why` 里
 // 明确告诉用户「你的组合属于哪一类」，不是承诺。
 var pendingDirections = []Direction{
-	{Source: "mysql", Target: "postgres"},
 	{Source: "mysql", Target: "mysql"},
 }
 

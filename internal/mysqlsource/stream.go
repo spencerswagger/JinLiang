@@ -10,6 +10,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -30,9 +31,8 @@ var _ source.Source = (*Source)(nil)
 // snapshot, and the binlog change stream. It implements source.Source from
 // internal/source/contract.go without changing it.
 type Source struct {
-	db  *sql.DB
-	ep  dsn.Endpoint
-	raw string
+	db *sql.DB
+	ep dsn.Endpoint
 
 	// Stream tuning.
 	ServerID        uint32
@@ -57,6 +57,17 @@ type Source struct {
 
 	lastNote SnapshotNote
 
+	// snapMu 护住 snap：分块全量的读会话（BeginSnapshot → SnapshotChunksFrom → EndSnapshot）。
+	// 读会话必须挂在 Source 上，因为「位点」和「一致性快照」必须在同一个连接里取，
+	// 而引擎要在读第一块之前就把位点写进目标库。
+	snapMu sync.Mutex
+	snap   *snapshotSession
+
+	// known / enriched：binlog_row_metadata=MINIMAL 时按 catalog 补列名（见 enrichRelation）。
+	knownMu  sync.Mutex
+	known    map[string]source.Table
+	enriched map[*source.Table]*source.Table
+
 	// lastCommit 是「下游已经成功处理完的最后一笔事务位点」——引擎的
 	// SafeAckPoint 语义（MySQL 没有服务端 ack，但这个值仍要能读到）。
 	lastCommit atomic.Value // Position
@@ -70,6 +81,12 @@ func Open(ctx context.Context, rawDSN string) (*Source, error) {
 	if err != nil {
 		return nil, err
 	}
+	return OpenEndpoint(ctx, ep)
+}
+
+// OpenEndpoint 从**已解析的端点**构造（引擎手里就是 dsn.Endpoint，口令只在内存里）。
+// 与 Open 走同一条构造路径，两处不会分叉。
+func OpenEndpoint(ctx context.Context, ep dsn.Endpoint) (*Source, error) {
 	if ep.Kind != dsn.KindMySQL {
 		return nil, fmt.Errorf("这不是 MySQL 的连接串（%s）", ep.Kind)
 	}
@@ -83,7 +100,7 @@ func Open(ctx context.Context, rawDSN string) (*Source, error) {
 		db.Close()
 		return nil, fmt.Errorf("连不上源库 %s:%d: %w", ep.Host, ep.Port, err)
 	}
-	s := &Source{db: db, ep: ep, raw: rawDSN, HeartbeatPeriod: 10 * time.Second}
+	s := &Source{db: db, ep: ep, HeartbeatPeriod: 10 * time.Second}
 	s.ServerID = serverIDFor("", ep)
 	// 单事务缓冲上限：job 配置之外的兜底开关（运维改不了 job 文件时用环境变量）。
 	// 默认 128 MB / 100 万事件，见 docs/STREAMING.md §1。
@@ -320,6 +337,18 @@ func (s *Source) Stream(ctx context.Context, from source.Position, handler sourc
 	}
 	asm := NewAssembler(func(ctx context.Context, tx Tx) error {
 		for _, ev := range tx.Events {
+			// EvCommit 交付**之前**就把这笔事务的提交位点记下来：引擎的 batcher 在
+			// EvCommit 上取 LastCommit 当作「这一批要写进目标库的位点」，晚一步就会
+			// 永远落后一个事务（下次重启多重放一笔，幂等但会白做）。
+			// 提前记不会丢数据：此刻数据还在引擎的批缓冲里，位点只有在
+			// sink.Apply 成功之后才会随数据一起落库；而 batcher 在事务未提交前
+			// 拒绝 AdvanceTo（inTx=true），所以不存在「位点先走、数据没写」。
+			if ev.Kind == source.EvCommit {
+				s.markCommitted(tx.Commit)
+			}
+			if ev.Relation != nil {
+				ev.Relation = s.enrichRelation(ev.Relation)
+			}
 			if err := handler(ctx, ev); err != nil {
 				return err
 			}
@@ -466,6 +495,20 @@ func (s *Source) RunStream(ctx context.Context, start Position, asm *Assembler) 
 		return err
 	}
 	defer conn.Close()
+
+	// 取消要**立刻**生效：ReadEventPacket 会一直阻塞到下一帧或心跳（默认 10 秒），
+	// 只在循环开头查 ctx.Done() 意味着「用户按停后还要等 10 秒」，收尾路径里的
+	// drain/flush 全被拖住（引擎那边看到的就是「--stop-after 3s 实际跑了 10s」）。
+	// 关掉连接让读立刻返回，这才是取消该有的形状。
+	stopClose := make(chan struct{})
+	defer close(stopClose)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-stopClose:
+		}
+	}()
 
 	if err := conn.execute(`SET @master_binlog_checksum='CRC32', @source_binlog_checksum='CRC32'`); err != nil {
 		return err

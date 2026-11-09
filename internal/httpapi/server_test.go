@@ -1803,7 +1803,8 @@ func TestUnsupportedDirectionIsFourPartAndFactual(t *testing.T) {
 	ts, store := newTestServer(t)
 	token := setupAdmin(t, ts)
 
-	// 造一对当前不支持的组合：mysql 源 → postgres 目标
+	// 造一对当前不支持的组合：mysql 源 → mysql 目标
+	// （MySQL → PG 已接通，不能再拿它当「不支持」的例子）
 	mk := func(name, kind string) control.Connection {
 		c, err := store.CreateConnection(context.Background(), control.ConnectionInput{
 			Name: name, Kind: kind, Host: "127.0.0.1", Port: 1,
@@ -1815,7 +1816,7 @@ func TestUnsupportedDirectionIsFourPartAndFactual(t *testing.T) {
 		return c
 	}
 	src := mk("my-src", "mysql")
-	tgt := mk("pg-tgt", "postgres")
+	tgt := mk("my-tgt", "mysql")
 	job, err := store.CreateJob(context.Background(), control.JobInput{
 		Name: "bad-direction", SourceID: src.ID, TargetID: tgt.ID,
 		Spec: control.JobDoc{
@@ -1845,8 +1846,8 @@ func TestUnsupportedDirectionIsFourPartAndFactual(t *testing.T) {
 	if errObj["why"] == nil || errObj["risk"] == nil || errObj["next"] == nil {
 		t.Fatalf("四段式不完整：%v", errObj)
 	}
-	// 方向以客观事实出现，且**方向正确**（源 mysql → 目标 postgres）
-	if body["source_kind"] != "mysql" || body["target_kind"] != "postgres" {
+	// 方向以客观事实出现，且**方向正确**（源 mysql → 目标 mysql）
+	if body["source_kind"] != "mysql" || body["target_kind"] != "mysql" {
 		t.Fatalf("事实字段不对：source_kind=%v target_kind=%v", body["source_kind"], body["target_kind"])
 	}
 	// 文案里不写方向描述：message 里不该出现「PostgreSQL → MySQL」这类自然语言

@@ -86,7 +86,15 @@ func parseRows(body []byte, kind source.EventKind, version int, tables map[uint6
 		}
 		pos += n
 		if kind != source.EvUpdate {
-			re.Changes = append(re.Changes, Change{Kind: kind, New: oldImg})
+			// 行事件只有一份镜像：INSERT 的是「新增后的值」，DELETE 的是「删除前的值」。
+			// 归位必须按语义放对侧——删除的定位依据是删除前的值（Change.Old），
+			// 放进 New 会让上层拿到一条「没有值」的删除事件（目标端 WHERE 全 NULL，
+			// 静默删 0 行：数据永远删不掉，而日志里一切正常）。
+			if kind == source.EvDelete {
+				re.Changes = append(re.Changes, Change{Kind: kind, Old: oldImg})
+			} else {
+				re.Changes = append(re.Changes, Change{Kind: kind, New: oldImg})
+			}
 			continue
 		}
 		newImg, n, err := decodeImage(tm, body[pos:], bitmap2)
