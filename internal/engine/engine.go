@@ -758,14 +758,19 @@ func (r *runner) prepare(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("准备源端对象失败: %w", err)
 	}
+	// 位点这一轮要不要动、什么时候动，是三件不同的事：
+	//   - 续跑：不动（靠增量从原位点重放来收敛）；
+	//   - 从头搬：**等块标记清干净了再动**，两者必须同一个事务（snapshot() 里的
+	//     StartFreshCopy）——先动位点、后清标记，中间崩一次就会以「续跑」的名义丢一段变更；
+	//   - 不搬：不动（位点只在数据事务里前进）。
+	writePos := ""
 	switch plan.Kind {
 	case copyResume:
-		// 位点不许往前挪：续跑剩下的块读的是更晚的视图，靠「增量从原来那个位点重放」
-		// 把这段时间的变更再盖一遍。挪了位点，就会丢「已搬块区间里新增的行」。
 		r.consistentPoint = parsedCP(src, posInTarget)
 		r.snapshotName = ""
 		src.SetSnapshotName("")
 		r.reusedSlot = false
+		writePos = posInTarget // 原样写回：不挪
 		r.note(ctx, plan.Why)
 	default:
 		if plan.Why != "" {
@@ -776,13 +781,16 @@ func (r *runner) prepare(ctx context.Context) error {
 		src.SetSnapshotName(prep.SnapshotName)
 		r.snapshotName = prep.SnapshotName
 		r.consistentPoint = prep.ConsistentPoint
+		if plan.Kind == copySkip {
+			writePos = prep.ConsistentPoint.String() // 沿用旧行为：书签已确认的位置就是消费到的位置
+		}
 	}
 	for _, a := range prep.Actions {
 		r.emit(ctx, control.Event{Type: "note", Message: a.What})
 		_ = r.sink.RecordObject(ctx, objectOf(a), objectKind(a))
 	}
 	if err := r.sink.EnsureMeta(ctx, hashOf(r.doc), string(state.Prepare),
-		r.consistentPoint.String(), prep.SnapshotName); err != nil {
+		writePos, prep.SnapshotName); err != nil {
 		return err
 	}
 	return nil
@@ -926,10 +934,12 @@ func (r *runner) snapshot(ctx context.Context) error {
 				r.note(ctx, "清空了上次没搬完的 "+name+"（重搬全量，避免留下源端已删除的行）")
 			}
 		}
-		// 从头搬就是一次新的搬：块标记只描述**这一次**。不在这里清，上一次留下的
-		// 「搬完了」章会替这一次撒谎（新搬只搬了 5 块，状态却写着整表已搬完）。
-		if err := r.sink.ResetChunks(ctx); err != nil {
-			return err
+		// 开始一次新的搬：**清块标记 + 推位点，同一个事务**（pgsink.StartFreshCopy）。
+		// 分两次写、还先推位点的话，中间崩一次会留下「新位点 + 上一轮的块标记」，
+		// 下次被判成续跑：旧游标接着搬、增量从新位点重放 → (旧位点,新位点] 的
+		// 增/改/删永远不重放，还以退出码 0 收尾。
+		if err := r.sink.StartFreshCopy(ctx, r.consistentPoint.String()); err != nil {
+			return fmt.Errorf("开始新一轮全量（清块进度 + 定位点）失败: %w", err)
 		}
 	}
 	// 续跑时没有导出的视图（视图随上个进程一起没了），靠新的 REPEATABLE READ；

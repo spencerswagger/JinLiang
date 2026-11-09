@@ -60,7 +60,30 @@ phase 写成 `done`（drain 的既有语义），于是「取消过的半截全�
 变异验证：把 `planCopy` 强行改成永远 `copyFresh`，两条续跑用例立刻红
 （「重启后搬了 200000 行…这是整轮重搬」）——用例确实盯着这件事。
 
-## 5. 留给 Ark 的口径（我没自己改文档）
+## 5. 必改 1：清标记与推位点必须同一个事务
+
+原来的写法是两次写：`prepare` 里 `EnsureMeta` 把 `_jl_meta.position` 推到新视图的位点，
+`snapshot` 里再清块标记。中间崩一次（kill -9 / OOM / TRUNCATE 报错后人工重跑）就留下
+「新位点 P2 + 上一轮的块标记 1..50」；下次 `planCopy` 读到 anyMarker/not-done/StoredCP=P2/
+书签可用 → 判成续跑：从旧游标接着搬、增量却从 P2 重放，(P1,P2] 的增/改/删永不重放，
+而且退出码 0、日志写着「续跑」。
+
+现在：
+
+- `pgsink.StartFreshCopy(ctx, pos)`：一个事务里 `DELETE _jl_chunk`（整个 job_key，含本次
+  未选中的表）+ 推进位点。库里只剩两种状态——「旧位点 + 旧标记」或「新位点 + 无标记」。
+- `prepare` 在从头搬时**不**写位点（`writePos=""`，`EnsureMeta` 用 COALESCE 保留旧值）。
+- 覆盖到的入口：必改窗口本身；本次未选中的表残留旧标记（同一个 DELETE 按 job_key 清掉）。
+  未覆盖：`on_exists=recreate` 把表重建后残留的 Done 标记（属 Owl 建议项，另排）。
+- `pgsource.slotPosition` 顺带把 `wal_status='lost'`（max_slot_wal_keep_size 把 WAL 丢了）
+  当成「书签不可用」：书签还在但重放不了，当「还能续」一样是静默丢一段。
+
+新用例 `TestSlotLossForcesFullRecopyNotResume`：kill 中途 → drop 书签 → 改已搬区间 →
+用另一条连接压住目标表的 ACCESS SHARE 让 TRUNCATE 卡在锁上（窗口确定命中）→ kill -9 →
+断言**位点没被提前推**，再跑一次必须整轮重搬且内容 md5 与源端一致。
+变异验证（把位点改回 prepare 推）：立刻红——「从头搬的窗口里位点被提前推了……」。
+
+## 6. 留给 Ark 的口径（我没自己改文档）
 
 1. `docs/SNAPSHOT.md §4` 现在写「快照 id 已失效 → 整段重来」。实测：导出的视图**必然**
    随进程失效（kill -9 之后一定失效），真正的判据是**书签还能不能从原位点重放**。

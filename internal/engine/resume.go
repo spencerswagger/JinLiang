@@ -74,6 +74,8 @@ type copyInputs struct {
 	SlotOK bool
 	// SlotAhead 表示书签已确认的位点**越过了** StoredCP：中间那段变更已被丢弃。
 	SlotAhead bool
+	// SlotCP 是书签已确认位点的原文（只用于把「哪一条不成立」写清楚）。
+	SlotCP string
 	// PriorPhase 是 _jl_meta.phase，只给「没有块标记的老状态」兜底用。
 	PriorPhase string
 	// Capable 表示目标端会记块进度（PG 目标端；MySQL 全量路径本版还没有块记账）。
@@ -152,11 +154,13 @@ func planCopy(in copyInputs) chunkPlan {
 		p.Interrupted = interrupted
 		switch {
 		case in.StoredCP == "":
-			p.Why = "目标端没有可用的一致性位点，这一轮从头搬"
+			p.Why = "目标端没有可用的一致性位点（_jl_meta.position 为空），这一轮从头搬"
 		case !in.SlotOK:
-			p.Why = "源端书签已经不在了（被清理或重建），追不回这段时间的变更，这一轮从头搬"
+			p.Why = "源端书签已经不在了（被清理，或 WAL 已被 max_slot_wal_keep_size 丢掉）：" +
+				"从目标位点 " + in.StoredCP + " 往后那段变更重放不出来，这一轮从头搬"
 		default:
-			p.Why = "源端书签已经越过目标端的位点（中间那段变更被清理了），这一轮从头搬"
+			p.Why = "源端书签已经越过目标端的位点（书签确认到 " + in.SlotCP +
+				"，目标位点是 " + in.StoredCP + "，中间那段变更已被清理）：这一轮从头搬"
 		}
 		return p
 	}
@@ -232,6 +236,7 @@ func (r *runner) decideCopyPlan(ctx context.Context, src *pgsource.Source,
 		return chunkPlan{}, fmt.Errorf("读源端书签的确认位点失败: %w", err)
 	}
 	in.SlotOK = ok
+	in.SlotCP = slot.String()
 	// 书签确认位点**越过**目标位点：中间那段变更已经被源端清理，追不回来了。
 	in.SlotAhead = ok && !slot.IsZero() && slot.Compare(pgPos) > 0
 	return planCopy(in), nil

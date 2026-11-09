@@ -110,6 +110,40 @@ func (s *Sink) MarkTableDone(ctx context.Context, ref source.TableRef) error {
 	return err
 }
 
+// StartFreshCopy opens a new initial copy: it drops this job's chunk markers and
+// moves the authoritative position to the new view's start **in one transaction**.
+//
+// 为什么必须同一个事务（这是 Owl 必改 1）：这两件事分开写、还先推位点的话，中间崩一次
+// 就留下「新位点 P2 + 上一轮的块标记 1..50」。下次 planCopy 会读到 anyMarker=true /
+// not-done / StoredCP=P2 / 书签可用 → 判成**续跑**：从旧游标接着搬，增量却从 P2 重放，
+// 于是 (P1,P2] 之间的增/改/删永远不会被重放，而且退出码是 0、日志还写着「续跑」。
+//
+// 同事务之后，库里只有两种状态：要么「旧位点 + 旧标记」（下次照旧判重搬），
+// 要么「新位点 + 没有标记」（新的一次拷贝，从头开始）。
+func (s *Sink) StartFreshCopy(ctx context.Context, pos string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	tx, err := s.conn.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	// 按 job_key 清**全部**标记，不只本次选中的表：上次在范围内、这次不在的表留下的
+	// 旧标记同样是「另一次拷贝」的东西，留着只会让下一次判定读错代号。
+	q := fmt.Sprintf(`DELETE FROM %s WHERE job_key=$1`, s.stateTable("_jl_chunk"))
+	if _, err := tx.Exec(ctx, q, s.opt.JobKey); err != nil {
+		return fmt.Errorf("清掉本任务的块进度失败: %w", err)
+	}
+	if pos != "" {
+		if err := s.setPositionTx(ctx, tx, pos); err != nil {
+			return err
+		}
+	}
+	return tx.Commit(ctx)
+}
+
 // ResetTableChunks puts one table back to the start: empty the table and drop
 // its chunk markers **in one transaction**.
 //

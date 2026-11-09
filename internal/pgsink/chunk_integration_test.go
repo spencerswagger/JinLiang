@@ -85,6 +85,31 @@ func TestChunkProgressRoundTrip(t *testing.T) {
 		t.Fatalf("续写后应有 9 行（不重不漏），实际 %d", n)
 	}
 
+	// StartFreshCopy：**清标记 + 推位点，同一个事务**（Owl 必改 1）。
+	// 判据：调完之后「没有块进度」且「位点就是新位点」——两个状态不可能只成立一半。
+	if err := s.StartFreshCopy(ctx, "pos-fresh"); err != nil {
+		t.Fatal(err)
+	}
+	got, err = s.ChunkProgress(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p, ok := got[table]; ok && (p.LastNo != 0 || p.Done) {
+		t.Fatalf("StartFreshCopy 之后不该再有块进度，得到 %+v", p)
+	}
+	if pos, err := s.Position(ctx); err != nil {
+		t.Fatal(err)
+	} else if pos != "pos-fresh" {
+		t.Fatalf("StartFreshCopy 之后位点应为 pos-fresh，得到 %q", pos)
+	}
+	// 它不是「清表」：数据还在（清不清表由调用方按表决定，无主键表那套走 ResetTableChunks）。
+	if err := s.conn.QueryRow(ctx, "SELECT count(*) FROM "+table).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 9 {
+		t.Fatalf("StartFreshCopy 不该动数据，实际 %d 行", n)
+	}
+
 	// ResetTableChunks：数据和标记一起回到起点
 	if err := s.ResetTableChunks(ctx, ref); err != nil {
 		t.Fatal(err)

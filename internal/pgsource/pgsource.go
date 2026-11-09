@@ -365,17 +365,24 @@ func (s *Source) publicationTargets() string {
 }
 
 // slotPosition returns the slot's confirmed position ("" when it exists but has
-// never been confirmed).
+// never been confirmed). 书签的 WAL 已经被 max_slot_wal_keep_size 丢掉时也当成不存在：
+// 那种书签还在，但**从任何旧位点都重放不了**，当「还能续」会让增量静默丢一段。
 func (s *Source) slotPosition(ctx context.Context) (string, bool, error) {
 	var lsn *string
+	var walStatus *string
+	// wal_status 是 PG 13+ 的列：老版本用 to_jsonb 取，取不到就是 NULL（不写版本号分支）。
 	err := s.conn.QueryRow(ctx,
-		`SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name=$1`,
-		s.opt.Slot).Scan(&lsn)
+		`SELECT confirmed_flush_lsn::text, to_jsonb(s)->>'wal_status'
+		   FROM pg_replication_slots s WHERE slot_name=$1`,
+		s.opt.Slot).Scan(&lsn, &walStatus)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", false, nil
 	}
 	if err != nil {
 		return "", false, err
+	}
+	if walStatus != nil && *walStatus == "lost" {
+		return "", false, nil
 	}
 	if lsn == nil {
 		return "", true, nil
@@ -384,9 +391,9 @@ func (s *Source) slotPosition(ctx context.Context) (string, bool, error) {
 }
 
 // SlotConfirmed reports the slot's confirmed position, i.e. how far the source
-// has already been acknowledged. ok=false means the slot is gone (dropped,
-// expired, or the whole cluster was rebuilt) — in that case a checkpoint older
-// than the slot cannot be replayed any more.
+// has already been acknowledged. ok=false means the slot cannot be replayed from
+// any old checkpoint any more: it was dropped, the whole cluster was rebuilt, or
+// `max_slot_wal_keep_size` already threw its WAL away (wal_status='lost').
 func (s *Source) SlotConfirmed(ctx context.Context) (Position, bool, error) {
 	raw, exists, err := s.slotPosition(ctx)
 	if err != nil || !exists {

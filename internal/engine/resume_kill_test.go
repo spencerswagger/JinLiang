@@ -11,6 +11,7 @@ package engine_test
 // 缺 DSN 直接失败（不跳过）：静默通过是这个仓库最不能犯的错。
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -94,6 +95,7 @@ type resumeFixture struct {
 	table    string
 	srcDB    *pgx.Conn
 	dstDB    *pgx.Conn
+	dstDSN   string
 	baseline string // 一次性全量的内容 md5（基准）
 	// interrupted 是中断那一刻的事实（块号/行数/位点）。
 	interrupted interruption
@@ -110,6 +112,7 @@ func newResumeFixture(t *testing.T, name string) *resumeFixture {
 		table:   name,
 		srcDB:   mustConn(t, srcDSN),
 		dstDB:   mustConn(t, dstDSN),
+		dstDSN:  dstDSN,
 	}
 
 	ctx := context.Background()
@@ -321,6 +324,160 @@ func (f *resumeFixture) assertResume(t *testing.T, posBefore string) {
 	t.Logf("续跑：中断时 %d 行 / %d 块（最大块号 %d）→ 续跑搬 %d 行、用时 %s；"+
 		"最终 %d 行，md5 %s == 基准，位点未挪（%s）",
 		before.rows, before.chunks, before.maxChunk, copied, elapsed, n, f.md5(t, f.dstDB, f.table), after.position)
+}
+
+// 书签被清掉（max_slot_wal_keep_size 把它的 WAL 丢干净、或被人 drop）→ 重启必须**整轮重搬**。
+//
+// 这条盯的是「新位点 + 上一轮的块标记」那个中间态：从头搬的时候，位点必须在
+// **块标记清掉的同一个事务里**才前进。为了稳定地停在窗口中间，这里不靠 sleep 掐时间：
+// 测试自己开一个读事务压住目标表的 ACCESS SHARE 锁，TRUNCATE 会在锁上等——等到
+// 「TRUNCATE 正在等锁」这一刻再 kill -9，窗口就是确定命中的。
+//
+// 改之前（位点在 prepare 就推了、标记要到 snapshot 才清）这里的位点会变成新视图的位点，
+// 于是断言 `位点没被提前推` 立刻红；接着的重启会按「续跑」从旧游标搬，已搬区间里
+// 停机期间改过的行永远不会被重放 —— 内容 md5 那条也跟着红。
+func TestSlotLossForcesFullRecopyNotResume(t *testing.T) {
+	f := newResumeFixture(t, "resume_slotlost")
+	f.killDuringCopy(t)
+	before := f.interrupted
+
+	ctx := context.Background()
+	jobKey := f.jobKey(t)
+
+	// ① 模拟书签被清：max_slot_wal_keep_size 超额时 PG 会把书签的 WAL 丢掉（wal_status=lost），
+	//    这里直接 drop——对引擎来说等价：从任何旧位点都重放不了。
+	exec(t, f.srcDB, "SELECT pg_drop_replication_slot('"+slotNameFor(jobKey)+"')")
+
+	// ② 停机期间改「已搬区间」里的行：整轮重搬会读到新值；错判成续跑就再也读不到。
+	exec(t, f.srcDB, "UPDATE "+f.table+" SET payload='post-slot-loss-'||id WHERE id <= 1000")
+	// 表尾新增：不管怎么搬都该在。
+	exec(t, f.srcDB, "INSERT INTO "+f.table+" SELECT g, 'tail-'||g FROM generate_series("+
+		strconv.Itoa(resumeTotal+1)+","+strconv.Itoa(resumeTotal+200)+") g")
+
+	// ③ 压住目标表的锁，让第二轮全量卡在 TRUNCATE（也就是「标记还没清、位点已经推了」的窗口）。
+	// 必须用**另一条连接**持有这个事务：f.dstDB 还要用来查 pg_stat_activity 和进度。
+	lockConn, err := pgx.Connect(ctx, f.dstDSN)
+	if err != nil {
+		t.Fatalf("开锁会话失败: %v", err)
+	}
+	defer lockConn.Close(context.Background())
+	lockTx, err := lockConn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var held int
+	if err := lockTx.QueryRow(ctx, "SELECT count(*) FROM "+f.table).Scan(&held); err != nil {
+		t.Fatal(err)
+	}
+
+	var runOut bytes.Buffer
+	cmd := execpkg.Command(f.bin, "run", "--job", f.jobName, "--data-dir", f.dataDir, "--snapshot-only")
+	cmd.Env = os.Environ()
+	cmd.Stdout, cmd.Stderr = &runOut, &runOut
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("启动第二轮全量失败: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	f.waitTruncateBlocked(t, done, &runOut)
+	if err := cmd.Process.Kill(); err != nil {
+		t.Fatalf("kill -9 失败: %v", err)
+	}
+	_ = cmd.Wait()
+	if err := lockTx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// ④ 位点不许被提前推：此刻块标记还在（这一轮一块都没搬），位点必须仍是中断前那个。
+	//    这就是「清标记与推位点同事务」的可观测判据。
+	afterCrash := f.readState(t)
+	if afterCrash.position != before.position {
+		t.Fatalf("从头搬的窗口里位点被提前推了：中断前 %s，崩后 %s（块标记还在，下次会被判成续跑）",
+			before.position, afterCrash.position)
+	}
+
+	// ⑤ 再跑一次：必须整轮重搬（不是续跑），且内容与源端一致（含停机期间的修改）。
+	out, code := f.run(t, "--snapshot-only")
+	if code != 0 {
+		t.Fatalf("整轮重搬失败（退出码 %d）：\n%s", code, out)
+	}
+	if copied := copiedRows(t, out); copied != resumeTotal+200 {
+		t.Fatalf("书签被清后应整轮重搬 %d 行（源端当前行数），实际搬了 %d 行\n%s",
+			resumeTotal+200, copied, out)
+	}
+	var srcN, dstN int
+	if err := f.srcDB.QueryRow(ctx, "SELECT count(*) FROM "+f.table).Scan(&srcN); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.dstDB.QueryRow(ctx, "SELECT count(*) FROM "+f.table).Scan(&dstN); err != nil {
+		t.Fatal(err)
+	}
+	if srcN != dstN {
+		t.Fatalf("整轮重搬后行数不一致：源 %d / 目标 %d", srcN, dstN)
+	}
+	if s, d := f.md5(t, f.srcDB, f.table), f.md5(t, f.dstDB, f.table); s != d {
+		t.Fatalf("整轮重搬后内容不一致：源 %s / 目标 %s；差异 %s", s, d, f.diff(t))
+	}
+	t.Logf("书签被清 → 整轮重搬：崩溃窗口内位点保持 %s；重搬 %d 行，%d 行，md5 %s == 源端",
+		afterCrash.position, resumeTotal+200, dstN, f.md5(t, f.dstDB, f.table))
+}
+
+// waitTruncateBlocked 等到「有 TRUNCATE 卡在锁上」——那就是新一轮全量的窗口。
+// 进程提前结束就直接报错（否则「等不到」会被误读成「窗口没构造出来」）。
+func (f *resumeFixture) waitTruncateBlocked(t *testing.T, done <-chan error, out *bytes.Buffer) {
+	t.Helper()
+	ctx := context.Background()
+	deadline := time.Now().Add(60 * time.Second)
+	for time.Now().Before(deadline) {
+		select {
+		case err := <-done:
+			t.Fatalf("第二轮全量在 TRUNCATE 之前就结束了（%v）：\n%s", err, out.String())
+		default:
+		}
+		var n int
+		err := f.dstDB.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity
+			WHERE datname = current_database() AND state = 'active'
+			  AND wait_event_type = 'Lock' AND query ILIKE '%truncate%'`).Scan(&n)
+		if err == nil && n > 0 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("60 秒内没有看到 TRUNCATE 卡在锁上：\n%s\n--- pg_stat_activity ---\n%s",
+		out.String(), f.sessions(t))
+}
+
+// jobKey 读目标端状态行里的 job_key（书签名是 jl_<job_key>_1）。
+func (f *resumeFixture) jobKey(t *testing.T) string {
+	t.Helper()
+	var k string
+	if err := f.dstDB.QueryRow(context.Background(),
+		"SELECT job_key FROM _jl_meta LIMIT 1").Scan(&k); err != nil {
+		t.Fatalf("读 job_key 失败: %v", err)
+	}
+	return k
+}
+
+func slotNameFor(jobKey string) string { return "jl_" + jobKey + "_1" }
+
+// sessions 列出目标库里所有会话在干什么（卡住时用来定位到底等在哪一句）。
+func (f *resumeFixture) sessions(t *testing.T) string {
+	t.Helper()
+	rows, err := f.dstDB.Query(context.Background(), `SELECT state, COALESCE(wait_event_type,'')||'/'||COALESCE(wait_event,''),
+		left(replace(query, E'\n',' '), 70) FROM pg_stat_activity WHERE datname = current_database()`)
+	if err != nil {
+		return "读 pg_stat_activity 失败: " + err.Error()
+	}
+	defer rows.Close()
+	out := ""
+	for rows.Next() {
+		var st, ev, q string
+		if err := rows.Scan(&st, &ev, &q); err != nil {
+			return "扫描失败: " + err.Error()
+		}
+		out += st + " " + ev + " | " + q + "\n"
+	}
+	return out
 }
 
 // interrupted 让 assertResume 知道中断点；只在这条用例的生命周期里读。
