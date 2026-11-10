@@ -222,11 +222,11 @@ func (s *Source) Preflight(ctx context.Context, req source.Requirements) (source
 
 // Prepare implements source.Source. MySQL needs no server-side objects for a
 // stream, so there is nothing to apply — and nothing to undo.
-func (s *Source) Prepare(ctx context.Context, actions []source.Action) (out0 []source.Action, err error) {
+func (s *Source) Prepare(ctx context.Context, actions []source.Action) (out []source.Action, err error) {
 	// 出口统一打语义标记（契约 §4.4）：引擎只问 source.ClassOf，不 import 本包。
 	// 没有这一层时，MySQL 源的错误在引擎里**全部**落到「未识别的数据库错误」。
 	defer func() { err = markClass(err) }()
-	out := make([]source.Action, 0, len(actions))
+	out = make([]source.Action, 0, len(actions))
 	for _, a := range actions {
 		a.Applied = false
 		a.Reason = "MySQL 的增量不依赖服务端对象（没有槽位/发布），无需准备"

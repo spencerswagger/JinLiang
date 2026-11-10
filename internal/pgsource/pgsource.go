@@ -254,7 +254,8 @@ type PrepareResult struct {
 // 为什么单独一个方法而不是给 Prepare 加参数：`--resync` 在 continuous 模式（只接增量、
 // 不做快照）下要的正是「不导出视图、只换书签」，而 Prepare 的 Snapshot 参数同时管着
 // 导出视图；把两件事绑在一起会顺手多开一条永远不会被读的快照连接。
-func (s *Source) RebuildSlot(ctx context.Context) error {
+func (s *Source) RebuildSlot(ctx context.Context) (err error) {
+	defer func() { err = markClass(err) }()
 	_, exists, err := s.slotPosition(ctx)
 	if err != nil {
 		return err
@@ -532,7 +533,10 @@ func (s *Source) SnapshotChunks(ctx context.Context, opt source.SnapshotOpt, fn 
 // 剩下的块读的是一个更晚的视图——这不会丢变更，因为增量仍然从原来的位点重放
 // （见 engine.planCopy 与本文件上层说明）。
 func (s *Source) SnapshotChunksFrom(ctx context.Context, opt source.SnapshotOpt,
-	resume map[string]ChunkResume, fn ChunkHandler) (Position, error) {
+	resume map[string]ChunkResume, fn ChunkHandler) (pos0 Position, err error) {
+	// 全量搬运也会撞结构/权限类错误（例如目标端 COPY 前的读），出口一样要打标记——
+	// 少打一个出口，那条错误在引擎里就退回「未识别」（Owl II P2）。
+	defer func() { err = markClass(err) }()
 	if opt.ChunkRows <= 0 {
 		opt.ChunkRows = 100000
 	}
@@ -1166,7 +1170,8 @@ func (s *Source) Tables() []source.TableRef {
 
 // Advance moves the slot forward without a running stream (used after a clean
 // shutdown and by gc). It never moves backwards.
-func (s *Source) Advance(ctx context.Context, to Position) error {
+func (s *Source) Advance(ctx context.Context, to Position) (err error) {
+	defer func() { err = markClass(err) }()
 	if to.IsZero() {
 		return nil
 	}

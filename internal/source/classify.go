@@ -17,8 +17,6 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-
-	"github.com/spencerswagger/jinliang/internal/pgwire"
 )
 
 // Class 是「这条错误属于哪一类」的稳定枚举。引擎按它挂码，连接器按它标记。
@@ -79,12 +77,15 @@ func (m *Marked) Unwrap() error      { return m.Err }
 func (m *Marked) SourceClass() Class { return m.Class }
 
 // Mark 给一条错误打上语义类。err 为 nil 时返回 nil（好让调用方直接 `return Mark(err, …)`）。
-// 已经有标记的不重复包——外层知道得更多，保留外层。
+// **第一条标记生效**：已经有标记的不再包第二层（`errors.As` 判，不只看最外层 `*Marked`）。
+// 理由：类会被「最外层 Classified」决定，再包一层等于让后来的、知道得更少的调用点
+// 覆盖掉连接器原本的判断（Owl II 探针：retryable 会被翻成 no_privilege）。
 func Mark(err error, c Class) error {
 	if err == nil {
 		return nil
 	}
-	if _, ok := err.(*Marked); ok {
+	var already *Marked
+	if errors.As(err, &already) {
 		return err
 	}
 	return &Marked{Class: c, Err: err}
@@ -99,7 +100,7 @@ func ClassOf(err error) Class {
 	if errors.As(err, &c) {
 		return c.SourceClass()
 	}
-	state := pgwire.SQLState(err)
+	state := sqlStateOf(err)
 	if cls, ok := classFromSQLState(state); ok {
 		return cls
 	}
@@ -112,6 +113,18 @@ func ClassOf(err error) Class {
 		}
 	}
 	return ClassUnknown
+}
+
+// sqlStateOf 取 SQLSTATE，但**不 import 任何驱动/内部包**：只要错误自己带
+// `SQLState() string`（pgconn.PgError 就有），契约层就不用依赖具体驱动。
+// 这条依赖线很重要——`internal/source` 是契约包，一旦 import 了 pgwire，
+// 以后每个连接器都会被拖进来（Owl II P2）。
+func sqlStateOf(err error) string {
+	var st interface{ SQLState() string }
+	if errors.As(err, &st) {
+		return st.SQLState()
+	}
+	return ""
 }
 
 // classFromSQLState 是**协议层**的公共词汇，不是某家连接器的私有约定。
