@@ -36,7 +36,7 @@
 | 角色 | 方法 | 说明 |
 |---|---|---|
 | **唯一写点** | `pgsink.PauseTable(ctx, ref, reason, detail)` | B2 后加 `mysqlsink` 同构实现；**引擎/HTTP/CLI 不得直接改这一列** |
-| 读（每轮一次） | `LoadPausedTables(ctx)` | `prepare` 末尾（`EnsureMeta` 之后、`EnsureSchema` 之前）读进内存缓存 |
+| 读（每轮一次） | `LoadPausedTables(ctx)` | `EnsureMeta` 之后、`EnsureSchema` 之前读进内存缓存（**写路径快检必须在第一次写入前就绪**，而 `EnsureSchema` 本身可能写行） |
 | 读（展示） | `PausedTables(ctx)` | `status` / doctor / UI 用 |
 | 读（写路径快检） | `isPausedLocked(ref)` | 仅用于**留痕与整批拒绝**，**不用于跳过写行** |
 

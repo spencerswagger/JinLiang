@@ -841,9 +841,9 @@ func (r *runner) prepare(ctx context.Context) error {
 		return err
 	}
 	r.src = src
-	// 暂停记录要在 interval 早退**之前**收口：interval 既不清表、也不走 Apply，
-	// 但用户对齐结构后改 interval 跑时，记录如果不在这里清掉，status 会一直显示「已暂停」
-	// 而数据其实在写——那种「界面与事实相反」最难查。
+	// interval 单独在这里收口：它既不清表、也不走 Apply，但用户对齐结构后改 interval 跑时，
+	// 记录不清掉会让 status 一直显示「已暂停」而数据其实在写。
+	// **只在这里调**：interval 没有「存量」概念，`copyDoneFor` 恒真是设计如此（契约 §1.2 例外段）。
 	if err := r.reconcilePaused(ctx); err != nil {
 		return err
 	}
@@ -952,9 +952,10 @@ func (r *runner) prepare(ctx context.Context) error {
 		writePos, prep.SnapshotName); err != nil {
 		return err
 	}
-	// 收口已经在 openSource 之后、interval 早退之前做过一次（见上）；
-	// 这里不再重复，避免同一次 prepare 里跑两遍。
-	return nil
+	// 收口必须在 `decideCopyPlan` **之后**：`progressByTable` 是那一步才赋值，
+	// 提前调会让 `chunkProgress()` 是空 map、`copyDoneFor` 走 `!ok → true` → 每张表都被
+	// 判成「已搬完」→ 暂停记录被无条件清掉（半截拷贝的表会显示「已恢复」而数据是半空的）。
+	return r.reconcilePaused(ctx)
 }
 
 // reconcilePaused 收紧本轮的暂停记录。

@@ -76,7 +76,7 @@
 9. 本轮**不含**：`mysqlsink` 同构列、`docs/` 外壳、`verify --fix`、Owl 在 #75 的两条残余、`#64` 已合部分的复查项。
 10. **写路径快检在引擎层不可达（代码级理由，逐状态穷举）**：试过「流式暂停 → 手工对齐 → 同模式重跑」这条路，结论仍是不可达，原因是**三条退出路径各自堵死**：
     - **结构未对齐**：`EnsureSchema` 在 `prepare` 里就失败（E1015），run 在进入写路径之前结束；
-    - **结构已对齐**：`reconcilePaused` 里 `copyDoneFor(表)` 为真（有 `Done` 标记，或**一条块标记都没有**——`continuous`/`interval` 就是这种）→ 当场 `ClearPausedTable` 并发 note，写路径拿不到记录；
+    - **结构已对齐**：`reconcilePaused`（在 `decideCopyPlan` **之后**调，`progressByTable` 已有值）里 `copyDoneFor(表)` 为真 → 当场 `ClearPausedTable` 并发 note，写路径拿不到记录。注意 `copyDoneFor` 只在「**这张表一条块进度都没有**」时才当作已完成（`continuous`/`interval` 的情形，契约 §1.2 例外），**半截拷贝（有块标记、无 `Done`）一律不算完成**——所以「半截拷贝 + 记录」会保留（`TestReconcilePausedKeepsHalfCopiedAndClearsDone` 第一格）；
     - **存量没搬完**（半截拷贝）：`planCopy` 判 `copyResume`/`copyFresh`，写路径排在搬运之后；搬运成功那一刻 `snapshot()` 在 `MarkTableDone` 前调 `ClearPausedTable`，同样先解除；搬运失败则 run 直接结束。
     因此「结构已对齐 + 记录仍在 + 走到 `Apply`」三件事不能同时成立。判据 4(d) 的落点因此在 **pgsink 层**：`TestApplyRefusesPausedTable`（第二个 Sink 实例、只靠 `LoadPausedTables` 读回 → 整批拒绝 + 目标端 0 行），变异「删掉 `Apply` 暂停判定」→ 该格红。
     引擎层「不会带着暂停记录继续写」靠**上游三处**：①`EnsureSchema` 结构不一致即失败；②`reconcilePaused` 对齐且存量完成即解除；③搬运成功即解除。`Apply` 的判定是**最后一道闸**（契约 §1.2 的写路径快检），不是主路径——保留它是因为删掉等于撤掉这道闸。
