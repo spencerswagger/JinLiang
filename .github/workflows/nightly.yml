@@ -351,9 +351,9 @@ jobs:
             sleep 2
           done
           [ "$ok" = 1 ] || { echo "--- pg-src 没起来 ---"; docker logs pg-src; exit 1; }
-          wl=$(pgq "show wal_level") || fail "连不上 pg-src"
+          wl=$(docker exec pg-src psql -U jinliang -d postgres -tAc "show wal_level")
           echo "PG: wal_level=$wl"
-          [ "$wl" = "logical" ] || { echo "❌ PG 的 wal_level=$wl（要 logical）"; exit 1; }
+          [ "$wl" = "logical" ] || { echo "❌ PG 的 wal_level=$wl（要 logical）；缺了它 B1 引擎建逻辑书签会报 SQLSTATE 55000"; exit 1; }
       - name: 第二套库
         run: |
           set -euo pipefail
