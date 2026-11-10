@@ -50,22 +50,45 @@ nightly 连续四次 `schedule` 全红：`42308052749`（11-06）、`42416727996
 
 ## 四、验证（Actions 实跑）
 
-- nightly（workflow_dispatch，`jinliang/nightly-wal-level`）：
-  https://github.com/spencerswagger/JinLiang/actions/runs/42744528527
-  `conclusion=success`，02:41:56Z → 02:45:06Z ≈ **3m10s**。
-  - `integration`：3m06s，PASS=326（含子用例）/ SKIP=0 / FAIL=0；
-    断言输出 `PG: wal_level=logical max_replication_slots=40 max_wal_senders=40`、
-    `MySQL: log_bin=1 binlog_format=ROW binlog_row_image=FULL`。
-  - `pg-matrix (10..18)` 9/9 success，各 69~83s；`pg-matrix (10)` PASS=53 / SKIP=0 / FAIL=0。
-  - `mysql-matrix (5.7/8.0/8.4/9.4)` 4/4 success，各 ~66s；
-    `MySQL 5.7: log_bin=1 binlog_format=ROW binlog_row_image=FULL server_id=1`。
-  - `bench` success（`scripts/bench.sh --enforce`）。
-- PR #77 的 `ci`：build / race / testmatrix / schema / control-plane / b1-engine /
-  b4-mysql-source 全 success。
-- `b1-engine`：PASS=139 / SKIP=0 / FAIL=0（与 main 基线 139/0/0 一致）；
+最终 head `efa286a`，连续两次 `workflow_dispatch` 全绿：
+
+| run | 结论 | 用时 | 备注 |
+|---|---|---|---|
+| [42746733746](https://github.com/spencerswagger/JinLiang/actions/runs/42746733746) | success 15/15 | 2m47s | 首绿（最终 head） |
+| [42747168318](https://github.com/spencerswagger/JinLiang/actions/runs/42747168318) | success 15/15 | 3m14s | 再跑一次确认不偶发 |
+
+- `integration`：PASS=326（含子用例）/ SKIP=0 / FAIL=0；
+  断言输出 `PG: wal_level=logical max_replication_slots=40 max_wal_senders=40`、
+  `MySQL: log_bin=1 binlog_format=ROW binlog_row_image=FULL`。
+- `pg-matrix (10..17..18)` 9/9 success；`pg-matrix (17)` PASS=53 / SKIP=0 / FAIL=0。
+- `mysql-matrix (5.7/8.0/8.4/9.4)` 4/4 success；
+  `MySQL 5.7: log_bin=1 binlog_format=ROW binlog_row_image=FULL server_id=1`。
+- `bench` success（`scripts/bench.sh --enforce`）。
+- PR #77 的 `ci`（run `42746737181`）：build / race / testmatrix / schema /
+  control-plane / b1-engine / b4-mysql-source **7/7 success**；
+  `b1-engine` PASS=139 / SKIP=0 / FAIL=0（与 main 基线 139/0/0 一致）。
   本机同命令（带 MySQL 源 DSN、不 `-skip`）PASS=141，差的正好是
   `TestMySQLSource*` 两条（b1-engine 有意 `-skip`，它们在 b4-mysql-source 里跑），
   即**该配置下一条都没丢**。
+
+### 中间踩到的两个坑（都已修，是这次实跑抓出来的）
+
+1. run `42745456817`：`pg-matrix (17)` 红在
+   `psql: FATAL: the database system is shutting down`——**单次** `select 1` 会打到
+   initdb 的临时实例上，随后它立刻重启（`ci.yml` 里那句注释说的就是这个坑，
+   但只做单次探测仍然会撞）。改成「连续两次真查询都成功、间隔 2s」才算起好；
+   MySQL 的 `mysqladmin ping` 同理。
+2. run `42746063512`：`bench` 红在 `pgq: command not found`——断言步骤里新加的
+   `pgq`/`fail` 被误用到了没有定义的步骤（bench 的启动步骤里）。已改回直接
+   `docker exec`，并在提交前用本地真库把断言脚本跑了一遍（见下）。
+
+**断言脚本本地验证**（沙盒 PG 17.11 `wal_level=logical`、`max_replication_slots=10`；
+MySQL 8.0.28 `log_bin=1 / ROW / FULL`）：
+- 把 `docker exec` 换成本地 `psql`/`mysql` 后跑断言 →
+  `❌ 缺数据库前提：max_replication_slots=10（要 ≥20）：多任务同时建书签会撞上限`（按预期红）；
+- 强行让 `wal_level` 读成 `replica` →
+  `❌ 缺数据库前提：PG 的 wal_level=replica（要 logical）：B1 引擎建逻辑书签会报 SQLSTATE 55000。services 传不了启动参数，必须 docker run … -c wal_level=logical`；
+- `mysql-matrix` 那套断言在本地真 MySQL 上全通过（`rc=0`）。
 
 ## 五、同源隐患（只列，没改）
 
