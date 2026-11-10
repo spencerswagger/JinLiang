@@ -1956,3 +1956,36 @@ func TestRunCodeRendersBadgeAndFourPart(t *testing.T) {
 		}
 	}
 }
+
+// UI 侧的三条不变量（纯文本断言，不为几行 JS 引构建链）：
+// ① 进度条元素存在；② JS 只接受单调不减的数字（回退的一律丢弃，包括在途轮询）；
+// ③ rows_total 缺省时**不画条**（不能拿 0 冒充「未知」）。
+func TestProgressUIRespectsMonotonicAndUnknownTotal(t *testing.T) {
+	tmpl, err := os.ReadFile("web/templates/job_detail.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(tmpl), `id="live-progress"`) {
+		t.Fatal("详情页缺进度条元素")
+	}
+	if !strings.Contains(string(tmpl), `id="live-rows"`) {
+		t.Fatal("详情页缺进度文本元素（JS 靠它显示「已处理 N 行」）")
+	}
+
+	js, err := os.ReadFile("web/static/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(js)
+	for _, want := range []string{
+		"if (num < lastRows) return;",         // 回退丢弃
+		"typeof ev.rows_total === \"number\"", // 只在给数时才用
+		"ev.rows_total > 0",                   // 0/缺省 = 未知，不画条
+		"if (rowsFromEventSeen) return;",      // 在途轮询不得覆盖事件值
+		"barEl.hidden = false;",               // 只有估得出总数才显示条
+	} {
+		if !strings.Contains(src, want) {
+			t.Fatalf("app.js 缺判定：%q", want)
+		}
+	}
+}

@@ -36,6 +36,14 @@ type Event struct {
 	// 「值是 0」与「没给」——0 行是合法结果，缺省表示这一帧没带这个数。
 	RowsDone *int64 `json:"rows_done,omitempty"`
 	LagBytes *int64 `json:"lag_bytes,omitempty"`
+	// RowsTotal 只在**估得出来**时发（例如全量已知每表行数），估不出就不发。
+	// 不要用 0 冒充「未知」：0 是「一条都没有」，两者在进度条上是两回事。
+	RowsTotal *int64 `json:"rows_total,omitempty"`
+	// TablesDone / TablesTotal 是全量阶段「表搬到第几张」，同样只在知道时发。
+	TablesDone  *int64 `json:"tables_done,omitempty"`
+	TablesTotal *int64 `json:"tables_total,omitempty"`
+	// BytesDone 是这一轮已写入的字节数（有就发；没有就不发）。
+	BytesDone *int64 `json:"bytes_done,omitempty"`
 	// FinishReason 只在 done 事件上有意义：completed / failed / stopped / interrupted。
 	// 有了它，前端才能分清「跑完了」与「被停止」——徽章（runs 行）早就分开了，
 	// 事件流此前没有。
