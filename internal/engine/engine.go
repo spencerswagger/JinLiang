@@ -32,8 +32,8 @@ import (
 // Exit codes are the contract spencer asked for (0 完成 / 1 失败 / 130 手动停止),
 // so a container or CI can tell "finished" from "someone pressed Ctrl-C".
 const (
-	ExitOK      = 0
-	ExitFailed  = 1
+	ExitOK     = 0
+	ExitFailed = 1
 	// ExitNeedsAction 是**规范里的第 3 档**（SPEC §74 / PLAN §55/66 早已写死）：
 	// 「跑完了，但有欠账需要人看一眼」。当前唯一的来源是「有表因结构不一致被暂停」。
 	//
