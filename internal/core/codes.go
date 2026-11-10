@@ -36,6 +36,7 @@ const (
 	CodeObjectMissing        Code = "E1013" // 缺这个 schema 或表（SQLSTATE 3F000 / 42P01）
 	CodeUnsupportedDirection Code = "E1014" // 当前版本不支持这个同步方向（源×目标组合）
 	CodeSchemaMismatch       Code = "E1015" // 表结构不一致（prepare 类型不一致 / 运行时改类型改名删列）
+	CodeSourceResourceLimit  Code = "E1016" // 源端资源或上限已用满（SQLSTATE 53400）
 	CodeTargetReset          Code = "E2001" // 目标连接被重置
 	CodeSourceTimeout        Code = "E2002" // 源库连接超时
 	CodeLockTimeout          Code = "E2003" // 目标库锁等待超时
@@ -234,6 +235,20 @@ var specs = []Spec{
 		//（用例 TestSchemaMismatchSaysWholeRunStops 会 grep 它）。
 		Risk: "整条同步停在这里：位点不推进、一条变更都不会丢；该表后续变更不会被写入，" +
 			"其它表也不会继续推进。最常见误判是把它当成单表问题不管，于是整条同步都停在原地",
+	},
+	{
+		Code: CodeSourceResourceLimit, Class: UserAction,
+		Message: "源端资源或上限已用满",
+		Why: "源端拒绝了这次操作（SQLSTATE 53400）：复制书签的名额或连接数已经到顶——" +
+			"最常见是书签名额（max_replication_slots）被占光，也可能是连接数（max_connections）" +
+			"或发送进程（max_wal_senders）到顶。原始消息与 SQLSTATE 原样留在 last_error 里",
+		Next: []string{
+			"先看是谁占着（复制即可执行）：psql \"$SRC\" -c \"SHOW max_replication_slots\" -c \"SELECT slot_name, active, database FROM pg_replication_slots\"；我们建的书签都以 jl_ 开头",
+			"清理确认没在用的：SELECT pg_drop_replication_slot('jl_xxx'); 若是已删任务的遗留，先 jinliang gc --dry-run 看一眼，确认没有别的实例在用再 jinliang gc --force",
+			"确实要更多名额：ALTER SYSTEM SET max_replication_slots = <n>; 然后重启实例（这个参数是 postmaster 级，reload 不生效），再重跑（位点没动，不会重搬历史）",
+		},
+		Risk: "一条数据都不会写入、位点也不动（还没开始搬）；最常见误判是去 --resync 重搬全量——没用，名额还是满的。" +
+			"另一个误判是把别人的书签当孤儿删掉：gc --force 会跨实例清理，删了正在用的书签会让那个任务丢变更流水",
 	},
 	{
 		Code: CodeControlDBBroken, Class: Fatal,
