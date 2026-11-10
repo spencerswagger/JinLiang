@@ -285,7 +285,9 @@ YAML
   sed 's/frequency: once/frequency: continuous+initial/' "$job" > "$W/job2.yaml"
   timeout 120 "$BIN" import --file "$W/job2.yaml" --data-dir "$data" >/dev/null 2>&1 || true
   mark "增量（应被拒）开始"
-  if runbin run --job acc-pg-mysql --data-dir "$data" >"$W/incr.log" 2>&1; then
+  # --stop-after 是保险：拒绝应该是毫秒级；万一引擎真进了流，10s 也会自己收尾并留下日志，
+  # 而不是让这一轮挂到外层 timeout（那样日志是空的，什么都查不到）。
+  if timeout -k 5 60 "$BIN" run --job acc-pg-mysql --data-dir "$data" --stop-after 10s >"$W/incr.log" 2>&1; then
     echo "FAIL: PG→MySQL 增量居然跑成功了（本版应明确拒绝）"; tail -3 "$W/incr.log"; return 1
   fi
   after_n=$(myq "SELECT COUNT(*) FROM \`$T\`")
@@ -351,7 +353,7 @@ YAML
   sed 's/frequency: once/frequency: continuous+initial/' "$job" > "$W/job2.yaml"
   timeout 120 "$BIN" import --file "$W/job2.yaml" --data-dir "$data" >/dev/null 2>&1 || true
   mark "增量（应被拒）开始"
-  if runbin run --job acc-mysql-mysql --data-dir "$data" >"$W/incr.log" 2>&1; then
+  if timeout -k 5 60 "$BIN" run --job acc-mysql-mysql --data-dir "$data" --stop-after 10s >"$W/incr.log" 2>&1; then
     echo "FAIL: MySQL→MySQL 增量居然跑成功了（本版应明确拒绝）"; tail -3 "$W/incr.log"; return 1
   fi
   after_n=$(myq "SELECT COUNT(*) FROM \`$T\`")
