@@ -83,20 +83,35 @@ emit() { # combo rows md5 seconds status extra
 
 workdir() { mktemp -d; }
 
-# 造数：MySQL 侧（id 1..N，payload=row-N）
+# 造数：MySQL 侧（id 1..N，payload=row-N）。
+#
+# **不用 CTE**：MySQL 5.7 没有 WITH RECURSIVE（8.0 才有），而矩阵要在 5.7 上跑。
+# 用一个 10 万行的数字表（5 层 0..9 交叉连接）代替——5.7 / 8.0 / 8.4 都能跑。
+nums_mysql() { # 幂等：建好 _acc_nums（100000 行）
+  myq "CREATE TABLE IF NOT EXISTS _acc_nums (n INT NOT NULL PRIMARY KEY) ENGINE=InnoDB"
+  if [ "$(myq "SELECT COUNT(*) FROM _acc_nums")" != "100000" ]; then
+    myq "DROP TABLE IF EXISTS _acc_nums"
+    myq "CREATE TABLE _acc_nums (n INT NOT NULL PRIMARY KEY) ENGINE=InnoDB"
+    myq "INSERT INTO _acc_nums(n)
+         SELECT a.i + b.i*10 + c.i*100 + d.i*1000 + e.i*10000 + 1
+         FROM (SELECT 0 i UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4
+               UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9) a,
+              (SELECT 0 i UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4
+               UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9) b,
+              (SELECT 0 i UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4
+               UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9) c,
+              (SELECT 0 i UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4
+               UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9) d,
+              (SELECT 0 i UNION SELECT 1 UNION SELECT 2 UNION SELECT 3 UNION SELECT 4
+               UNION SELECT 5 UNION SELECT 6 UNION SELECT 7 UNION SELECT 8 UNION SELECT 9) e"
+  fi
+}
+
 seed_mysql() { # $1=表名 $2=行数
   myq "DROP TABLE IF EXISTS \`$1\`"
   myq "CREATE TABLE \`$1\` (id BIGINT NOT NULL PRIMARY KEY, payload VARCHAR(64) NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
-  local i=1 step=${INSERT_STEP:-10000} hi
-  while [ "$i" -le "$2" ]; do
-    hi=$((i + step - 1)); [ "$hi" -gt "$2" ] && hi=$2
-    myq "SET SESSION cte_max_recursion_depth=1000000;
-         INSERT INTO \`$1\`(id,payload)
-         SELECT n, CONCAT('row-', n) FROM
-           (WITH RECURSIVE seq AS (SELECT $i AS n UNION ALL SELECT n+1 FROM seq WHERE n < $hi)
-            SELECT n FROM seq) s"
-    i=$((hi + 1))
-  done
+  nums_mysql
+  myq "INSERT INTO \`$1\`(id,payload) SELECT n, CONCAT('row-', n) FROM _acc_nums WHERE n <= $2 ORDER BY n"
 }
 
 seed_pg() { # $1=dsn $2=表名 $3=行数
@@ -173,10 +188,9 @@ YAML
   local extra="latency=${lat}s"
   if [ "$KILL" = 1 ]; then
     # kill -9 打在**增量**中间：此时全量已完成，重启只许从落库位点重放，重搬必须为 0。
-    myq "SET SESSION cte_max_recursion_depth=1000000;
-         INSERT INTO \`$T\`(id,payload) SELECT n, CONCAT('stream-',n) FROM
-           (WITH RECURSIVE seq AS (SELECT $((ROWS+2)) AS n UNION ALL SELECT n+1 FROM seq WHERE n < $((ROWS+2001)))
-            SELECT n FROM seq) s"
+    nums_mysql
+    myq "INSERT INTO \`$T\`(id,payload) SELECT n, CONCAT('stream-',n) FROM _acc_nums
+         WHERE n BETWEEN $((ROWS+2)) AND $((ROWS+2001)) ORDER BY n"
     local before
     before=$(pgq "$dst" "SELECT count(*) FROM $T")
     "$BIN" run --job acc-mysql-pg --data-dir "$data" --stop-after 600s >"$W/kill1.log" 2>&1 &
@@ -343,7 +357,7 @@ for line in "${RESULTS[@]}"; do
   combo="" rows="" md5="" seconds="" status="" latency="" kill="" incremental="" rc="" mysql=""
   eval "$(printf '%s' "$line" | sed -E 's/^RESULT //; s/([a-z-]+)=([^ ]*)/\1="\2"/g')"
   if [ "${status:-fail}" = "pass" ]; then
-    echo "| ${combo:-?} | ${mysql:-?} | ${rows:-?} | \`${md5:-?}\` | ${seconds:-?}s | ${latency:-} ${kill:-} ${incremental:-} |"
+    echo "| ${combo:-?} | ${mysql:-?} | ${rows:-?} | \`${md5:-?}\` | ${seconds:-?}s | ${latency:-}${restart:+ restart=${restart}} ${kill:-} ${incremental:-} |"
   else
     echo "| ${combo:-?} | - | - | - | - | **FAIL** ${rc:-} |"
   fi
