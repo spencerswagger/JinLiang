@@ -13,6 +13,16 @@ package engine_test
 // 一旦要改 `paused_tables` 就 RAISE。读路径照常（所以 prepare 仍能跑），
 // 只有写入失败——正是我们要的那种失败。
 //
+// 为什么用触发器而不是 `REVOKE UPDATE`（Owl II 也问过这条）：
+//  1. 测试/CI 连的 `jinliang` 是超级用户，`REVOKE` **对它不生效**，构造会静默失效；
+//  2. 就算生效，它拦的是**整个** `_jl_meta` 写路径（`EnsureMeta` 的 upsert、租约心跳），
+//     prepare 会在到达「登记」之前就失败 —— 测到的就不是 A3 了；
+//  3. 触发器用 `NEW.paused_tables IS DISTINCT FROM OLD.paused_tables` 把范围收在**这一列**，
+//     而且它是**自证**的：触发器没生效 → 这一轮会成功 → 下面第 ④ 步直接红，
+//     不需要靠注释声称「构造是真的」。
+//  4. 引擎侧一行都没为测试改过：`PauseTable` 里那条 UPDATE 就是生产那条，
+//     触发器产生的是数据库侧的真实拒绝（与盘满/锁等待/权限被收回在引擎侧不可区分）。
+//
 // 反向注入（Gate 门禁第 10 条，两个注入点任选其一，用例都必须红）：
 //  1. `internal/pgsink/paused.go` 的 `PauseTable` 开头加 `return nil`
 //     → 登记变成「无条件成功」，run 不再失败 → 「这一轮必须失败」那条断言红；
@@ -84,9 +94,12 @@ func TestPauseRegistrationFailureFailsRunAndWritesNothing(t *testing.T) {
 		FOR EACH ROW EXECUTE FUNCTION jl_block_pause_write()`)
 	t.Cleanup(func() {
 		_, _ = dstDB.Exec(context.Background(), `DROP TRIGGER IF EXISTS jl_block_pause ON _jl_meta`)
+		_, _ = dstDB.Exec(context.Background(), `DROP FUNCTION IF EXISTS jl_block_pause_write()`)
 	})
 
-	// ④ 这一轮**必须失败**（A3：登记失败 = 整批失败）
+	// ④ 这一**轮**必须失败（A3 在 prepare 期的形状：登记失败 → 整轮停，一行都不搬）。
+	//    「这一批」那条（流式期，已经跑起来、批里混着别的表）由
+	//    `pause_skip_test.go` 的 `TestPauseSinkApplyFailsWholeBatchWhenRegistrationFails` 钉。
 	res, err := engine.Run(ctx, engine.Options{Store: store, JobID: jobID, SnapshotOnly: true})
 	if err == nil {
 		t.Fatal("登记暂停失败时这一轮必须失败：否则「跳过了但没记下」= 静默缺数据")
