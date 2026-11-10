@@ -20,7 +20,9 @@
 |---|---|---|
 | `internal/mysqlsource/ddl_table.go`（新） | `ddlTargetTable()`：从 DDL 原文认出作用表 | Query 事件只有「默认库 + 语句」；不给表名，引擎的「在不在范围内」判定恒落空 → **源端 DDL 被静默丢掉**，连「本版不搬 DDL」那声提示都发不出 |
 | `internal/mysqlsource/assembler.go` | `statementEvent` 填 `Table.Schema/Table` | 同上 |
-| `internal/mysqlsource/relation.go` | VARCHAR 长度：字节 → 字符（按列字符集 mbmaxlen 换算）；`mysqlTypeName` 多一个 `maxLen` | binlog 给的是**字节**上限，utf8mb4 的 `VARCHAR(64)` 记 256 → 之前报成 `varchar(256)`（§5.1） |
+| `internal/mysqlsource/relation.go` | 类型渲染按**字节→字符**换算（VARCHAR/CHAR，按列字符集 mbmaxlen）；TEXT 与 BLOB 按字符集分开；VARBINARY 不再报成 varchar；`enrichRelation` 改成**宽松同型**判定 | binlog 给的是**字节**上限，utf8mb4 的 `VARCHAR(64)` 记 256；TEXT/BLOB 共用类型字节（§5.1、§5.3） |
+| `internal/mysqlsource/decode.go` | VARBINARY 恒按字节交（`KindBytes`）；可打印判定拒绝控制字符 | `\x00\x01` 被当成 Go 字符串 → 写 bytea 直接 `cannot find encode plan`（§5.4） |
+| `internal/pgsink/pgsink.go`（typeAliases） | 加 `char → character` | MySQL 的 `char(10)` 与 PG information_schema 的 `character(10)` 被判成「类型不一致」，一个 CHAR 列就能把整轮停掉（§5.5） |
 | `internal/pgsink/pgsink.go` | `tableInfo.srcTypes`（源端原文类型）+ 改类型提示改成「源端 旧→新（目标端映射 旧→新）」 | 之前两句都是**目标端映射后**的类型，跨引擎时变成 `text → text`，用户看不懂改了什么 |
 | `internal/engine/run_source.go` | DDL 归属判定加大小写兜底（只影响「要不要发提示」，数据行仍精确匹配） | 表名来自 SQL 原文，大小写与 information_schema 未必逐字一致 |
 | `internal/engine/integration_mysql_type_pause_test.go`（新） | 真 MySQL 源改类型的端到端用例（12s） | ②的验收，见 §3 |
@@ -45,6 +47,9 @@
 | MySQL→PG 增量中途 kill -9（Go 集成用例） | 21850 | `21850:8873f5e5054c409dab2c543544031737` | **0 行** | 6.19s |
 
 MySQL→PG 那条的位点（本轮改成真断言之后）：`675108 → 719304`（中断）`→ 753216`（追平），只前进。
+
+> 本轮新增用例 `TestMySQLSourceTypeChangePausesOnlyThatTableAndRecovers`（真 MySQL 源）：
+> 12.2–12.8s，先全量、再流式改列类型、看暂停记录与位点、对齐后重放追平。
 
 > 环境说明：容器重建后宿主上的 PG/MySQL 都没了。工作区里加了一套本地起库脚本（`.work/env_up.sh`，
 > 不入库）：PG 17 用嵌套 bwrap 以 uid 102 起（沙盒里 `su`/`setuid` 后 `getpwuid` 解析不出来），
@@ -102,19 +107,48 @@ MySQL→PG 那条的位点（本轮改成真断言之后）：`675108 → 719304
 
 ## 5. 本轮发现的两个缺陷（都已修，附判据）
 
-### 5.1 `varchar` 把字节当字符（真 bug，影响 MySQL→MySQL 建表与所有提示文案）
+### 5.1 类型渲染把字节当字符（CHAR / VARCHAR 都中）
 
-binlog 的 VARCHAR 元数据是**字节**上限：utf8mb4 的 `VARCHAR(64)` → 256。
-`typeNameAndArgs` 直接拿它拼 `varchar(256)`：
+binlog 的 VARCHAR/CHAR 元数据是**字节**上限：utf8mb4 的 `VARCHAR(64)` → 256、`CHAR(10)` → 40。
+`typeNameAndArgs` 直接拿它拼 `varchar(256)` / `char(40)`：
 
-- MySQL→MySQL：目标端建表会建成 `varchar(256)`（现在 `m2m_orders.payload` 实测是 `varchar(64)`）；
-- E1015 提示会说「源端 bigint → varchar(256)」，用户明明写的是 64；
+- E1015 / 暂停提示会说「源端 bigint → varchar(256)」「char(10) → char(40)」，用户明明写的是 64 / 10；
+- 目标端按 Relation 补列（`ADD COLUMN`）时会用这个错长度；
 - 类型字典比对（`compatibleType`）按这个字符串比，长度维度静默偏宽。
 
-修法：渲染类型前先取列字符集（`TableMap.collationFor` → `charsetMaxLen`），`varchar` 的 meta 除以
-mbmaxlen（除不尽就按字节报，不猜）。`varbinary` **不除**（没有字符集）。
-判据：`TestTypeNames` 加了 `utf8mb4 256→varchar(64)`、`utf8mb3 300→varchar(100)`、`varbinary 不除` 三格；
-MySQL→MySQL 真跑后查 `information_schema.columns` 得 `varchar(64)`。
+> 更正一句 PR 初稿里写错的话：**建表不走 binlog 类型**，走的是 catalog（information_schema），
+> 所以「MySQL→MySQL 目标端会建成 varchar(256)」是我写错了（Owl II 也复现不出来）。
+> 受影响的只有：提示文案、按 Relation 补的列、以及 `compatibleType` 的比对输入。
+
+修法：渲染类型前先取列字符集（`TableMap.collationFor` → `charsetMaxLen`），VARCHAR/CHAR 的 meta 除以
+mbmaxlen（除不尽就按字节报，不猜）。判据：`TestTypeNames` 加了 `utf8mb4 256→varchar(64)`、
+`utf8mb3 300→varchar(100)`、`char(40)→char(10)`、`varbinary 不除` 四格。
+
+### 5.3 `enrichRelation` 把「同一列」和「改了类型」判反了（MINIMAL 的默认路径）
+
+MINIMAL 元数据下没有列名/字符集，只能按序号用 catalog 补。原来的规则是「列数一致就整体套 catalog」：
+
+- 列数不变的 `MODIFY COLUMN v VARCHAR(64)` → catalog 把它**盖回旧类型**，改类型在流上彻底看不见；
+- 反过来一律信 binlog 也不行：MINIMAL 下 char(10) 会渲染成 char(40)、TEXT 会渲染成 blob，
+  与 catalog 一比就是「每一张带字符类的表都停下」。
+
+改成**宽松同型**（`looseSameType`）：长度允许 `×1..×4`（字符集未知）、`varbinary≈varchar`、
+TEXT 与 BLOB 按尺寸档视为同类；**其余一律不同型 → 保留 binlog 的新类型**。
+判据：`TestLooseSameType` 14 格（含「必须判不同」的 5 格）+ `TestEnrichRelationKeepsBinlogTypeWhenTypeChanged`。
+
+### 5.4 VARBINARY 被当成字符串 → 写 bytea 直接失败
+
+`decodeStringCell` 按「内容是不是可打印 UTF-8」决定 Kind，而可打印判定只看 U+FFFD：
+`\x00\x01` 这种值被判成字符串，写给 PG 的 bytea 时 `cannot find encode plan`（真库实测，整块数据失败）。
+修法：VARBINARY **按定义就是字节**（不看内容），可打印判定拒绝控制字符。
+判据：类型改类型用例里加了一张 `engine_my_chartypes`（CHAR/TEXT/VARBINARY/VARCHAR 四列），
+全量与增量都必须原样过去（`encode(vb,'hex')='0001'`、`c='中文十'`、`t='文本'`）。
+
+### 5.5 `char(10)` vs `character(10)`：一个 CHAR 列就能停掉整轮
+
+MySQL 侧写 `char(10)`，PG 的 `information_schema` 回 `character(10)`；`typeAliases` 里有
+`bpchar→character` 却没有 `char→character`，`compatibleType` 判不兼容 → prepare 期 E1015 整轮失败。
+修法：别名表加 `char → character`。判据：`TestCompatibleType` + 上面那张 chartypes 表的真库用例。
 
 ### 5.2 位点断言空转（我自己的用例，假绿）
 

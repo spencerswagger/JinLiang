@@ -161,27 +161,33 @@ func TestTypeNames(t *testing.T) {
 		typ      byte
 		meta     uint16
 		unsigned bool
-		maxLen   int
+		charset  string
 		want     string
 	}{
-		{typeTiny, 0, true, 1, "tinyint unsigned"},
-		{typeInt24, 0, false, 1, "mediumint"},
-		{typeNewDecimal, 10<<8 | 2, false, 1, "decimal(10,2)"},
-		{typeDateTime2, 6, false, 1, "datetime(6)"},
-		{typeBit, 1<<8 | 3, false, 1, "bit(11)"},
-		{typeJSON, 4, false, 4, "json"},
+		{typeTiny, 0, true, "", "tinyint unsigned"},
+		{typeInt24, 0, false, "", "mediumint"},
+		{typeNewDecimal, 10<<8 | 2, false, "", "decimal(10,2)"},
+		{typeDateTime2, 6, false, "", "datetime(6)"},
+		{typeBit, 1<<8 | 3, false, "", "bit(11)"},
+		{typeJSON, 4, false, "utf8mb4", "json"},
 		// VARCHAR 的 meta 是**字节**上限：latin1 的 VARCHAR(255) 是 255，
 		// utf8mb4 的 VARCHAR(64) 是 256，utf8mb3 的 VARCHAR(100) 是 300。
-		{typeVarchar, 255, false, 1, "varchar(255)"},
-		{typeVarchar, 256, false, 4, "varchar(64)"},
-		{typeVarchar, 300, false, 3, "varchar(100)"},
+		{typeVarchar, 255, false, "latin1", "varchar(255)"},
+		{typeVarchar, 256, false, "utf8mb4", "varchar(64)"},
+		{typeVarchar, 300, false, "utf8mb3", "varchar(100)"},
 		// VARBINARY 没有字符集，按字节，不许除。
-		{typeVarString, 64, false, 4, "varbinary(64)"},
-		{typeBlob, 3, false, 1, "mediumblob"},
+		{typeVarString, 64, false, "utf8mb4", "varbinary(64)"},
+		{typeBlob, 3, false, "binary", "mediumblob"},
+		// TEXT 与 BLOB 共用类型字节，只有字符集能分开
+		{typeBlob, 2, false, "utf8mb4", "text"},
+		// CHAR 的长度也是字节
+		{typeString, 0xFE<<8 | 40, false, "utf8mb4", "char(10)"},
+		// VARBINARY 走 VARCHAR 的类型字节 + binary 字符集
+		{typeVarchar, 32, false, "binary", "varbinary(32)"},
 	}
 	for _, c := range cases {
-		if got := mysqlTypeName(c.typ, c.meta, c.unsigned, c.maxLen); got != c.want {
-			t.Fatalf("类型 %d/%d/maxLen=%d → %q，期望 %q", c.typ, c.meta, c.maxLen, got, c.want)
+		if got := mysqlTypeName(c.typ, c.meta, c.unsigned, c.charset); got != c.want {
+			t.Fatalf("类型 %d/%d/charset=%q → %q，期望 %q", c.typ, c.meta, c.charset, got, c.want)
 		}
 	}
 }

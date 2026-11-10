@@ -54,10 +54,11 @@ func ddlTargetTable(stmt string) (schema, table string, ok bool) {
 					i += 2
 				}
 			}
-			// 多表形态：`DROP TABLE a, b`。**只对 DROP 判逗号**：
-			// `ALTER TABLE t ADD INDEX i (a), ADD INDEX j (b)` 是最常见的单表写法，
-			// 拿逗号否掉它等于把绝大多数 ALTER 都变成「不知道是哪张表」。
-			if up(toks[0]) == "DROP" && hasTopLevelComma(toks[i:]) {
+			// 多表形态：`DROP TABLE a, b`、`OPTIMIZE TABLE a, b`。
+			// **ALTER / CREATE 不判逗号**：`ALTER TABLE t ADD INDEX i (a), ADD INDEX j (b)`
+			// 与 `CREATE TABLE t (a INT, b INT)` 里的逗号都是单表的正常写法，
+			// 拿逗号否掉它们等于把绝大多数 DDL 变成「不知道是哪张表」。
+			if up(toks[0]) != "ALTER" && up(toks[0]) != "CREATE" && hasTopLevelComma(toks[i:]) {
 				return "", "", false
 			}
 			return identPair(toks[i:])
@@ -80,6 +81,13 @@ func ddlTargetTable(stmt string) (schema, table string, ok bool) {
 		if hasTopLevelComma(toks[i:]) {
 			return "", "", false // 多对重命名：说不清是哪张表
 		}
+		// 认**目标**名字：`RENAME TABLE _t_gho TO t`（gh-ost / pt-osc 的收尾）之后，
+		// 往后所有变更都属于 `t`；报旧名字等于让后面这条提示指着一张已经不存在的表。
+		for j := i; j < len(toks); j++ {
+			if up(toks[j]) == "TO" {
+				return identPair(toks[j+1:])
+			}
+		}
 		return identPair(toks[i:])
 	}
 	return "", "", false
@@ -94,6 +102,14 @@ func identPair(toks []string) (schema, table string, ok bool) {
 		return "", "", false
 	}
 	first := toks[0]
+	// `` `a`.`b` ``：两个被引号包住的标识符（分词时已合成一个词元）→ 按 `\`.\`` 拆。
+	if i := strings.Index(first, "`.`"); i > 0 {
+		return trimIdent(first[:i+1]), trimIdent(first[i+2:]), true
+	}
+	// 整词被一对引号包住（`` `a.b` ``）：这是**一个**标识符，里面的点是名字的一部分。
+	if len(first) >= 2 && (first[0] == '`' || first[0] == '"') && first[len(first)-1] == first[0] {
+		return "", trimIdent(first), true
+	}
 	if i := strings.IndexByte(first, '.'); i >= 0 {
 		// `db`.`tbl` 在分词阶段已经合成一个词元
 		schema, table = trimIdent(first[:i]), trimIdent(first[i+1:])
@@ -144,6 +160,24 @@ func ddlTokens(stmt string) []string {
 	}
 	for i := 0; i < len(s); i++ {
 		c := s[i]
+		// 语句**中间**的注释也要跳：`ALTER TABLE /*gh-ost*/ t …` 是 gh-ost / pt-osc 的常见形态，
+		// 不跳的话表名会被解析成 `/*` 这样的垃圾词元（Owl II 实测过）。
+		if c == '/' && i+1 < len(s) && s[i+1] == '*' {
+			if j := strings.Index(s[i+2:], "*/"); j >= 0 {
+				flush()
+				i += 2 + j + 1
+				continue
+			}
+			break
+		}
+		if c == '-' && i+1 < len(s) && s[i+1] == '-' {
+			flush()
+			if j := strings.IndexByte(s[i+2:], '\n'); j >= 0 {
+				i += 2 + j
+				continue
+			}
+			break
+		}
 		switch {
 		case c == '\'' || c == '"' || c == '`':
 			// 引号内容整体进当前词元（反引号标识符里可以有空格与点）

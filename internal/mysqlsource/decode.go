@@ -205,10 +205,14 @@ func decodeCell(tm *TableMap, col int, data []byte) (source.Value, int, error) {
 			return source.Value{}, 0, fmt.Errorf("第 %d 列的 JSON 值解不出来: %w", col, err)
 		}
 		return source.Value{Kind: source.KindJSON, S: text}, prefix + length, nil
-	case typeVarchar, typeVarString:
-		return decodeStringCell(col, data, int(meta))
+	case typeVarchar:
+		return decodeStringCell(col, data, int(meta), false)
+	case typeVarString:
+		// VARBINARY 按定义就是字节，不按内容猜（见 decodeStringCell 的注释）。
+		return decodeStringCell(col, data, int(meta), true)
 	case typeString:
-		return decodeStringCell(col, data, packedLen)
+		// CHAR / ENUM / SET 走这条；binary 字符集的 CHAR 由内容启发式判（下面 stringOrBytes）。
+		return decodeStringCell(col, data, packedLen, false)
 	case typeInvalid:
 		return source.Value{}, 0, fmt.Errorf("第 %d 列的列类型是 INVALID，表结构可能在拉流期间被改了", col)
 	default:
@@ -222,7 +226,7 @@ func errShort(col, want, got int) error {
 	return fmt.Errorf("第 %d 列需要 %d 字节，行镜像只剩 %d 字节", col, want, got)
 }
 
-func decodeStringCell(col int, data []byte, maxLen int) (source.Value, int, error) {
+func decodeStringCell(col int, data []byte, maxLen int, binaryCol bool) (source.Value, int, error) {
 	var length, prefix int
 	switch {
 	case maxLen < 256:
@@ -240,7 +244,10 @@ func decodeStringCell(col int, data []byte, maxLen int) (source.Value, int, erro
 		return source.Value{}, 0, errShort(col, prefix+length, len(data))
 	}
 	raw := data[prefix : prefix+length]
-	// 二进制排序规则（binary/varbinary）的列原样交字节；其余按字符串。
+	// 二进制列（VARBINARY / binary 字符集）原样交字节；其余按字符串。
+	if binaryCol {
+		return source.Value{Kind: source.KindBytes, B: append([]byte(nil), raw...)}, prefix + length, nil
+	}
 	return stringOrBytes(raw), prefix + length, nil
 }
 
@@ -260,6 +267,12 @@ func isPrintableUTF8(b []byte) bool {
 	s := string(b)
 	for _, r := range s {
 		if r == 0xfffd {
+			return false
+		}
+		// 控制字符（NUL、0x01…）说明这是二进制内容，不是文本：
+		// 之前只看 U+FFFD，于是 VARBINARY/BLOB 里的 `\x00\x01` 被当成"可打印 UTF-8"
+		// 变成 Go 字符串，写 bytea 时编码失败（真库实测）。
+		if r < 0x20 && r != '\t' && r != '\n' && r != '\r' {
 			return false
 		}
 	}

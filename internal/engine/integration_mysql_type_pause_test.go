@@ -16,6 +16,7 @@ package engine_test
 
 import (
 	"context"
+	"database/sql"
 	"os"
 	execpkg "os/exec"
 	"path/filepath"
@@ -36,7 +37,11 @@ func TestMySQLSourceTypeChangePausesOnlyThatTableAndRecovers(t *testing.T) {
 
 	const changed = "engine_my_type_change" // 改类型的那张
 	const other = "engine_my_bystander"     // 旁证：同一批次里另一张表
-	for _, tbl := range []string{changed, other} {
+	// mixed 专门压「字符类列的渲染」：CHAR / TEXT / VARBINARY / VARCHAR(utf8mb4)。
+	// binlog 给的长度是**字节**、TEXT 与 BLOB 共用类型字节 —— 渲染错一个字，这一张表
+	// 就会在第一条 Relation 上被判成「改类型」并停下来（Owl II 在 #94 评审里实测过 char→char(40)、text→blob）。
+	const mixed = "engine_my_chartypes"
+	for _, tbl := range []string{changed, other, mixed} {
 		myExec(t, my, "DROP TABLE IF EXISTS "+tbl)
 		exec(t, dst, "DROP TABLE IF EXISTS "+tbl)
 	}
@@ -44,6 +49,14 @@ func TestMySQLSourceTypeChangePausesOnlyThatTableAndRecovers(t *testing.T) {
 	myExec(t, my, "CREATE TABLE "+other+" (id BIGINT NOT NULL PRIMARY KEY, payload VARCHAR(64) NOT NULL) ENGINE=InnoDB")
 	myExec(t, my, "INSERT INTO "+changed+" (id,v) VALUES (1,10),(2,20),(3,30)")
 	myExec(t, my, "INSERT INTO "+other+" (id,payload) VALUES (1,'r1'),(2,'r2'),(3,'r3')")
+	myExec(t, my, "CREATE TABLE "+mixed+` (
+		id BIGINT NOT NULL PRIMARY KEY,
+		c CHAR(10) NOT NULL,
+		t TEXT NULL,
+		vb VARBINARY(32) NULL,
+		vc VARCHAR(64) NOT NULL
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`)
+	myExec(t, my, "INSERT INTO "+mixed+" (id,c,t,vb,vc) VALUES (1,'中文十','文本',UNHEX('0001'),REPEAT('é',20))")
 	exec(t, dst, "DROP TABLE IF EXISTS _jl_meta, _jl_chunk, _jl_lease, _jl_object, _jl_instance")
 
 	bin := buildBinary(t)
@@ -55,7 +68,7 @@ func TestMySQLSourceTypeChangePausesOnlyThatTableAndRecovers(t *testing.T) {
 		"  scope:\n    schema: " + mySchemaOf(t0DSN("JINLIANG_TEST_MYSQL_SRC_DSN")) + "\n" +
 		"  snapshot:\n    chunk_rows: 1000\n" +
 		"target:\n  kind: postgres\n  dsn: env:JINLIANG_TEST_PG_DSN\n  schema: public\n  on_exists: append\n" +
-		"content:\n  tables:\n    " + changed + ": {}\n    " + other + ": {}\n" +
+		"content:\n  tables:\n    " + changed + ": {}\n    " + other + ": {}\n    " + mixed + ": {}\n" +
 		"mode:\n  frequency: continuous+initial\n"
 	if err := os.WriteFile(jobYAML, []byte(yaml), 0o644); err != nil {
 		t.Fatal(err)
@@ -84,6 +97,19 @@ func TestMySQLSourceTypeChangePausesOnlyThatTableAndRecovers(t *testing.T) {
 	if got := pgCount(t, dst, changed); got != 3 {
 		t.Fatalf("全量后 %s 应有 3 行，实际 %d", changed, got)
 	}
+	// CHAR/TEXT/VARBINARY 三列的全量必须**原样过去**（长度按字节渲染错了这里就露馅）。
+	if got := pgCount(t, dst, mixed); got != 1 {
+		t.Fatalf("全量后 %s 应有 1 行，实际 %d", mixed, got)
+	}
+	// CHAR 在两端都会按定义**补空格**到定长（MySQL 取回时剥、PG 不剥），比较时去掉尾空格。
+	var c, t2, vb, vc string
+	if err := dst.QueryRow(ctx, "SELECT btrim(c), t, encode(vb,'hex'), vc FROM "+mixed+" WHERE id=1").
+		Scan(&c, &t2, &vb, &vc); err != nil {
+		t.Fatalf("读 %s 失败: %v", mixed, err)
+	}
+	if c != "中文十" || t2 != "文本" || vc != strings.Repeat("é", 20) || vb != "0001" {
+		t.Fatalf("字符类列搬家后不一致：c=%q t=%q vb=%s vc=%q", c, t2, vb, vc)
+	}
 	posFull := myPosition(t, dst)
 	mustMySQLPos(t, "全量后", posFull)
 
@@ -105,7 +131,11 @@ func TestMySQLSourceTypeChangePausesOnlyThatTableAndRecovers(t *testing.T) {
 	// **位点基线要在这里取**：上面那行流过去之后「数据 + 位点」一起提交，位点本来就该前进；
 	// 拿全量后的位点当基线，会把这次正常前进误判成「暂停期间位点被推进」。
 	myExec(t, my, "INSERT INTO "+other+" (id,payload) VALUES (10,'r10')")
-	waitRows(t, dst, other, 4, 45*time.Second)
+	if !waitRowsQuiet(t, dst, other, 4, 45*time.Second) {
+		body, _ := os.ReadFile(logFile.Name())
+		t.Fatalf("增量流没把 id=10 搬过来（%s 仍是 %d 行）。这一轮的输出：\n%s",
+			other, pgCount(t, dst, other), body)
+	}
 	posBefore := myPosition(t, dst)
 	mustMySQLPos(t, "改类型前", posBefore)
 
@@ -168,13 +198,19 @@ func TestMySQLSourceTypeChangePausesOnlyThatTableAndRecovers(t *testing.T) {
 	if rec.Reason != pgsink.PauseReasonTypeChanged {
 		t.Fatalf("暂停原因码应为 type_changed，实际 %q（detail=%s）。原因码是机器判等用的稳定值", rec.Reason, rec.Detail)
 	}
-	for _, want := range []string{"bigint", "varchar(64)", "v"} { // 64 是**字符**：binlog 给的是字节 256
+	// 前后对照必须写清楚，长度单位随「元数据级别」可能差一档：
+	//   - binlog_row_metadata=FULL（带列字符集）→ `varchar(64)`，与用户写的一致；
+	//   - MINIMAL（8.0/8.4/9 的开箱默认，CI 的 b4 就是这一套）→ 只有字节上限，
+	//     报 `varchar(256)`。这是已知差别，要精确到字符请开 FULL（notes 里有写）。
+	// 两种都必须给出「哪张表、哪一列、从什么类型到什么类型」。
+	for _, want := range []string{"bigint", "v"} {
 		if !strings.Contains(rec.Detail, want) {
-			t.Fatalf("detail 里应有 %q（用户要知道哪一列、从什么类型到什么类型），实际 %q", want, rec.Detail)
+			t.Fatalf("detail 里应有 %q（用户要知道哪一列），实际 %q", want, rec.Detail)
 		}
 	}
-	if !strings.Contains(rec.Detail, "bigint → varchar(64)") {
-		t.Fatalf("detail 应写成「源端 bigint → varchar(64)」这种前后对照，实际 %q", rec.Detail)
+	if !strings.Contains(rec.Detail, "bigint → varchar(64)") &&
+		!strings.Contains(rec.Detail, "bigint → varchar(256)") {
+		t.Fatalf("detail 应写成「源端 bigint → varchar(N)」这种前后对照（N 随元数据级别），实际 %q", rec.Detail)
 	}
 
 	// 判据③（当前契约的诚实断言）：另一张表的那一行也没落库。
@@ -257,6 +293,17 @@ func waitRows(t *testing.T, conn *pgx.Conn, table string, n int, d time.Duration
 	t.Fatalf("等 %s 到 %d 行超时（实际 %d）：增量流没有跑起来", table, n, pgCount(t, conn, table))
 }
 
+// binlogRowMetadata 读源端的 binlog_row_metadata（FULL / MINIMAL / NOBLOB）。
+// 它决定 binlog 里有没有列名与字符集，也就决定了类型串能精确到哪一步。
+func binlogRowMetadata(t *testing.T, my *sql.DB) string {
+	t.Helper()
+	var v string
+	if err := my.QueryRow("SELECT @@binlog_row_metadata").Scan(&v); err != nil {
+		t.Fatalf("读 @@binlog_row_metadata 失败: %v", err)
+	}
+	return v
+}
+
 // pgHasRow 报告目标表里有没有满足条件的那一行。
 func pgHasRow(t *testing.T, conn *pgx.Conn, table, where string) bool {
 	t.Helper()
@@ -266,4 +313,17 @@ func pgHasRow(t *testing.T, conn *pgx.Conn, table, where string) bool {
 		t.Fatalf("查 %s 的行失败: %v", table, err)
 	}
 	return n > 0
+}
+
+// waitRowsQuiet 与 waitRows 相同，但只回报结果（调用方自己决定打印什么）。
+func waitRowsQuiet(t *testing.T, conn *pgx.Conn, table string, n int, d time.Duration) bool {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		if pgCount(t, conn, table) >= n {
+			return true
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return false
 }

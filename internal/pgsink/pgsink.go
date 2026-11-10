@@ -861,14 +861,17 @@ func parseTypeArgs(args string) ([]int, bool) {
 }
 
 var typeAliases = map[string]string{
-	"int4":        "integer",
-	"int8":        "bigint",
-	"int2":        "smallint",
-	"float8":      "double precision",
-	"float4":      "real",
-	"bool":        "boolean",
-	"varchar":     "character varying",
-	"bpchar":      "character",
+	"int4":    "integer",
+	"int8":    "bigint",
+	"int2":    "smallint",
+	"float8":  "double precision",
+	"float4":  "real",
+	"bool":    "boolean",
+	"varchar": "character varying",
+	"bpchar":  "character",
+	// MySQL 侧写的是 `char(10)`，PG 的 information_schema 回的是 `character(10)`：
+	// 不归一化就会判成「列类型不一致」，源端一个 CHAR 列就能把整轮同步停掉（真库实测）。
+	"char":        "character",
 	"timestamptz": "timestamp with time zone",
 	"timestamp":   "timestamp without time zone",
 	"decimal":     "numeric",
