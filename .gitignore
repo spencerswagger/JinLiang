@@ -14,4 +14,5 @@ bench/latest.json
 
 # 本地草稿/临时日志（曾经误提交过：commit message 草稿与整份测试日志）
 /.gitmsg
+/.commitmsg
 .work/

@@ -174,15 +174,11 @@ func (r *runner) executeGeneric(ctx context.Context, res *Result) error {
 		r.note(ctx, fmt.Sprintf("--verify 在 %s 目标端这一版不生效（跨引擎的行级校验走 `jinliang verify`）："+
 			"本次没有做内容校验", r.tgtEP.Kind))
 	}
-	// **先读「上一轮留下的阶段」，再动任何阶段**：下面的 phaseTo(Prepare) 会把它写成
-	// 'prepare'，那样「上一轮崩在快照中途」这条事实就没了（清表判据要靠它）。
+	// **先读「上一轮留下的阶段」**：它是「上一轮崩在哪个阶段」的唯一可重算事实。
 	// 表还不存在（首次跑）时读不到，按空处理。
 	priorPhase, _, perr := st.State(ctx)
 	if perr != nil {
 		priorPhase = ""
-	}
-	if err := r.phaseTo(ctx, state.Prepare); err != nil {
-		return err
 	}
 
 	// ① 先拿租约：拿不到就停，一个字节都不写。冲突是 E1005（有码，历史页能看见）。
@@ -253,9 +249,18 @@ func (r *runner) executeGeneric(ctx context.Context, res *Result) error {
 		}
 	}
 	if needCopy {
+		// 清表判定必须排在**任何阶段写入之前**：phaseTo(Prepare) 会把 `_jl_meta.phase`
+		// 改写成 'prepare'，而它正是这一步要读的事实。写早了，保护就变成 one-shot：
+		// 第一次重跑硬停（phase 已被这轮改成 prepare）→ 第二次重跑读回 prepare →
+		// 走「跳过 + note」、退出码 0，源端停机期删掉的行留在用户表里。
 		if err := r.cleanBeforeGenericCopy(ctx, st, fresh, priorPhase); err != nil {
 			return err
 		}
+	}
+	if err := r.phaseTo(ctx, state.Prepare); err != nil {
+		return err
+	}
+	if needCopy {
 		if err := r.phaseTo(ctx, state.Snapshot); err != nil {
 			return err
 		}

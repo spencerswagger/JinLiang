@@ -505,7 +505,8 @@ func TestMySQLTargetCrashMidCopyOnUserTableStops(t *testing.T) {
 	if _, err := dst.ExecContext(ctx, "CREATE TABLE `"+table+"` (id BIGINT PRIMARY KEY, payload TEXT)"); err != nil {
 		t.Fatalf("建用户表失败: %v", err)
 	}
-	// 用户自己的 3 行 + 我们上一轮搬进去的 1 行（混在一起，分不清）
+	// 用户自己的 3 行 + **上一轮搬进去的 1 行**（id=1 来自源端，代表「崩在半路时已经写进去的行」）。
+	// 两种行混在一张表里，引擎无从分辨哪些该清——这正是必须停下来问人的情形。
 	if _, err := dst.ExecContext(ctx,
 		"INSERT INTO `"+table+"` VALUES (900001,'user-1'),(900002,'user-2'),(900003,'user-3'),(1,'src-1')"); err != nil {
 		t.Fatalf("预置行失败: %v", err)
@@ -544,6 +545,89 @@ func TestMySQLTargetCrashMidCopyOnUserTableStops(t *testing.T) {
 	// 一行都不能少：用户的 3 行 + 我们的 1 行都还在（没有清表）
 	if n := myCount(t, dst, table); n != 4 {
 		t.Fatalf("硬停时不该动数据：应有 4 行，实际 %d", n)
+	}
+}
+
+// 硬停必须**不是 one-shot**：连续重跑两次都要停。
+//
+// 为什么单独钉这一条：`phaseTo(Prepare)` 一旦排在清表判定**之前**，第一次重跑硬停时
+// 已经把 `_jl_meta.phase` 写成了 'prepare'；第二次重跑读回 prepare → 走「跳过 + note」、
+// 退出码 0 —— 保护只生效一次，而用户看到的恰恰是「第一次说表是你的，第二次就悄悄过了」。
+// 判据不能挂在「本轮自己会改写掉的状态」上（#74 的同一课）。
+func TestMySQLTargetCrashMidCopyKeepsStoppingOnRerun(t *testing.T) {
+	srcDSN, dstDSN := mysqlTargetDSNs(t)
+	src := mustConn(t, srcDSN)
+	dst := mustMySQLTarget(t, dstDSN)
+	table := "engine_my_crash_twice"
+
+	exec(t, src, "DROP TABLE IF EXISTS "+table)
+	exec(t, src, "CREATE TABLE "+table+" (id bigint PRIMARY KEY, payload text)")
+	exec(t, src, "INSERT INTO "+table+" SELECT g, 'src-'||g FROM generate_series(1,10) g")
+	t.Cleanup(func() { exec(t, src, "DROP TABLE IF EXISTS "+table) })
+
+	ctx := context.Background()
+	_, _ = dst.ExecContext(ctx, "DROP TABLE IF EXISTS `"+table+"`")
+	dropMySQLState(t, dst)
+	if _, err := dst.ExecContext(ctx, "CREATE TABLE `"+table+"` (id BIGINT PRIMARY KEY, payload TEXT)"); err != nil {
+		t.Fatalf("建用户表失败: %v", err)
+	}
+	if _, err := dst.ExecContext(ctx,
+		"INSERT INTO `"+table+"` VALUES (900001,'user-1'),(900002,'user-2'),(900003,'user-3'),(1,'src-1')"); err != nil {
+		t.Fatalf("预置行失败: %v", err)
+	}
+	t.Cleanup(func() { _, _ = dst.ExecContext(context.Background(), "DROP TABLE IF EXISTS `"+table+"`") })
+
+	store, jobID := newMySQLTargetJob(t, srcDSN, dstDSN, "my-crash-twice", table, "once")
+	job, err := store.GetJob(ctx, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	my := myConfigOf(t, dstDSN)
+	seed, err := mysqlsink.Open(ctx, mysqlsink.Options{
+		DSN: myEndpoint(my), JobKey: job.JobKey, Name: job.Name,
+		InstanceID: "crashed-instance", OnExists: mysqlsink.OnExists("append"),
+	})
+	if err != nil {
+		t.Fatalf("打开种子句柄失败: %v", err)
+	}
+	if err := seed.EnsureMeta(ctx, "seed", "prepare", "", ""); err != nil {
+		t.Fatalf("种 _jl_meta 失败: %v", err)
+	}
+	if err := seed.SetPhase(ctx, "snapshot"); err != nil {
+		t.Fatalf("种阶段失败: %v", err)
+	}
+	_ = seed.Close()
+
+	readPhase := func() string {
+		var phase string
+		if err := dst.QueryRowContext(ctx,
+			"SELECT phase FROM `_jl_meta` WHERE job_key = ?", job.JobKey).Scan(&phase); err != nil {
+			t.Fatalf("读阶段失败: %v", err)
+		}
+		return phase
+	}
+
+	// 第一次重跑：必须硬停
+	if _, err := engine.Run(ctx, engine.Options{Store: store, JobID: jobID}); err == nil {
+		t.Fatal("第一次重跑必须硬停")
+	} else if !strings.Contains(err.Error(), "是你自己的表") {
+		t.Fatalf("第一次重跑要给出「你自己的表」说明，得到: %v", err)
+	}
+	if got := readPhase(); got != "snapshot" {
+		t.Fatalf("硬停之后 `_jl_meta.phase` 必须还是 snapshot（判据不能被本轮改写），实际 %q", got)
+	}
+
+	// 第二次重跑：**仍然**必须硬停（不许退化成「跳过 + note」然后退出码 0）
+	_, err = engine.Run(ctx, engine.Options{Store: store, JobID: jobID})
+	if err == nil {
+		t.Fatalf("第二次重跑也必须硬停：现在是 exit 0（保护只生效一次），"+
+			"源端停机期删掉的行会留在用户表里；phase=%q", readPhase())
+	}
+	if !strings.Contains(err.Error(), "是你自己的表") {
+		t.Fatalf("第二次重跑的错误也该是「你自己的表」，得到: %v", err)
+	}
+	if n := myCount(t, dst, table); n != 4 {
+		t.Fatalf("两次硬停都不该动数据：应有 4 行，实际 %d", n)
 	}
 }
 
@@ -589,9 +673,12 @@ func TestMySQLTargetDeleteByTemporalKey(t *testing.T) {
 	table := "engine_my_ts_pk"
 
 	exec(t, src, "DROP TABLE IF EXISTS "+table)
-	// 时间主键用 **timestamptz**：pgoutput 对它会发带时区后缀的文本
-	// （`…+00`），MySQL 的 datetime 不接受——这正是 Old 必须规范化的场景。
-	// （`timestamp` 不带后缀，MySQL 本来就能解析，测不出这条。）
+	// 时间主键**只测 timestamptz**，原因两条，都不是随手选的：
+	//   - `timestamp`（无时区）pgoutput 发的文本不带 `+00` 后缀，MySQL 本来就能解析，
+	//     规范化与不规范化结果一样 → 测不出「Old 有没有被规范化」；
+	//   - `time` 不被 `parsePGTime` 的 layouts 接受（那里没有裸 time 的格式），
+	//     规范化对它本来就不生效 → 同样测不出。
+	// 只有 timestamptz 会发出带时区后缀的文本，MySQL 的 datetime 直接拒绝（1292）。
 	exec(t, src, "CREATE TABLE "+table+" (at timestamptz PRIMARY KEY, payload text)")
 	exec(t, src, "INSERT INTO "+table+` VALUES
 		('2026-01-01 10:00:00.000001','a'),
