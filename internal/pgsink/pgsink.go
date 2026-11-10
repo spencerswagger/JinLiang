@@ -364,6 +364,26 @@ func (s *Sink) SetPhase(ctx context.Context, phase string) error {
 	return err
 }
 
+// ClearProgress 清掉权威位点、水位与快照 ID。**只有 `--resync` 会调它**。
+//
+// 为什么单开一个方法而不是用 EnsureMeta("", "", "")：EnsureMeta 对 position/snapshot_id
+// 走的是 COALESCE(EXCLUDED.x, 旧值)——空串等于「别改」，正好反了。要让「清空」这件事
+// 只有一个写法，就必须有个显式的方法；否则 resync 得先 UPDATE 再 EnsureMeta，
+// 两处一旦分叉就会出现「位点没清掉，却清了表」的致命顺序。
+//
+// 不动 phase（阶段由调用方推进），也不动 paused_tables：清表不清暂停记录——
+// 「暂停」是后果记录，「清表」是这一轮的动作，维度不同；绑在一起会造出
+// 「结构已对齐却一直显示暂停」或「清了表、却没人知道它还暂停着」两种坏状态。
+func (s *Sink) ClearProgress(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	q := fmt.Sprintf(`UPDATE %s SET position=NULL, watermark=NULL, snapshot_id=NULL, updated_at=now()
+		WHERE job_key=$1`, s.stateTable("_jl_meta"))
+	_, err := s.conn.Exec(ctx, q, s.opt.JobKey)
+	return err
+}
+
 // State returns the recorded phase and position. The phase is what tells a
 // restart whether the initial copy ever finished: a position written during the
 // snapshot only means "these chunks are durable", not "all data is here".

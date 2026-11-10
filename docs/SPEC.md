@@ -129,7 +129,7 @@ DocURL    对应文档锚点
 | E1001 | user_action | 源库没有开启「变更流水」（wal_level=replica） | 执行给出的 ALTER SYSTEM；重启实例；回来 `jinliang run` 续跑 |
 | E1002 | user_action | 目标表已存在，按当前设置停止 | 改 `on_exists: append`，或换 schema |
 | E2001 | retryable | 目标库连接被重置 | 自动重试中；若持续，检查网络/连接数上限 |
-| E3001 | fatal | 位点与源库不连续（变更流水已被清理） | 需要重新初始化：`jinliang run --resync` |
+| E3001 | fatal | 位点与源库不连续（变更流水已被清理） | 需要重新初始化：`jinliang run --job <任务名> --resync` |
 | E4001 | bug | 解码遇到未支持的类型 oid=… | 附日志提 issue |
 
 ## 5. 指标（Prometheus）

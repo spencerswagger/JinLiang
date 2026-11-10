@@ -187,7 +187,9 @@ COMMIT;
    ├─ phase=snapshot → 读 _jl_chunk 找未完成块，继续；快照 id 过期则整段重来
    ├─ phase=catchup/streaming → 从目标位点继续流
    └─ 无记录 → 新任务
-4. 若源端 slot 不存在但 _jl_meta 有 position → 判定「变更流水已被清理」，E3001 要求 --resync
+4. 若源端 slot 不存在但 _jl_meta 有 position → 判定「变更流水已被清理」，E3001；
+   出路是 `jinliang run --job <任务名> --resync`：清空 position/watermark/snapshot_id，
+   再清本任务建的表 + 块标记，然后整轮重搬（不清用户表、不换 job_key）
 5. 正常结束 → phase=done，Cleanup 清 slot / publication / 临时快照；保留 meta 供查历史
 ```
 
