@@ -1467,7 +1467,8 @@ func (r *runner) stream(ctx context.Context, res *Result) error {
 		}
 		return streamErr
 	}
-	res.Note = "增量到运行结束（continuous）"
+	// 追加而不是赋值：迁移失败（列已存在那类良性失败）留的 early note 不能被盖掉。
+	emitEarlyNote(res, "增量到运行结束（continuous）")
 	return nil
 }
 

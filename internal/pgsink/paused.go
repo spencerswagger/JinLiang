@@ -233,6 +233,8 @@ func PausedKeys(m map[string]PausedTable) []string {
 }
 
 // EnsureStateTables 只做「状态表建表 + 迁移」，不建 Sink、不抢租约、不读业务表。
+// **超时由调用方给**（`context.WithTimeout`）：这里不自己设，因为不同调用方（引擎首跑 /
+// verify / doctor）能容忍的等待不同；但每个调用方都必须给，否则目标端黑洞时会卡到 OS TCP 超时。
 //
 // 为什么单独开这个口子：状态表迁移**不该依赖「这一轮有没有走到 prepare」**。
 // 真实场景是——目标库还是旧 schema，用户第一次跑因为租约/预检/表不存在在 prepare 之前
