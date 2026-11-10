@@ -150,6 +150,10 @@ func (r *runner) prepareGeneric(ctx context.Context) error {
 			return err
 		}
 	}
+	// 源端 vs 目标端的列类型对账（MySQL 的 EnsureSchema 不会替我们做这件事）。
+	if err := r.detectPrepareDrift(ctx); err != nil {
+		return err
+	}
 	src, err := r.openSource(ctx)
 	if err != nil {
 		return err
@@ -470,6 +474,11 @@ func (r *runner) copyGeneric(ctx context.Context) error {
 			// 一页可能十万行：按小批喂给 Apply，避免一条超大 INSERT 撞 max_allowed_packet。
 			const perBatch = 500
 			ref := r.targetRef(chRef)
+			// 本轮暂停的表：**连存量都不搬**（契约 §6 硬口径 2）。源端没法按表过滤
+			// （`SnapshotChunksFrom` 的入参里没有表集合），所以这里丢掉。
+			if r.skippedTables[ref.Table] {
+				return nil
+			}
 			rel := r.targetRelation(chRef)
 			for i := 0; i < len(rows); i += perBatch {
 				end := i + perBatch

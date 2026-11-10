@@ -319,3 +319,68 @@ func (r *runner) pausedSnapshot() map[string]pgsink.PausedTable {
 	}
 	return out
 }
+
+// detectPrepareDrift 在**通用目标端** prepare 期做一次「源端列 vs 目标端实际列」的对账。
+//
+// 这是 PG 目标端那条 `TakePendingPauses` 的对应物：PG 的 `EnsureSchema` 会自己比类型并返回
+// `PausableError`；MySQL 的 `EnsureSchema` 只补缺列、**不改列类型**，所以「上次跑完之后源端
+// 改了列类型」在 MySQL 目标端没有任何信号——只有把行写进去才炸，而 MySQL 会**静默收敛**
+// （1.25 存进 bigint 变成 1），连炸都不会炸。
+//
+// 判据：目标端存在这张表 ∧ 按类型字典映射过来的列类型对不上 → 登记暂停 + 本轮不搬它的存量。
+// 目标端还没有这张表（首次）→ 不算漂移（EnsureSchema 会建）。读不到 → 不猜，交给写路径响亮失败。
+func (r *runner) detectPrepareDrift(ctx context.Context) error {
+	if r.pauseReg == nil || r.sink != nil {
+		return nil // 只服务「目标端没有 sink 侧对账」的通用路径
+	}
+	exists, ok := r.pauseReg.(interface {
+		TableExists(context.Context, source.TableRef) (bool, error)
+	})
+	matcher, ok2 := r.pauseReg.(interface {
+		ColumnsMatch(context.Context, source.TableRef, []source.Column) (bool, string, error)
+	})
+	if !ok || !ok2 {
+		return nil // 目标端还不具备对账能力：不在这里判（写路径会响亮失败）
+	}
+	for _, t := range r.tables {
+		if _, paused := r.pausedRecord(t.Table); paused {
+			continue // 已经在暂停里：由 planGenericRecopy 判能不能恢复
+		}
+		tref := r.targetRef(t)
+		has, err := exists.TableExists(ctx, tref)
+		if err != nil {
+			return fmt.Errorf("查目标表 %s 是否存在失败: %w", t.Table, err)
+		}
+		if !has {
+			continue // 首次搬：EnsureSchema 会建，不算漂移
+		}
+		want, okc := r.catalogTable(t)
+		if !okc {
+			continue
+		}
+		aligned, why, err := matcher.ColumnsMatch(ctx, tref, want.Columns)
+		if err != nil {
+			return fmt.Errorf("对账目标表 %s 的列类型失败: %w", t.Table, err)
+		}
+		if aligned {
+			continue
+		}
+		// 登记先行（契约 §1.5 第 2 条）：先落库成功，才允许本轮不搬它。
+		rec := pgsink.PausedTable{
+			Reason: pgsink.PauseReasonTypeChanged,
+			Detail: "源端列的当前类型与目标端不一致：" + why,
+			Resume: r.resumeModeFor(ctx, tref),
+		}
+		if err := r.pauseReg.PauseTable(ctx, tref, rec); err != nil {
+			return fmt.Errorf("登记表 %s 的暂停失败（本轮一行都没搬）: %w", t.Table, err)
+		}
+		r.rememberPaused(t.Table, rec)
+		if r.skippedTables == nil {
+			r.skippedTables = map[string]bool{}
+		}
+		r.skippedTables[t.Table] = true
+		r.note(ctx, "表 "+t.Table+" 的结构和源端对不上（"+rec.Reason+"）：暂停这张表，"+
+			"本轮不搬它的存量，其它表照常跑；结构对齐后重跑会整表重搬补齐")
+	}
+	return nil
+}
