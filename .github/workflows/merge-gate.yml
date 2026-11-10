@@ -16,6 +16,11 @@ on:
       - "internal/pgsink/**"
       - "internal/mysqlsource/**"
       - "internal/mysqlsink/**"
+      # 这四类是门禁的输入面：方向表（支持哪些组合）、分类语义、MySQL↔PG 值规范化、CLI 退出码
+      - "internal/core/**"
+      - "internal/source/**"
+      - "internal/mysqlcanon/**"
+      - "cmd/**"
       - "scripts/gate_checks.py"
       - "scripts/mutation_gate.py"
       - "scripts/merge_gate.sh"
@@ -233,7 +238,7 @@ jobs:
           path: acceptance-${{ matrix.mysql }}.json
 
   mysql-mysql:
-    name: MySQL→MySQL（双实例：全量 / 增量 kill / 块级续跑）
+    name: MySQL→MySQL（双实例：全量 / 增量 kill / 块记账）
     # 参数与本地验收一致：ROWS=20000、两个独立实例（源 53306 / 目标 53307）。
     # 为什么必须两个实例：同实例时目标端的写入会进源端 binlog，读到自己刚写的行。
     runs-on: ubuntu-latest
@@ -301,19 +306,6 @@ jobs:
         # 判据不依赖引擎的续跑读路径：只验目标端有没有认真记账。
         env: *m2m-env
         run: timeout -k 10 900 bash scripts/b1_mysql_to_mysql.sh ./dist/jinliang accounting
-      - name: 块级续跑（known-red：单表口径，重启搬 ≈ 未搬完 ±1 块）
-        id: killcopy
-        # ⚠ 已知红，**有台账**：scripts/known_red.py 的 chunk-resume-wiring
-        # （责任人 Core / 转绿用例 killcopy / 移除条件：executeGeneric 接 planCopy+DoneChunks）。
-        # 记账已落（上一步阻塞），但引擎侧读块进度还没接 → 重启仍整表重搬。
-        continue-on-error: true
-        env: *m2m-env
-        run: timeout -k 10 900 bash scripts/b1_mysql_to_mysql.sh ./dist/jinliang killcopy
-      - name: 已知红台账对账（实现能过了但断言还挂着 → 拦）
-        if: always()
-        # 用**这一步的真实 outcome** 判「实现落地没有」：success = 能过了 = 该把断言打开。
-        # 只看静态代码（有没有写 _jl_chunk）会误判：#95 落了块记账，但续跑接线还没接。
-        run: python3 scripts/known_red.py verify --id chunk-resume-wiring --result "${{ steps.killcopy.outcome }}"
       - name: 结果进 job summary
         if: always()
         run: |
@@ -322,5 +314,72 @@ jobs:
             echo "- 全量+增量：见上一步日志"
             echo "- kill -9：判据「重启重搬 0 行」"
             echo "- 块记账（阻塞）：搬运期逐块 + 完成后表标记 rows = 各块之和"
-            echo "- 块级续跑（known-red，单表口径）：重启搬 ≈ 未搬完 ±1 块——引擎读块进度未接（Core），台账由 verify 对账"
+            echo "- 块级续跑（单表口径）不在本 job：见独立跟踪 job chunk-resume-tracking（不阻塞合并）"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  chunk-resume-tracking:
+    name: 【跟踪·不阻塞】块级续跑（单表口径）
+    # 为什么单列：generic 全量路径还没读块进度——`copyGeneric` 把 `nil` 传给
+    # SnapshotChunksFrom（internal/engine/target.go:456），`executeGeneric` 从不读
+    # `ChunkProgress`，所以**当前必然整轮重搬**。这是结构性红，不是「等实现会自己绿」的
+    # 开关问题；放在门禁 job 里会把整条门禁堵死，所以单列成跟踪 job（job 级别不阻塞）。
+    # 责任人 Core；转阻塞条件：读路径接通 且 该格重搬行数 ≤1 块（单表口径）。
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.x"
+      - name: 起 MySQL 源（8.0）
+        run: |
+          set -e
+          for attempt in 1 2 3; do
+            docker rm -f my-src >/dev/null 2>&1 || true
+            docker run -d --name my-src -p 43306:3306 \
+              -e MYSQL_ROOT_PASSWORD=root -e MYSQL_DATABASE=jinliang_src \
+              -e MYSQL_USER=jinliang -e MYSQL_PASSWORD=jinliang \
+              mysql:8.0 --server-id=1 --log-bin=mysql-bin --binlog-format=ROW --binlog-row-image=FULL && break
+            echo "第 $attempt 次起 my-src 失败，5s 后重试"; sleep 5
+          done
+          for i in $(seq 1 120); do
+            docker exec my-src mysql -uroot -proot -N -e 'select 1' >/dev/null 2>&1 && exit 0
+            sleep 2
+          done
+          docker logs my-src; exit 1
+      - name: 起 MySQL 目标（8.0）
+        run: |
+          set -e
+          for attempt in 1 2 3; do
+            docker rm -f my-dst >/dev/null 2>&1 || true
+            docker run -d --name my-dst -p 43307:3306 \
+              -e MYSQL_ROOT_PASSWORD=root -e MYSQL_DATABASE=jinliang_target \
+              -e MYSQL_USER=jinliang -e MYSQL_PASSWORD=jinliang \
+              mysql:8.0 --server-id=2 --log-bin=mysql-bin --binlog-format=ROW --binlog-row-image=FULL && break
+            echo "第 $attempt 次起 my-dst 失败，5s 后重试"; sleep 5
+          done
+          for i in $(seq 1 120); do
+            docker exec my-dst mysql -uroot -proot -N -e 'select 1' >/dev/null 2>&1 && exit 0
+            sleep 2
+          done
+          docker logs my-dst; exit 1
+      - name: 补权限
+        run: |
+          set -e
+          docker exec my-src mysql -uroot -proot -e "GRANT ALL PRIVILEGES ON *.* TO 'jinliang'@'%' WITH GRANT OPTION; FLUSH PRIVILEGES;"
+          docker exec my-dst mysql -uroot -proot -e "GRANT ALL PRIVILEGES ON *.* TO 'jinliang'@'%' WITH GRANT OPTION; FLUSH PRIVILEGES;"
+      - name: 构建
+        run: |
+          mkdir -p dist
+          CGO_ENABLED=0 go build -trimpath -o dist/jinliang ./cmd/jinliang
+      - name: 块级续跑（known-red：单表口径，重启搬 ≈ 未搬完 ±1 块）
+        id: killcopy
+        continue-on-error: true
+        env:
+          JINLIANG_TEST_MYSQL_SRC_DSN: mysql://jinliang:jinliang@127.0.0.1:43306/jinliang_src
+          JINLIANG_TEST_MYSQL_DST_DSN: mysql://jinliang:jinliang@127.0.0.1:43307/jinliang_target
+          ROWS: "20000"
+        run: timeout -k 10 900 bash scripts/b1_mysql_to_mysql.sh ./dist/jinliang killcopy
+      - name: 已知红台账对账（实现能过了但断言还挂着 → 拦）
+        if: always()
+        run: python3 scripts/known_red.py verify --id chunk-resume-wiring --result "${{ steps.killcopy.outcome }}"

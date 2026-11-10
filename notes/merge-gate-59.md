@@ -290,7 +290,14 @@ scripts/local_stack.sh down
 `gate_checks.py recopy` 现在必须显式给 `--scope whole|table|pause`，selftest 24 条覆盖三种口径
 （含「单表口径整表重搬必须红」「暂停恢复多搬/少搬必须红」）。
 
-## 7.9 killcopy：记账转阻塞（绿），续跑仍 known-red（Core）
+## 7.9 killcopy：记账转阻塞（绿）；续跑是**结构性红**，单列跟踪 job（不阻塞）
+
+> **更正**（2026-11-12，撤回「killcopy 可以整格转阻塞」）：转阻塞的前提是「实现已落地」，
+> 而这里只落了一半，且缺的那一半在**引擎**不在 Data：
+> `copyGeneric` 把 `nil` 传给 `SnapshotChunksFrom`（`internal/engine/target.go:456`），
+> `executeGeneric` 从不读 `ChunkProgress` → **当前必然整轮重搬**。所以在 Core 接通前，
+> 把它放进门禁 job 只会把整条门禁堵死。处理：单列成跟踪 job `chunk-resume-tracking`
+> （job 级 `continue-on-error`，**不阻塞合并**），门禁 job 只留能绿的部分。
 
 Data 的块记账（#95）落地后，按「实现已落地 + 步骤仍挂起 = 判 1」的规则，把这一格**拆成两步**：
 
@@ -299,9 +306,18 @@ Data 的块记账（#95）落地后，按「实现已落地 + 步骤仍挂起 = 
 | `块进度记账（阻塞）` | 搬运期逐块（`chunk_no>0 ∧ done=1`）+ 完成后表标记 `chunk_no=0` 的 `rows` **等于各块之和**、等于表行数；记账不许虚报 | 只依赖目标端记账（#95 已落） | **PASS**：`搬运期 2 块 / 4000 行；完成后表标记 rows=20000 = 各块之和 = 表行数` |
 | `块级续跑（known-red）` | 单表口径：重启搬 ≈ 未搬完 ±1 块 | 引擎通用全量路径读块进度（**未落**，`executeGeneric` 至今不调 `DoneChunks`） | **仍红**：`中断 4500 行 → 重启搬 20000 行（应补 15500 + 多出 4500）` → `[单表口径] 超界` |
 
-为什么没有把整格直接转阻塞：转阻塞的前提是「实现已落地」，而这里是**一半落地**——记账有了，
-读路径没有；`executeGeneric` 里 `DoneChunks` 零调用点（`grep -n "DoneChunks(" internal/engine/*.go`
-只有接口声明）。现在硬转阻塞就会让 `mysql-mysql` job 常红，等于把 known-red 变成 noise，
-所以按台账规则保留 known-red，责任人改为 **Core**，触发条件写成：
-「`planCopy`/`DoneChunks` 接进 `executeGeneric`，重启搬 ≈ 未搬完（±1 块）后删 `continue-on-error`」。
-台账 probe 仍用这一步的真实 `outcome`——接线一旦落地，`verify` 会立刻判「断言未激活」逼着删。
+为什么没有把整格直接转阻塞：`executeGeneric` 里 `DoneChunks` 零调用点（`grep -n "DoneChunks("
+internal/engine/*.go` 只有接口声明），硬转阻塞会让 `mysql-mysql` job 常红，等于把 known-red 变成 noise。
+现在按「结构性红」处理：**移出**门禁 job、单列 `chunk-resume-tracking`（不阻塞合并），
+workflow 注释与台账都写成事实：「generic 路径未读块进度（`target.go:456`），当前必然整轮重搬」。
+责任人 **Core**；转阻塞条件＝读路径接通 **且** 该格重搬行数 ≤1 块。台账 probe 仍用这一步的真实
+`outcome`——接线一旦落地，`verify` 会立刻判「断言未激活」逼着转阻塞。
+
+### 7.10 采纳 Owl 的四条建议（都已落）
+
+| 建议 | 落法 |
+|---|---|
+| `merge-gate.yml` 的 paths 太窄 | 补 `internal/core/**`、`internal/source/**`、`internal/mysqlcanon/**`、`cmd/**`（方向表/分类语义/值规范化/CLI 退出码都是门禁输入面） |
+| `acceptance_matrix.sh` 的 `seconds` 被 restart 覆盖 | 拆成 `copy_seconds`（全量+追平）与 `restart_seconds`（kill 后重启），`RESULT` 行两个字段都在，三组合可比 |
+| `mutation_gate.py` 的 killed 判据是 `rc!=0` | 收紧：**go 检测器必须出现 `--- FAIL:`** 才算 killed；出现 `[build failed]`/`cannot use`/`undefined:` 记 `COMPILE-FAILED`（不算抓住）；非 go 检测器（python selftest / known_red）仍按退出非 0 |
+| 与本 PR 无关的 `notes/instabox-*` | 7 个文件（约 1030 行）移出仓库（副本挪到工作区 `local-notes/`），PR diff 只剩门禁相关 |

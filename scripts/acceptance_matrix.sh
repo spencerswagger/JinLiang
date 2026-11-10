@@ -218,7 +218,7 @@ YAML
     mark "kill -9 后重启（只许从位点重放）"
     t0=$(now_s)
     runbin run --job acc-mysql-pg --data-dir "$data" --stop-when-idle 5s >"$W/kill2.log" 2>&1
-    rc=$?; t1=$(now_s); secs=$(elapsed "$t0" "$t1")
+    rc=$?; t1=$(now_s); restart_seconds=$(elapsed "$t0" "$t1")
     [ $rc -eq 0 ] || { echo "FAIL: 重启退出码 $rc"; tail -5 "$W/kill2.log"; return 1; }
     local copied
     copied=$(grep -oE "全量完成：[0-9]+ 行" "$W/kill2.log" | tail -1 | grep -oE "[0-9]+")
@@ -229,11 +229,11 @@ YAML
     python3 "$GC" recopy --scope whole --copied "$copied" --label "kill -9 重启（整轮口径）" || return 1
     s_fp=$(fp_mysql "$T"); d_fp=$(fp_pg "$dst" "$T")
     python3 "$GC" fp --src "$s_fp" --dst "$d_fp" --label "kill -9 重启后" || { echo "  源 $s_fp / 目标 $d_fp"; return 1; }
-    extra="$extra kill=recopy-${copied}-rows restart=${secs}s"
+    extra="$extra kill=recopy-${copied}-rows restart_seconds=${restart_seconds}s"
   fi
 
   local n; n=$(pgq "$dst" "SELECT count(*) FROM $T")
-  emit "mysql-postgres" "$n" "${s_fp#*:}" "$secs" pass "mysql=$ver $extra"
+  emit "mysql-postgres" "$n" "${s_fp#*:}" "$copy_seconds" pass "mysql=$ver copy_seconds=${copy_seconds} restart_seconds=${restart_seconds:-0} $extra"
 }
 
 # 增量验收（三组合共用）：按 #93 之后的实现判，**不再把「被拒」当通过**。

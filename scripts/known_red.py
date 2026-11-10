@@ -37,9 +37,9 @@ REGISTRY = [
         step="块级续跑（known-red：单表口径，重启搬 ≈ 未搬完 ±1 块）",
         owner="Core",
         detector="scripts/b1_mysql_to_mysql.sh killcopy（单表口径：重启搬 ≈ 未搬完 ±1 块）",
-        unblock="引擎通用全量路径接 planCopy/DoneChunks（MySQL 目标端读块进度）；"
-                "合入后重启搬 ≈ 未搬完，删掉该步骤的 continue-on-error。"
-                "注：块记账本身已落（#95），已单独成**阻塞**步骤",
+        unblock="引擎 generic 全量路径读块进度（当前 copyGeneric 把 nil 传给 SnapshotChunksFrom，"
+                "internal/engine/target.go:456；executeGeneric 从不读 ChunkProgress → 必然整轮重搬）；"
+                "接通且该格重搬行数 ≤1 块后转阻塞。注：块记账本身已落（#95），已是**阻塞**步骤",
         probe="job:mysql-mysql",
     ),
     dict(

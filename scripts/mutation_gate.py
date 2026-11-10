@@ -254,7 +254,27 @@ def run(m, shadow, env):
     proc = subprocess.run(m["cmd"], cwd=shadow, env=env, stdout=subprocess.PIPE,
                           stderr=subprocess.STDOUT, text=True)
     tail = [l for l in proc.stdout.splitlines() if l.strip()][-4:]
-    return proc.returncode, tail
+    return proc.returncode, tail, proc.stdout
+
+
+def judge(m, rc, out):
+    """killed 的判据：**检测器真的报出「测试失败」**，不是「进程非 0」。
+
+    为什么收紧：注入点在 Go 文件里时，改坏语法/类型会编译失败——`go test` 同样返回非 0，
+    旧判据会把它记成 killed，等于「注入没编译过」也算门禁有效。现在：
+      · go 检测器：必须出现 `--- FAIL:` 才是 killed；出现 `[build failed]`/`# ` 记 COMPILE-FAILED；
+      · 其它（python selftest / known_red）：退出非 0 即 killed（它们本身就是判据脚本）。
+    """
+    is_go = bool(m["cmd"]) and m["cmd"][0] == "go"
+    if rc == 0:
+        return "SURVIVED"
+    if is_go:
+        if "--- FAIL:" in out:
+            return "KILLED"
+        if "[build failed]" in out or "cannot use" in out or "undefined:" in out:
+            return "COMPILE-FAILED"
+        return "SURVIVED"  # 非 0 但不是断言失败（比如超时/环境）：不算抓住
+    return "KILLED"
 
 
 def main(argv=None):
@@ -293,13 +313,13 @@ def main(argv=None):
                 print("mutation-gate: FAIL %-28s 检测器用例不存在（%s）—— 先合「%s」再收门禁"
                       % (m["name"], m["requires"], m["name"]))
                 continue
-            rc, tail = run(m, shadow, env)
-            killed = rc != 0
-            rows.append(dict(m, verdict="KILLED" if killed else "SURVIVED", detail=" | ".join(tail), rc=rc))
-            if not killed:
+            rc, tail, out = run(m, shadow, env)
+            verdict = judge(m, rc, out)
+            rows.append(dict(m, verdict=verdict, detail=" | ".join(tail), rc=rc))
+            if verdict != "KILLED":
                 failed += 1
-            print("mutation-gate: %-8s %-28s rc=%s  %s" %
-                  ("killed" if killed else "SURVIVED", m["name"], rc, tail[-1] if tail else ""))
+            print("mutation-gate: %-13s %-28s rc=%s  %s" %
+                  (verdict, m["name"], rc, tail[-1] if tail else ""))
             # 每条都从干净影子开始，避免上一条的注入影响下一条。
             shutil.rmtree(shadow); shadow = make_shadow()
     finally:
@@ -316,7 +336,7 @@ def main(argv=None):
             json.dump(rows, f, ensure_ascii=False, indent=2)
         print("报告：%s" % a.json)
     if failed:
-        print("mutation-gate: %d/%d 条注入存活（门禁拦不住这种破坏）" % (failed, len(rows)))
+        print("mutation-gate: %d/%d 条注入未抓住（存活 / 编译失败 / 注入点失配）" % (failed, len(rows)))
         return 1
     print("mutation-gate: %d/%d 条注入全部被抓住" % (len(rows), len(rows)))
     return 0
