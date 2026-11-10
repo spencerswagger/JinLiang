@@ -24,8 +24,6 @@ import (
 	"github.com/spencerswagger/jinliang/internal/dsn"
 	"github.com/spencerswagger/jinliang/internal/mysqlsink"
 	"github.com/spencerswagger/jinliang/internal/pgsink"
-	"github.com/spencerswagger/jinliang/internal/pgsource"
-	"github.com/spencerswagger/jinliang/internal/pgwire"
 	"github.com/spencerswagger/jinliang/internal/preflight"
 	"github.com/spencerswagger/jinliang/internal/source"
 	"github.com/spencerswagger/jinliang/internal/state"
@@ -1909,10 +1907,13 @@ func classifyError(err error) (code core.Code, classified bool) {
 		return "", false
 	}
 	var pb *preflightBlocked
-	var foreign *pgsource.ErrPositionForeignSource
 	var kindErr *positionKindError
 	var tooBig *txTooLargeError
 	var lost *leaseLostError
+	// 源端语义类：**问连接器**（`source.ClassOf`），不 import 任何具体连接器包。
+	// 契约 §4.4——异构之后按具体连接器的谓词（IsNoPrivilege 之类）判类，
+	// 会让 MySQL 的错误全部落到「未识别」。
+	class := source.ClassOf(err)
 	switch {
 	case errors.As(err, &pb):
 		return pb.Code(), true
@@ -1920,7 +1921,7 @@ func classifyError(err error) (code core.Code, classified bool) {
 		return core.CodeJobRunningElsewhere, true
 	case errors.Is(err, pgsink.ErrTargetTableExists), errors.As(err, new(*reusedTableRecopyError)):
 		return core.CodeTargetTableExists, true
-	case errors.As(err, &foreign), errors.As(err, &kindErr):
+	case class == source.ClassPositionForeign, errors.As(err, &kindErr):
 		return core.CodePositionKindMismatch, true
 	case errors.As(err, &tooBig):
 		return core.CodeTxTooLarge, true
@@ -1942,24 +1943,22 @@ func classifyError(err error) (code core.Code, classified bool) {
 		// 文案以码表 E1013 为准；**不造伪 SQLSTATE**——那是协议语义，塞假值会带偏所有
 		// 按 SQLSTATE 分类的地方。
 		return core.CodeObjectMissing, true
-	case pgsource.IsNoPrivilege(err):
-		// 42501：源端 SELECT 或目标端 DDL/DML 被拒——用户要做的事都是「去要授权」。
+	case class == source.ClassNoPrivilege:
+		// 42501 / MySQL 1045：源端 SELECT 或目标端 DDL/DML 被拒——用户要做的事都是「去要授权」。
 		return core.CodeNoPrivilege, true
-	case pgwire.SQLState(err) == "53400":
+	case class == source.ClassResourceLimit:
 		// all replication slots are in use：权限够、资源满（E1016）。
-		// 位置：排在 42501（权限不足）之后——那是**另一个码、另一类动作**；
-		// 53400 与 3F000/42P01（对象不存在）互斥（一个错误只带一个 SQLSTATE），
-		// 放在这里只是就近，不构成「必须在这之后」的约束。
-		// 用户要做的事只有三件（见码表 E1016 的 Next）；last_error 原样保留 SQLSTATE 与消息。
+		// 位置：排在「权限不足」之后——那是**另一个码、另一类动作**；
+		// 两者互斥（一个错误只带一个 SQLSTATE），放在这里只是就近。
 		return core.CodeSourceResourceLimit, true
-	case pgsource.IsObjectMissing(err):
-		// 3F000/42P01：schema 或表不存在。next 里按 SQLSTATE 分流（缺 schema 建 schema、
-		// 缺表别去建 schema），文案以码表为准，不走 hint()。
+	case class == source.ClassObjectMissing:
+		// 3F000/42P01/42703（MySQL 1146）：schema 或表不存在。next 里按 SQLSTATE 分流
+		//（缺 schema 建 schema、缺表别去建 schema），文案以码表为准，不走 hint()。
 		return core.CodeObjectMissing, true
-	case pgsource.IsWalLevelTooLow(err):
+	case class == source.ClassWalLevel:
 		// 运行期撞上「源库没开逻辑变更流」：用户要做的事与预检时一模一样，复用 E1001。
 		return core.CodeWalLevel, true
-	case pgsource.IsPositionGap(err):
+	case class == source.ClassPositionGap:
 		return core.CodePositionGap, true
 	}
 	return "", false
