@@ -133,6 +133,14 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 	srcEP := endpointOf(srcConn, srcSecret)
 	tgtEP := endpointOf(tgtConn, tgtSecret)
 
+	// **状态表迁移要早于任何读 `_jl_meta` 的动作**（StartRun 的冲突回收会读租约/状态）。
+	// 否则旧 schema 的库会在 prepare 之前就因为「没有 paused_tables 列」报一条与真实原因
+	// 无关的错（租约/预检/表不存在才是真因），用户还会以为要手工改表。幂等，一条 DDL。
+	if tgtEP.Kind == dsn.KindPostgres {
+		if err := pgsink.EnsureStateTables(ctx, tgtEP, schemaOf(doc, tgtConn)); err != nil {
+			return res, fmt.Errorf("把目标端的状态表升到当前版本失败（旧库首次运行也要先完成迁移）: %w", err)
+		}
+	}
 	run, err := opt.Store.StartRun(ctx, job.ID, state.Preflight, control.RunKindSync)
 	if err != nil && errors.Is(err, control.ErrConflict) {
 		// 控制面有「一个任务只允许一条活跃 run」的约束（#5）。进程被 kill -9 之后

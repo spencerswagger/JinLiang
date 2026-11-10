@@ -11,6 +11,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/spencerswagger/jinliang/internal/dsn"
+	"github.com/spencerswagger/jinliang/internal/pgwire"
 	"github.com/spencerswagger/jinliang/internal/source"
 )
 
@@ -228,4 +230,24 @@ func PausedKeys(m map[string]PausedTable) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// EnsureStateTables 只做「状态表建表 + 迁移」，不建 Sink、不抢租约、不读业务表。
+//
+// 为什么单独开这个口子：状态表迁移**不该依赖「这一轮有没有走到 prepare」**。
+// 真实场景是——目标库还是旧 schema，用户第一次跑因为租约/预检/表不存在在 prepare 之前
+// 就失败了，他看到的却是 `column "paused_tables" does not exist`：一条与真实原因无关的
+// 报错，还会让他以为要手工改表。所以引擎在**任何读 `_jl_meta` 之前**先调一次本函数
+// （幂等，代价是一条 ADD COLUMN IF NOT EXISTS）。
+func EnsureStateTables(ctx context.Context, ep dsn.Endpoint, schema string) error {
+	if strings.TrimSpace(schema) == "" {
+		schema = "public"
+	}
+	conn, err := pgwire.Connect(ctx, ep)
+	if err != nil {
+		return err
+	}
+	defer conn.Close(context.Background())
+	s := &Sink{conn: conn, opt: Options{Target: ep, Schema: schema}}
+	return s.ensureStateTables(ctx)
 }
