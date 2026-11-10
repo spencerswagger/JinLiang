@@ -321,15 +321,8 @@ func FillColumnKinds(tm *TableMap, known *source.Table) {
 	kinds := make([]binaryKind, tm.Columns)
 	any := false
 	for i := range kinds {
-		cs := known.Columns[i].Charset
-		switch {
-		case cs == "":
-			kinds[i] = binUnknown
-		case strings.EqualFold(cs, "binary"):
-			kinds[i] = binBinary
-			any = true
-		default:
-			kinds[i] = binText
+		kinds[i] = catalogBinaryKind(known.Columns[i])
+		if kinds[i] != binUnknown {
 			any = true
 		}
 	}
@@ -560,4 +553,33 @@ func fracArg(fsp int) string {
 		return ""
 	}
 	return fmt.Sprintf("(%d)", fsp)
+}
+
+// catalogBinaryKind 从 catalog 的一列判断「按字节存还是按字符存」。
+//
+// 两个来源，按可靠性排序：
+//  1. `CHARACTER_SET_NAME`：非 binary 的字符集 → 按字符存（utf8mb4/latin1/…）。
+//     **但 MySQL 对 BINARY/VARBINARY/BLOB 列不给字符集（NULL）**——所以「空」不等于
+//     「不知道」，它恰好是二进制列最常见的形态（真库实测：`binary(4)` 的
+//     CHARACTER_SET_NAME 是 NULL，而 `char(10)` 是 utf8mb4）。
+//  2. 因此空字符集时看**类型名**：binary/varbinary/blob 家族 → 按字节；
+//     char/varchar/text 家族 → 按字符；其余（数值/时间）与行列镜像无关，留 binUnknown。
+func catalogBinaryKind(c source.Column) binaryKind {
+	if cs := c.Charset; cs != "" {
+		if strings.EqualFold(cs, "binary") {
+			return binBinary
+		}
+		return binText
+	}
+	base := strings.ToLower(c.Type)
+	if i := strings.IndexAny(base, "( "); i >= 0 {
+		base = base[:i]
+	}
+	switch base {
+	case "binary", "varbinary", "tinyblob", "blob", "mediumblob", "longblob", "geometry":
+		return binBinary
+	case "char", "varchar", "tinytext", "text", "mediumtext", "longtext", "enum", "set":
+		return binText
+	}
+	return binUnknown
 }

@@ -42,6 +42,23 @@ func TestIntegrationBinaryVsTextDecoding(t *testing.T) {
 	}
 	s.SetKnownTables(cat.Tables)
 
+	// 真库的 information_schema：BINARY/VARBINARY/BLOB 的 CHARACTER_SET_NAME 是 **NULL**，
+	// 只靠「字符集空 = 不知道」会让 5.7 继续按内容猜（CI 的 5.7 腿就是这么红的）。
+	// 这里直接对真 catalog 断言判据本身。
+	for _, tb := range cat.Tables {
+		if tb.Table != table {
+			continue
+		}
+		want := map[string]binaryKind{"b4": binBinary, "vb": binBinary, "bl": binBinary,
+			"c10": binText, "v16": binText, "tx": binText}
+		for _, c := range tb.Columns {
+			if w, ok := want[c.Name]; ok && catalogBinaryKind(c) != w {
+				t.Fatalf("catalog 判据错：%s（%s, charset=%q）应是 %v，实际 %v",
+					c.Name, c.Type, c.Charset, w, catalogBinaryKind(c))
+			}
+		}
+	}
+
 	start, err := s.Status(ctx)
 	if err != nil {
 		t.Fatalf("取起点失败: %v", err)

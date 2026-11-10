@@ -27,12 +27,14 @@ func TestFillColumnKindsCovers57(t *testing.T) {
 		t.Fatalf("没有 catalog 时退回内容启发式（已知边界）：ctx=%v", v.Kind)
 	}
 
-	// 有 catalog（流开始时 information_schema 读到的字符集）：判据变精确。
+	// 有 catalog（流开始时 information_schema 读到的列定义）：判据变精确。
+	// 注意 BINARY/VARBINARY/BLOB 的 CHARACTER_SET_NAME 在 MySQL 里就是 **NULL**
+	// （真库实测），所以判据不能只看字符集——没有字符集时按类型名认。
 	FillColumnKinds(tm, &source.Table{
 		TableRef: source.TableRef{Schema: "app", Table: "t"},
 		Columns: []source.Column{
-			{Name: "b4", Type: "binary(4)", Charset: "binary"},
-			{Name: "vb", Type: "varbinary(8)", Charset: "binary"},
+			{Name: "b4", Type: "binary(4)", Charset: ""},
+			{Name: "vb", Type: "varbinary(8)", Charset: ""},
 			{Name: "vc", Type: "varchar(64)", Charset: "utf8mb4"},
 		},
 	})
@@ -73,5 +75,31 @@ func TestFillColumnKindsRefusesWhenColumnCountDiffers(t *testing.T) {
 	})
 	if tm.ColumnKinds != nil {
 		t.Fatalf("列数对不上时不许补 kind（会按序号错位），实际 %v", tm.ColumnKinds)
+	}
+}
+
+// catalogBinaryKind：MySQL 对 BINARY/VARBINARY/BLOB 不给字符集（NULL），
+// 只靠「字符集空 = 不知道」会让 5.7 上这几列继续走内容启发式（CI 的 5.7 腿就是这么红的）。
+func TestCatalogBinaryKind(t *testing.T) {
+	cases := []struct {
+		col  source.Column
+		want binaryKind
+		why  string
+	}{
+		{source.Column{Type: "binary(4)"}, binBinary, "字符集 NULL + binary 类型名"},
+		{source.Column{Type: "varbinary(8)"}, binBinary, "同上"},
+		{source.Column{Type: "blob"}, binBinary, "BLOB 字符集也是 NULL"},
+		{source.Column{Type: "mediumblob"}, binBinary, "尺寸档不影响"},
+		{source.Column{Type: "geometry"}, binBinary, "几何类型按字节"},
+		{source.Column{Type: "char(10)", Charset: "utf8mb4"}, binText, "有字符集就是按字符"},
+		{source.Column{Type: "text", Charset: "utf8mb4"}, binText, "同上"},
+		{source.Column{Type: "varchar(16)"}, binText, "类型名兜底"},
+		{source.Column{Type: "int"}, binUnknown, "数值列与行列镜像无关"},
+		{source.Column{Type: "datetime(6)"}, binUnknown, "时间列同上"},
+	}
+	for _, c := range cases {
+		if got := catalogBinaryKind(c.col); got != c.want {
+			t.Errorf("catalogBinaryKind(%+v) = %v，应为 %v —— %s", c.col, got, c.want, c.why)
+		}
 	}
 }

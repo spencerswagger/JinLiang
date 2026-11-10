@@ -46,6 +46,12 @@
 **结论：修复**（不是降级）。顺带确认没打坏别的路径：`TestMySQLTarget*` 12 条全 PASS（含重搬清表、
 `full_interval`、用户表崩溃硬停）。
 
+**评审后修正（Owl II 必改 ②③）**
+- `ErrTruncateNotOwned` 原来会落到 `hint()` 的兜底「未识别的数据库错误 → 把日志发给维护者」，
+  把三条出路盖住了：已加专门分支（用户自己就能解决的事不找维护者），用例 `TestHintTruncateNotOwnedGivesRealOptions`。
+- 出路③ 原来是**死路**：只手工 TRUNCATE 不会放行（失败批的位点没越过这条事件，重跑撞同一道闸）。
+  文案改成「手工清空 **+** 改 recreate/移出范围才放行」，并写明为什么。
+
 ---
 
 ## P2 二进制列按排序规则判定
@@ -74,6 +80,19 @@
 - 判据③：类型串 `[int binary(4) varbinary(8) blob char(10) varchar(16) text]`——binary 与 char 分开，改类型判定不会再漏。
 
 结果：**PASS 0.89s**。
+
+**评审后修正（Owl II 必改 ①，CI 的 `mysql 5.7` 腿红）**
+
+5.7 没有排序规则 → `binUnknown` → 内容启发式 → `BINARY(4)='abcd'` 仍然被判成字符串。
+不按「5.7 就跳过用例」降级，改成**从 catalog 补判据**：`FillColumnKinds(tm, known)` 把
+`information_schema.columns.CHARACTER_SET_NAME`（`binary` 即按字节）写进 `TableMap.ColumnKinds`，
+在 **TABLE_MAP 解析完、行事件解码之前**（`Parser.OnTableMap` 回调）填好。
+于是 5.7 与 8.0 走同一条判定，内容启发式只剩「catalog 也没有」的兜底。
+
+- 用例 `TestFillColumnKindsCovers57`：没有 catalog → `binUnknown`（已知边界）；
+  有 catalog（binary/binary/utf8mb4）→ `binBinary/binBinary/binText`，且 `BINARY(4)='abcd'` 交字节；
+- `TestFillColumnKindsRefusesWhenColumnCountDiffers`：列数对不上就不补（不按序号错位猜）；
+- 真库用例改走 `s.Catalog(...)` + `SetKnownTables`（与引擎 `newMyRunSource` 同一条前置）。
 
 **结论：修复。**
 
