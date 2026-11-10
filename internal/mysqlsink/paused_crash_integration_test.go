@@ -16,7 +16,6 @@ package mysqlsink
 
 import (
 	"context"
-	"errors"
 	"strings"
 	"testing"
 
@@ -202,30 +201,7 @@ func TestIntegrationPauseCrashAfterSkipKeepsRecoverable(t *testing.T) {
 	if err := b.ClearPausedTable(ctx, ref); err != nil {
 		t.Fatalf("解除失败: %v", err)
 	}
-	if _, ok := readPausedMap(t, b, mustJobKey(t, b))[tbl]; ok {
-		t.Fatal("解除后记录应消失")
+	if paused, _ := b.PausedTables(ctx); len(paused) != 0 {
+		t.Fatalf("解除后记录应消失，实际 %v", paused)
 	}
 }
-
-// mustJobKey 读本任务在 `_jl_meta` 的 job_key（与 readPaused 的形状对齐）。
-func mustJobKey(t *testing.T, s *Sink) string {
-	t.Helper()
-	var k string
-	if err := s.db.QueryRowContext(context.Background(),
-		"SELECT job_key FROM `_jl_meta` WHERE job_key = ?", s.opt.JobKey).Scan(&k); err != nil {
-		t.Fatalf("读 job_key 失败: %v", err)
-	}
-	return k
-}
-
-func readPausedMap(t *testing.T, s *Sink, jobKey string) map[string]pgsink.PausedTable {
-	t.Helper()
-	m, err := s.PausedTables(context.Background())
-	if err != nil {
-		t.Fatalf("读暂停记录失败: %v", err)
-	}
-	_ = jobKey
-	return m
-}
-
-var _ = errors.Is

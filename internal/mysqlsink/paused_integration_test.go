@@ -62,7 +62,7 @@ func TestIntegrationPauseRegisterThenClear(t *testing.T) {
 	first := r.At
 	incremental := r
 	incremental.At = ""
-	incremental.Reason = "schema_drift" // 第二次是另一个原因
+	incremental.Reason = pgsink.PauseReasonSchemaDrift // 第二次是另一个原因
 	incremental.Detail = "第二次"
 	if err := s.PauseTable(ctx, refOf("jl_b3_pause_a"), incremental); err != nil {
 		t.Fatalf("第二次登记失败: %v", err)
@@ -74,7 +74,7 @@ func TestIntegrationPauseRegisterThenClear(t *testing.T) {
 	// reason / detail 用**最新**这一次（「这张表现在为什么停着」），与 PG 侧同一口径。
 	// 早先这里保留过第一次的 reason，会让 reason 与 detail 互相矛盾
 	// （reason=type_changed，detail 却写着「列被改名」）。
-	if got2["jl_b3_pause_a"].Reason != "schema_drift" {
+	if got2["jl_b3_pause_a"].Reason != pgsink.PauseReasonSchemaDrift {
 		t.Fatalf("reason 应跟随最新一次（schema_drift），实际 %q", got2["jl_b3_pause_a"].Reason)
 	}
 	if got2["jl_b3_pause_a"].Detail != "第二次" {
