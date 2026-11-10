@@ -1,0 +1,174 @@
+name: merge-gate
+
+# #59 合并门禁的「能拦住错误合并」那一层。
+#
+# 与 review-gate.yml 的分工：
+#   review-gate.yml —— 人/结论这一侧（最新 review 锚在当前 head、明确放行）；
+#   merge-gate.yml  —— 事实这一侧（判据自检 + 反向注入 + 三组合验收）。
+# 两者都绿才允许合并；本文件把「测试跑绿了」升级成「把实现改坏，测试会红」。
+#
+# 为什么矩阵在 Actions 上跑：沙盒/开发机只有 MySQL 8.0，5.7 / 8.4 需要 docker。
+
+on:
+  pull_request:
+    paths:
+      - "internal/engine/**"
+      - "internal/pgsink/**"
+      - "internal/mysqlsource/**"
+      - "internal/mysqlsink/**"
+      - "scripts/gate_checks.py"
+      - "scripts/mutation_gate.py"
+      - "scripts/merge_gate.sh"
+      - "scripts/acceptance_matrix.sh"
+      - "scripts/review_gate_logic.py"
+      - ".github/workflows/merge-gate.yml"
+  workflow_dispatch:
+
+jobs:
+  logic:
+    name: 判据自检 + 反向注入（logic）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 判据自检（门禁自己的判据必须能红）
+        run: python3 scripts/gate_checks.py selftest
+      - name: review 门禁自检（#59：锚定 / 否决词 / 解冲突放行）
+        run: python3 scripts/review_gate_logic.py selftest
+      - name: 反向注入（改坏判据 → 自检必须红）
+        run: python3 scripts/mutation_gate.py --tier logic
+
+  engine-mutation:
+    name: 反向注入（engine：位点 / 暂停 / 块进度）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.x"
+      - name: 起 PG（wal_level=logical）
+        run: |
+          set -e
+          docker run -d --name pg -p 55432:5432 \
+            -e POSTGRES_USER=jinliang -e POSTGRES_PASSWORD=jinliang -e POSTGRES_DB=jinliang_test \
+            postgres:16 -c wal_level=logical -c max_replication_slots=40 -c max_wal_senders=40
+          docker run -d --name pg-src -p 55433:5432 \
+            -e POSTGRES_USER=jinliang -e POSTGRES_PASSWORD=jinliang -e POSTGRES_DB=jinliang_src \
+            postgres:16 -c wal_level=logical -c max_replication_slots=40 -c max_wal_senders=40
+          for c in pg pg-src; do
+            ok=0
+            for _ in $(seq 1 90); do
+              docker exec "$c" psql -U jinliang -d postgres -tAc 'select 1' >/dev/null 2>&1 && { ok=1; break; }
+              sleep 2
+            done
+            [ "$ok" = 1 ] || { docker logs "$c"; exit 1; }
+          done
+      - name: 注入实现 → 对应用例必须红
+        env:
+          JINLIANG_TEST_PG_DSN: postgres://jinliang:jinliang@127.0.0.1:55432/jinliang_test?sslmode=disable
+          JINLIANG_TEST_PG_SRC_DSN: postgres://jinliang:jinliang@127.0.0.1:55433/jinliang_src?sslmode=disable
+          JINLIANG_TEST_RECLAIM_SLOTS: "1"
+        run: python3 scripts/mutation_gate.py --tier engine --json mutation-engine.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mutation-engine
+          path: mutation-engine.json
+
+  acceptance:
+    name: 三组合 × MySQL ${{ matrix.mysql }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mysql: ["5.7", "8.0", "8.4"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.x"
+      - name: 备好客户端
+        run: |
+          set -e
+          command -v psql >/dev/null || { sudo apt-get update -qq; sudo apt-get install -y -qq postgresql-client; }
+      - name: 起 PG 源 / PG 目标（都开 wal_level=logical）
+        run: |
+          set -e
+          docker run -d --name pg-src -p 55432:5432 \
+            -e POSTGRES_USER=jinliang -e POSTGRES_PASSWORD=jinliang -e POSTGRES_DB=jinliang_src \
+            postgres:16 -c wal_level=logical -c max_replication_slots=40 -c max_wal_senders=40
+          docker run -d --name pg-dst -p 55433:5432 \
+            -e POSTGRES_USER=jinliang -e POSTGRES_PASSWORD=jinliang -e POSTGRES_DB=jinliang_test \
+            postgres:16 -c wal_level=logical -c max_replication_slots=40 -c max_wal_senders=40
+          for c in pg-src pg-dst; do
+            ok=0
+            for _ in $(seq 1 90); do
+              docker exec "$c" psql -U jinliang -d postgres -tAc 'select 1' >/dev/null 2>&1 && { ok=1; break; }
+              sleep 2
+            done
+            [ "$ok" = 1 ] || { docker logs "$c"; exit 1; }
+          done
+      - name: 起 MySQL 源（${{ matrix.mysql }}，开 binlog ROW/FULL）
+        run: |
+          set -e
+          docker run -d --name my-src -p 53306:3306 \
+            -e MYSQL_ROOT_PASSWORD=root -e MYSQL_DATABASE=jinliang_src \
+            -e MYSQL_USER=jinliang -e MYSQL_PASSWORD=jinliang \
+            mysql:${{ matrix.mysql }} \
+            --server-id=1 --log-bin=mysql-bin --binlog-format=ROW --binlog-row-image=FULL
+          for i in $(seq 1 90); do
+            docker exec my-src mysqladmin ping -uroot -proot --silent >/dev/null 2>&1 && exit 0
+            sleep 2
+          done
+          docker logs my-src; exit 1
+      - name: 起 MySQL 目标（${{ matrix.mysql }}，开 binlog —— 目标端也要能被校验）
+        run: |
+          set -e
+          docker run -d --name my-dst -p 53307:3306 \
+            -e MYSQL_ROOT_PASSWORD=root -e MYSQL_DATABASE=jinliang_target \
+            -e MYSQL_USER=jinliang -e MYSQL_PASSWORD=jinliang \
+            mysql:${{ matrix.mysql }} \
+            --server-id=2 --log-bin=mysql-bin --binlog-format=ROW --binlog-row-image=FULL
+          for i in $(seq 1 90); do
+            docker exec my-dst mysqladmin ping -uroot -proot --silent >/dev/null 2>&1 && exit 0
+            sleep 2
+          done
+          docker logs my-dst; exit 1
+      - name: 补权限 + 报版本
+        run: |
+          set -e
+          docker exec my-src mysql -uroot -proot -e "
+            GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'jinliang'@'%';
+            CREATE DATABASE IF NOT EXISTS jinliang_test; FLUSH PRIVILEGES; SELECT VERSION();"
+          docker exec my-dst mysql -uroot -proot -e "
+            CREATE DATABASE IF NOT EXISTS jinliang_target; FLUSH PRIVILEGES; SELECT VERSION();"
+      - name: 三组合验收（行数 + md5 + 耗时；MySQL→PG 追加 kill -9 重搬 0 行）
+        env:
+          JINLIANG_TEST_MYSQL_SRC_DSN: mysql://jinliang:jinliang@127.0.0.1:53306/jinliang_src
+          JINLIANG_TEST_MYSQL_DST_DSN: mysql://jinliang:jinliang@127.0.0.1:53307/jinliang_target
+          JINLIANG_TEST_PG_SRC_DSN: postgres://jinliang:jinliang@127.0.0.1:55432/jinliang_src?sslmode=disable
+          JINLIANG_TEST_PG_DSN: postgres://jinliang:jinliang@127.0.0.1:55433/jinliang_test?sslmode=disable
+          MYSQL_VERSION: ${{ matrix.mysql }}
+          ROWS: "20000"
+        run: |
+          set -e
+          mkdir -p .localdb/bin
+          CGO_ENABLED=0 go build -trimpath -o .localdb/bin/jinliang ./cmd/jinliang
+          scripts/acceptance_matrix.sh --rows 20000 --kill --json acceptance-${{ matrix.mysql }}.json
+      - name: ① 的验收用例（MySQL 增量 kill -9 → 重搬 0 行）
+        env:
+          JINLIANG_TEST_MYSQL_SRC_DSN: mysql://jinliang:jinliang@127.0.0.1:53306/jinliang_src
+          JINLIANG_TEST_PG_DSN: postgres://jinliang:jinliang@127.0.0.1:55433/jinliang_test?sslmode=disable
+          JINLIANG_TEST_RECLAIM_SLOTS: "1"
+        run: go test -tags=integration -count=1 -v -timeout 10m -run '^TestMySQLSourceIncrementalResumeAfterSIGKILL$' ./internal/engine/
+      - name: 结果表进 job summary
+        if: always()
+        run: |
+          { echo "### MySQL ${{ matrix.mysql }}"; echo; cat acceptance-${{ matrix.mysql }}.json 2>/dev/null || true; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: acceptance-mysql-${{ matrix.mysql }}
+          path: acceptance-${{ matrix.mysql }}.json
