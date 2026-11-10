@@ -321,3 +321,32 @@ workflow 注释与台账都写成事实：「generic 路径未读块进度（`ta
 | `acceptance_matrix.sh` 的 `seconds` 被 restart 覆盖 | 拆成 `copy_seconds`（全量+追平）与 `restart_seconds`（kill 后重启），`RESULT` 行两个字段都在，三组合可比 |
 | `mutation_gate.py` 的 killed 判据是 `rc!=0` | 收紧：**go 检测器必须出现 `--- FAIL:`** 才算 killed；出现 `[build failed]`/`cannot use`/`undefined:` 记 `COMPILE-FAILED`（不算抓住）；非 go 检测器（python selftest / known_red）仍按退出非 0 |
 | 与本 PR 无关的 `notes/instabox-*` | 7 个文件（约 1030 行）移出仓库（副本挪到工作区 `local-notes/`），PR diff 只剩门禁相关 |
+
+## 7.11 `TestStopRequestDoesNotSwallowLateRealError` 转阻塞（Core #99 落地）
+
+Core #99（`c72f36c`）把 `target.go` 的收尾判定收窄到 `isLocalClose`（只认本地关闭：
+`context.Canceled` / `net.ErrClosed` / `use of closed network connection` / `connection is closed`），
+**裸 `io.EOF` 不认**（对端发 FIN ≠ 我们关的连接）。按「实现落地 ⇒ 断言必须激活」的规则：
+
+| 项 | 内容 |
+|---|---|
+| 步骤 | `回归：停止请求之后的真实流错误不许被记成「已停止」（含裸 io.EOF）` |
+| 变更 | 去掉 `continue-on-error`（转阻塞）；去掉 `knownred` 构建标签（回归进常规 `go test`）；`-tags=knownred` 从命令里删掉 |
+| 实跑 | 本地 `PASS`（0.17s，两个子用例）；CI 见下一轮 run |
+| 顺带修的一处**用例口径错** | 原用例直接调 `streamGeneric` 后断言 `run.last_error`，但落库是调用方 `run()` → `fail()` 的事；改成显式调 `r.fail(ctx, err)` 再断言（否则永远拿到空 last_error——这正是「先红」时被误读成实现没修的地方） |
+
+**裸 `io.EOF` 那一面独立可证伪**（不依赖 Core 的用例）：
+
+- 用例里两个子用例：`real-error`（binlog 被清理）与 `bare-eof`（`io.EOF`），都要求「不是 reachedDone / 不是 stopped / last_error 带根因」；
+- 注入 `local-close-accepts-eof`：把 `err.Error() == "EOF"` 加进 `isLocalClose` → 子用例 `bare-eof` 必红
+  （实测输出：`错误被记成「正常收尾」（reachedDone）：退出码会变成 130（已停止）`）→ **KILLED**。
+
+## 7.12 倒计时清单（当前只欠一格）
+
+| 步骤 | 责任人 | 转绿用例 | 转阻塞条件 | 现状 |
+|---|---|---|---|---|
+| `块级续跑（known-red：单表口径…）` | **Core** | `b1_mysql_to_mysql.sh killcopy` | generic 路径读块进度（`target.go:456` 传 nil → 必然整轮重搬）；接通且重搬 ≤1 块 | 挂起（合法已知红） |
+
+第 10 条注入（`registerPause` 那条）**不需要 Core 打洞**：用例直测写路径 + 目标端触发器把
+「登记落库失败」造出来，注入 `pause-registration-succeeds`（`pgsink.PauseTable` 无条件成功）
+→ `TestPauseRegistrationFailureFailsWholeBatch` 必红 → **KILLED**（engine 档 9/9）。所以它不进倒计时清单。

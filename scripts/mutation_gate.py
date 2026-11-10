@@ -161,6 +161,18 @@ MUTATIONS = [
         note="把 pgwire 判据加回 classifyError（AST 守卫必须报「引用了 pgwire.SQLState」）",
     ),
     dict(
+        name="local-close-accepts-eof",
+        tier="engine",
+        file="internal/engine/local_close.go",
+        find="\tif errors.Is(err, context.Canceled) || errors.Is(err, net.ErrClosed) {",
+        replace="\tif errors.Is(err, context.Canceled) || errors.Is(err, net.ErrClosed) || err.Error() == \"EOF\" { // SABOTAGE: 把对端 FIN 当成本地关闭",
+        cmd=["go", "test", "-count=1", "-run",
+             "^TestStopRequestDoesNotSwallowLateRealError$", "./internal/engine/"],
+        requires="TestStopRequestDoesNotSwallowLateRealError",
+        signal="TestStopRequestDoesNotSwallowLateRealError/bare-eof FAIL（裸 io.EOF 被当成本地关闭=对端掉线被记成「我们停的」）",
+        note="把裸 io.EOF 加进 isLocalClose 的识别集合",
+    ),
+    dict(
         name="chunk-resume-degraded",
         tier="engine",
         file="internal/engine/resume.go",

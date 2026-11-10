@@ -42,14 +42,6 @@ REGISTRY = [
                 "接通且该格重搬行数 ≤1 块后转阻塞。注：块记账本身已落（#95），已是**阻塞**步骤",
         probe="job:mysql-mysql",
     ),
-    dict(
-        id="stop-swallow-late-error",
-        step="回归（knownred）：停止请求之后的真实流错误不许被记成「已停止」",
-        owner="Core",
-        detector="TestStopRequestDoesNotSwallowLateRealError（-tags=knownred）",
-        unblock="target.go 的收尾判据改成「先判错误是否由我们 cancel 引起，再看 stopHit」；合入后删 continue-on-error 并去掉 knownred 标签",
-        probe="late-error-test-passes",
-    ),
 ]
 
 

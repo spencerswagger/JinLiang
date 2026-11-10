@@ -1,15 +1,5 @@
-//go:build knownred
-
 package engine
 
-// ⚠ 这是一个**已知会红**的用例（构建标签 knownred）：它钉的行为现在还没实现——
-// 停止请求之后才到的真实流错误会被 swallow 成「已停止」（见下面「触发条件」）。
-// 用标签而不是 Skip 的理由：Skip 会让人以为「跑过了」；标签保证
-//   · `go test ./...` 与 CI 的常规步骤不受影响（不阻塞别的 PR）；
-//   · 想复现就跑 `go test -tags=knownred -run TestStopRequestDoesNotSwallowLateRealError ./internal/engine/`；
-//   · merge-gate workflow 里有一条 continue-on-error 的步骤天天跑它——实现修好后
-//     那一步会自己变绿，把标签去掉即可（判据不靠人记得）。
-//
 // 「停止请求之后才到的真实流错误」不能被记成「已停止」。
 //
 // 背景（评审风险）：`target.go` 的 streamGeneric 收尾分支里有一格
@@ -38,6 +28,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"io"
 	"strings"
 	"testing"
 	"time"
@@ -109,51 +100,73 @@ func (q *quietSink) PositionDurable(ctx context.Context, want string) (mysqlsink
 	return mysqlsink.PositionDurable, nil
 }
 
-// TestStopRequestDoesNotSwallowLateRealError 钉住「停止请求之后的真实错误不许被吞」。
+// TestStopRequestDoesNotSwallowLateRealError 钉住「停止请求之后的错误**不能一律吞**」。
+//
+// 两条口径必须同时成立（Core #99 把 `isLocalClose` 收窄到「本地关闭」四种形态，
+// 裸 `io.EOF` 刻意不认——对端发 FIN ≠ 我们自己关的连接）：
+//
+//	· 真实业务/协议错误（如 binlog 被清理）→ 必须失败并把根因写进 last_error；
+//	· 裸 `io.EOF`（对端走了）→ **也必须是失败**，不许被当成「我们按了停」。
+//
+// 第二条就是本用例的 mmol：把 `io.EOF` 加进 `isLocalClose` 的识别集合 ⇒ 这一格必红。
 func TestStopRequestDoesNotSwallowLateRealError(t *testing.T) {
-	const realErr = "源端报错：binlog 已被清理（Error 1236），增量无法继续"
-	store, jobID := newControlStore(t)
-	run, err := store.StartRun(context.Background(), jobID, state.Streaming, control.RunKindSync)
-	if err != nil {
-		t.Fatalf("建 run 失败: %v", err)
+	cases := []struct {
+		name string
+		err  error
+		want string // last_error 里必须出现的根因片段
+	}{
+		{"real-error", errors.New("源端报错：binlog 已被清理（Error 1236），增量无法继续"), "binlog 已被清理"},
+		{"bare-eof", io.EOF, "EOF"},
 	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store, jobID := newControlStore(t)
+			run, err := store.StartRun(context.Background(), jobID, state.Streaming, control.RunKindSync)
+			if err != nil {
+				t.Fatalf("建 run 失败: %v", err)
+			}
 
-	r := &runner{
-		opt: Options{
-			Store:     store,
-			StopAfter: 40 * time.Millisecond, // 先触发「我们自己要停」
-			IdleAfter: 0,
-		},
-		job:   control.Job{ID: jobID},
-		run:   run,
-		phase: state.Streaming,
-		src:   &lateErrSource{err: errors.New(realErr), delay: 30 * time.Millisecond},
-		gsink: &quietSink{},
-		tgtEP: lateEndpoint(t, "postgres://u:p@127.0.0.1:5432/db"),
-		srcEP: lateEndpoint(t, "postgres://u:p@127.0.0.1:5432/db"),
-	}
+			r := &runner{
+				opt: Options{
+					Store:     store,
+					StopAfter: 40 * time.Millisecond, // 先触发「我们自己要停」
+					IdleAfter: 0,
+				},
+				job:   control.Job{ID: jobID},
+				run:   run,
+				phase: state.Streaming,
+				src:   &lateErrSource{err: tc.err, delay: 30 * time.Millisecond},
+				gsink: &quietSink{},
+				tgtEP: lateEndpoint(t, "postgres://u:p@127.0.0.1:5432/db"),
+				srcEP: lateEndpoint(t, "postgres://u:p@127.0.0.1:5432/db"),
+			}
 
-	err = r.streamGeneric(context.Background(), nil, nil)
-	if err == nil {
-		t.Fatalf("真实流错误被吞了：streamGeneric 返回 nil（run 会被记成 stopped，last_error 为空）")
-	}
-	var done *reachedDone
-	if errors.As(err, &done) {
-		t.Fatalf("真实流错误被记成「正常收尾」（reachedDone）：退出码会变成 %d（已停止），用户看到的是自己按停", ExitStopped)
-	}
-	if !strings.Contains(err.Error(), "binlog 已被清理") {
-		t.Fatalf("错误内容被替换了（根因丢了）：%v", err)
-	}
+			err = r.streamGeneric(context.Background(), nil, nil)
+			if err == nil {
+				t.Fatalf("错误被吞了：streamGeneric 返回 nil（run 会被记成 stopped，last_error 为空）")
+			}
+			var done *reachedDone
+			if errors.As(err, &done) {
+				t.Fatalf("错误被记成「正常收尾」（reachedDone）：退出码会变成 %d（已停止）", ExitStopped)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("错误内容被替换了（根因丢了）：%v", err)
+			}
 
-	got, err := store.GetRun(context.Background(), run.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.FinishReason == control.FinishStopped {
-		t.Fatalf("run 被记成 stopped（finish_reason=%q，exit=%v）：真实错误 arr 之后才到，不能算「我们停的」",
-			got.FinishReason, got.ExitCode)
-	}
-	if !strings.Contains(got.LastError, "binlog 已被清理") {
-		t.Fatalf("last_error 没留下根因：%q", got.LastError)
+			// 引擎的真实调用方是 `run()`：它拿到 streamGeneric 的错误后交给 fail() 落库。
+			_ = r.fail(context.Background(), err)
+
+			got, err := store.GetRun(context.Background(), run.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.FinishReason == control.FinishStopped {
+				t.Fatalf("run 被记成 stopped（finish_reason=%q，exit=%v）：错误在停止之后才到，不能算「我们停的」",
+					got.FinishReason, got.ExitCode)
+			}
+			if !strings.Contains(got.LastError, tc.want) {
+				t.Fatalf("last_error 没留下根因（%q）：%q", tc.want, got.LastError)
+			}
+		})
 	}
 }
