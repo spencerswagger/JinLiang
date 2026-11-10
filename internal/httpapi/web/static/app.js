@@ -179,6 +179,14 @@
         return;
       }
       appendLine(ev);
+      // 暂停表：`pause` 事件与 `done` 帧都可能带（客户端可能收尾后才连上）。
+      // 退出码 3 只是粗信号，这一行才是「哪几张表、欠多少行」。
+      if (ev.paused_tables && ev.paused_tables.length) {
+        var names = ev.paused_tables.map(function (p) {
+          return p.table + "（" + p.reason + (p.skipped_rows ? "，欠 " + p.skipped_rows + " 行" : "") + "）";
+        });
+        appendLine({ type: "note", message: "暂停中：" + names.join("、") + "；其它表照常同步" });
+      }
       if (ev.phase_label && live) live.textContent = ev.phase_label;
       if (ev.phase_hint && hint) hint.textContent = ev.phase_hint;
       // run_id 为空 = 还没开跑就失败（Core 的收紧规则）：这种帧不推进阶段、
@@ -197,14 +205,16 @@
             fr === "completed" ? "已完成" :
             fr === "stopped" ? "已停止（不是失败）" :
             fr === "interrupted" ? "已中断（被别的实例接管）" :
-            fr === "failed" ? "失败" : fr;
+            fr === "failed" ? "失败" :
+            fr === "paused_tables" ? "已完成，但有表被暂停（数据不全，需要看一眼）" : fr;
         }
         if (fr && fr !== "completed" && dot) dot.classList.add("warn");
       }
     }
     // 服务端给每条事件都带 event: <type>，所以必须按名字订阅；
     // onmessage 只收「没有 event 字段」的消息（保留它是为了兼容旧服务端）。
-    ["phase", "progress", "note", "error", "done"].forEach(function (name) {
+    // `pause` 必须在这里：服务端发了没订阅，浏览器会静默丢弃（服务端有 EventTypes 校验）。
+    ["phase", "progress", "note", "error", "pause", "done"].forEach(function (name) {
       es.addEventListener(name, onEvent);
     });
     es.addEventListener("reset", function (msg) {

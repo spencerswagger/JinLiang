@@ -130,7 +130,17 @@ var migrations = []migration{
 			`ALTER TABLE runs ADD COLUMN code TEXT`,
 		},
 	},
-}
+
+	// v6：`runs.paused_tables` —— 「这一轮结束时还停着哪几张表」（JSON 数组）。
+	// 退出码 3 只是粗信号（整数装不下表名/欠行数/起始位点），这一列才是权威。
+	// 与 `runs.code` 同一路数：先正常收尾，再补一列；补列失败不该让收尾失败。
+	{
+		Version: 6,
+		Name:    "runs-paused-tables",
+		Stmts: []string{
+			`ALTER TABLE runs ADD COLUMN paused_tables TEXT`,
+		},
+	}}
 
 // closeOnlyStaleRunsThenIndex 是 v2 的收尾。
 //

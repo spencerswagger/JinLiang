@@ -411,3 +411,30 @@ func (r *runner) detectPrepareDrift(ctx context.Context) error {
 	}
 	return nil
 }
+
+// pausedStats 把内存里的暂停集合转成对外形状（按表名排序，输出稳定。
+// status / 事件 / Result / runs 行共用这一份——四处各转一次迟早不一致）。
+func (r *runner) pausedStats() []PausedTableStat {
+	r.mu.Lock()
+	snapshot := make(map[string]pgsink.PausedTable, len(r.paused))
+	for k, v := range r.paused {
+		snapshot[k] = v
+	}
+	r.mu.Unlock()
+	if len(snapshot) == 0 {
+		return nil
+	}
+	out := make([]PausedTableStat, 0, len(snapshot))
+	for _, key := range pgsink.PausedKeys(snapshot) {
+		rec := snapshot[key]
+		out = append(out, PausedTableStat{
+			Table:          key,
+			Reason:         rec.Reason,
+			Detail:         rec.Detail,
+			SkippedRows:    rec.SkippedRows,
+			SkippedFrom:    rec.SkippedFrom,
+			LastSkippedPos: rec.LastSkippedPos,
+		})
+	}
+	return out
+}

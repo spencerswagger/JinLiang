@@ -5,7 +5,9 @@ import (
 	"time"
 
 	"github.com/spencerswagger/jinliang/internal/control"
+	"github.com/spencerswagger/jinliang/internal/dsn"
 	"github.com/spencerswagger/jinliang/internal/pgsink"
+	"github.com/spencerswagger/jinliang/internal/state"
 )
 
 // Status is one job's "where is it now", assembled from three places:
@@ -25,7 +27,11 @@ type Status struct {
 	LagBytes  int64        `json:"lag_bytes"`
 	SlotBytes int64        `json:"slot_wal_bytes"`
 	LastRun   *control.Run `json:"last_run,omitempty"`
-	Note      string       `json:"note,omitempty"`
+	// PausedTables 是「现在还停着哪几张表」。**读不到时是 null + PausedNote**，
+	// 不是空数组——空数组的意思是「没有暂停」，两者在「要不要处理」上是相反的结论。
+	PausedTables []PausedTableStat `json:"paused_tables,omitempty"`
+	PausedNote   string            `json:"paused_note,omitempty"`
+	Note         string            `json:"note,omitempty"`
 }
 
 // StatusFor resolves a job (id or name) and reports its current state.
@@ -85,6 +91,16 @@ func StatusFor(ctx context.Context, opt Options) (Status, error) {
 		return st, nil
 	}
 	st.Tables = tableNames(r.tables)
+	// 暂停表：读不到就明说「未知」——空数组的意思是「没有暂停」，两者结论相反。
+	if reg := r.pauseRegistryOf(); reg != nil {
+		if rec, perr := reg.PausedTables(ctx); perr != nil {
+			st.PausedNote = "读不到暂停记录（不是「没有暂停」）：" + perr.Error()
+		} else {
+			st.PausedTables = pausedStatsOf(rec)
+		}
+	} else if r.tgtEP.Kind == dsn.KindMySQL {
+		st.PausedNote = "这个目标端还没有实现暂停记录（按表暂停在 MySQL 目标端暂不支持）"
+	}
 	src, err := r.openSource(ctx)
 	if err != nil {
 		st.Note = "连不上源库：" + err.Error()
@@ -113,4 +129,55 @@ func StatusFor(ctx context.Context, opt Options) (Status, error) {
 		st.SlotBytes = n
 	}
 	return st, nil
+}
+
+// PausedTableStat 是一张暂停表对外的形状（status / 事件 / Result 共用一份）。
+//
+// 为什么不做成 `map[string]pgsink.PausedTable` 直接透出：那是**存储**的形状（key 是裸表名），
+// 对外的形状要带表名本身，且不能随存储层加字段就抖动（外部是 JSON 契约）。
+type PausedTableStat struct {
+	Table          string `json:"table"`
+	Reason         string `json:"reason"`
+	Detail         string `json:"detail,omitempty"`
+	SkippedRows    int64  `json:"skipped_rows,omitempty"`
+	SkippedFrom    string `json:"skipped_from,omitempty"`
+	LastSkippedPos string `json:"last_skipped_pos,omitempty"`
+}
+
+// DecideExit 是退出码的**唯一派生点**（Panel 裁决：失败→1 > 用户停止→130 > 有暂停→3 > 0）。
+//
+// 为什么必须单点：这个码会被 CLI、容器、CI 三处读，散着算迟早不一致；
+// 而且「有暂停表却退 0」正是这一版要修的 bug——只要派生只有一处，就不可能漏。
+//
+// 注意：`phase` 参数目前不参与判定（有暂停时 phase 仍是 done，见 drain 的注释），
+// 留着是为了将来「blocked 复用 3」时有地方表达；**不要**在这里判 `state.Paused`：
+// 那个阶段 `HoldsLease()=true`，会把「停一张表」变成「整个任务停摆」。
+func DecideExit(phase state.Phase, exit int, paused []PausedTableStat) int {
+	_ = phase
+	if exit == ExitFailed {
+		return ExitFailed // 失败优先：真错误比「有欠账」重要
+	}
+	if exit == ExitStopped {
+		return ExitStopped // 用户按停：语义是「没跑完」，不是「跑完了有欠账」
+	}
+	if len(paused) > 0 {
+		return ExitNeedsAction
+	}
+	return ExitOK
+}
+
+// pausedStatsOf 把存储层的暂停记录转成对外形状（排序稳定）。
+func pausedStatsOf(rec map[string]pgsink.PausedTable) []PausedTableStat {
+	if len(rec) == 0 {
+		return nil
+	}
+	out := make([]PausedTableStat, 0, len(rec))
+	for _, key := range pgsink.PausedKeys(rec) {
+		one := rec[key]
+		out = append(out, PausedTableStat{
+			Table: key, Reason: one.Reason, Detail: one.Detail, SkippedRows: one.SkippedRows,
+			SkippedFrom: one.SkippedFrom, LastSkippedPos: one.LastSkippedPos,
+		})
+	}
+	return out
 }

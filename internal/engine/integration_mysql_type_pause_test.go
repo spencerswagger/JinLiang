@@ -13,7 +13,8 @@ package engine_test
 //  2. **其它表照跑**：同一时段另一张表（旁证）的那一行必须落库（5 行；旧契约下会停在 4 行）；
 //  3. **位点照常前进**（`posBefore < posAfterPause`），被暂停那张表的行**不写**（跳过是事实）——
 //     欠账由恢复时的整表重搬还（不是靠把位点卡住）；
-//  4. run **不失败**，`--stop-when-idle` 正常收尾（退出码 0）；
+//  4. run **不失败**，`--stop-when-idle` 正常收尾，但**退出码是 3**（`ExitNeedsAction`：
+//     「跑完了但有欠账」。退 0 是旧 bug；退 1 是把「停一张表」当失败，两者都不对）；
 //  5. 对齐目标端列类型后重跑：暂停记录清空、**整表重搬**把跳过的那一行补回来、
 //     位点不后退、两张表与源端逐行一致。
 //
@@ -179,9 +180,11 @@ func TestMySQLSourceTypeChangePausesOnlyThatTableAndRecovers(t *testing.T) {
 	_ = logFile.Close()
 	body, _ := os.ReadFile(logFile.Name())
 	out := string(body)
-	// 判据（run 不失败）：裁决 A 下「只停该表」不该把整条同步判死。
-	if code != 0 {
-		t.Fatalf("裁决 A 下「只停该表」不该让 run 失败，实际退出码 %d：\n%s", code, out)
+	// 判据（run 不失败，但**必须**退 3）：`ExitNeedsAction=3` 表示「跑完了，但有欠账」。
+	// 退 0 就是这一版要修的 bug（整数是 CI/容器唯一能看的粗信号；权威仍是
+	// `status --json` 的 paused_tables + SSE pause 事件）。
+	if code != 3 {
+		t.Fatalf("有表被暂停时退出码必须是 3（ExitNeedsAction），实际 %d：\n%s", code, out)
 	}
 
 	// 判据（只有那张表进 paused）：paused_tables 里只有改类型的那张表，且记录可读。

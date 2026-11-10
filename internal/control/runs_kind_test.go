@@ -28,7 +28,9 @@ func TestMigrateRunsKindBackfillsOldStubRows(t *testing.T) {
 	// 退回「v1 结构」：把 v2（心跳/归属/结束原因）与 v3（kind）加的列都删掉，
 	// 这样重开时两条迁移都会真跑一遍——只删 kind 的话 v2 会因为列已存在而报
 	// "duplicate column name"，测的就不是升级了。
-	for _, col := range []string{"kind", "heartbeat_at", "owner_instance", "finish_reason", "code"} {
+	// 注意：**每条迁移新增的列都要在这里删掉**，否则重开时那条迁移会因为
+	// "duplicate column name" 失败，测的就不是升级了（v6 的 paused_tables 就踩过）。
+	for _, col := range []string{"kind", "heartbeat_at", "owner_instance", "finish_reason", "code", "paused_tables"} {
 		if _, err := s1.DB().ExecContext(ctx, `ALTER TABLE runs DROP COLUMN `+col); err != nil {
 			t.Fatalf("模拟 v1 旧库失败（删 %s；SQLite 需要 3.35+ 的 DROP COLUMN）: %v", col, err)
 		}
