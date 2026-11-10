@@ -46,6 +46,17 @@ RESULT combo=mysql-mysql    rows=2000 md5=915ced9f9564a3def41e2dc4cbfb8454 secon
 注意：MySQL→MySQL 源/目标**不能放同一个实例**（目标端的写入会进源端 binlog，
 读到自己刚写的行 → 「已应用 3 行」无限循环）。CI 本来就是两个容器，本地复现也要两个。
 
+CI 复跑（PR #92，run 42877072433，8.4 腿，20000 行）：
+
+```
+| 组合           | 版本    | 行数  | md5                              | 耗时   | 备注 |
+| mysql-postgres | 8.4.13 | 21995 | 83646f7706a8dd35af431553dd003cf3 | 6.10s  | kill=recopy-0-rows |
+| postgres-mysql | 8.4.13 | 20000 | 330ccea0293f33177530c2a6933dad45 | 9.35s  | incremental=ok |
+| mysql-mysql    | 8.4.13 | 20000 | 330ccea0293f33177530c2a6933dad45 | 9.17s  | incremental=ok |
+```
+
+5.7 / 8.0 / 8.4 三格全绿；`反向注入（engine）` 也绿（6/6）。
+
 ## 3. 反向注入翻转（`scripts/mutation_gate.py`）
 
 `pgsink.Apply` 的暂停判定已搬到 `internal/engine/pause_skip.go`，原注入
