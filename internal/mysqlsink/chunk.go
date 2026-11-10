@@ -107,3 +107,52 @@ func (s *Sink) ChunkProgress(ctx context.Context) (map[string]ChunkProgress, err
 	}
 	return out, rows.Err()
 }
+
+// MarkChunkDoneWithPos 记一块的进度，并在**同一个事务**里把起点位点写进 `_jl_meta.position`。
+//
+// 为什么必须带上位点（Owl II P0，CI `TestMySQLTargetCopyResumesFromChunkBoundary` 就是这么红的）：
+// 通用路径的全量块是用 `Apply(evs, nil)` 写的（不带位点），位点只在**全量结束**时写一次。
+// 于是进程被 kill -9 之后目标端「有块进度、没有位点」——`planCopy` 会判「位点缺失 → 从头搬」，
+// 块边界根本没被看到，续跑退化成整轮重搬。
+//
+// PG 目标端没这个问题：`BulkApply` 每一块的事务里就把**同一个起点位点**写进去了。
+// 这里对齐那个口径：位点写的是 `pos`（本轮全量的起点，不是「当前进度」），所以
+// 「已搬块在停机窗口里的变更」仍然由增量从**原起点**重放补上。
+//
+// 数据行本身是分小批 upsert 的（一块十万行不能一个事务），重放时从块起点重读、靠 upsert 收敛；
+// 这条与 PG 的差别只在粒度，不在正确性方向。
+func (s *Sink) MarkChunkDoneWithPos(ctx context.Context, ref source.TableRef, no int,
+	from, to string, rows int64, pos string) error {
+	if no <= 0 {
+		return fmt.Errorf("内部错误：块号必须从 1 开始（0 是完成标记），拿到 %d", no)
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("开事务失败: %w", err)
+	}
+	fail := true
+	defer func() {
+		if fail {
+			_ = tx.Rollback()
+		}
+	}()
+	q := "INSERT INTO `_jl_chunk` (job_key, table_name, chunk_no, range_from, range_to, done, `rows`) " +
+		"VALUES (?,?,?,?,?,1,?) ON DUPLICATE KEY UPDATE range_from=VALUES(range_from), " +
+		"range_to=VALUES(range_to), done=1, `rows`=VALUES(`rows`)"
+	if _, err := tx.ExecContext(ctx, q, s.opt.JobKey, ref.Table, no, from, to, rows); err != nil {
+		return fmt.Errorf("记 %s 第 %d 块的进度失败: %w", ref.Table, no, err)
+	}
+	if pos != "" {
+		// 位点只在「还没写过」时落：续跑轮不该把它往前挪（契约 §1.6：续跑不动位点）。
+		if _, err := tx.ExecContext(ctx,
+			"UPDATE `_jl_meta` SET position = COALESCE(NULLIF(position,''), ?), updated_at = NOW(6) WHERE job_key = ?",
+			pos, s.opt.JobKey); err != nil {
+			return fmt.Errorf("写全量起点位点失败: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("提交块进度失败: %w", err)
+	}
+	fail = false
+	return nil
+}
