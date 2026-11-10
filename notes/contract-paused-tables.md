@@ -25,7 +25,7 @@
 | 字段 | 语义 | 约束 |
 |---|---|---|
 | key | **规范化后的裸表名** | 与 `_jl_chunk.table_name` **逐字节相同**；不带 schema 前缀、不用源端原始大小写 |
-| `reason` | 稳定原因码 | 只允许 `type_changed` / `schema_drift`；**不写中文句子**，机器按它判等。映射以 main 的 #72 更正为准：`type_changed` = 列类型变了（**prepare 与 streaming 两个时机都会出现**）；`schema_drift` = 改名/删列（**只在 streaming**） |
+| `reason` | 稳定原因码 | 只允许 `type_changed` / `schema_drift`；**不写中文句子**，机器按它判等。映射：`type_changed` = 列类型变了（prepare 与 streaming 都会出现）；`schema_drift` = 改名或删列（streaming 所有表都判；prepare **只判本任务建的表**） |
 | `at` | 第一次被暂停的时刻 | UTC RFC3339；**后续不覆盖**（第一次的最有价值） |
 | `detail` | 给人看的说明 | 建议「列名: 目标类型 / 源类型」；不参与判等 |
 

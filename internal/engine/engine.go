@@ -892,6 +892,14 @@ func (r *runner) prepare(ctx context.Context) error {
 	for _, a := range actions {
 		r.emit(ctx, control.Event{Type: "note", Message: a.What})
 	}
+	// prepare 阶段降级成提示的判定（用户表多出的列不算漂移）——必须发出来，不许无声。
+	// **位置很关键：必须在 EnsureSchema 之后**——`prepareNotes` 是在它调用的
+	// `reconcileColumns` 里 append 的；放在之前排空，拿到的永远是空列表（实测过：
+	// 用户表那格没有 note，而用例断言不出来的话就是静默）。
+	// 这里 `EnsureSchema` 已返回并释放了 `s.mu`，`PrepareNotes()` 再加锁不会重入。
+	for _, n := range sink.PrepareNotes() {
+		r.note(ctx, n)
+	}
 	src, err := r.openSource(ctx)
 	if err != nil {
 		return err

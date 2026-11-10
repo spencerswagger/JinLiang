@@ -148,6 +148,16 @@ func (s *Sink) ClearPausedTable(ctx context.Context, ref source.TableRef) error 
 	return nil
 }
 
+// PrepareNotes 交出（并清空）prepare 阶段降级成提示的判定
+// （例如「用户表多出的列不算漂移」），由引擎统一发 note + 进 plan 记录——不许无声。
+func (s *Sink) PrepareNotes() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := s.prepareNotes
+	s.prepareNotes = nil
+	return out
+}
+
 // isPausedLocked 是写路径上的快速判定（调用方已持锁；缓存由 LoadPausedTables 装好）。
 func (s *Sink) isPausedLocked(table string) bool {
 	if s.pausedCache == nil {
