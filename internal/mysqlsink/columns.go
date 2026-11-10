@@ -37,7 +37,9 @@ func (s *Sink) ColumnsMatch(ctx context.Context, ref source.TableRef, cols []sou
 		want := canonType(s.targetType(c))
 		got, ok := have[c.Name]
 		if !ok {
-			diffs = append(diffs, fmt.Sprintf("列 %s：目标端没有这一列", c.Name))
+			// **缺列不算类型漂移**：`EnsureSchema` 会按类型字典补上（补出来的类型天然一致）。
+			// 把它算成漂移会让「源端加了一列」变成「暂停这张表」——与契约 §3 的
+			// 「加列 = 追平」直接矛盾（CI 里 TestMySQLTargetFullIntervalFollowsAddedColumn 就是这么红的）。
 			continue
 		}
 		if canonType(got) != want {

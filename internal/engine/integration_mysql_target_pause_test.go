@@ -81,6 +81,10 @@ func myTableFingerprint(t *testing.T, db *sql.DB, table string) string {
 	t.Helper()
 	var n int
 	var fp string
+	// GROUP_CONCAT 默认只留 1024 字节（25 行 md5）——不调大，指纹会静默截断，两边永远对不上。
+	if _, err := db.ExecContext(context.Background(), "SET SESSION group_concat_max_len=1073741824"); err != nil {
+		t.Fatalf("调大 group_concat_max_len 失败: %v", err)
+	}
 	q := "SELECT COUNT(*), COALESCE(MD5(GROUP_CONCAT(h ORDER BY id SEPARATOR '')), '-') FROM (" +
 		"SELECT id, MD5(CONCAT_WS('|', id, payload, v)) h FROM `" + table + "`) x"
 	if err := db.QueryRowContext(context.Background(), q).Scan(&n, &fp); err != nil {
