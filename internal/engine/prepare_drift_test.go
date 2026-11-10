@@ -120,3 +120,51 @@ func TestPrepareDriftUserTableOnlyNotes(t *testing.T) {
 	// 这里同时钉三件：用户表不判漂移、不报错、用户列不被我们动 + **note 真的发出去了**。
 	t.Logf("用户表多出的列：不报错、用户列数据完好（%q）", mine)
 }
+
+// 成功路径上的**反向**断言：自有表、结构已对齐（没有多余列）→ `EnsureSchema` 成功，
+// 事件流里**不得**出现「不判为漂移」类 note。
+//
+// 为什么这格才有意义：自有表一旦真有漂移，`EnsureSchema` 直接返回 `SchemaDriftError`、
+// prepare 中止，`PrepareNotes()` 根本不会被 drain——在**那条**路径上断言「不该有 note」
+// 永远是绿的（空断言）。这里走成功路径，拦的是「本来对齐却报警」的误报。
+// 变异：让 `reconcileColumns` 对自有表无差别 append note → 这格红。
+func TestPrepareAlignedOwnTableSendsNoDriftNote(t *testing.T) {
+	srcDSN, dstDSN := dsns(t)
+	srcDB := mustConn(t, srcDSN)
+	dstDB := mustConn(t, dstDSN)
+	table := "drift_aligned"
+	ctx := context.Background()
+
+	exec(t, srcDB, "DROP TABLE IF EXISTS "+table)
+	exec(t, srcDB, "CREATE TABLE "+table+" (id bigint PRIMARY KEY, v text)")
+	exec(t, srcDB, "INSERT INTO "+table+" VALUES (1,'x')")
+	// 目标端：我们建的表，**列与源端完全一致**（没有任何多余列）
+	exec(t, dstDB, "DROP TABLE IF EXISTS "+table)
+	exec(t, dstDB, "DROP TABLE IF EXISTS _jl_meta, _jl_chunk, _jl_lease, _jl_object, _jl_instance")
+	exec(t, dstDB, "CREATE TABLE "+table+" (id bigint PRIMARY KEY, v text)")
+
+	store, jobID := onceJobSingleTable(t, srcDSN, dstDSN, "drift-aligned", table)
+	ensureStateTables(t, store, dstDSN, jobID)
+	markTableCreatedByJob(t, store, dstDB, jobID, table)
+
+	ch, stopSub := store.Bus().Subscribe(jobID)
+	defer stopSub()
+	driftNotes := make(chan string, 64)
+	go func() {
+		for ev := range ch {
+			if ev.Message != "" && strings.Contains(ev.Message, "不判为漂移") {
+				driftNotes <- ev.Message
+			}
+		}
+	}()
+
+	if _, err := engine.Run(ctx, engine.Options{Store: store, JobID: jobID, SnapshotOnly: true}); err != nil {
+		t.Fatalf("结构已对齐的自有表：这一轮应成功，得到 %v", err)
+	}
+	select {
+	case m := <-driftNotes:
+		t.Fatalf("结构已对齐却发了「不判为漂移」的 note（误报）：%s", m)
+	case <-time.After(300 * time.Millisecond):
+	}
+	t.Logf("结构已对齐的自有表：跑成功，且没有「不判为漂移」note")
+}

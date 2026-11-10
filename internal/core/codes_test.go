@@ -168,6 +168,9 @@ func TestSchemaMismatchSaysWholeRunStops(t *testing.T) {
 	}
 	// 漂移判定的两个时机必须在 Why 里写清：prepare 只判本任务建的表、streaming 判所有表。
 	// 防的是有人把它改回「schema_drift 只属 streaming」。
+	if !strings.Contains(spec.Why, "跑起来后所有表都判") {
+		t.Fatalf("E1015 的 Why 还要写清「跑起来后所有表都判」（两时机都得钉住），得到：%s", spec.Why)
+	}
 	if !strings.Contains(spec.Why, "prepare") || !strings.Contains(spec.Why, "本任务建的表") {
 		t.Fatalf("E1015 的 Why 必须写清 prepare 期只在本任务建的表上判漂移，得到：%s", spec.Why)
 	}
