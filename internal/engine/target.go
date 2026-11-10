@@ -374,7 +374,8 @@ func (r *runner) storedPosition(ctx context.Context) (source.Position, error) {
 // 表已经空了，下一轮第一件事就是 Count==0 跳过，不会因为 phase 还停在 'snapshot' 而
 // 永久硬停（那会把「防止静默跳过」换成「卡死不可恢复」）。会一直硬停的只有
 // 「用户表 + 有行 + phase=='snapshot'」——那正是要停下来问人的那一格，且有三条出路
-// （改 on_exists / 换空的 target.schema / 手动删掉本任务写进去的行）。
+// （改 on_exists / 换空的 target.schema）。**不再有「手动删掉我们写的行」这条路**：
+// 「凡从头搬就清表」之后它失效了（标记删了也会因 copiedBefore 整批点名）。
 // 用例：TestCleanBeforeGenericCopySkipsEmptyTable（不连库，`go test ./...` 里就能发现
 // 有人把顺序改回去了）与 TestMySQLTargetEmptyTableWithSnapshotPhaseStillCopies（真库）。
 func (r *runner) cleanBeforeGenericCopy(ctx context.Context, st stateCapable, fresh bool, phase string) error {

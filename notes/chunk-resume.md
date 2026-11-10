@@ -177,7 +177,7 @@ if Capable && unreplayable { copyFresh + cleanAll }   // ① 三个出口合一
 - `interval` 仍不追 delete：完成信息里写明「水位增量只补新增与更新，不同步删除」，
   并指向 continuous+initial / 定期 once。
 - 清不动（用户自己的表）**不许静默降级**：`reusedTableRecopyError` 给三条都做得到的路
-  （recreate / 换空 schema / 手动删掉我们写的行），并说明 `verify` 会逐条报「目标端多出一行」、
+  （recreate / 换空 schema；「手动删掉我们写的行」在 #74「凡从头搬就清表」之后已失效，故不再给出），并说明 `verify` 会逐条报「目标端多出一行」、
   本版还没有按块补 delete 的自动修正。
 - 清表时的 note 讲明维护窗口：「从这一刻到这张表搬完之前，目标端是部分数据，不是旧但完整的快照」。
 
