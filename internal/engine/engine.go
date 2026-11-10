@@ -1400,6 +1400,8 @@ func (r *runner) stream(ctx context.Context, res *Result) error {
 
 	streamCtx, cancelStream := context.WithCancel(ctx)
 	defer cancelStream()
+	// 后台提交失败要立刻打断流：否则错误被吞在 goroutine 里，任务卡在「实时同步中」。
+	b.onError = func(error) { cancelStream() }
 	go b.flushLoop(streamCtx)
 
 	var stopHit, idleDone atomic.Bool
@@ -1491,6 +1493,11 @@ func (r *runner) stream(ctx context.Context, res *Result) error {
 	cancelStream()
 	if err := b.Flush(context.Background()); err != nil {
 		return err
+	}
+	// 后台提交失败过：它是真正的原因，而 streamErr 只是被它 cancel 掉之后的
+	// 「流被打断」。先报真原因，别让用户看到一句「上下文取消」。
+	if ferr := b.Err(); ferr != nil {
+		return ferr
 	}
 	if streamErr != nil {
 		var stopped *stoppedError

@@ -353,12 +353,12 @@ func (m myRunSource) EndSnapshot() { m.s.EndSnapshot() }
 func (m myRunSource) Stream(ctx context.Context, from source.Position, fn source.EventHandler) error {
 	keep := make(map[string]bool, len(m.tables))
 	for _, t := range m.tables {
-		keep[t.Table] = true
+		keep[tableKey(t.TableRef)] = true
 	}
 	return m.s.Stream(ctx, from, func(c context.Context, ev source.Event) error {
 		switch ev.Kind {
 		case source.EvDDL:
-			if !keep[ev.Table.Table] {
+			if !keep[tableKey(ev.Table)] {
 				return nil
 			}
 			// MySQL 的 DDL 语句（`ALTER TABLE ... ENGINE=InnoDB`、`MODIFY COLUMN`）
@@ -366,12 +366,12 @@ func (m myRunSource) Stream(ctx context.Context, from source.Position, fn source
 			// 但必须说出来——静默跳过会让人以为索引/约束也过去了。
 			// 行数据不受影响：新列会随 Relation 带来，目标端按「加列」白名单自己补。
 			if m.note != nil {
-				m.note(fmt.Sprintf("源端 DDL 没有搬到目标端（MySQL → PG 方言不同，本版不搬）：%s。"+
+				m.note(fmt.Sprintf("源端 DDL 没有搬到目标端（本版不搬 DDL）：%s。"+
 					"数据行照常同步；索引/约束/改类型需要手工在目标端执行", clipSQL(ev.DDL)))
 			}
 			return nil
 		case source.EvInsert, source.EvUpdate, source.EvDelete, source.EvTruncate:
-			if !keep[ev.Table.Table] {
+			if !keep[tableKey(ev.Table)] {
 				// 不在本次范围里的表：数据不交付，但事务边界照样往上走
 				// （EvBegin/EvCommit 不受影响），位点因此不会卡在别人的事务上。
 				return nil
@@ -380,6 +380,16 @@ func (m myRunSource) Stream(ctx context.Context, from source.Position, fn source
 		return fn(c, ev)
 	})
 }
+
+// tableKey 是「一张表」的判等键：**必须是 schema + 表名**。
+//
+// 只按表名比会串库：同一个 MySQL 实例上，`业务库.orders` 与 `目标库.orders` 是两张表，
+// 表名一样。MySQL 的 binlog 是实例级的（没有「只订阅某几张表」这回事），所以
+// 目标库如果和源库同实例（本地验收、小规模自建很常见），引擎会读到自己刚写进去的行，
+// 结果就是「把自己的写入当成源端变更再写一遍」——当时的报错是
+// `Unknown column 'col_1'`：目标库那张同名表不在 catalog 里，binlog 没给列名
+// （binlog_row_metadata=MINIMAL），于是拿占位名去拼 UPDATE。
+func tableKey(ref source.TableRef) string { return ref.Schema + "." + ref.Table }
 
 // clipSQL 把一条 DDL 截短到一句能进事件流的话（全文没有意义，用户有源库）。
 func clipSQL(s string) string {

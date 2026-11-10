@@ -492,6 +492,8 @@ func (r *runner) streamGeneric(ctx context.Context, st stateCapable, from source
 
 	streamCtx, cancelStream := context.WithCancel(ctx)
 	defer cancelStream()
+	// 后台提交失败要立刻打断流（否则错误被吞，任务停在「实时同步中」）。
+	b.onError = func(error) { cancelStream() }
 	go b.flushLoop(streamCtx)
 
 	var stopHit, idleHit atomic.Bool
@@ -544,6 +546,10 @@ func (r *runner) streamGeneric(ctx context.Context, st stateCapable, from source
 	if err := b.Flush(context.Background()); err != nil {
 		return err
 	}
+	// 后台提交失败过就是失败：报真原因，不报「流被打断」。
+	if ferr := b.Err(); ferr != nil {
+		return ferr
+	}
 	code := ExitOK
 	if idleHit.Load() {
 		r.note(context.Background(), fmt.Sprintf("已经追平且安静了 %s：按 --stop-when-idle 正常收尾", r.opt.IdleAfter))
@@ -557,6 +563,15 @@ func (r *runner) streamGeneric(ctx context.Context, st stateCapable, from source
 				code = ExitOK
 			}
 		case errors.Is(streamErr, context.Canceled) || isUserStop(ctx, streamErr):
+			code = ExitStopped
+			if idleHit.Load() {
+				code = ExitOK
+			}
+		case stopHit.Load() || idleHit.Load():
+			// 我们自己要求收尾（按停 / 到达 --stop-after / 已追平）后 cancel ctx 打断阻塞读，
+			// 有的连接器会把这个中断冒成一个网络错误（MySQL 源的
+			// `use of closed network connection`）。判据是「**我们先要停的**」，
+			// 不是错误长什么样：真实写入错误不会同时把 stopHit/idleHit 置起来。
 			code = ExitStopped
 			if idleHit.Load() {
 				code = ExitOK
