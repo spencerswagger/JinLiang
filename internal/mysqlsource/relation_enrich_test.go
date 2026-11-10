@@ -225,3 +225,39 @@ func TestEnrichRelationConverts5_7ByteLengths(t *testing.T) {
 		t.Fatal("换算之后应判成同一列（否则 5.7 上会一直假暂停）")
 	}
 }
+
+// 5.7 上 BINARY 与 CHAR 在 binlog 里分不开（共用类型字节、没有排序规则），
+// 类型串只能靠 catalog 纠正基名——否则「改类型」判定会把 binary 与 char 看成同一列。
+// 长度仍按 binlog（这样长度变化照样看得见）。
+func TestEnrichRelationFixesBinaryBaseOn57(t *testing.T) {
+	s := &Source{}
+	s.SetKnownTables([]source.Table{{
+		TableRef: source.TableRef{Schema: "app", Table: "t"},
+		Columns: []source.Column{
+			{Name: "b4", Type: "binary(4)"},                     // MySQL 不给字符集（NULL）
+			{Name: "vb", Type: "varbinary(8)"},                  // 同上
+			{Name: "bl", Type: "blob"},                          // 同上
+			{Name: "c10", Type: "char(10)", Charset: "utf8mb4"}, // 有字符集
+			{Name: "tx", Type: "text", Charset: "utf8mb4"},      // 有字符集
+		},
+		PrimaryKey: []string{"b4"}, HasStablePK: true,
+	}})
+	// 5.7 的 binlog：全部落在「字符家族」的基名上，长度是字节。
+	rel := &source.Table{
+		TableRef: source.TableRef{Schema: "app", Table: "t"},
+		Columns: []source.Column{
+			{Name: "col_1", Type: "char(4)"},
+			{Name: "col_2", Type: "varchar(8)"},
+			{Name: "col_3", Type: "text"},
+			{Name: "col_4", Type: "char(40)"},
+			{Name: "col_5", Type: "text"},
+		},
+	}
+	got := s.enrichRelation(rel)
+	want := []string{"binary(4)", "varbinary(8)", "blob", "char(10)", "text"}
+	for i, w := range want {
+		if got.Columns[i].Type != w {
+			t.Errorf("第 %d 列应是 %q，实际 %q（catalog 的 binary/字符家族是权威基名）", i+1, w, got.Columns[i].Type)
+		}
+	}
+}

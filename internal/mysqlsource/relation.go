@@ -57,10 +57,19 @@ func (s *Source) enrichRelation(rel *source.Table) *source.Table {
 		if cp.Columns[i].Charset != "" || i >= len(known.Columns) {
 			continue
 		}
+		kind := catalogBinaryKind(known.Columns[i])
 		if cs := known.Columns[i].Charset; cs != "" {
 			cp.Columns[i].Charset = cs
 			cp.Columns[i].Collation = known.Columns[i].Collation
-			cp.Columns[i].Type = bytesToCharsType(cp.Columns[i].Type, cs)
+		}
+		if kind != binUnknown {
+			// 二进制/字符的**基名**也按 catalog 纠正：5.7 的 binlog 分不开 CHAR 与 BINARY，
+			// 渲染出来是 `char(4)`，而 catalog 明明白白写着 `binary(4)`。
+			// 只纠基名、长度仍来自 binlog（长度变化照样能看见）。
+			cp.Columns[i].Type = rerenderForKind(cp.Columns[i].Type, kind)
+		}
+		if cp.Columns[i].Charset != "" {
+			cp.Columns[i].Type = bytesToCharsType(cp.Columns[i].Type, cp.Columns[i].Charset)
 		}
 	}
 	// 「还能不能当成同一个类型」而不是「列数一样就覆盖」：
@@ -582,4 +591,30 @@ func catalogBinaryKind(c source.Column) binaryKind {
 		return binText
 	}
 	return binUnknown
+}
+
+// rerenderForKind 用「按字节存 / 按字符存」把类型的**基名**换成对的那个。
+//
+// 为什么需要：binlog 里 CHAR 与 BINARY、VARCHAR 与 VARBINARY、TEXT 与 BLOB 共用同一个
+// 类型字节，5.7 又没有排序规则，渲染出来一律是字符家族的名字（`char(4)`）。
+// catalog 知道真相（`binary(4)`），把基名换掉，长度保持 binlog 的——这样
+// 「长度真的变了」仍然看得见，只有「binary↔char 换了」在 5.7 上看不见（已知边界）。
+func rerenderForKind(t string, kind binaryKind) string {
+	base, args := splitTypeString(t)
+	var to string
+	switch kind {
+	case binBinary:
+		to = map[string]string{"char": "binary", "varchar": "varbinary",
+			"tinytext": "tinyblob", "text": "blob", "mediumtext": "mediumblob", "longtext": "longblob"}[base]
+	case binText:
+		to = map[string]string{"binary": "char", "varbinary": "varchar",
+			"tinyblob": "tinytext", "blob": "text", "mediumblob": "mediumtext", "longblob": "longtext"}[base]
+	}
+	if to == "" {
+		return t
+	}
+	if args == "" {
+		return to
+	}
+	return to + "(" + args + ")"
 }
