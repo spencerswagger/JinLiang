@@ -62,7 +62,10 @@ func (s *Sink) MarkTableDone(ctx context.Context, ref source.TableRef) error {
 		return fmt.Errorf("统计 %s 已搬行数失败: %w", ref.Table, err)
 	}
 	q := "INSERT INTO `_jl_chunk` (job_key, table_name, chunk_no, range_from, range_to, done, `rows`) " +
-		"VALUES (?,?,?,NULL,NULL,1,?) ON DUPLICATE KEY UPDATE done=1"
+		// rows 必须跟着刷新：块重放（续跑重读 / 重搬后再盖一次）会改各块之和，
+		// 完成标记若停在旧值，它和 `ChunkProgress.Rows` 就永久脱节——
+		// 任何「按已搬行数判断搬没搬完」的逻辑都会被这个陈旧值带偏（该重搬判成已搬完）。
+		"VALUES (?,?,?,NULL,NULL,1,?) ON DUPLICATE KEY UPDATE done=1, `rows`=VALUES(`rows`)"
 	if _, err := s.db.ExecContext(ctx, q, s.opt.JobKey, ref.Table, TableDoneChunkNo, sum); err != nil {
 		return fmt.Errorf("记 %s 的搬完标记失败: %w", ref.Table, err)
 	}

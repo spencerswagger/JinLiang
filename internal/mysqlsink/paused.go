@@ -19,6 +19,13 @@ import (
 //
 //	{"orders":{"reason":"type_changed","at":"…","detail":"…","resume":"recopy","skipped_rows":1284}}
 //
+// 字段的**时态**（与 PG 侧一致，写进这里免得两边再漂）：
+//
+//	at          第一次登记的时刻，永不覆盖
+//	reason      最新一次的原因码（稳定码：type_changed / schema_drift）
+//	detail      最新一次的差异描述（人话）
+//	skipped_*   累计值（跳过窗口的行数与首末位点，重登记不清零）
+//
 // 五条硬约束（改这段代码前先读）：
 //  1. **key = 目标端裸表名**，与 `_jl_chunk.table_name` 逐字节同源（不带 schema）。
 //  2. **只碰这一列**：登记是独立一条 UPDATE，绝不与 `position` 同一条——位点只能由数据事务推进。
@@ -78,15 +85,13 @@ func (s *Sink) PauseTable(ctx context.Context, ref source.TableRef, rec pgsink.P
 	}
 	cur, err := s.mutatePaused(ctx, ref.Table, func(m map[string]pgsink.PausedTable) error {
 		if old, ok := m[ref.Table]; ok {
-			// at / reason **都不覆盖**：第一次的时刻与原因最有价值，而且 reason 是机器判等用的
-			// （第二次因为别的原因又停一次，把 type_changed 改成 schema_drift 会让对账口径漂）。
-			// resume 跟着本次判定走（所有权可能变了）；detail 用新的（用户要看的是当前差异）。
+			// **三个字段三种时态**（与 PG 侧逐字对齐，见文件头）：
+			//   - at：**第一次**登记的时刻，永不覆盖（用户要能看出「停了多久」）；
+			//   - reason / detail：**最新**这一次的（「这张表现在为什么停着」）；
+			//   - skipped_*：累计值，重登记不清零（同一段欠账）。
+			// 早先这里保留过「第一次的 reason」，但那会让 reason 与 detail 互相矛盾
+			// （reason=type_changed，detail 却写着「列被改名」），诊断时反而要二次解释。
 			rec.At = old.At
-			if old.Reason != "" {
-				// 旧记录没有原因码（手写进库/更早的版本）时不要把空码钉死：
-				// 空 reason 在本文件的不变量里等于「没登记过」。
-				rec.Reason = old.Reason
-			}
 			if rec.Resume == "" {
 				rec.Resume = old.Resume
 			}
