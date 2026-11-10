@@ -1654,8 +1654,10 @@ func classifyError(err error) (code core.Code, classified bool) {
 		// 42501：源端 SELECT 或目标端 DDL/DML 被拒——用户要做的事都是「去要授权」。
 		return core.CodeNoPrivilege, true
 	case pgwire.SQLState(err) == "53400":
-		// all replication slots are in use：权限够、资源满。按 Ark 的边界，它必须排在
-		// 42501（权限）/ 3F000·42P01（对象不存在）之后、兜底之前 —— 那三类动作不同。
+		// all replication slots are in use：权限够、资源满（E1016）。
+		// 位置：排在 42501（权限不足）之后——那是**另一个码、另一类动作**；
+		// 53400 与 3F000/42P01（对象不存在）互斥（一个错误只带一个 SQLSTATE），
+		// 放在这里只是就近，不构成「必须在这之后」的约束。
 		// 用户要做的事只有三件（见码表 E1016 的 Next）；last_error 原样保留 SQLSTATE 与消息。
 		return core.CodeSourceResourceLimit, true
 	case pgsource.IsObjectMissing(err):
