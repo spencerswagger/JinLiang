@@ -381,9 +381,13 @@ jobs:
           # `|| true`：没匹配到时也要走到下面的显式判空（否则 set -e/pipefail 会静默退出，
           # 红是红了，但日志里没有「为什么」）。
           rates=$(grep 'batch=500' /tmp/bench.txt | grep -oE '[0-9]+ rows/s' | grep -oE '^[0-9]+' | sort -n || true)
-          echo "batch=500 三次实测: $(echo "$rates" | tr '\n' ' ')"
-          rate=$(echo "$rates" | sed -n '2p')   # 3 个值的中位数（第 2 小）
-          [ -n "$rate" ] || { echo "❌ 没测到 batch=500 的吞吐数值（benchmark 没跑或输出格式变了）——这不算通过"; tail -30 /tmp/bench.txt; exit 1; }
+          n=$(echo "$rates" | grep -c . || true)
+          echo "batch=500 实测 $n 次: $(echo "$rates" | tr '\n' ' ')"
+          # 样本数按**实际**取，不假定正好 3 个：输出格式一变被正则丢掉一两个，
+          # 死取第 2 行会退化成「2 个里取较大者」= 偏松。少样本直接失败，别静默用少样本过门禁。
+          [ "$n" -ge 2 ] || { echo "❌ batch=500 样本数 $n < 2：样本不足不许过门禁（benchmark 没跑或输出格式变了）"; tail -30 /tmp/bench.txt; exit 1; }
+          idx=$(( (n + 1) / 2 ))   # 保守取下半中位数：n=2→第1小、n=3→第2小、n=4→第2小
+          rate=$(echo "$rates" | sed -n "${idx}p")
           echo "批量路径吞吐（中位数）: $rate rows/s（阈值 $THRESHOLD）"
           [ "$rate" -ge "$THRESHOLD" ] || { echo "❌ 批量 upsert 吞吐中位数 $rate 低于阈值 $THRESHOLD rows/s"; exit 1; }
       - uses: actions/upload-artifact@v4
