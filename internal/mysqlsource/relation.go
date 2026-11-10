@@ -44,6 +44,25 @@ func (s *Source) enrichRelation(rel *source.Table) *source.Table {
 	}
 	cp := *rel
 	cp.Columns = append([]source.Column(nil), rel.Columns...)
+	// 5.7 的 TABLE_MAP **不带列字符集**（没有可选元数据那一套），于是 VARCHAR/CHAR 的长度
+	// 只能按字节报（utf8mb4 的 VARCHAR(64) → `varchar(256)`）。这会让：
+	//   - 提示文案说错长度；
+	//   - 与 catalog（字符）比对时「同一列」被判成改类型 → 每张多字节字符列都假暂停。
+	//
+	// 处理：binlog 没给字符集、而 catalog 给了的时候，**按 catalog 的字符集把字节换算回字符**
+	// （`charsetMaxLen`）。误差方向要写清：换算用的是「流开始那一刻」的字符集——
+	// 若源端在流中把列字符集也改了，我们会按旧字符集算，长度对不上 → **多暂停一次**（安全方向），
+	// 不会出现「该停没停」。catalog 也对不上（列数变了）时不做换算，保持字节原样，同样走「暂停」。
+	for i := range cp.Columns {
+		if cp.Columns[i].Charset != "" || i >= len(known.Columns) {
+			continue
+		}
+		if cs := known.Columns[i].Charset; cs != "" {
+			cp.Columns[i].Charset = cs
+			cp.Columns[i].Collation = known.Columns[i].Collation
+			cp.Columns[i].Type = bytesToCharsType(cp.Columns[i].Type, cs)
+		}
+	}
 	// 「还能不能当成同一个类型」而不是「列数一样就覆盖」：
 	//
 	// 列数一样时整体套 catalog 会把**改类型**盖掉（`MODIFY COLUMN v VARCHAR(64)` 看不见），
@@ -85,6 +104,27 @@ func (s *Source) SetKnownTables(tables []source.Table) {
 	s.enriched = map[*source.Table]*source.Table{}
 }
 
+// bytesToCharsType 把按字节渲染的类型换成按字符（`varchar(256)` + utf8mb4 → `varchar(64)`）。
+//
+// 只动 CHAR / VARCHAR：BINARY / VARBINARY / BLOB 本来就是字节计（charset=binary 的
+// mbmaxlen 是 1，除下去也不变），TEXT 家族的长度在 binlog 里是**尺寸档**不是字符数。
+// 除不尽（不该发生）时原样返回——不猜，留给比对去判「变了」。
+func bytesToCharsType(t, charset string) string {
+	base, args := splitTypeString(t)
+	if base != "varchar" && base != "char" {
+		return t
+	}
+	n, ok := atoiArgs(args)
+	if !ok {
+		return t
+	}
+	mb := charsetMaxLen(charset)
+	if mb <= 1 || n%mb != 0 {
+		return t
+	}
+	return fmt.Sprintf("%s(%d)", base, n/mb)
+}
+
 // columnsLooseSame 逐列判断「binlog 给的类型」与「catalog 的类型」还能不能算同一个。
 func columnsLooseSame(binlogCols, catalogCols []source.Column) bool {
 	if len(binlogCols) != len(catalogCols) {
@@ -105,9 +145,12 @@ func columnsLooseSame(binlogCols, catalogCols []source.Column) bool {
 // 说的是同一列。直接字符串比对会把「同一列」判成「改类型」，反过来把「改类型」判成
 // 「没变」——两头都是错，所以这里按**可能的等价形态**放行：
 //
-//	varchar(N) / char(N)  ≈ 同长度或 N×2..4（多字节字符集，字符集未知）
-//	varbinary(N)          ≈ varchar(N)（binary 字符集在 MINIMAL 下拿不到）
+//	varbinary(N)          ≈ varchar(N)（二进制改字符集/反过来，长度单位相同）
 //	tinytext/text/…       ≈ 同尺寸档的 blob 家族（TEXT 与 BLOB 共用类型字节）
+//
+// **长度不再放行任何倍数**：字节→字符的换算已经在 enrichRelation 里按 catalog 字符集做完了
+// （5.7 那条路）。剩下的「未知」场景宁可判不同 → 多暂停一次（安全方向），
+// 也不许把 latin1 的 `varchar(64)→varchar(128)`（字节恰好 ×2）当成「utf8mb3 的同一列」放过。
 //
 // 除此之外一律「不同型」——宁可让上层报一次结构变化，也不要把新类型盖回旧的。
 func looseSameType(binlogType, catalogType string) bool {
@@ -117,22 +160,9 @@ func looseSameType(binlogType, catalogType string) bool {
 		if bArgs == cArgs || bArgs == "" || cArgs == "" {
 			return bArgs == cArgs
 		}
-		bn, bok := atoiArgs(bArgs)
-		cn, cok := atoiArgs(cArgs)
-		if !bok || !cok {
-			return bArgs == cArgs
-		}
-		if bn == cn {
-			return true
-		}
-		// 字符集未知时，字符数 × 1..4 都可能是 binlog 的字节数。
-		if bBase == "varchar" || bBase == "char" {
-			for mb := 2; mb <= 4; mb++ {
-				if bn == cn*mb {
-					return true
-				}
-			}
-		}
+		// 参数不同：**长度必须逐字相等**才算同一列。
+		// 字节↔字符的换算已经在 enrichRelation 里按 catalog 字符集做完了（5.7 那条路），
+		// 这里再放行任何倍数都等于给「真改了长度」开一条静默通道——宁可多暂停一次。
 		return false
 	}
 	// varbinary(N) vs varchar(N)：binary 字符集在 MINIMAL 里拿不到，名字会变。
@@ -237,6 +267,40 @@ func tableFromMapWith(tm *TableMap, collations map[uint64]collation) *source.Tab
 		}
 	}
 	return t
+}
+
+// binaryKind 是「这一列按字节存还是按字符存」的三态。
+//
+// 为什么不是 bool：5.7 的 TABLE_MAP 没有可选元数据（不给排序规则），此时**说不上来**。
+// 说不上来 ≠ 按字符存——那会把 BINARY 当成文本；也 ≠ 按字节存——那会把中文 VARCHAR
+// 变成 KindBytes，pgsink 写 text 列会报编码错。这种情况只能退回内容启发式。
+type binaryKind uint8
+
+const (
+	binUnknown binaryKind = iota // 排序规则拿不到（5.7 / 非字符列）
+	binText                      // 按字符存：CHAR / VARCHAR / TEXT
+	binBinary                    // 按字节存：BINARY / VARBINARY / BLOB
+)
+
+// binaryCollationID 是 MySQL 的 `binary` 排序规则（字符集 `binary`）的固定 id。
+//
+// 用它当判据而不是「字符集名字 == binary」：名字要先查 collation 表，而 id 就在
+// TABLE_MAP 里（FULL 元数据）。分不开的后果不是显示错：
+//   - `BINARY(4)='abcd'` 被当成 KindString → pgsink 走 `$n::text::bytea`，
+//     值以反斜杠开头时会被 PG **静默改写**（不是报错，是错值）；
+//   - 类型串把 binary 写成 varchar → 「改类型」判定把 binary↔char 的改动看漏。
+const binaryCollationID = 63
+
+// columnBinaryKind 判断第 i 列按字节存还是按字符存。
+func (tm *TableMap) columnBinaryKind(i int) binaryKind {
+	switch tm.collationFor(i) {
+	case 0:
+		return binUnknown
+	case binaryCollationID:
+		return binBinary
+	default:
+		return binText
+	}
 }
 
 // collationFor returns the collation id that applies to column i, walking the
