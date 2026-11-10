@@ -24,6 +24,7 @@ import (
 	"github.com/spencerswagger/jinliang/internal/mysqlsink"
 	"github.com/spencerswagger/jinliang/internal/pgsink"
 	"github.com/spencerswagger/jinliang/internal/pgsource"
+	"github.com/spencerswagger/jinliang/internal/pgwire"
 	"github.com/spencerswagger/jinliang/internal/preflight"
 	"github.com/spencerswagger/jinliang/internal/source"
 	"github.com/spencerswagger/jinliang/internal/state"
@@ -1649,6 +1650,11 @@ func classifyError(err error) (code core.Code, classified bool) {
 		// 文案以码表 E1013 为准；**不造伪 SQLSTATE**——那是协议语义，塞假值会带偏所有
 		// 按 SQLSTATE 分类的地方。
 		return core.CodeObjectMissing, true
+	case pgwire.SQLState(err) == "53400":
+		// all replication slots are in use：源端的书签/连接数用满。这不是「未识别」——
+		// 它发生在写任何数据之前，用户要做的事只有三件（见码表 E1016 的 Next）。
+		// `last_error` 里仍原样保留驱动给的 SQLSTATE 与消息（下面统一拼 err.Error()）。
+		return core.CodeSourceLimit, true
 	case pgsource.IsNoPrivilege(err):
 		// 42501：源端 SELECT 或目标端 DDL/DML 被拒——用户要做的事都是「去要授权」。
 		return core.CodeNoPrivilege, true
