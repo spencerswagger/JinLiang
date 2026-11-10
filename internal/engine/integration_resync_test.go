@@ -130,6 +130,18 @@ func TestResyncRebuildsBrokenBookmarkAndCatchesUp(t *testing.T) {
 		t.Fatalf("整轮重搬应该搬回 ≥%d 行，只搬了 %d 行", rows, res2.RowsCopied)
 	}
 
+	// **禁止把它实现成「删任务再重建」**：身份必须原样（id 与 job_key 都不变）。
+	// 换了 job_key 就是另一个任务——审计对不上、历史断掉，用户以为在修问题，
+	// 实际换了个任务；这条断言让任何「删了重建」的实现直接红。
+	after, err := store.GetJob(ctx, jobID)
+	if err != nil {
+		t.Fatalf("--resync 之后任务应该还在（不是删了重建）：%v", err)
+	}
+	if after.ID != job.ID || after.JobKey != job.JobKey {
+		t.Fatalf("--resync 不许换任务身份：id %s → %s，job_key %s → %s",
+			job.ID, after.ID, job.JobKey, after.JobKey)
+	}
+
 	// 数据到齐：行数、指纹、以及「源端删掉的行不许留在目标端」。
 	srcRows, srcFP := tableShape(t, srcDB, table)
 	dstRows, dstFP := tableShape(t, dstDB, table)
