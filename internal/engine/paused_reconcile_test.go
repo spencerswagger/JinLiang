@@ -144,6 +144,27 @@ func TestRunKeepsOrClearsPauseRecordByChunkProgress(t *testing.T) {
 				}
 			}
 
+			// 源端表得真的存在（CI 上没有我本机手工建的那两张）
+			srcCfg, err := pgx.ParseConfig(os.Getenv("JINLIANG_TEST_PG_SRC_DSN"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			srcConn, err := pgx.ConnectConfig(ctx, srcCfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, stmt := range []string{
+				"DROP TABLE IF EXISTS " + table,
+				"CREATE TABLE " + table + " (id bigint PRIMARY KEY, v text)",
+				"INSERT INTO " + table + " SELECT g, 'r'||g FROM generate_series(1,5) g",
+			} {
+				if _, err := srcConn.Exec(ctx, stmt); err != nil {
+					srcConn.Close(ctx)
+					t.Fatalf("建源端表失败（%s）: %v", stmt, err)
+				}
+			}
+			srcConn.Close(ctx)
+
 			// 先把状态表建出来（生产里由 EnsureStateTables 负责），否则下面没法播种子
 			ep := dsn.Endpoint{Kind: "postgres", Host: cfg.Host, Port: int(cfg.Port),
 				Database: cfg.Database, Username: cfg.User, Password: cfg.Password,
