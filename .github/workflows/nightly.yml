@@ -376,7 +376,7 @@ jobs:
           rate=$(awk '/batch=500/ { for (i=1;i<=NF;i++) if ($i=="rows/s") print $(i-1) }' /tmp/bench.txt | tail -1)
           [ -n "$rate" ] || { echo "❌ 没测到 batch=500 的吞吐数值（benchmark 没跑或输出格式变了）——这不算通过"; tail -30 /tmp/bench.txt; exit 1; }
           echo "批量路径吞吐: $rate rows/s（阈值 20000）"
-          awk -v r="$rate" 'BEGIN { exit !(r+0 >= 100000) }' || { echo "❌ 批量 upsert 吞吐 $rate 低于 20000 rows/s"; exit 1; }
+          awk -v r="$rate" 'BEGIN { exit !(r+0 >= 500000) }' || { echo "❌ 批量 upsert 吞吐 $rate 低于 20000 rows/s"; exit 1; }
       - uses: actions/upload-artifact@v4
         if: always()
         with:
