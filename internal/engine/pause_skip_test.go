@@ -97,7 +97,7 @@ func TestApplyForcedRecopyRescuesSingleTableCopySkip(t *testing.T) {
 		t.Fatalf("前提变了：planCopy 对「零块标记的单表」不再判 copySkip，得到 %s", plan.Kind)
 	}
 	r := &runner{forceRecopy: map[string]source.TableRef{"orders": ref}}
-	r.commitPlan(plan)
+	r.commitPlan(&plan)
 	// 断言的是 **r.plan**：`snapshot()` 只读它。改局部变量那份等于没改（踩过一次）。
 	if r.plan.Kind == copySkip {
 		t.Fatal("有表欠重搬时 Kind 不能是 copySkip：snapshot 会整段跳过，说了重搬却一步不动")
@@ -123,7 +123,7 @@ func TestApplyForcedRecopyOnlyTouchesThePausedTable(t *testing.T) {
 		Skip: map[string]bool{"healthy": true},
 	}
 	r := &runner{forceRecopy: map[string]source.TableRef{"orders": a}}
-	r.commitPlan(plan)
+	r.commitPlan(&plan)
 
 	if !containsTable(r.plan.Recopy, "orders") {
 		t.Fatal("欠重搬的表必须进 r.plan.Recopy")
@@ -136,6 +136,12 @@ func TestApplyForcedRecopyOnlyTouchesThePausedTable(t *testing.T) {
 	}
 	if r.plan.Kind != copyResume {
 		t.Fatalf("Kind 不该被动过，得到 %s", r.plan.Kind)
+	}
+	// **调用方那份也必须被改**：`prepare()` 后面还用局部 `plan` 做 `src.Prepare(...)` 与
+	// `switch plan.Kind` 的决定。收值的写法会「r.plan 新、调用方旧」两份各说各话
+	// （Owl II 探针：单表会重建书签 + 位点跳到新 LSN，与「续跑不动位点」相反）。
+	if !containsTable(plan.Recopy, "orders") {
+		t.Fatal("commitPlan 收值就会让调用方那份 plan 停在旧值（这里只该被改一次）")
 	}
 	_ = b
 }

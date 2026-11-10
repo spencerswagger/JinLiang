@@ -1031,7 +1031,7 @@ func (r *runner) prepare(ctx context.Context) error {
 	//
 	// 位置也要在 `applyResync` **之后**：它会 `p.Recopy = nil` 并按 `CleanNames` 重排，
 	// 先接的话会被清掉——而 `--resync` 恰恰是结构对不上时最会按的那个键。
-	r.commitPlan(plan)
+	r.commitPlan(&plan)
 	if r.opt.Resync {
 		// **先问「这几张表能不能清」，再动任何东西**。清位点、重建书签、清表是三步
 		// 破坏性动作；把「不是本任务建的表」这种需要用户决定的失败留到最后一步，
@@ -1263,10 +1263,16 @@ func (r *runner) applyForcedRecopy(plan *chunkPlan) {
 }
 
 // commitPlan 是「把计划落到 runner 上」的唯一入口：先接欠重搬的表，再赋值。
-// 拆成两步做过一次，就踩了值类型别名的坑（改的是局部 `plan`，`r.plan` 还是旧的）。
-func (r *runner) commitPlan(plan chunkPlan) {
-	r.applyForcedRecopy(&plan)
-	r.plan = plan
+//
+// **收指针，不收值**：`chunkPlan` 是值类型，收值的话函数里改的是形参副本——
+// `r.plan` 拿到了新值，而调用方（`prepare()`）手里那份还是旧的，后面
+// `src.Prepare(... plan.Kind != copyResume)` 与 `switch plan.Kind` 全按旧值走：
+// 单表那条会「Prepare 按从头搬重建书签（还会先 drop 旧槽）+ 位点跳到新 LSN」，
+// 与「续跑不动位点」直接相反。收指针之后，调用方与 runner 读的是同一份，
+// 这类别名在类型层面就不成立了。
+func (r *runner) commitPlan(plan *chunkPlan) {
+	r.applyForcedRecopy(plan)
+	r.plan = *plan
 	r.needSnapshot = plan.Kind != copySkip
 }
 
