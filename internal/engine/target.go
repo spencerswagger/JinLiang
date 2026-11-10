@@ -136,20 +136,20 @@ func (r *runner) prepareGeneric(ctx context.Context) error {
 		return err
 	}
 	r.gsink = gs
-	// **故意先不绑 `pauseReg`**（Owl II 必改 2，维护者止损指令）。
+	// 绑暂停存储（Data #95 的六个方法，与 PG 侧同构）+ 载入跨轮可见的暂停集合。
 	//
-	// 存储层（Data #95）已经同构就绪，但**恢复路径只在 PG 侧**：
-	// `reconcilePaused` / `forceRecopy` / `MarkTableRecopyPending` / 搬成时 `ClearPausedTable`
-	// 都长在 `prepare()` + `snapshot()` 里，`prepareGeneric` 一个都没调。
-	// 现在把 `pauseReg` 绑上去的后果是：流式期某张表被暂停之后**没有任何解除路径**——
-	// 用户对齐结构、重跑、`EnsureSchema` 通过，这张表仍被 `pauseSink` 静默跳过，
-	// `skipped_rows` 一直涨而这一轮"成功"；这正是「静默缺数据」。
-	//
-	// 所以 Way 1（Owl 建议的安全收尾）：接口抽好、MySQL 侧**继续明确失败**
-	//（写行时报 MySQLError → 整轮失败，响的），等恢复路径一起上再绑。
-	//
-	// TODO(片 C 收尾)：恢复路径搬到与目标端无关的层之后，在这里绑 `pauseReg`
-	//   （`gs.(pauseRegistry)` 已经能命中；**还要补 `StoredJobHash`**，它不在那六个方法里）。
+	// **只有恢复路径真能跑时才绑**：`executeGeneric` 里已经接了「对齐了 → 清空 + 整表重搬
+	// → 搬成才解除」（见 `planGenericRecopy` / `finishGenericRecopy`）。少一样都不许绑——
+	// 只停不恢复 = 那张表被静默跳过、`skipped_rows` 一直涨而这一轮"成功"。
+	if reg, ok := gs.(pauseRegistry); ok {
+		r.pauseReg = reg
+		if err := reg.LoadPausedTables(ctx); err != nil {
+			return err
+		}
+		if err := r.loadPausedSet(ctx); err != nil {
+			return err
+		}
+	}
 	src, err := r.openSource(ctx)
 	if err != nil {
 		return err
@@ -239,7 +239,11 @@ func (r *runner) executeGeneric(ctx context.Context, res *Result) error {
 	fresh := rawPos == ""
 	// once 已经有位点：这一轮没有要搬的，直接收尾（不重搬、不流）。
 	// full_interval 相反：**每轮都整轮重搬**，这是模式的语义。
-	needCopy := fresh || r.mode() == "full_interval"
+	//
+	// 第三种「要搬」：有表**欠一次整表重搬**（结构刚对齐、或一直在暂停）。
+	// 不搬它就没有解除路径——那才是真正的静默缺数据（Owl II 必改 2）。
+	r.planGenericRecopy(ctx)
+	needCopy := fresh || r.mode() == "full_interval" || len(r.forceRecopy) > 0
 
 	// ② 源端准备（PG 源要建书签+发布；MySQL 源要开一致性快照）。必须在取位点之前：
 	// 全量的读视图与增量起点是同一瞬间定下来的。
@@ -298,10 +302,18 @@ func (r *runner) executeGeneric(ctx context.Context, res *Result) error {
 		if err := r.phaseTo(ctx, state.Snapshot); err != nil {
 			return err
 		}
+		// 欠一次重搬的表：**先清空再从头读**（只清本任务建的表，见函数注释）。
+		if err := r.truncateForcedRecopy(ctx, st); err != nil {
+			return err
+		}
 		if err := r.copyGeneric(ctx); err != nil {
 			return err
 		}
 		r.src.EndSnapshot()
+		// 搬成才解除（契约 §1.6 步 4）：**先盖章**（copyGeneric 里 MarkTableDone）再删记录。
+		if err := r.finishGenericRecopy(ctx); err != nil {
+			return err
+		}
 		// 全量结束把**起点位点**写进目标端：不写的话下次会当成首次又整表重搬一遍。
 		// 用空批 Apply 写位点，与 batcher.AdvanceTo 是同一个机制。
 		if err := r.gsink.Apply(ctx, nil, from); err != nil {
