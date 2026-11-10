@@ -1651,10 +1651,10 @@ func classifyError(err error) (code core.Code, classified bool) {
 		// 按 SQLSTATE 分类的地方。
 		return core.CodeObjectMissing, true
 	case pgwire.SQLState(err) == "53400":
-		// all replication slots are in use：源端的书签/连接数用满。这不是「未识别」——
-		// 它发生在写任何数据之前，用户要做的事只有三件（见码表 E1016 的 Next）。
-		// `last_error` 里仍原样保留驱动给的 SQLSTATE 与消息（下面统一拼 err.Error()）。
-		return core.CodeSourceLimit, true
+		// all replication slots are in use：权限够、资源满。按 Ark 的边界，它必须排在
+		// 42501（权限）/ 3F000·42P01（对象不存在）之后、兜底之前 —— 那三类动作不同。
+		// 用户要做的事只有三件（见码表 E1016 的 Next）；last_error 原样保留 SQLSTATE 与消息。
+		return core.CodeSourceResourceLimit, true
 	case pgsource.IsNoPrivilege(err):
 		// 42501：源端 SELECT 或目标端 DDL/DML 被拒——用户要做的事都是「去要授权」。
 		return core.CodeNoPrivilege, true

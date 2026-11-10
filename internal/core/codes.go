@@ -36,7 +36,7 @@ const (
 	CodeObjectMissing        Code = "E1013" // 缺这个 schema 或表（SQLSTATE 3F000 / 42P01）
 	CodeUnsupportedDirection Code = "E1014" // 当前版本不支持这个同步方向（源×目标组合）
 	CodeSchemaMismatch       Code = "E1015" // 表结构不一致（prepare 类型不一致 / 运行时改类型改名删列）
-	CodeSourceLimit          Code = "E1016" // 源端资源/上限受限（SQLSTATE 53400：书签或连接数已达上限）
+	CodeSourceResourceLimit  Code = "E1016" // 源端资源或上限已用满（SQLSTATE 53400）
 	CodeTargetReset          Code = "E2001" // 目标连接被重置
 	CodeSourceTimeout        Code = "E2002" // 源库连接超时
 	CodeLockTimeout          Code = "E2003" // 目标库锁等待超时
@@ -237,21 +237,18 @@ var specs = []Spec{
 			"其它表也不会继续推进。最常见误判是把它当成单表问题不管，于是整条同步都停在原地",
 	},
 	{
-		Code: CodeSourceLimit, Class: UserAction,
-		Message: "源端的书签或连接数已达上限",
-		// 为什么要独立一个码：这条不是「方向不支持」（E1014 的 Why 是方向矩阵口吻），
-		// 也不是「未识别」。用户要做的事只有三件，都在下面 Next 里，且都是真能跑的命令。
-		Why: "源端拒绝了这次请求：书签或连接数已达上限（SQLSTATE 53400，all replication slots are in use）。" +
-			"常见成因：前几次异常退出留下的同步书签没清、`max_replication_slots` 设得太小、" +
-			"或同时跑了过多任务。这类失败发生在写任何数据之前——**位点没有推进，一条数据都不会写入**",
+		Code: CodeSourceResourceLimit, Class: UserAction,
+		Message: "源端资源或上限已用满",
+		Why: "源端拒绝了这次操作（SQLSTATE 53400）：复制书签的名额或连接数已经到顶——" +
+			"最常见是书签名额（max_replication_slots）被占光，也可能是连接数（max_connections）" +
+			"或发送进程（max_wal_senders）到顶。原始消息与 SQLSTATE 原样留在 last_error 里",
 		Next: []string{
-			// 命令必须真能跑（用例会去问 binary 与 SQL 是否成立，别写不存在的动作）
-			`看上限与占用量：psql "$SRC" -c "SHOW max_replication_slots" -c "SELECT slot_name, active FROM pg_replication_slots"`,
-			`清理不再使用的书签（确认没有进程连着它）：psql "$SRC" -c "SELECT pg_drop_replication_slot('<slot_name>')"` +
-				`（本任务的书签形如 jl_<job_key>_1，也可以在删任务时由我们回收）`,
-			`调大上限后重跑：psql "$SRC" -c "ALTER SYSTEM SET max_replication_slots = 20" -c "SELECT pg_reload_conf()"（需要重启才生效的配置见源库文档）`,
+			"先看是谁占着（在源库 psql 里执行）：SELECT slot_name, active, database FROM pg_replication_slots;——我们建的书签都以 jl_ 开头",
+			"清理确认没在用的：SELECT pg_drop_replication_slot('jl_xxx'); 若是已删任务的遗留，先 jinliang gc --dry-run 看一眼，确认没有别的实例在用再 jinliang gc --force",
+			"确实要更多名额：ALTER SYSTEM SET max_replication_slots = <n>; 然后重启实例（这个参数是 postmaster 级，reload 不生效），再重跑（位点没动，不会重搬历史）",
 		},
-		Risk: "一条数据都不会写入，位点不动；最危险的误判是把它当成「结构问题」去改表——那只会让下一次仍然失败在这里",
+		Risk: "一条数据都不会写入、位点也不动（还没开始搬）；最常见误判是去 --resync 重搬全量——没用，名额还是满的。" +
+			"另一个误判是把别人的书签当孤儿删掉：gc --force 会跨实例清理，删了正在用的书签会让那个任务丢变更流水",
 	},
 	{
 		Code: CodeControlDBBroken, Class: Fatal,

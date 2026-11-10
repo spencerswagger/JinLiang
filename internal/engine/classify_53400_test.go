@@ -24,10 +24,10 @@ func TestSlotExhaustedClassifiesAsE1016(t *testing.T) {
 	if !ok {
 		t.Fatal("53400 必须被识别（不许落到「未识别」）")
 	}
-	if code != core.CodeSourceLimit {
-		t.Fatalf("53400 应挂 %s，得到 %q", core.CodeSourceLimit, code)
+	if code != core.CodeSourceResourceLimit {
+		t.Fatalf("53400 应挂 %s，得到 %q", core.CodeSourceResourceLimit, code)
 	}
-	spec, found := core.Lookup(core.CodeSourceLimit)
+	spec, found := core.Lookup(core.CodeSourceResourceLimit)
 	if !found {
 		t.Fatal("E1016 必须在码表里")
 	}
