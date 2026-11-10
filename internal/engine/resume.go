@@ -361,8 +361,8 @@ func (r *runner) decideCopyPlan(ctx context.Context, src runSource,
 		Progress:   prog,
 		StoredCP:   pos,
 		PriorPhase: phase,
-		// prepare() 只服务 PG 目标端（MySQL 目标端走 executeGenericFullCopy），
-		// 而 PG 目标端就是记块进度的那个。
+		// prepare() 只服务 PG 目标端（MySQL 目标端走 executeGeneric，那条路径没有
+		// 块级续跑、也不读块进度），而 PG 目标端就是记块进度的那个。
 		Capable: true,
 	}
 	if in.Mode == "interval" || in.Mode == "continuous" || pos == "" {

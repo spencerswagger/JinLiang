@@ -93,6 +93,13 @@ type batcher struct {
 	maxTxBytes  int64
 	maxTxEvents int
 
+	// ackGuard 是「ack 之前必须过的一道门」。
+	//
+	// 为什么需要它：目标端的「Apply 返回 nil」不总是等于「位点已落盘」——MySQL 目标端
+	// 含 DDL/TRUNCATE 的批次会隐式提交，位点是分三段写的（staged_phases）。这种目标端上
+	// 直接 ack 会让 PG 源清掉还能重放的 WAL：目标端一回滚就永久缺数据。
+	// 守卫由引擎在**构造阶段**装（装不上就是接线缺口，要响亮失败，见 target.go）。
+	ackGuard func(ctx context.Context, pos source.Position) error
 	// onFlush fires after a successful commit (used for phase switching).
 	onFlush func(applied int64, pos source.Position)
 	// onApplied reports rows/position to the runner.
@@ -128,6 +135,9 @@ func (b *batcher) AdvanceTo(ctx context.Context, pos source.Position) error {
 		return nil
 	}
 	if err := b.sink.Apply(ctx, nil, pos); err != nil {
+		return err
+	}
+	if err := b.guardAck(ctx, pos); err != nil {
 		return err
 	}
 	b.src.Ack(pos)
@@ -267,7 +277,10 @@ func (b *batcher) flushLocked(ctx context.Context) error {
 	if err := b.sink.Apply(ctx, b.pending, pos); err != nil {
 		return err
 	}
-	// 只有提交成功后才把位点告诉源端：先告诉它会丢数据。
+	// 只有提交成功**且位点确认落盘**之后，才把位点告诉源端：先告诉它会丢数据。
+	if err := b.guardAck(ctx, pos); err != nil {
+		return err
+	}
 	b.src.Ack(pos)
 	b.applied += rows
 	b.lastPos = pos
@@ -281,6 +294,15 @@ func (b *batcher) flushLocked(ctx context.Context) error {
 		b.onFlush(b.applied, pos)
 	}
 	return nil
+}
+
+// guardAck 在 ack 之前跑一遍守卫（没装守卫时什么也不做：PG 目标端是 same_tx，
+// 「Apply 返回」就是「位点落盘」，见 docs/STATE-SCHEMA.md）。
+func (b *batcher) guardAck(ctx context.Context, pos source.Position) error {
+	if b.ackGuard == nil {
+		return nil
+	}
+	return b.ackGuard(ctx, pos)
 }
 
 // flushLoop commits on the batch delay even when the stream is quiet, so lag

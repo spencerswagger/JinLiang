@@ -11,6 +11,7 @@ import (
 
 	"github.com/spencerswagger/jinliang/internal/dsn"
 	"github.com/spencerswagger/jinliang/internal/mysqlcanon"
+	"github.com/spencerswagger/jinliang/internal/pgsink"
 	"github.com/spencerswagger/jinliang/internal/source"
 )
 
@@ -45,6 +46,27 @@ type LeaseHolder struct {
 	Label      string
 	Expires    time.Time
 }
+
+// Abandoned 报告「这条租约背后已经没有活着的进程」：过期了，或 label 里的 pid 不在。
+//
+// 与 pgsink.LeaseHolder.Abandoned 同一套判据——引擎的崩溃恢复靠它决定「上一次是不是
+// 真的死了」，两个目标端给出不同答案就会一边能自动收尾、一边永远 E1005。
+func (h LeaseHolder) Abandoned(now time.Time, alive func(int) bool) bool {
+	if !h.Exists {
+		return true
+	}
+	if h.Expires.Before(now) {
+		return true
+	}
+	pid, _, ok := parseLeaseLabel(h.Label)
+	if !ok {
+		return false // 说不清就不动
+	}
+	return !alive(pid)
+}
+
+// ProcessAlive 暴露平台存活探测（引擎的崩溃恢复要判断持有者是否还活着）。
+func ProcessAlive(pid int) bool { return pgsink.ProcessAlive(pid) }
 
 // leaseOwnerLabel 渲染持有者：任务名#pid#token。
 func leaseOwnerLabel(job string, pid int, token string) string {
@@ -216,12 +238,18 @@ func ReadLease(ctx context.Context, ep dsn.Endpoint, jobKey string) (LeaseHolder
 
 // EnsureMeta 建立/更新本 job 的元数据行（幂等）。
 func (s *Sink) EnsureMeta(ctx context.Context, jobHash, phase, position, snapshotID string) error {
+	// **phase 只在插入时写，冲突时不改**（与 pgsink 同一口径）。
+	//
+	// 为什么：阶段只能由 SetPhase 推进。这里每次都把它重置成 'prepare'，等于把
+	// 「上一轮崩在哪个阶段」这条唯一的可重算事实擦掉——引擎就没法区分
+	// 「这张用户表我从来没碰过」和「我搬到一半崩了，表里已经混进我的行」，
+	// 而这两者的安全动作是相反的（前者可以 upsert，后者必须停下问人）。
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO _jl_meta (job_key, name, instance_id, schema_version, job_hash, phase, position, snapshot_id, started_at, updated_at)
 		VALUES (?, ?, ?, 1, ?, ?, ?, ?, NOW(6), NOW(6))
 		ON DUPLICATE KEY UPDATE
 		  name=VALUES(name), instance_id=VALUES(instance_id), job_hash=VALUES(job_hash),
-		  phase=VALUES(phase), snapshot_id=VALUES(snapshot_id), updated_at=NOW(6)`,
+		  snapshot_id=COALESCE(VALUES(snapshot_id), snapshot_id), updated_at=NOW(6)`,
 		s.opt.JobKey, s.opt.Name, s.opt.InstanceID, jobHash, phase, position, snapshotID)
 	if err != nil {
 		return fmt.Errorf("写 _jl_meta 失败: %w", err)
@@ -310,11 +338,16 @@ func (s *Sink) TruncateTable(ctx context.Context, ref source.TableRef) error {
 }
 
 // RecordObject 登记「这个对象是本任务建的」（孤儿判定与 recopy fail-closed 的依据）。
+//
+// 冲突时**连 job_key 一起更新**：`_jl_object` 的主键是 object_name（与 PG 侧同构），
+// 表被上一个任务软删、这个任务重新建出来时，只更新 dropped_at 会让「谁建的」永远停在
+// 旧任务上 —— 于是新任务重搬前问「这表是我的吗」得到 false，明明自己刚建的表却不敢清。
 func (s *Sink) RecordObject(ctx context.Context, name, kind string) error {
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO _jl_object (object_name, object_kind, job_key, instance_id, created_at)
 		VALUES (?, ?, ?, ?, NOW(6))
-		ON DUPLICATE KEY UPDATE object_kind=VALUES(object_kind), dropped_at=NULL`,
+		ON DUPLICATE KEY UPDATE object_kind=VALUES(object_kind), job_key=VALUES(job_key),
+			instance_id=VALUES(instance_id), dropped_at=NULL`,
 		name, kind, s.opt.JobKey, s.opt.InstanceID)
 	if err != nil {
 		return fmt.Errorf("登记对象 %s 失败: %w", name, err)

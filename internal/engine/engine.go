@@ -21,6 +21,7 @@ import (
 	"github.com/spencerswagger/jinliang/internal/control"
 	"github.com/spencerswagger/jinliang/internal/core"
 	"github.com/spencerswagger/jinliang/internal/dsn"
+	"github.com/spencerswagger/jinliang/internal/mysqlsink"
 	"github.com/spencerswagger/jinliang/internal/pgsink"
 	"github.com/spencerswagger/jinliang/internal/pgsource"
 	"github.com/spencerswagger/jinliang/internal/preflight"
@@ -231,9 +232,9 @@ func reclaimAbandonedRun(ctx context.Context, store *control.Store, job control.
 		// 只看第 1 条会漏掉「读不到租约表 / 目标端连不上」的情况——那时用户会陷入
 		// 「崩过一次就永远 E1005 等 serve 来救」，而 serve 可能根本没在跑。
 		why := ""
-		holder, lerr := pgsink.ReadLease(ctx, ep, schema, job.JobKey)
+		abandoned, lerr := targetLeaseAbandoned(ctx, ep, schema, job.JobKey)
 		switch {
-		case lerr == nil && holder.Abandoned(time.Now(), pgsink.ProcessAlive):
+		case lerr == nil && abandoned:
 			why = "目标端租约已无人续期"
 		case heartbeatStale(run, time.Now()):
 			why = "控制面心跳已停超过 " + control.StaleAfter(control.DefaultHeartbeatInterval).String()
@@ -249,6 +250,28 @@ func reclaimAbandonedRun(ctx context.Context, store *control.Store, job control.
 		return true, nil
 	}
 	return false, nil
+}
+
+// targetLeaseAbandoned 判断「目标端那条租约背后还有没有活着的进程」。
+//
+// 按目标端类型分派：PG 的租约表在 schema 里、MySQL 的在库里；两边的 label 都是
+// `任务名#pid#token`，所以「pid 不在 / 已过期」的判据一致。这里只做分派，
+// 判断逻辑不复制（各自实现 Abandoned）。
+func targetLeaseAbandoned(ctx context.Context, ep dsn.Endpoint, schema, jobKey string) (bool, error) {
+	switch ep.Kind {
+	case dsn.KindMySQL:
+		h, err := mysqlsink.ReadLease(ctx, ep, jobKey)
+		if err != nil {
+			return false, err
+		}
+		return h.Abandoned(time.Now(), mysqlsink.ProcessAlive), nil
+	default:
+		h, err := pgsink.ReadLease(ctx, ep, schema, jobKey)
+		if err != nil {
+			return false, err
+		}
+		return h.Abandoned(time.Now(), pgsink.ProcessAlive), nil
+	}
 }
 
 // heartbeatStale 判断一条活跃 run 的心跳是否已经停了超过 StaleAfter。
@@ -398,7 +421,7 @@ func (r *runner) execute(parent context.Context, res *Result) error {
 			return r.fail(ctx, err)
 		}
 		defer r.teardown()
-		if err := r.executeGenericFullCopy(ctx, res); err != nil {
+		if err := r.executeGeneric(ctx, res); err != nil {
 			if r.leaseLost.Load() {
 				return r.fail(ctx, r.leaseLostError())
 			}
@@ -626,6 +649,9 @@ const (
 	recopyOnce                         // once / full_interval：每轮整轮重搬，必须清空重建
 	recopyNoPos                        // 搬过，但目标端没留下位点（一块都没搬完）
 	recopyResync                       // --resync：用户显式要求整轮重搬
+	// recopyReused：目标端没有可用位点（要重搬），而表里已经有**用户自己的行**。
+	// 与「once / full_interval 每轮重搬」是两种不同的话：前者是状态缺失，后者是模式语义。
+	recopyReused
 )
 
 func (w recopyReason) sentence() string {
@@ -641,6 +667,8 @@ func (w recopyReason) sentence() string {
 		return "之前搬过但目标端没留下一致性位点（很可能一块都没搬完就断了）"
 	case recopyResync:
 		return "你显式要求了 --resync（整轮重搬）：这一轮先从零重建，目标端结果要等于源端当前状态"
+	case recopyReused:
+		return "目标端没有可用的同步位点，这一轮要从头搬"
 	default:
 		return "上次全量搬到一半就断了"
 	}
@@ -1508,8 +1536,8 @@ func (r *runner) drain(ctx context.Context, exit int, msg string) error {
 	if _, err := r.opt.Store.FinishRun(dctx, r.run.ID, state.Done, "", exit, reason); err != nil {
 		return err
 	}
-	if r.sink != nil {
-		_ = r.sink.SetPhase(dctx, string(state.Done))
+	if st := r.stateSink(); st != nil {
+		_ = st.SetPhase(dctx, string(state.Done))
 	}
 	r.phase = state.Done
 	r.emit(dctx, control.Event{Type: "done", Phase: state.Done, Message: msg})
@@ -1842,6 +1870,18 @@ type stoppedError struct {
 
 func (e *stoppedError) Error() string { return e.msg }
 
+// stateSink 返回「能写阶段/位点的那个目标端」：PG 目标端是 pgsink（r.sink），
+// 非 PG 目标端是 gsink 的状态表能力（mysqlsink）。两条路径共用同一套阶段语义。
+func (r *runner) stateSink() stateCapable {
+	if r.sink != nil {
+		return r.sink
+	}
+	if st, ok := r.gsink.(stateCapable); ok {
+		return st
+	}
+	return nil
+}
+
 func (r *runner) phaseTo(ctx context.Context, to state.Phase) error {
 	if r.phase == to {
 		return nil
@@ -1853,8 +1893,11 @@ func (r *runner) phaseTo(ctx context.Context, to state.Phase) error {
 		return err
 	}
 	r.phase = to
-	if r.sink != nil {
-		_ = r.sink.SetPhase(ctx, string(to))
+	// 阶段必须真的落到目标端：PG 目标端写 pgsink（r.sink），非 PG 目标端写它的
+	// 状态表能力。少了后半句，「上一轮崩在哪个阶段」这条唯一可重算的事实永远是
+	// 'prepare'——引擎就分不清「这张用户表我没碰过」和「我搬到一半崩了」。
+	if st := r.stateSink(); st != nil {
+		_ = st.SetPhase(ctx, string(to))
 	}
 	r.emit(ctx, control.Event{Type: "phase", Phase: to, Message: control.PhaseLabel(to)})
 	return nil

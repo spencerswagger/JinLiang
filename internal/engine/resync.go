@@ -58,7 +58,7 @@ func (r *runner) checkResync() error {
 	}
 	if r.tgtEP.Kind != dsn.KindPostgres {
 		return fmt.Errorf("目标端是 %s：本版它没有同步书签/位点可重建（这条路径本来就是每轮整表全量，"+
-			"而且目标端所有权还没登记，分不清哪些表是本任务建的）。"+
+			"清表判据与 PG 路径不同（没有块级续跑与块进度可依据））。"+
 			"你现在能做什么：去掉 --resync 直接跑（它就是全量）。"+
 			"风险：没有（什么都没动）", r.tgtEP.Kind)
 	}

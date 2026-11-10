@@ -94,6 +94,12 @@ func (s *Sink) EnsureSchema(ctx context.Context, cat source.Catalog) ([]sink.Act
 			if err := s.createTable(ctx, t); err != nil {
 				return actions, err
 			}
+			// 登记所有权：只有「本任务建的表」才允许在重搬前清空（与 pgsink 同构）。
+			// 不记的话引擎分不清「我们的表」和「用户复用的表」，重搬时会一律停下——
+			// 或者更糟：一律清掉用户的表。
+			if err := s.RecordObject(ctx, s.tableObjectName(t.TableRef), "table"); err != nil {
+				return actions, fmt.Errorf("登记表 %s 的所有权失败: %w", qualified(t.TableRef), err)
+			}
 			actions = append(actions, sink.Action{
 				ID: "create:" + t.Table, What: "建表 " + qualified(t.TableRef),
 				Reason: "目标端原本没有这张表", Applied: true,

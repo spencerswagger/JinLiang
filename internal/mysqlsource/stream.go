@@ -151,7 +151,9 @@ func serverIDFor(jobKey string, ep dsn.Endpoint) uint32 {
 		if pid := os.Getpid(); pid > 0 {
 			h.Write([]byte("|" + strconv.Itoa(pid)))
 		}
-		seed := make([]byte, 2)
+		// 4 字节随机：2 字节只有 65536 种取值，8 次抽样撞号的概率约 0.04%——
+		// 表现是「CI 偶发红一条 server_id 重复」，而它本来的用途只是「同机多任务别撞号」。
+		seed := make([]byte, 4)
 		if _, err := rand.Read(seed); err == nil {
 			h.Write(seed)
 		}
