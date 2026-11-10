@@ -56,11 +56,15 @@ split_mysql() { # $1=mysql://u:p@h:port/db → 全局 MUSER MPASS MHOST MPORT MD
   MHOST=${hp%%:*}; MPORT=${hp#*:}; [ "$MPORT" = "$hp" ] && MPORT=3306
   MDB=$db
 }
+# 所有外部命令都带 timeout：CI 上「某一步卡住」会变成一条明确的失败，而不是把 job
+# 拖到 6 小时超时（第一次跑就是这么丢的日志——in_progress 永远看不到输出）。
 myq() { # $1=sql（用当前 split 出来的连接）
-  mysql --protocol=TCP -h "$MHOST" -P "$MPORT" -u"$MUSER" "--password=$MPASS" \
+  timeout 60 mysql --protocol=TCP -h "$MHOST" -P "$MPORT" -u"$MUSER" "--password=$MPASS" \
         --batch --skip-column-names -e "$1" "$MDB" 2>/dev/null
 }
-pgq() { psql "$1" -v ON_ERROR_STOP=1 -tAq -c "$2" 2>/dev/null; }
+pgq() { timeout 30 psql "$1" -v ON_ERROR_STOP=1 -tAq -c "$2" 2>/dev/null; }
+runbin() { timeout 300 "$BIN" "$@"; }
+mark() { echo "-- $(date -u +%H:%M:%S) $*"; }
 
 fp_mysql() { # $1=表名（当前连接）
   myq "SET SESSION group_concat_max_len=1073741824;
@@ -154,11 +158,12 @@ content:
 mode: {frequency: continuous+initial}
 reliability: {batch_rows: 5000}
 YAML
-  "$BIN" import --file "$job" --data-dir "$data" >/dev/null 2>&1 || { echo "FAIL: import 失败"; return 1; }
+  timeout 120 "$BIN" import --file "$job" --data-dir "$data" >/dev/null 2>&1 || { echo "FAIL: import 失败"; return 1; }
 
   local t0 t1 secs s_fp d_fp
+  mark "mysql→pg 全量开始（$ROWS 行）"
   t0=$(now_s)
-  "$BIN" run --job acc-mysql-pg --data-dir "$data" --stop-when-idle 5s >"$W/run1.log" 2>&1
+  runbin run --job acc-mysql-pg --data-dir "$data" --stop-when-idle 5s >"$W/run1.log" 2>&1
   local rc=$?
   t1=$(now_s); secs=$(elapsed "$t0" "$t1")
   [ $rc -eq 0 ] || { echo "FAIL: 全量+追平退出码 $rc"; tail -5 "$W/run1.log"; return 1; }
@@ -170,8 +175,9 @@ YAML
   myq "INSERT INTO \`$T\` VALUES ($((ROWS+1)),'inc-insert')"
   myq "UPDATE \`$T\` SET payload='inc-update' WHERE id=2"
   myq "DELETE FROM \`$T\` WHERE id=3"
+  mark "mysql→pg 增量三笔"
   t0=$(now_s)
-  "$BIN" run --job acc-mysql-pg --data-dir "$data" --stop-when-idle 3s >"$W/run2.log" 2>&1 &
+  runbin run --job acc-mysql-pg --data-dir "$data" --stop-when-idle 3s >"$W/run2.log" 2>&1 &
   local pid=$! got="" lat=""
   for _ in $(seq 1 600); do
     got=$(pgq "$dst" "SELECT (SELECT count(*) FROM $T WHERE id=$((ROWS+1)))::text||','||
@@ -193,6 +199,9 @@ YAML
          WHERE n BETWEEN $((ROWS+2)) AND $((ROWS+2001)) ORDER BY n"
     local before
     before=$(pgq "$dst" "SELECT count(*) FROM $T")
+    mark "mysql→pg 增量中（准备 kill -9）"
+    # 这条**不能**套 timeout：我们要 kill -9 的是引擎自己的 pid，套一层 wrapper 杀的是
+    # wrapper，引擎会变成孤儿继续流——重启那一轮就会撞租约。
     "$BIN" run --job acc-mysql-pg --data-dir "$data" --stop-after 600s >"$W/kill1.log" 2>&1 &
     pid=$!
     for _ in $(seq 1 1200); do
@@ -206,8 +215,9 @@ YAML
     # 停机期间再改三笔：只能靠「重启后从位点重放」补上
     myq "UPDATE \`$T\` SET payload='while-down' WHERE id BETWEEN 10 AND 20"
     myq "DELETE FROM \`$T\` WHERE id BETWEEN 30 AND 34"
+    mark "kill -9 后重启（只许从位点重放）"
     t0=$(now_s)
-    "$BIN" run --job acc-mysql-pg --data-dir "$data" --stop-when-idle 5s >"$W/kill2.log" 2>&1
+    runbin run --job acc-mysql-pg --data-dir "$data" --stop-when-idle 5s >"$W/kill2.log" 2>&1
     rc=$?; t1=$(now_s); secs=$(elapsed "$t0" "$t1")
     [ $rc -eq 0 ] || { echo "FAIL: 重启退出码 $rc"; tail -5 "$W/kill2.log"; return 1; }
     local copied
@@ -253,11 +263,12 @@ content:
 mode: {frequency: once}
 YAML
   [ -n "${JINLIANG_TEST_MYSQL_DST_DSN:-}" ] || export JINLIANG_TEST_MYSQL_DST_DSN=$dst
-  "$BIN" import --file "$job" --data-dir "$data" >/dev/null 2>&1 || { echo "FAIL: import 失败"; return 1; }
+  timeout 120 "$BIN" import --file "$job" --data-dir "$data" >/dev/null 2>&1 || { echo "FAIL: import 失败"; return 1; }
 
   local t0 t1 secs s_fp d_fp n rc
+  mark "pg→mysql 全量开始"
   t0=$(now_s)
-  "$BIN" run --job acc-pg-mysql --data-dir "$data" >"$W/run1.log" 2>&1
+  runbin run --job acc-pg-mysql --data-dir "$data" >"$W/run1.log" 2>&1
   rc=$?
   t1=$(now_s); secs=$(elapsed "$t0" "$t1")
   [ $rc -eq 0 ] || { echo "FAIL: 全量退出码 $rc"; tail -5 "$W/run1.log"; return 1; }
@@ -268,7 +279,7 @@ YAML
   # 增量必须**明确拒绝**（不静默降级成「只搬一次」）
   sed 's/frequency: once/frequency: continuous+initial/' "$job" > "$W/job2.yaml"
   "$BIN" import --file "$W/job2.yaml" --data-dir "$data" >/dev/null 2>&1 || true
-  if "$BIN" run --job acc-pg-mysql --data-dir "$data" >"$W/incr.log" 2>&1; then
+  if runbin run --job acc-pg-mysql --data-dir "$data" >"$W/incr.log" 2>&1; then
     echo "FAIL: PG→MySQL 增量居然跑了（本版应明确拒绝）"; tail -3 "$W/incr.log"; return 1
   fi
   grep -q "只搬全量\|还没接上" "$W/incr.log" || { echo "FAIL: 增量被拒但没说清原因"; tail -3 "$W/incr.log"; return 1; }
@@ -308,11 +319,12 @@ content:
     $T: {}
 mode: {frequency: once}
 YAML
-  "$BIN" import --file "$job" --data-dir "$data" >/dev/null 2>&1 || { echo "FAIL: import 失败"; return 1; }
+  timeout 120 "$BIN" import --file "$job" --data-dir "$data" >/dev/null 2>&1 || { echo "FAIL: import 失败"; return 1; }
 
   local t0 t1 secs d_fp n rc
+  mark "mysql→mysql 全量开始"
   t0=$(now_s)
-  "$BIN" run --job acc-mysql-mysql --data-dir "$data" >"$W/run1.log" 2>&1
+  runbin run --job acc-mysql-mysql --data-dir "$data" >"$W/run1.log" 2>&1
   rc=$?
   t1=$(now_s); secs=$(elapsed "$t0" "$t1")
   [ $rc -eq 0 ] || { echo "FAIL: 全量退出码 $rc"; tail -5 "$W/run1.log"; return 1; }
@@ -322,7 +334,7 @@ YAML
 
   sed 's/frequency: once/frequency: continuous+initial/' "$job" > "$W/job2.yaml"
   "$BIN" import --file "$W/job2.yaml" --data-dir "$data" >/dev/null 2>&1 || true
-  if "$BIN" run --job acc-mysql-mysql --data-dir "$data" >"$W/incr.log" 2>&1; then
+  if runbin run --job acc-mysql-mysql --data-dir "$data" >"$W/incr.log" 2>&1; then
     echo "FAIL: MySQL→MySQL 增量居然跑了（本版应明确拒绝）"; tail -3 "$W/incr.log"; return 1
   fi
   grep -q "只搬全量\|还没接上\|只支持全量" "$W/incr.log" || { echo "FAIL: 增量被拒但没说清原因"; tail -3 "$W/incr.log"; return 1; }
@@ -354,7 +366,7 @@ echo
 echo "| 组合 | MySQL | 行数 | md5 | 耗时 | 备注 |"
 echo "|---|---|---|---|---|---|"
 for line in "${RESULTS[@]}"; do
-  combo="" rows="" md5="" seconds="" status="" latency="" kill="" incremental="" rc="" mysql=""
+  combo="" rows="" md5="" seconds="" status="" latency="" kill="" incremental="" rc="" mysql="" restart=""
   eval "$(printf '%s' "$line" | sed -E 's/^RESULT //; s/([a-z-]+)=([^ ]*)/\1="\2"/g')"
   if [ "${status:-fail}" = "pass" ]; then
     echo "| ${combo:-?} | ${mysql:-?} | ${rows:-?} | \`${md5:-?}\` | ${seconds:-?}s | ${latency:-}${restart:+ restart=${restart}} ${kill:-} ${incremental:-} |"
