@@ -185,42 +185,42 @@ func TestPausedTableWithClearedChunksWouldSkipWithoutForcedRecopy(t *testing.T) 
 	}
 }
 
-// 两表场景：本任务建的待重搬表要在 `CleanNames` 里（`Written` 是按清标记**之前**的块进度算的，
-// 刚被清过的那张表进不去 → 「从表头重读却不清表」）。
+// 两表 + **从头搬**的轮次（位点追不回来）：待重搬的表必须被补进 `CleanNames`。
+//
+// 为什么专门构造这个形状（Owl II P3）：`plan.Written` 是按**清块标记之前**的块进度算的，
+// 刚被 reconcilePaused 清过标记的那张表进不去 → 会「从表头重读却不清表」→ 暂停窗口里
+// 被删的行留成幻行。普通 once 轮次判的是 resume（Clean=cleanNone），那条断言会被
+// `Clean != cleanNone` 短路掉，等于什么都没钉住。
 func TestForcedRecopyJoinsCleanNamesOnFreshRuns(t *testing.T) {
 	a := source.TableRef{Schema: "public", Table: "orders"}
 	b := source.TableRef{Schema: "public", Table: "healthy"}
 	in := copyInputs{
-		Mode:       "once", // AlwaysCopy → copyFresh + cleanAll
-		AlwaysCopy: true,
-		Tables:     []source.Table{{TableRef: a, PrimaryKey: []string{"id"}}, {TableRef: b, PrimaryKey: []string{"id"}}},
+		Mode:   "continuous+initial",
+		Tables: []source.Table{{TableRef: a, PrimaryKey: []string{"id"}}, {TableRef: b, PrimaryKey: []string{"id"}}},
 		Progress: map[string]pgsink.ChunkProgress{
-			// orders 的标记刚被清掉；healthy 还有完成标记 → 不是 allDone，落「续跑」那支；
-			// 于是 CleanNames 是按**清标记前**的块进度算的，含不了 orders（这条用例要钉的正是它）。
-			"healthy": {Done: true, LastNo: 1},
+			"healthy": {Done: true, LastNo: 1}, // orders 的标记刚被 reconcilePaused 清掉
 		},
-		StoredCP: "postgres:v1:0/100", SlotReplayable: true, Capable: true, PriorPhase: "paused",
+		StoredCP: "postgres:v1:0/100",
+		// 书签追不回位点 → 整轮从头搬（copyFresh + cleanAll），这正是「清表」真正发生的那条路
+		SlotReplayable: false, SlotWhy: "WAL 段已被删除", Capable: true, PriorPhase: "paused",
 	}
 	plan := planCopy(in)
-	// 两表（一张搬完、一张标记被清）判的是**续跑**：那条路 `Clean=cleanNone`、`Recopy` 也空，
-	// 从表头重读却不清表 —— 这就是止损指令里说的第二个形状。
-	if plan.Kind != copyResume {
-		t.Fatalf("前提变了：两表且一张待重搬现在判 %s（期望 resume）", plan.Kind)
+	if plan.Kind != copyFresh || plan.Clean == cleanNone {
+		t.Fatalf("前提变了：位点追不回应判 fresh + cleanAll，得到 %s / %v", plan.Kind, plan.Clean)
 	}
-	if containsTable(plan.Recopy, "orders") || containsName(plan.CleanNames, "orders") {
-		t.Fatalf("planCopy 自己不会把这张表排进 Recopy/CleanNames（Skip/From 也都没有它）——正因如此才需要 applyForcedRecopy")
+	if containsName(plan.CleanNames, "orders") {
+		t.Fatal("前提变了：CleanNames 居然已经含 orders —— 那这条用例就钉不住补丁了")
 	}
 
 	r := &runner{forceRecopy: map[string]source.TableRef{"orders": a}}
 	r.commitPlan(&plan)
 	if !containsName(r.plan.CleanNames, "orders") {
-		// 续跑那条路 Clean=cleanNone，清理名单不参与；此时由 recopyOne 的 ResetTableChunks 清。
-		// 所以这里只要求 Clean 真需要清的时候名单里必须有它。
-		if r.plan.Clean != cleanNone {
-			t.Fatalf("需要清表的轮次必须把待重搬的表补进清理名单（否则不清表只 upsert → 幻行），得到 %v", r.plan.CleanNames)
-		}
+		t.Fatalf("待重搬的表必须补进清理名单（否则不清表只 upsert → 幻行），得到 %v", r.plan.CleanNames)
 	}
 	if !containsTable(r.plan.Recopy, "orders") {
 		t.Fatal("也要进 Recopy（两个入口共用 recopyOne：判所有权 + 清空 + 清块标记）")
+	}
+	if r.plan.Skip["orders"] {
+		t.Fatal("它这次必须搬，不能留在 Skip 名单里")
 	}
 }

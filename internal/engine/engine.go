@@ -987,7 +987,7 @@ func (r *runner) prepare(ctx context.Context) error {
 	}
 	r.src = src
 	// **只有 interval 在这里收口**：它既不清表、也不走 Apply，且 `prepare` 早退后
-	// 再也走不到下面那一次调用；interval 没有「存量」概念，`copyDoneFor` 恒真是设计如此
+	// 再也走不到下面那一次调用；interval 没有「存量」概念（不搬历史，靠水位列追）
 	//（契约 §1.2 例外段）。
 	//
 	// 别的模式**必须**等 `decideCopyPlan` 之后再收口：`progressByTable` 是那一步才赋值，
@@ -1149,7 +1149,7 @@ func (r *runner) reconcilePaused(ctx context.Context) error {
 		if sameJob && inScope[key] {
 			continue
 		}
-		if err := r.sink.ClearPausedTable(ctx, source.TableRef{Schema: r.targetSchema(), Table: key}); err != nil {
+		if err := r.pauseReg.ClearPausedTable(ctx, source.TableRef{Schema: r.targetSchema(), Table: key}); err != nil {
 			return fmt.Errorf("清掉不再适用的暂停记录 %s 失败: %w", key, err)
 		}
 		r.forgetPaused(key)
@@ -1180,7 +1180,7 @@ func (r *runner) reconcilePaused(ctx context.Context) error {
 		// 永远停在暂停里（`planCopy` 在这两种模式下不会排存量），所以结构一通过就恢复。
 		// 代价必须说出来：解除暂停 ≠ 两侧已经一致——这两种模式不会替你重搬，差异要人看。
 		if r.mode() == "interval" || r.mode() == "continuous" {
-			if err := r.sink.ClearPausedTable(ctx, source.TableRef{Schema: r.targetSchema(), Table: key}); err != nil {
+			if err := r.pauseReg.ClearPausedTable(ctx, source.TableRef{Schema: r.targetSchema(), Table: key}); err != nil {
 				return fmt.Errorf("解除 %s 的暂停失败: %w", key, err)
 			}
 			r.forgetPaused(key)
@@ -1196,7 +1196,7 @@ func (r *runner) reconcilePaused(ctx context.Context) error {
 			continue
 		}
 		ref := r.targetRef(source.TableRef{Schema: r.targetSchema(), Table: key})
-		if err := r.sink.MarkTableRecopyPending(ctx, ref); err != nil {
+		if err := r.pauseReg.MarkTableRecopyPending(ctx, ref); err != nil {
 			return fmt.Errorf("把 %s 标成待重搬失败: %w", key, err)
 		}
 		if r.forceRecopy == nil {
@@ -1295,28 +1295,6 @@ func containsTable(refs []source.TableRef, table string) bool {
 		}
 	}
 	return false
-}
-
-// copyDoneFor 表示这张表的存量已经搬完（有 `chunk_no=0` 完成标记）。
-//
-// ⚠️ **语义已改，待 Ark 修订契约（M1）确认**（维护者 2026-11-11 止损指令 + Owl II 复审实测）：
-// 老版本这里是「一条块标记都没有 → true（当作已搬完）」，理由是「否则暂停永远解不开」。
-// 但那条假设在暂停恢复这条路上会做出**静默缺数据**：`reconcilePaused` 清掉块标记之后，
-// 下一轮 prepare 读到的就是「零块标记」，于是当场判「已搬完」→ 解除暂停 + skip，
-// 一张结构刚对齐的表**一行都没重搬**却显示已恢复。
-//
-// 现在的口径：**零块标记 = 没有「搬完」的证据**，一律 false。
-// 「continuous / interval 本来就没有存量」这种例外由调用方按模式判（它们不靠这个函数）；
-// 暂停恢复的判据也不再用它——`reconcilePaused` 只做「标成欠一次重搬」，
-// 真正的解除在 `snapshot()` 搬成那一刻。
-//
-// 注意：这个函数现在**没有生产调用点**，留着是为了让上面这条语义有地方写、有用例可钉。
-func (r *runner) copyDoneFor(table string) bool {
-	pr, ok := r.chunkProgress()[table]
-	if !ok {
-		return false
-	}
-	return pr.Done
 }
 
 // chunkProgress 是本轮 prepare 时读到的那份块进度（decideCopyPlan 里装好的）。
@@ -1521,7 +1499,7 @@ func (r *runner) snapshot(ctx context.Context) error {
 				r.note(ctx, "表 "+ref.Table+" 仍在暂停（目标端既有表，需你决定：重建 / 手工清空 / 移出范围）")
 				continue
 			}
-			if err := r.sink.ClearPausedTable(ctx, ref); err != nil {
+			if err := r.pauseReg.ClearPausedTable(ctx, ref); err != nil {
 				return fmt.Errorf("解除 %s 的暂停失败: %w", t.Table, err)
 			}
 			r.forgetPaused(ref.Table)
@@ -1765,7 +1743,10 @@ func (r *runner) stream(ctx context.Context, res *Result) error {
 		if errors.As(streamErr, &stopped) {
 			return stopped
 		}
-		if idleDone.Load() {
+		// `--stop-when-idle` 到点后我们 cancel 掉读；**只有错误像本地关闭**才算正常收尾。
+		// 无条件判 idleDone 会把「到点之后才到的真错误」（源库断连 / 解码失败）记成
+		// 「已追平并收尾」、退出码 0 —— 止损指令点名的就是这条（Owl II 必改 1 的另一格）。
+		if idleDone.Load() && isLocalClose(streamErr) {
 			return &stoppedError{ok: true, msg: fmt.Sprintf("已经追平且安静了 %s：按 --stop-when-idle 正常收尾", r.opt.IdleAfter)}
 		}
 		// 同 target.go：只有「我们先要停」+「错误像本地关闭」同时成立才算正常收尾。

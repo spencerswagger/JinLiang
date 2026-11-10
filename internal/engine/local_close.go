@@ -26,7 +26,7 @@ import (
 // 认的形状（都来自「本进程 close 之后继续读写」）：
 //   - `context.Canceled` —— 标准库路径；
 //   - `net.ErrClosed`（含 `use of closed network connection` 这一族）；
-//   - 少数驱动把关闭包成文本：`connection is closed` / `EOF`（读已关闭的 fd 常拿到它）。
+//   - 少数驱动把关闭包成文本：`connection is closed`。
 //
 // 刻意**不认**：`connection reset by peer`、`broken pipe`、超时、认证/权限/解码错误——
 // 那些要么是对端/网络的问题，要么是数据的问题，都不该被记成「用户按了停」。
@@ -43,10 +43,12 @@ func isLocalClose(err error) bool {
 		return true
 	case strings.Contains(msg, "connection is closed"):
 		return true
-	case strings.TrimSpace(msg) == "eof":
-		// 裸 EOF：读一个已经关掉的 fd。带上下文的 EOF（`unexpected EOF`）不算——
-		// 那是对端在报文中间断掉，是真实故障。
-		return true
 	}
+	// 裸 `EOF` **刻意不认**：Go 里「我们自己关了 conn」之后读返回的是 `net.ErrClosed`
+	//（`use of closed network connection`，上面已认）；而 `io.EOF` 的含义是**对端发了 FIN**，
+	// 也就是「对端走了」——把它写成「我们按了停」正是这条止损要禁的事。
+	// 两个连接器在 ctx 结束时都会先返回 `ctx.Err()`（pgsource 循环顶 + ReceiveMessage 失败后；
+	// mysqlsource 侧是 #91 修的），所以正常收尾拿到的是 `context.Canceled`，不是裸 EOF。
+	// 真有连接器冒裸 EOF，那是它的 bug，让它以「假失败」暴露比悄悄吞掉好。
 	return false
 }

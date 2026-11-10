@@ -136,17 +136,21 @@ func (r *runner) prepareGeneric(ctx context.Context) error {
 		return err
 	}
 	r.gsink = gs
-	// 目标端实现了暂停存储（六个方法）就绑上：MySQL 目标端从此也能「只停一张表」。
-	// 没实现则为 nil，写路径原样透传、遇结构不一致按失败处理（不许静默跳过）。
-	if reg, ok := gs.(pauseRegistry); ok {
-		r.pauseReg = reg
-		if err := reg.LoadPausedTables(ctx); err != nil {
-			return err
-		}
-		if err := r.loadPausedSet(ctx); err != nil {
-			return err
-		}
-	}
+	// **故意先不绑 `pauseReg`**（Owl II 必改 2，维护者止损指令）。
+	//
+	// 存储层（Data #95）已经同构就绪，但**恢复路径只在 PG 侧**：
+	// `reconcilePaused` / `forceRecopy` / `MarkTableRecopyPending` / 搬成时 `ClearPausedTable`
+	// 都长在 `prepare()` + `snapshot()` 里，`prepareGeneric` 一个都没调。
+	// 现在把 `pauseReg` 绑上去的后果是：流式期某张表被暂停之后**没有任何解除路径**——
+	// 用户对齐结构、重跑、`EnsureSchema` 通过，这张表仍被 `pauseSink` 静默跳过，
+	// `skipped_rows` 一直涨而这一轮"成功"；这正是「静默缺数据」。
+	//
+	// 所以 Way 1（Owl 建议的安全收尾）：接口抽好、MySQL 侧**继续明确失败**
+	//（写行时报 MySQLError → 整轮失败，响的），等恢复路径一起上再绑。
+	//
+	// TODO(片 C 收尾)：恢复路径搬到与目标端无关的层之后，把下面三行放回来——
+	//   if reg, ok := gs.(pauseRegistry); ok { r.pauseReg = reg; reg.LoadPausedTables(ctx); r.loadPausedSet(ctx) }
+	_ = gs
 	src, err := r.openSource(ctx)
 	if err != nil {
 		return err
@@ -532,7 +536,7 @@ func (r *runner) targetRelation(ref source.TableRef) *source.Table {
 // streamGeneric 是「非 PG 目标端」的持续流：与 PG 路径同一套 batcher 规则。
 func (r *runner) streamGeneric(ctx context.Context, st stateCapable, from source.Position) error {
 	// 按表暂停的过滤包在**映射之后**（paused_tables 的 key 是目标端裸表名）。
-	// 暂停存储没绑上时 pauseSink 原样透传——MySQL 目标端从 PR #95 起就有这套存储了。
+	// `pauseReg` 为 nil 时 pauseSink 原样透传：MySQL 目标端暂不绑（见 prepareGeneric 的说明）。
 	mapped := newRefMappedSink(r.gsink, r.targetRef)
 	b := newBatcher(newPauseSink(mapped, r), r.src, r.doc, r.batchRows(), r.batchDelay(), from,
 		func(rows int64, pos source.Position) {
@@ -626,7 +630,9 @@ func (r *runner) streamGeneric(ctx context.Context, st stateCapable, from source
 			if idleHit.Load() {
 				code = ExitOK
 			}
-		case errors.Is(streamErr, context.Canceled) || isUserStop(ctx, streamErr):
+		case (errors.Is(streamErr, context.Canceled) || isUserStop(ctx, streamErr)) && isLocalClose(streamErr):
+			// 与 engine.go 那条同一口径：`isUserStop` 只看「父 ctx 被取消」，不看错误形状。
+			// 用户按 Ctrl-C 撞上一条真错误时，只判前者会把真错误记成「已停止」。
 			code = ExitStopped
 			if idleHit.Load() {
 				code = ExitOK

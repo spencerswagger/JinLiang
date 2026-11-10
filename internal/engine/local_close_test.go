@@ -22,7 +22,6 @@ func TestIsLocalCloseAcceptsOurOwnCancel(t *testing.T) {
 		net.ErrClosed,
 		errors.New("read tcp 127.0.0.1:3306: use of closed network connection"),
 		errors.New("connection is closed"),
-		errors.New("EOF"),
 	}
 	for _, err := range cases {
 		if !isLocalClose(err) {
