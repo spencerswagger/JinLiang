@@ -13,98 +13,208 @@ on:
 jobs:
   pg-matrix:
     # 每个 PG 大版本起一套真库，跑 verify/gc/doctor/remedy 的集成用例。
+    #
+    # 为什么不用 services 起 PG：B1 引擎要建逻辑书签，要求 wal_level=logical，而
+    # services 只能传环境变量、不能给容器加启动参数（默认 replica，会报
+    # "logical decoding requires wal_level >= logical" / SQLSTATE 55000）。
+    # 所以这里 docker run 显式带 `-c`，并且在跑用例前**断言**这些前提真的生效：
+    # 配漏了就当场红，不让它退化成某个用例里的神秘报错（更不许跳过）。
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         pg: ["10", "11", "12", "13", "14", "15", "16", "17", "18"]
     services:
-      postgres:
-        image: postgres:${{ matrix.pg }}
-        env:
-          POSTGRES_USER: jinliang
-          POSTGRES_PASSWORD: jinliang
-          POSTGRES_DB: jinliang_src
-        ports: ["5432:5432"]
-        options: >-
-          --health-cmd "pg_isready -U jinliang"
-          --health-interval 5s --health-timeout 5s --health-retries 30
-    env:
-      JINLIANG_TEST_PG_SRC_DSN: postgres://jinliang:jinliang@127.0.0.1:5432/jinliang_src?sslmode=disable
-      JINLIANG_TEST_PG_DSN: postgres://jinliang:jinliang@127.0.0.1:5432/jinliang_test?sslmode=disable
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: "1.27.x"
-      - name: 第二套库
-        run: |
-          set -e
-          PGPASSWORD=jinliang psql -h 127.0.0.1 -U jinliang -d jinliang_src -c 'CREATE DATABASE jinliang_test'
-      - name: PG ${{ matrix.pg }} 集成（verify/gc/doctor/remedy）
-        run: go test -tags=integration ./internal/verify ./internal/gc ./internal/doctor ./internal/remedy
-
-  mysql-matrix:
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        mysql: ["5.7", "8.0", "8.4", "9.4"]
-    services:
-      mysql:
-        image: mysql:${{ matrix.mysql }}
-        env:
-          MYSQL_ROOT_PASSWORD: root
-          MYSQL_USER: jinliang
-          MYSQL_PASSWORD: jinliang
-          MYSQL_DATABASE: jinliang_test
-        ports: ["3306:3306"]
-        options: >-
-          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -proot"
-          --health-interval 5s --health-timeout 5s --health-retries 40
-    env:
-      JINLIANG_TEST_MYSQL_DSN: mysql://jinliang:jinliang@127.0.0.1:3306/jinliang_test
-      JINLIANG_TEST_MYSQL_SRC_DSN: mysql://jinliang:jinliang@127.0.0.1:3306/jinliang_src
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: "1.27.x"
-      - name: 第二套库 + 复制权限
-        run: |
-          set -e
-          mysql -h 127.0.0.1 -uroot -proot -e "
-            CREATE DATABASE IF NOT EXISTS jinliang_src;
-            GRANT ALL PRIVILEGES ON jinliang_src.* TO 'jinliang'@'%';
-            GRANT REPLICATION CLIENT, REPLICATION SLAVE ON *.* TO 'jinliang'@'%';
-            FLUSH PRIVILEGES;"
-      - name: MySQL ${{ matrix.mysql }} 集成（mysqlsource/verify/doctor）
-        run: go test -tags=integration ./internal/mysqlsource ./internal/verify ./internal/doctor
-
-  integration:
-    # 一套 PG + 一套 MySQL，跑所有集成包（engine 的重搬用例也在这里）。
-    runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_USER: jinliang
-          POSTGRES_PASSWORD: jinliang
-          POSTGRES_DB: jinliang_src
-        ports: ["5432:5432"]
-        options: >-
-          --health-cmd "pg_isready -U jinliang"
-          --health-interval 5s --health-timeout 5s --health-retries 30
+      # verify / doctor 里有一半用例是 MySQL 侧（缺 DSN 会直接失败，不跳过），
+      # 所以 PG 矩阵 job 也要一套 MySQL；8.0 官方镜像默认 log_bin=ON。
       mysql:
         image: mysql:8.0
         env:
           MYSQL_ROOT_PASSWORD: root
           MYSQL_USER: jinliang
           MYSQL_PASSWORD: jinliang
-          MYSQL_DATABASE: jinliang_test
+          MYSQL_DATABASE: jinliang_src
         ports: ["3306:3306"]
         options: >-
-          --health-cmd "mysqladmin ping -h 127.0.0.1 -ujinliang -pjinliang"
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -proot"
+          --health-interval 5s --health-timeout 5s --health-retries 40
+    env:
+      JINLIANG_TEST_PG_SRC_DSN: postgres://jinliang:jinliang@127.0.0.1:5432/jinliang_src?sslmode=disable
+      JINLIANG_TEST_PG_DSN: postgres://jinliang:jinliang@127.0.0.1:5432/jinliang_test?sslmode=disable
+      JINLIANG_TEST_MYSQL_SRC_DSN: mysql://jinliang:jinliang@127.0.0.1:3306/jinliang_src
+      JINLIANG_TEST_MYSQL_DSN: mysql://jinliang:jinliang@127.0.0.1:3306/jinliang_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.x"
+      - name: 起 PostgreSQL ${{ matrix.pg }}（wal_level=logical）
+        run: |
+          set -euo pipefail
+          docker run -d --name pg-src \
+            -e POSTGRES_USER=jinliang -e POSTGRES_PASSWORD=jinliang -e POSTGRES_DB=jinliang_src \
+            -p 5432:5432 postgres:${{ matrix.pg }} \
+            -c wal_level=logical -c max_replication_slots=40 -c max_wal_senders=40
+          # 不能只等 pg_isready：initdb 期间会先起一个临时实例应答，随后重启，
+          # 紧接着的 psql 会撞上 "the database system is shutting down"。
+          # 直接轮询真查询，能查通才算起好（与 ci.yml 的 b1-engine 同一修法）。
+          ok=0
+          for _ in $(seq 1 90); do
+            if docker exec pg-src psql -U jinliang -d postgres -tAc "select 1" >/dev/null 2>&1; then ok=1; break; fi
+            sleep 2
+          done
+          [ "$ok" = 1 ] || { echo "--- pg-src 没起来 ---"; docker logs pg-src; exit 1; }
+      - name: 断言数据库前提（配漏了就红）
+        run: |
+          set -euo pipefail
+          fail() { echo "❌ 缺数据库前提：$*"; exit 1; }
+
+          wl=$(docker exec pg-src psql -U jinliang -d postgres -tAc "show wal_level")
+          slots=$(docker exec pg-src psql -U jinliang -d postgres -tAc "show max_replication_slots")
+          senders=$(docker exec pg-src psql -U jinliang -d postgres -tAc "show max_wal_senders")
+          echo "PG ${{ matrix.pg }}: wal_level=$wl max_replication_slots=$slots max_wal_senders=$senders"
+          [ "$wl" = "logical" ] || fail "PG 的 wal_level=$wl（要 logical）：B1 引擎建逻辑书签会报 SQLSTATE 55000。services 传不了启动参数，必须 docker run … -c wal_level=logical"
+          [ "$slots" -ge 20 ] || fail "max_replication_slots=$slots（要 ≥20）：多任务同时建书签会撞上限"
+          [ "$senders" -ge 20 ] || fail "max_wal_senders=$senders（要 ≥20）"
+
+          logbin=$(mysql -h 127.0.0.1 -uroot -proot -N -B -e "select @@log_bin")
+          fmt=$(mysql -h 127.0.0.1 -uroot -proot -N -B -e "select @@binlog_format")
+          img=$(mysql -h 127.0.0.1 -uroot -proot -N -B -e "select @@binlog_row_image")
+          echo "MySQL: log_bin=$logbin binlog_format=$fmt binlog_row_image=$img"
+          [ "$logbin" = "1" ] || fail "MySQL log_bin=$logbin（要 1）：没有 binlog 就没有变更流水"
+          [ "$fmt" = "ROW" ] || fail "MySQL binlog_format=$fmt（要 ROW）"
+          [ "$img" = "FULL" ] || fail "MySQL binlog_row_image=$img（要 FULL）"
+      - name: 第二套库 + 复制权限
+        run: |
+          set -euo pipefail
+          docker exec pg-src psql -U jinliang -d jinliang_src -c 'CREATE DATABASE jinliang_test'
+          mysql -h 127.0.0.1 -uroot -proot -e "
+            CREATE DATABASE IF NOT EXISTS jinliang_test;
+            GRANT ALL PRIVILEGES ON jinliang_src.* TO 'jinliang'@'%';
+            GRANT ALL PRIVILEGES ON jinliang_test.* TO 'jinliang'@'%';
+            GRANT REPLICATION CLIENT, REPLICATION SLAVE ON *.* TO 'jinliang'@'%';
+            FLUSH PRIVILEGES;"
+      - name: PG ${{ matrix.pg }} 集成（verify/gc/doctor/remedy）
+        # -v 让日志里有用例名；日志里出现 --- SKIP 就按失败处理（跳过＝没验）。
+        run: |
+          set -euo pipefail
+          go test -tags=integration -count=1 -v ./internal/verify ./internal/gc ./internal/doctor ./internal/remedy 2>&1 | tee /tmp/go-test.log
+          if grep -qE '^[[:space:]]*--- SKIP' /tmp/go-test.log; then
+            echo "❌ 有用例被跳过（--- SKIP）：缺前提就是失败，不许静默通过"
+            grep -E '^[[:space:]]*--- SKIP' /tmp/go-test.log
+            exit 1
+          fi
+
+  mysql-matrix:
+    # MySQL 源矩阵：5.7 / 8.0 / 8.4 / 9.4 各起一套真库。
+    #
+    # 也不用 services：5.7 官方镜像默认 log_bin=OFF，而 services 没法给容器追加
+    # mysqld 参数。这里 docker run 把源库该开的开关写清楚，并在跑用例前断言
+    # （与 .github/workflows/mysql-matrix.yml 同一套参数）。
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mysql: ["5.7", "8.0", "8.4", "9.4"]
+    env:
+      JINLIANG_TEST_MYSQL_DSN: mysql://jinliang:jinliang@127.0.0.1:3306/jinliang_test
+      JINLIANG_TEST_MYSQL_SRC_DSN: mysql://jinliang:jinliang@127.0.0.1:3306/jinliang_src
+      # verify / doctor 里有 PG 侧用例（缺 DSN 直接失败），这个 job 也要一套 PG。
+      JINLIANG_TEST_PG_SRC_DSN: postgres://jinliang:jinliang@127.0.0.1:5432/jinliang_src?sslmode=disable
+      JINLIANG_TEST_PG_DSN: postgres://jinliang:jinliang@127.0.0.1:5432/jinliang_test?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.x"
+      - name: 起 MySQL ${{ matrix.mysql }}（binlog ROW + FULL 行镜像）
+        run: |
+          set -euo pipefail
+          docker run -d --name my-src -p 3306:3306 \
+            -e MYSQL_ROOT_PASSWORD=root \
+            -e MYSQL_DATABASE=jinliang_src \
+            -e MYSQL_USER=jinliang \
+            -e MYSQL_PASSWORD=jinliang \
+            mysql:${{ matrix.mysql }} \
+            --server-id=1 \
+            --log-bin=mysql-bin \
+            --binlog-format=ROW \
+            --binlog-row-image=FULL
+          ok=0
+          for i in $(seq 1 90); do
+            if mysqladmin ping -h 127.0.0.1 -uroot -proot --silent 2>/dev/null; then ok=1; break; fi
+            sleep 2
+          done
+          [ "$ok" = 1 ] || { echo "--- my-src 没起来 ---"; docker logs my-src; exit 1; }
+      - name: 起 PostgreSQL 16（wal_level=logical）
+        run: |
+          set -euo pipefail
+          docker run -d --name pg-src \
+            -e POSTGRES_USER=jinliang -e POSTGRES_PASSWORD=jinliang -e POSTGRES_DB=jinliang_src \
+            -p 5432:5432 postgres:16 \
+            -c wal_level=logical -c max_replication_slots=40 -c max_wal_senders=40
+          ok=0
+          for _ in $(seq 1 90); do
+            if docker exec pg-src psql -U jinliang -d postgres -tAc "select 1" >/dev/null 2>&1; then ok=1; break; fi
+            sleep 2
+          done
+          [ "$ok" = 1 ] || { echo "--- pg-src 没起来 ---"; docker logs pg-src; exit 1; }
+      - name: 断言数据库前提（配漏了就红）
+        run: |
+          set -euo pipefail
+          fail() { echo "❌ 缺数据库前提：$*"; exit 1; }
+
+          logbin=$(mysql -h 127.0.0.1 -uroot -proot -N -B -e "select @@log_bin")
+          fmt=$(mysql -h 127.0.0.1 -uroot -proot -N -B -e "select @@binlog_format")
+          img=$(mysql -h 127.0.0.1 -uroot -proot -N -B -e "select @@binlog_row_image")
+          sid=$(mysql -h 127.0.0.1 -uroot -proot -N -B -e "select @@server_id")
+          echo "MySQL ${{ matrix.mysql }}: log_bin=$logbin binlog_format=$fmt binlog_row_image=$img server_id=$sid"
+          [ "$logbin" = "1" ] || fail "MySQL ${{ matrix.mysql }} 的 log_bin=$logbin（要 1）：5.7 默认关闭，必须 docker run 带 --log-bin"
+          [ "$fmt" = "ROW" ] || fail "MySQL 的 binlog_format=$fmt（要 ROW）"
+          [ "$img" = "FULL" ] || fail "MySQL 的 binlog_row_image=$img（要 FULL）"
+          [ "$sid" != "0" ] || fail "MySQL 的 server_id=0：binlog 事件没法归组"
+
+          wl=$(docker exec pg-src psql -U jinliang -d postgres -tAc "show wal_level")
+          echo "PG: wal_level=$wl"
+          [ "$wl" = "logical" ] || fail "PG 的 wal_level=$wl（要 logical）"
+      - name: 第二套库 + 复制权限
+        run: |
+          set -euo pipefail
+          mysql -h 127.0.0.1 -uroot -proot -e "
+            CREATE DATABASE IF NOT EXISTS jinliang_test;
+            GRANT ALL PRIVILEGES ON jinliang_src.* TO 'jinliang'@'%';
+            GRANT ALL PRIVILEGES ON jinliang_test.* TO 'jinliang'@'%';
+            GRANT REPLICATION CLIENT, REPLICATION SLAVE ON *.* TO 'jinliang'@'%';
+            FLUSH PRIVILEGES;"
+          docker exec pg-src psql -U jinliang -d jinliang_src -c 'CREATE DATABASE jinliang_test'
+      - name: MySQL ${{ matrix.mysql }} 集成（mysqlsource/verify/doctor）
+        # -v 让日志里有用例名；日志里出现 --- SKIP 就按失败处理（跳过＝没验）。
+        run: |
+          set -euo pipefail
+          go test -tags=integration -count=1 -v ./internal/mysqlsource ./internal/verify ./internal/doctor 2>&1 | tee /tmp/go-test.log
+          if grep -qE '^[[:space:]]*--- SKIP' /tmp/go-test.log; then
+            echo "❌ 有用例被跳过（--- SKIP）：缺前提就是失败，不许静默通过"
+            grep -E '^[[:space:]]*--- SKIP' /tmp/go-test.log
+            exit 1
+          fi
+
+  integration:
+    # 一套 PG + 一套 MySQL，跑所有集成包（engine 的重搬用例也在这里）。
+    #
+    # PG 仍用 docker run 而不是 services：engine 的逻辑书签要 wal_level=logical，
+    # services 传不了启动参数（这就是 nightly 长期红的原因）。
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_USER: jinliang
+          MYSQL_PASSWORD: jinliang
+          MYSQL_DATABASE: jinliang_src
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -proot"
           --health-interval 5s --health-timeout 5s --health-retries 40
     env:
       JINLIANG_TEST_PG_SRC_DSN: postgres://jinliang:jinliang@127.0.0.1:5432/jinliang_src?sslmode=disable
@@ -116,40 +226,78 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: "1.27.x"
+      - name: 起 PostgreSQL 16（wal_level=logical）
+        run: |
+          set -euo pipefail
+          docker run -d --name pg-src \
+            -e POSTGRES_USER=jinliang -e POSTGRES_PASSWORD=jinliang -e POSTGRES_DB=jinliang_src \
+            -p 5432:5432 postgres:16 \
+            -c wal_level=logical -c max_replication_slots=40 -c max_wal_senders=40
+          # 不能只等 pg_isready：initdb 期间会先起一个临时实例应答，随后重启，
+          # 紧接着的 psql 会撞上 "the database system is shutting down"。
+          ok=0
+          for _ in $(seq 1 90); do
+            if docker exec pg-src psql -U jinliang -d postgres -tAc "select 1" >/dev/null 2>&1; then ok=1; break; fi
+            sleep 2
+          done
+          [ "$ok" = 1 ] || { echo "--- pg-src 没起来 ---"; docker logs pg-src; exit 1; }
+      - name: 断言数据库前提（配漏了就红）
+        run: |
+          set -euo pipefail
+          fail() { echo "❌ 缺数据库前提：$*"; exit 1; }
+
+          wl=$(docker exec pg-src psql -U jinliang -d postgres -tAc "show wal_level")
+          slots=$(docker exec pg-src psql -U jinliang -d postgres -tAc "show max_replication_slots")
+          senders=$(docker exec pg-src psql -U jinliang -d postgres -tAc "show max_wal_senders")
+          echo "PG: wal_level=$wl max_replication_slots=$slots max_wal_senders=$senders"
+          [ "$wl" = "logical" ] || fail "PG 的 wal_level=$wl（要 logical）：engine 建逻辑书签会报 SQLSTATE 55000"
+          [ "$slots" -ge 20 ] || fail "max_replication_slots=$slots（要 ≥20）"
+          [ "$senders" -ge 20 ] || fail "max_wal_senders=$senders（要 ≥20）"
+
+          logbin=$(mysql -h 127.0.0.1 -uroot -proot -N -B -e "select @@log_bin")
+          fmt=$(mysql -h 127.0.0.1 -uroot -proot -N -B -e "select @@binlog_format")
+          img=$(mysql -h 127.0.0.1 -uroot -proot -N -B -e "select @@binlog_row_image")
+          echo "MySQL: log_bin=$logbin binlog_format=$fmt binlog_row_image=$img"
+          [ "$logbin" = "1" ] || fail "MySQL log_bin=$logbin（要 1）"
+          [ "$fmt" = "ROW" ] || fail "MySQL binlog_format=$fmt（要 ROW）"
+          [ "$img" = "FULL" ] || fail "MySQL binlog_row_image=$img（要 FULL）"
       - name: 准备两套库
         run: |
-          set -e
-          PGPASSWORD=jinliang psql -h 127.0.0.1 -U jinliang -d jinliang_src -c 'CREATE DATABASE jinliang_test'
+          set -euo pipefail
+          docker exec pg-src psql -U jinliang -d jinliang_src -c 'CREATE DATABASE jinliang_test'
           mysql -h 127.0.0.1 -uroot -proot -e "
-            CREATE DATABASE IF NOT EXISTS jinliang_src;
+            CREATE DATABASE IF NOT EXISTS jinliang_test;
             GRANT ALL PRIVILEGES ON jinliang_src.* TO 'jinliang'@'%';
+            GRANT ALL PRIVILEGES ON jinliang_test.* TO 'jinliang'@'%';
             GRANT REPLICATION CLIENT, REPLICATION SLAVE ON *.* TO 'jinliang'@'%';
             FLUSH PRIVILEGES;"
       - name: 全量集成（含 engine / mysqlsource）
         # 资源隔离（不是 -p 1）：mysqlsource 的 Snapshot 枚举整个源库；mysqlsink、
         # engine、pgsink 各自在 public 里建/删 _jl_* 状态表，彼此会抢；verify/gc/
         # doctor/remedy 用独立 schema，可以并行。
+        #
+        # 每条命令都过 runOne：-v 让日志里有用例名，跑完再查一遍有没有 --- SKIP。
+        # 跳过＝没验（#75 的教训：Skip 让缺口静默通过），所以有一处 SKIP 就整步失败。
         run: |
-          set -e
-          go test -tags=integration ./internal/mysqlsource
-          go test -tags=integration ./internal/mysqlsink
-          go test -tags=integration ./internal/engine
-          go test -tags=integration ./internal/pgsink
-          go test -tags=integration ./internal/verify ./internal/gc ./internal/doctor ./internal/remedy
+          set -euo pipefail
+          runOne() {
+            go test -tags=integration -count=1 -v "$@" 2>&1 | tee /tmp/go-test.log
+            if grep -qE '^[[:space:]]*--- SKIP' /tmp/go-test.log; then
+              echo "❌ 有用例被跳过（--- SKIP）：缺前提就是失败，不许静默通过"
+              grep -E '^[[:space:]]*--- SKIP' /tmp/go-test.log
+              return 1
+            fi
+          }
+          runOne ./internal/mysqlsource
+          runOne ./internal/mysqlsink
+          runOne ./internal/engine
+          runOne ./internal/pgsink
+          runOne ./internal/verify ./internal/gc ./internal/doctor ./internal/remedy
 
   bench:
+    # 性能基线。PG 也用 docker run：与集成 job 保持同一套前提（wal_level=logical），
+    # 免得「换了个 job 就跑在另一套配置上」这种隐性差异。
     runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_USER: jinliang
-          POSTGRES_PASSWORD: jinliang
-          POSTGRES_DB: jinliang_src
-        ports: ["5432:5432"]
-        options: >-
-          --health-cmd "pg_isready -U jinliang"
-          --health-interval 5s --health-timeout 5s --health-retries 30
     env:
       JINLIANG_TEST_PG_DSN: "postgres://jinliang:jinliang@127.0.0.1:5432/jinliang_test?sslmode=disable"
     steps:
@@ -157,10 +305,26 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: "1.27.x"
+      - name: 起 PostgreSQL 16（wal_level=logical）
+        run: |
+          set -euo pipefail
+          docker run -d --name pg-src \
+            -e POSTGRES_USER=jinliang -e POSTGRES_PASSWORD=jinliang -e POSTGRES_DB=jinliang_src \
+            -p 5432:5432 postgres:16 \
+            -c wal_level=logical -c max_replication_slots=40 -c max_wal_senders=40
+          ok=0
+          for _ in $(seq 1 90); do
+            if docker exec pg-src psql -U jinliang -d postgres -tAc "select 1" >/dev/null 2>&1; then ok=1; break; fi
+            sleep 2
+          done
+          [ "$ok" = 1 ] || { echo "--- pg-src 没起来 ---"; docker logs pg-src; exit 1; }
+          wl=$(docker exec pg-src psql -U jinliang -d postgres -tAc "show wal_level")
+          echo "PG: wal_level=$wl"
+          [ "$wl" = "logical" ] || { echo "❌ PG 的 wal_level=$wl（要 logical）"; exit 1; }
       - name: 第二套库
         run: |
-          set -e
-          PGPASSWORD=jinliang psql -h 127.0.0.1 -U jinliang -d jinliang_src -c 'CREATE DATABASE jinliang_test'
+          set -euo pipefail
+          docker exec pg-src psql -U jinliang -d jinliang_src -c 'CREATE DATABASE jinliang_test'
       - name: 性能基线（不达标即红）
         run: scripts/bench.sh --enforce --out bench/latest.json
       - uses: actions/upload-artifact@v4
