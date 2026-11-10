@@ -63,6 +63,7 @@ step "gate_checks selftest" python3 "$ROOT/scripts/gate_checks.py" selftest
 # 已知红必须收口：台账由 scripts/known_red.py 维护，输出里永远打印倒计时清单，
 # 实现落地了却还挂着 continue-on-error 就直接判 1（「断言未激活」）。
 step "known-red 台账（已知红收口）" python3 "$ROOT/scripts/known_red.py" check
+step "known-red 判据自检（四种世界 + fixture 场景）" python3 "$ROOT/scripts/known_red.py" selftest
 step "review_gate_logic selftest" python3 "$ROOT/scripts/review_gate_logic.py" selftest
 step "mutation: logic 档" python3 "$ROOT/scripts/mutation_gate.py" --tier logic
 if [ "$DB" = 1 ]; then

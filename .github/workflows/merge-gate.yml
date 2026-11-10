@@ -297,12 +297,18 @@ jobs:
         env: *m2m-env
         run: timeout -k 10 900 bash scripts/b1_mysql_to_mysql.sh ./dist/jinliang kill
       - name: 块级续跑（块进度 > 0 且重启重搬 ≤ 1 块）
+        id: killcopy
         # ⚠ 已知红，**有台账**：scripts/known_red.py 的 mysqlsink-chunk-accounting
         # （责任人 Data / 转绿用例 b1_mysql_to_mysql.sh killcopy / 移除条件：mysqlsink 写 _jl_chunk）。
         # 台账每天对账：实现落地了这一步还挂着 continue-on-error，门禁会直接判 1（断言未激活）。
         continue-on-error: true
         env: *m2m-env
         run: timeout -k 10 900 bash scripts/b1_mysql_to_mysql.sh ./dist/jinliang killcopy
+      - name: 已知红台账对账（实现能过了但断言还挂着 → 拦）
+        if: always()
+        # 用**这一步的真实 outcome** 判「实现落地没有」：success = 能过了 = 该把断言打开。
+        # 只看静态代码（有没有写 _jl_chunk）会误判：#95 落了块记账，但续跑接线还没接。
+        run: python3 scripts/known_red.py verify --id mysqlsink-chunk-accounting --result "${{ steps.killcopy.outcome }}"
       - name: 结果进 job summary
         if: always()
         run: |

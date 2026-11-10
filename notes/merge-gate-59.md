@@ -252,7 +252,26 @@ scripts/local_stack.sh down
 
 - **门禁输出里可见**：`merge_gate.sh` 每次都在结论表之前打印「⚠ known-red 未收的账」表
   （步骤 / 责任人 / 转绿用例 / 移除条件 / 现状），不埋在 YAML、也不只躺在日志里。
-- **能自证**：注入项 `known-red-stale-suspended` —— 往 `internal/mysqlsink` 里塞一条
-  「写 `_jl_chunk`」的痕迹（模拟实现已落地），台账立刻判 `断言未激活`，`known_red.py check`
-  退出 1，注入框架记为 **KILLED**。这条不用等 Data/Core 真合入就能证明「机制会红」。
+- **能自证**：注入项 `known-red-stale-suspended` —— 把 `classify` 的「已落地 + 仍挂起」判据改松，
+  `known_red.py selftest` 立刻红（含 fixture 场景「步骤仍挂起 + 检测器 outcome=success → 判 1」），
+  注入框架记为 **KILLED**。
+- **真红过一次（不是推演）**：run `42893465770` 的 logic job 直接判红，原文
+  `❌ 实现已落地；步骤仍挂起 — 断言未激活（…）：chunk.go 里已经有写 _jl_chunk 的动作`。
+  这次是**真的**：#95（Data 的块记账）刚合入，而步骤还挂着 `continue-on-error` —— 台账按设计拦住了。
+
+**这次真红还暴露了一个判据缺陷（已修）**：用「静态代码里有没有写 `_jl_chunk`」当「实现落地」
+太粗——#95 只落了**记账**，引擎通用全量路径还没读块进度，行为仍然红（本地实测：`_jl_chunk` 2 行，
+重启仍搬 20000 行，重搬 4000 行 > 1 块）。所以判据改成**用检测器这一步的真实 outcome**：
+
+- `known_red.py verify --id <id> --result <success|failure>`：`success` 才等于「实现落地」；
+- 这个 `--result` 由 mysql-mysql job 的 `steps.killcopy.outcome` 提供（步骤本身带 `continue-on-error`，
+  `outcome` 仍是 `failure`，`conclusion` 才是 success —— 正好可用来区分「步骤挂起」与「检测器能过」）；
+- logic job 里对这类「要真库」的已知红只打提示（`由 mysql-mysql job 的 verify 步骤对账`），不判死。
+
+当前两格状态（2026-11-11 00:20）：
+
+| 步骤 | 实现 | 步骤 | 状态 |
+|---|---|---|---|
+| killcopy | ① 块记账已落（#95）；② 续跑接线**未落**（重启仍整轮重搬） | 仍挂起 | ✅ 合法已知红 |
+| late-error | 未修（knownred 用例仍红） | 仍挂起 | ✅ 合法已知红 |
 - 三元组失联也会红：步骤名改了/删了，`step_suspended` 找不到 → 判失败（台账与 YAML 失联）。

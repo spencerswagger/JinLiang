@@ -37,8 +37,10 @@ REGISTRY = [
         step="块级续跑（块进度 > 0 且重启重搬 ≤ 1 块）",
         owner="Data",
         detector="scripts/b1_mysql_to_mysql.sh killcopy（_jl_chunk > 0 且重启重搬 ≤ 1 块）",
-        unblock="mysqlsink 在全量搬到 MySQL 目标端时写 `_jl_chunk`；合入后删掉该步骤的 continue-on-error",
-        probe="mysqlsink-writes-chunks",
+        unblock="① mysqlsink 写 `_jl_chunk`（#95 已落，`internal/mysqlsink/chunk.go`）；"
+                "② 引擎通用全量路径读块进度，让「重启重搬」≤1 块（续跑接线）。"
+                "两条都在主干后，删掉该步骤的 continue-on-error",
+        probe="job:mysql-mysql",
     ),
     dict(
         id="stop-swallow-late-error",
@@ -160,6 +162,11 @@ def check(only=None, workflow=None, probes=None):
         if only and e["id"] != only:
             continue
         found, suspended = step_suspended(doc, e["step"], text)
+        if e["probe"].startswith("job:"):
+            rows.append((e, None, suspended,
+                         "由 %s job 的 verify 步骤对账（%s）" % (e["probe"][4:], "步骤仍挂起" if suspended else "步骤已激活"),
+                         True))
+            continue
         if not found:
             rows.append((e, False, False, "步骤不在工作流里（台账与 YAML 失联）", False))
             bad += 1
@@ -199,6 +206,9 @@ SELFTEST = [
 ]
 
 
+FIXTURE = os.path.join(ROOT, "scripts/testdata/known-red-suspended.yml")
+
+
 def selftest():
     bad = 0
     for name, landed, suspended, want in SELFTEST:
@@ -209,11 +219,54 @@ def selftest():
                   (name, "通过" if want else "拦截", "通过" if ok else "拦截", why))
         else:
             print("selftest: ok   %s" % name)
+    # 端到端那条：fixture 里步骤仍挂起 + 检测器 outcome=success（= 实现已落地）→ 必须判 1。
+    # 这是任务要求的「构造一次『实现已落地 + 步骤仍挂起』的场景，门禁必须红」的自证。
+    rc_hit = verify("mysqlsink-chunk-accounting", "success", workflow=FIXTURE, quiet=True)
+    rc_ok = verify("mysqlsink-chunk-accounting", "failure", workflow=FIXTURE, quiet=True)
+    if rc_hit != 1:
+        bad += 1
+        print("selftest: FAIL 已落地 + 仍挂起 —— 应判 1，实际 %d" % rc_hit)
+    else:
+        print("selftest: ok   已落地 + 仍挂起 = 门禁红（fixture）")
+    if rc_ok != 0:
+        bad += 1
+        print("selftest: FAIL 仍红 + 仍挂起 —— 应放行，实际 %d" % rc_ok)
+    else:
+        print("selftest: ok   仍红 + 仍挂起 = 放行（fixture）")
     if bad:
-        print("selftest: %d/%d 条不符合预期" % (bad, len(SELFTEST)))
+        print("selftest: %d 条不符合预期" % bad)
         return 1
-    print("selftest: %d 条判据全部符合预期" % len(SELFTEST))
+    print("selftest: %d 条判据全部符合预期" % (len(SELFTEST) + 2))
     return 0
+
+
+def verify(entry_id, result, workflow=None, text=None, quiet=False):
+    """由 DB job 用「检测器这一步的 outcome」对账：success = 实现已落地。"""
+    e = next((x for x in REGISTRY if x["id"] == entry_id), None)
+    if e is None:
+        print("known-red: 台账里没有 %r" % entry_id, file=sys.stderr)
+        return 2
+    workflow = workflow or WORKFLOW
+    yaml = _yaml()
+    with open(workflow, encoding="utf-8") as f:
+        wt = f.read()
+    doc = yaml.safe_load(wt) if yaml else None
+    found, suspended = step_suspended(doc, e["step"], wt)
+    if not found:
+        print("known-red: 步骤 %r 不在 %s 里（台账与 YAML 失联）" % (e["step"], workflow), file=sys.stderr)
+        return 1
+    landed = (result or "").strip() == "success"
+    ok, verdict = classify(landed, suspended)
+    if quiet:
+        return 0 if ok else 1
+    print("known-red[%s]：检测器 outcome=%s（%s），步骤%s → %s" %
+          (entry_id, result, "实现已落地" if landed else "仍红",
+           "仍挂起 continue-on-error" if suspended else "已激活", verdict))
+    if landed and suspended:
+        print("  ↑ 实现已经能过，断言还挂着：把这一步的 continue-on-error 删掉（责任人 %s）" % e["owner"])
+    if ok:
+        return 0
+    return 1
 
 
 def main(argv):
@@ -223,6 +276,10 @@ def main(argv):
     p = sub.add_parser("check")
     p.add_argument("--only", default="")
     p.add_argument("--workflow", default="")
+    q = sub.add_parser("verify")
+    q.add_argument("--id", required=True)
+    q.add_argument("--result", required=True, help="检测器这一步的 outcome：success / failure")
+    q.add_argument("--workflow", default="")
     sub.add_parser("selftest")
     a = ap.parse_args(argv)
     if a.cmd == "selftest":
@@ -231,6 +288,9 @@ def main(argv):
         return check()
     if a.cmd == "check":
         return check(only=a.only or None, workflow=a.workflow or None)
+    if a.cmd == "verify":
+        # verify 必须看**真实工作流**（或显式给的 fixture），不接受「没有 continue-on-error 的假文件」
+        return verify(a.id, a.result, workflow=a.workflow or None)
     ap.print_help()
     return 2
 

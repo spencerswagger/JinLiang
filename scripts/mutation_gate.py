@@ -91,13 +91,12 @@ MUTATIONS = [
     dict(
         name="known-red-stale-suspended",
         tier="logic",
-        file="internal/mysqlsink/state.go",
-        find="func (s *Sink) DoneChunks(",
-        replace="// 注入：假装块记账已经实现（INSERT INTO `_jl_chunk`），但 CI 步骤还挂着 continue-on-error\n" +
-                "func (s *Sink) DoneChunks(",
-        cmd=[sys.executable, "scripts/known_red.py", "check", "--only", "mysqlsink-chunk-accounting"],
-        signal="known_red.py check 退出 1（实现已落地 + 步骤仍挂起 = 断言未激活）",
-        note="模拟「实现已在主干但断言没打开」",
+        file="scripts/known_red.py",
+        find='    if landed and suspended:\n        return False, "断言未激活（实现已落地，步骤还挂着 continue-on-error）"',
+        replace='    if False and landed and suspended:  # SABOTAGE: 实现落地也放行\n        return False, "断言未激活（实现已落地，步骤还挂着 continue-on-error）"',
+        cmd=[sys.executable, "scripts/known_red.py", "selftest"],
+        signal="selftest 退出 1（「实现已落地 + 步骤仍挂起」那条必须红）",
+        note="模拟「实现已在主干但断言没打开」：判据被改松时 selftest 必须红",
     ),
     dict(
         name="review-deny-word-weakened",
