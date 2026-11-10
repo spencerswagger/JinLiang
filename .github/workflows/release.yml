@@ -1,6 +1,6 @@
 name: release
 
-# release 门禁（打 tag 时）：性能回归对比 + 二进制体积 + 覆盖度门槛。
+# release 门禁（打 tag 时）：三平台编译 + 性能回归对比 + 二进制体积 + 覆盖度门槛。
 # 与 nightly 的区别：nightly 收集基线，release 用仓库里的 bench/baseline.json
 # 做回归对比（>15% 变差即红；CPU 型号不同时只查绝对阈值并警告）。
 on:
@@ -8,6 +8,26 @@ on:
     tags: ["v*"]
 
 jobs:
+  cross-compile:
+    # 打 tag 前先把三平台编译真跑一遍（约 80s）。为什么放在 release 里：
+    # 被 tag 的 commit 理论上已经在 main 上过了 `ci` 的 cross-compile，但「理论上」靠人记性——
+    # 从特性分支直接打 tag、或 tag 打了没跑过 CI 的 commit，就会发出一个 arm64/darwin 编不过的版本。
+    # 这段与 ci.yml 的 cross-compile job 逐字相同，改一处要同步另一处。
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.x"
+          cache: true
+      - name: 交叉编译（linux/amd64, linux/arm64, darwin/arm64）
+        run: |
+          set -euo pipefail
+          for target in linux/amd64 linux/arm64 darwin/arm64; do
+            echo "building $target"
+            CGO_ENABLED=0 GOOS=${target%/*} GOARCH=${target#*/} go build -trimpath -o /dev/null ./cmd/jinliang
+          done
+
   coverage:
     runs-on: ubuntu-latest
     steps:
