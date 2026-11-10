@@ -809,6 +809,19 @@ func (r *runner) prepare(ctx context.Context) error {
 	if err := sink.EnsureMeta(ctx, hashOf(r.doc), "", "", ""); err != nil {
 		return fmt.Errorf("写入任务状态行失败: %w", err)
 	}
+	// 暂停记录读在 **EnsureMeta 之后、EnsureSchema 之前**（契约 §1.2）：
+	//   - 之后：状态行得先存在，否则读不到那一列；
+	//   - 之前：写路径的暂停快检必须在**第一次写入前**就绪——EnsureSchema 本身可能写行，
+	//     而 cleanBeforeRecopy 之后才读就已经晚了（那时表可能已经被清过一轮）。
+	// 只读一次：写路径每批都要判定，不能每批查库；这一列只在本轮 prepare 与
+	// 「某表搬成」两处变化。**顺序还有一条硬的：EnsureSchema 必须早于 cleanBeforeRecopy**
+	//（否则会「先清空、后报结构不对」）。三条一起看，这段位置就是唯一正确的。
+	if err := sink.LoadPausedTables(ctx); err != nil {
+		return err
+	}
+	if sink.PausedDirty() {
+		r.note(ctx, "目标端的暂停表记录不是合法 JSON：本轮按「没有暂停」继续（不影响同步）")
+	}
 	// 建表要用**目标端**的表定义（schema 换成目标端的）：源端 catalog 里的
 	// schema 是源库名（MySQL 源就是库名），直接拿去建表会变成「目标端没有这个 schema」。
 	// **顺序有要求：EnsureSchema 必须早于 snapshot() 里的 cleanBeforeRecopy。**
@@ -823,16 +836,6 @@ func (r *runner) prepare(ctx context.Context) error {
 	for _, a := range actions {
 		r.emit(ctx, control.Event{Type: "note", Message: a.What})
 	}
-	// 暂停记录要在 **EnsureSchema 判定之后** 读（它可能刚把结构对齐/建表改过），
-	// 且在 cleanBeforeRecopy **之前**（契约：清表不清记录）。只读一次：写路径每批
-	// 都要判定，不能每批查库；而这一列只在本轮 prepare 与「某表搬成」两处变化。
-	if err := sink.LoadPausedTables(ctx); err != nil {
-		return err
-	}
-	if sink.PausedDirty() {
-		r.note(ctx, "目标端的暂停表记录不是合法 JSON：本轮按「没有暂停」继续（不影响同步）")
-	}
-
 	src, err := r.openSource(ctx)
 	if err != nil {
 		return err
