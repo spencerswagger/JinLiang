@@ -1148,3 +1148,216 @@ func onceJobSingleTable(t *testing.T, srcDSN, dstDSN, name, table string) (*cont
 	}
 	return store, job.ID
 }
+
+// EnsureSchema 必须早于 cleanBeforeRecopy：清表要清的表得先存在。
+//
+// 构造：目标端**表不存在**，但状态行说「搬过、有位点」（老状态）→ 这一轮判成
+// 「从头搬 + 要清表」。顺序要是反了，清表这一步会撞 "relation does not exist"；
+// 顺序对了就是「先建表 → 再清（空表）→ 再搬」。
+func TestCleanRunsAfterEnsureSchema(t *testing.T) {
+	srcDSN, dstDSN := dsns(t)
+	srcDB := mustConn(t, srcDSN)
+	dstDB := mustConn(t, dstDSN)
+	table := "ensure_before_clean"
+	ctx := context.Background()
+
+	exec(t, srcDB, "DROP TABLE IF EXISTS "+table)
+	exec(t, srcDB, "CREATE TABLE "+table+" (id bigint PRIMARY KEY, payload text)")
+	exec(t, srcDB, "INSERT INTO "+table+" SELECT g,'r'||g FROM generate_series(1,200) g")
+
+	exec(t, dstDB, "DROP TABLE IF EXISTS "+table)
+	exec(t, dstDB, "DROP TABLE IF EXISTS _jl_meta, _jl_chunk, _jl_lease, _jl_object, _jl_instance")
+
+	store, jobID := onceJobSingleTable(t, srcDSN, dstDSN, "ensure-clean", table)
+	ensureStateTables(t, store, dstDSN, jobID)
+	job, err := store.GetJob(ctx, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 老状态：有位点、阶段说搬过，但块账一条都没有、目标表也不在。
+	exec(t, dstDB, `INSERT INTO _jl_meta (job_key,name,instance_id,phase,position)
+		VALUES ($1,$2,'test','streaming','postgres:v1:0/10')
+		ON CONFLICT (job_key) DO UPDATE SET phase='streaming', position='postgres:v1:0/10'`,
+		job.JobKey, job.Name)
+
+	// 前提不许含混：此刻目标表确实不存在、块账确实为空（否则这条用例测不到顺序）。
+	var tables0, markers0 int
+	if err := dstDB.QueryRow(ctx, `SELECT count(*) FROM information_schema.tables
+		WHERE table_schema='public' AND table_name=$1`, table).Scan(&tables0); err != nil {
+		t.Fatal(err)
+	}
+	if err := dstDB.QueryRow(ctx, `SELECT count(*) FROM _jl_chunk`).Scan(&markers0); err != nil {
+		t.Fatal(err)
+	}
+	if tables0 != 0 || markers0 != 0 {
+		t.Fatalf("前提不成立：目标表存在=%d、块账条数=%d（都应为 0）", tables0, markers0)
+	}
+
+	// 订阅事件：这一轮**必须真的清了表**，否则这条用例根本没走到那个顺序上。
+	ch, stopSub := store.Bus().Subscribe(jobID)
+	defer stopSub()
+	notes := make(chan string, 512)
+	go func() {
+		for ev := range ch {
+			if ev.Message != "" {
+				notes <- ev.Message
+			}
+		}
+	}()
+
+	if _, err := engine.Run(ctx, engine.Options{Store: store, JobID: jobID, SnapshotOnly: true}); err != nil {
+		t.Fatalf("目标表不存在但需要清表时，必须先 EnsureSchema 建表再清：%v", err)
+	}
+	close(notes)
+	cleaned := false
+	for msg := range notes {
+		if strings.Contains(msg, "清空了") {
+			cleaned = true
+		}
+	}
+	if !cleaned {
+		t.Fatal("这一轮应当清表（老状态 + 有位点 → 从头搬先清），事件里没有「清空了」")
+	}
+	var n int
+	if err := dstDB.QueryRow(ctx, "SELECT count(*) FROM "+table).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 200 {
+		t.Fatalf("应搬 200 行，得到 %d", n)
+	}
+	t.Logf("先建表再清表：目标表从「不存在」到 200 行，指纹 %s", tableFingerprint(t, dstDB, table))
+}
+
+// tableFingerprint 是这套用例通用的内容指纹（行数 + 内容哈希），两端同一条 SQL。
+func tableFingerprint(t *testing.T, conn *pgx.Conn, table string) string {
+	t.Helper()
+	var fp string
+	q := "SELECT count(*)::text || ':' || COALESCE(sum(hashtextextended(t::text,0)),0)::text FROM " + table + " t"
+	if err := conn.QueryRow(context.Background(), q).Scan(&fp); err != nil {
+		t.Fatalf("算 %s 的指纹失败: %v", table, err)
+	}
+	return fp
+}
+
+// columnType 读目标端列的 data_type（改类型前后各查一次，用来证明两端一致）。
+func columnType(t *testing.T, conn *pgx.Conn, table, col string) string {
+	t.Helper()
+	var typ string
+	if err := conn.QueryRow(context.Background(),
+		`SELECT data_type FROM information_schema.columns
+		 WHERE table_schema='public' AND table_name=$1 AND column_name=$2`,
+		table, col).Scan(&typ); err != nil {
+		t.Fatalf("读 %s.%s 的类型失败: %v", table, col, err)
+	}
+	return typ
+}
+
+// DDL 改类型这条路的端到端证据（A 切片：契约与引擎路径，不含按表暂停）。
+//
+// 走的是「错误文案给的那条路」：源端改类型 → 本版**明确拒绝**（E1015，点名表与原因码）
+// → 用户把目标端列类型改成与源端一致 → 重跑 → 两端类型一致、数据指纹一致 →
+// 之后的增/改/删照样追平。三件事各自有判据，缺一条这条用例就该红。
+func TestTypeChangeAlignThenIncrementalWorks(t *testing.T) {
+	srcDSN, dstDSN := dsns(t)
+	srcDB := mustConn(t, srcDSN)
+	dstDB := mustConn(t, dstDSN)
+	table := "type_align_inc"
+	ctx := context.Background()
+
+	exec(t, srcDB, "DROP TABLE IF EXISTS "+table)
+	exec(t, srcDB, "CREATE TABLE "+table+" (id bigint PRIMARY KEY, payload text, v bigint)")
+	exec(t, srcDB, "INSERT INTO "+table+" SELECT g,'r'||g,g FROM generate_series(1,1000) g")
+	exec(t, dstDB, "DROP TABLE IF EXISTS "+table)
+	exec(t, dstDB, "DROP TABLE IF EXISTS _jl_meta, _jl_chunk, _jl_lease, _jl_object, _jl_instance")
+
+	store, jobID := continuousJob(t, srcDSN, dstDSN, "type-align-inc", table)
+
+	// ① 首搬：两端列类型一致（改类型**前**的那一次）
+	if _, err := engine.Run(ctx, engine.Options{Store: store, JobID: jobID, SnapshotOnly: true}); err != nil {
+		t.Fatalf("首搬失败: %v", err)
+	}
+	srcType0, dstType0 := columnType(t, srcDB, table, "v"), columnType(t, dstDB, table, "v")
+	if srcType0 != dstType0 {
+		t.Fatalf("首搬后两端列类型应一致：源 %s / 目标 %s", srcType0, dstType0)
+	}
+	srcFP0 := tableFingerprint(t, srcDB, table)
+	if dstFP0 := tableFingerprint(t, dstDB, table); dstFP0 != srcFP0 {
+		t.Fatalf("首搬后指纹不一致：源 %s / 目标 %s", srcFP0, dstFP0)
+	}
+
+	// ② 源端改类型（bigint → numeric(12,2)）
+	exec(t, srcDB, "ALTER TABLE "+table+" ALTER COLUMN v TYPE numeric(12,2)")
+
+	// ③ 本版不跟随改类型：必须明确拒绝，且**同一个失败同一个原因码**（E1015 + 表名 + 原因码）
+	res, err := engine.Run(ctx, engine.Options{Store: store, JobID: jobID, SnapshotOnly: true})
+	if err == nil {
+		t.Fatal("源端改了列类型，本版不跟随：必须拒绝，不能静默按旧类型写")
+	}
+	run, gerr := store.GetRun(ctx, res.RunID)
+	if gerr != nil {
+		t.Fatal(gerr)
+	}
+	if run.Code != string(core.CodeSchemaMismatch) {
+		t.Fatalf("改类型应挂 %s，得到 %q；last_error=%s", core.CodeSchemaMismatch, run.Code, run.LastError)
+	}
+	for _, want := range []string{table, pgsink.PauseReasonTypeChanged} {
+		if !strings.Contains(run.LastError, want) {
+			t.Fatalf("last_error 应含 %q，得到：%s", want, run.LastError)
+		}
+	}
+
+	// ④ 按文案给的下一步：把目标端列类型改成与源端一致，再跑一次
+	exec(t, dstDB, "ALTER TABLE "+table+" ALTER COLUMN v TYPE numeric(12,2)")
+	if _, err := engine.Run(ctx, engine.Options{Store: store, JobID: jobID, SnapshotOnly: true}); err != nil {
+		t.Fatalf("两边类型对齐后重跑应成功: %v", err)
+	}
+	srcType1, dstType1 := columnType(t, srcDB, table, "v"), columnType(t, dstDB, table, "v")
+	if srcType1 != dstType1 {
+		t.Fatalf("改类型后两端列类型应一致：源 %s / 目标 %s", srcType1, dstType1)
+	}
+	srcFP1 := tableFingerprint(t, srcDB, table)
+	if dstFP1 := tableFingerprint(t, dstDB, table); dstFP1 != srcFP1 {
+		t.Fatalf("改类型后指纹不一致：源 %s / 目标 %s", srcFP1, dstFP1)
+	}
+
+	// ⑤ 改类型后增量仍可用：一次增/改/删，量「源端提交 → 目标端可见」的时延
+	exec(t, srcDB, "INSERT INTO "+table+" (id,payload,v) VALUES (1001,'ins',1.50)")
+	exec(t, srcDB, "UPDATE "+table+" SET payload='upd', v=9.99 WHERE id=1")
+	exec(t, srcDB, "DELETE FROM "+table+" WHERE id=2")
+	committed := time.Now()
+
+	seen := make(chan time.Duration, 1)
+	go func() {
+		deadline := time.Now().Add(30 * time.Second)
+		for time.Now().Before(deadline) {
+			var n int
+			var p1 string
+			var has1001, has2 int
+			err := dstDB.QueryRow(ctx, `SELECT count(*),
+				COALESCE((SELECT payload FROM `+table+` WHERE id=1),''),
+				(SELECT count(*) FROM `+table+` WHERE id=1001),
+				(SELECT count(*) FROM `+table+` WHERE id=2) FROM `+table).Scan(&n, &p1, &has1001, &has2)
+			if err == nil && n == 1000 && p1 == "upd" && has1001 == 1 && has2 == 0 {
+				seen <- time.Since(committed)
+				return
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+		seen <- -1
+	}()
+
+	if _, err := engine.Run(ctx, engine.Options{Store: store, JobID: jobID, IdleAfter: 800 * time.Millisecond}); err != nil {
+		t.Fatalf("改类型后的增量应能跑（追平即收尾）: %v", err)
+	}
+	latency := <-seen
+	if latency < 0 {
+		t.Fatal("30 秒内没追平：改类型之后增量不可用")
+	}
+	if fp := tableFingerprint(t, dstDB, table); fp != tableFingerprint(t, srcDB, table) {
+		t.Fatalf("追平后指纹不一致：目标 %s", fp)
+	}
+	t.Logf("改类型前 %s/%s → 改类型后 %s/%s；指纹 %s → %s；拒绝时码=%s；"+
+		"改类型后增/改/删追平时延 %.0fms",
+		srcType0, dstType0, srcType1, dstType1, srcFP0, srcFP1, run.Code,
+		float64(latency.Microseconds())/1000)
+}

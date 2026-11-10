@@ -933,7 +933,7 @@ func (s *Sink) Apply(ctx context.Context, evs []source.Event, pos source.Positio
 			// **DDL 必须在这里执行**。之前这行注释写的是「由引擎处理」——而引擎里
 			// 根本没有 EvDDL 的处理代码（`grep EvDDL internal/engine` 为空），
 			// 于是源端 DDL 从来没搬到目标端：加列后整批行写失败、建索引完全静默、
-			// 改类型下次 EnsureSchema 撞 ErrTypeMismatch 把整个任务打死。
+			// 改类型下次 Prepare 的对列对不上，会以 E1015 拒掉整轮（按表暂停见第③步）。
 			if err := s.applyDDLTx(ctx, tx, ev); err != nil {
 				return err
 			}

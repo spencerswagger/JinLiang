@@ -365,10 +365,14 @@ func (r *runner) execute(parent context.Context, res *Result) error {
 		return nil
 	}
 
+	// teardown 要在 prepare **之前**注册：prepare 已经抢了租约、开了连接，它中途失败
+	// （比如目标列类型对不上）时若直接返回，租约就没人放 —— 同一台机器上紧接着再跑一次
+	// 会撞「另一个实例正在跑这个任务」（E1005），而「改完类型重跑」正是错误文案让用户做的
+	// 下一步。teardown 对 nil 的 sink/src 安全，提前注册没有副作用。
+	defer r.teardown()
 	if err := r.prepare(ctx); err != nil {
 		return r.fail(ctx, err)
 	}
-	defer r.teardown()
 
 	if r.needSnapshot {
 		if err := r.snapshot(ctx); err != nil {
@@ -777,6 +781,11 @@ func (r *runner) prepare(ctx context.Context) error {
 	}
 	// 建表要用**目标端**的表定义（schema 换成目标端的）：源端 catalog 里的
 	// schema 是源库名（MySQL 源就是库名），直接拿去建表会变成「目标端没有这个 schema」。
+	// **顺序有要求：EnsureSchema 必须早于 snapshot() 里的 cleanBeforeRecopy。**
+	// 清表这一步要清的表得先存在：EnsureSchema 负责建表并把「这张表是本任务建的」
+	// 记进 _jl_object，cleanBeforeRecopy 正靠它决定能不能 TRUNCATE；反过来就会
+	// 撞上「relation does not exist」，或者把用户的表当成自己的清掉。
+	// 断言在 TestCleanRunsAfterEnsureSchema（真库：目标表不存在 + 需要清表的那一走法）。
 	actions, err := sink.EnsureSchema(ctx, r.targetCatalog())
 	if err != nil {
 		return fmt.Errorf("准备目标表失败: %w", err)
