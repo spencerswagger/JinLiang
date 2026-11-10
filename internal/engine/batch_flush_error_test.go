@@ -86,3 +86,68 @@ func TestBatcherErrIsNilAfterCleanFlush(t *testing.T) {
 		t.Fatalf("干净提交不该留下错误：%v", err)
 	}
 }
+
+// cancelAwareSink 模拟「在途提交被我方 cancel 打断」的目标端：
+// 提交一开始就卡住，直到 ctx 结束才返回 ctx.Err()（驱动的真实行为）。
+type cancelAwareSink struct {
+	started chan struct{}
+}
+
+func (s *cancelAwareSink) Apply(ctx context.Context, _ []source.Event, _ source.Position) error {
+	select {
+	case s.started <- struct{}{}:
+	default:
+	}
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+// 我方取消打断在途提交，**不能**被记成「后台提交失败」（Owl II P1）。
+//
+// 症状：后台提交在途中按停 → flushLocked 拿到 context canceled → 记进 b.err →
+// 调用方收尾时看到「后台提交失败」而不是「收到停止信号」；若驱动回的是
+// `invalid connection` 一类，run 会被判 failed —— 正是本 PR 要消灭的那类误报。
+// 判据是「ctx 已经结束」，不是错误长相。
+func TestBatcherDoesNotRecordCanceledFlushAsError(t *testing.T) {
+	sink := &cancelAwareSink{started: make(chan struct{}, 1)}
+	src := &fakeSource{}
+	b := newTestBatcher(sink, src, 100)
+	b.delay = 5 * time.Millisecond
+
+	notified := make(chan error, 1)
+	b.onError = func(err error) { notified <- err }
+
+	_ = b.Add(context.Background(), ev(source.EvBegin, ""))
+	_ = b.Add(context.Background(), ev(source.EvInsert, ""))
+	_ = b.Add(context.Background(), commitEvent(src, "0/400"))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		b.flushLoop(ctx)
+	}()
+
+	// 等到提交真的开始，再取消：这样走的确实是「在途提交被打断」那条路。
+	select {
+	case <-sink.started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("后台提交没有开始：这条用例没构造到在途提交")
+	}
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("flushLoop 没有在取消后退出")
+	}
+
+	if err := b.Err(); err != nil {
+		t.Fatalf("我方取消不该被记成后台提交失败，得到 %v", err)
+	}
+	select {
+	case err := <-notified:
+		t.Fatalf("我方取消不该触发 onError，得到 %v", err)
+	default:
+	}
+}
