@@ -150,7 +150,10 @@ func Run(in Input) source.Report {
 		})
 	} else if in.TargetKind == "postgres" {
 		add(source.Check{ID: "PAUSE-01", Title: "目标端支持按表暂停", Status: source.StatusOK,
-			Detail: "结构对不上的表会被记录并停下来，位点不推进"})
+			// 口径（docs/CONTRACT-PAUSE-AND-POSITION.md §1.5/§1.6）：只停**这张表**，
+			// 其它表照常提交、位点照常前进；跳过窗口记账，结构对齐后整表重搬补齐。
+			Detail: "结构对不上的表会被记录并只停它自己：其它表照常同步、位点照常前进，" +
+				"跳过的那段在结构对齐后由整表重搬补齐"})
 	}
 
 	// ── 批次与并发 ───────────────────────────────────────────

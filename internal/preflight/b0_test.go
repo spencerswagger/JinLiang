@@ -264,3 +264,49 @@ func TestTypeMappingChecksAppearInPreflight(t *testing.T) {
 		}
 	}
 }
+
+// PAUSE-01 的两句话必须与实现同源（契约 docs/CONTRACT-PAUSE-AND-POSITION.md §1.5/§1.6）。
+//
+// 这里曾经写反过：`#93` 把「按表暂停」改成「只停该表 + 其它表照常 + 位点照常前进」，
+// codes.go 的 E1015 三句跟着改了，`PAUSE-01`(OK) 却还写着「位点不推进」——
+// 用户按预检报告判断「停一张表还是整条同步」，这句话必须跟着行为走。
+// 两条各自钉住：PG 目标端是新口径，非 PG 目标端仍是「整条停下等手工对齐」（那份能力还没落地）。
+func TestPause01TextMatchesPerTablePauseSemantics(t *testing.T) {
+	mk := func(targetKind string) source.Report {
+		return Run(Input{
+			SourceKind: "postgres", TargetKind: targetKind,
+			SourceVer: "16.2", TargetVer: "8.0.36",
+			SourceCaps: source.CapSet{source.CapCDC: {Supported: true}},
+			SourceCat:  catalog(source.Table{TableRef: source.TableRef{Table: "orders"}, HasStablePK: true}),
+			TargetCat:  catalog(),
+			Tables:     []string{"orders"},
+			Mode:       "continuous+initial",
+			OnExists:   "error",
+			BatchRows:  500,
+		})
+	}
+
+	pg, ok := statusOf(mk("postgres"), "PAUSE-01")
+	if !ok {
+		t.Fatal("PG 目标端必须有 PAUSE-01")
+	}
+	for _, want := range []string{"只停它自己", "位点照常前进", "整表重搬"} {
+		if !strings.Contains(pg.Detail, want) {
+			t.Errorf("PAUSE-01(OK) 应写明 %q（只停该表 / 位点前进 / 重搬补齐），得到：%s", want, pg.Detail)
+		}
+	}
+	if strings.Contains(pg.Detail, "位点不推进") {
+		t.Error("PAUSE-01(OK) 里的「位点不推进」已经是假话：#93 之后位点照常前进")
+	}
+
+	my, ok := statusOf(mk("mysql"), "PAUSE-01")
+	if !ok {
+		t.Fatal("非 PG 目标端也要有 PAUSE-01（要在 plan 里就说清能力缺失）")
+	}
+	if my.Status != source.StatusWarn {
+		t.Fatalf("非 PG 目标端应是 warn（不阻断），得到 %v", my.Status)
+	}
+	if !strings.Contains(my.Detail, "整条同步会停下来") {
+		t.Errorf("非 PG 目标端仍是「整条停下等手工对齐」，这句话不能改错：%s", my.Detail)
+	}
+}
