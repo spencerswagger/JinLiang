@@ -100,6 +100,20 @@ MySQL 目标端不支持按表暂停：给 `_jl_meta` 补 `paused_tables` 列失
    证明不了顺序。要真验得在块写完之后、记账之前 kill -9，看下一轮是否重搬而不是误判搬完——
    这条留给下一轮（与 Core 的暂停接线一起做更划算）。
 
+### 缺列的**真失败**输出（真库实测，不是抄文案）
+
+场景：目标账号只有 `SELECT/INSERT/UPDATE/DELETE/CREATE`、没有 `ALTER`，老库 `_jl_meta` 里没有这一列。
+
+```
+MySQL 目标端不支持按表暂停：给 `_jl_meta` 补 `paused_tables` 列失败（目标端是 MySQL 8.0.28）。
+你能做什么：① 用有 ALTER 权限的账号手工执行 `ALTER TABLE _jl_meta ADD COLUMN paused_tables text NULL`；
+② 或者换 PostgreSQL 目标端。风险：没有（本次没有跳过任何表，也没有推进位点）
+```
+
+复现方式（手工，不入 CI：矩阵里的账号没有「只有部分权限」这种形态）：
+`CREATE USER jl_ro IDENTIFIED BY 'ro'; GRANT SELECT,INSERT,UPDATE,DELETE,CREATE ON db.* TO jl_ro;`
+再用它的 DSN 打开 sink 调 `PauseTable`。
+
 ## 7. 仍未接的一段（不在本 PR，属 Core）
 
 引擎的暂停集合与写路径（`pause_skip.go`、`r.paused *pgsink.PausedTable`、`r.sink *pgsink.Sink`）
