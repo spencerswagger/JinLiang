@@ -156,13 +156,8 @@ jobs:
         with:
           go-version: "1.27.x"
           cache: true
-      - name: 交叉编译（linux/amd64, linux/arm64, darwin/arm64）
-        run: |
-          set -euo pipefail
-          for target in linux/amd64 linux/arm64 darwin/arm64; do
-            echo "building $target"
-            CGO_ENABLED=0 GOOS=${target%/*} GOARCH=${target#*/} go build -trimpath -o /dev/null ./cmd/jinliang
-          done
+      - name: 交叉编译（三平台，真源在 scripts/cross-compile.sh）
+        run: scripts/cross-compile.sh
 
   b1-engine:
     # B1 引擎：源 → 目标**真链路**（全量 + 增量 + kill -9 重搬 + 指纹比对）。

@@ -378,12 +378,24 @@ jobs:
           # 阈值只写这一个地方，判定和文案都引用它，避免两处漂移。
           # 20000 是「崩塌才红」的峰值门禁（不是性能基线：p99/内存/冷启在 scripts/bench.sh）。
           THRESHOLD=20000
-          # -count=3 + 取中位数：单次 40 iterations 在 shared runner 上实测 1.7~2.0 倍方差，
-          # 取中位数把「偶尔一次慢」和「真的垮了」分开。三次都慢 → 中位数也慢 → 照样红。
-          go test -tags=integration -run '^$' -bench BenchmarkApplyUpsert500 -benchtime=40x -count=3 ./internal/pgsink/ | tee /tmp/bench.txt
+          # -count=5 + 取中位数：单次 40 iterations 在 shared runner 上实测 **14474~174350 rows/s（约 12 倍）**，
+          # 20000 只是「崩塌」下限。3 个样本只能容忍 1 个慢样本（同轮出现两个 14474 这种就误红），
+          # 所以取 5 个、容忍 2 个慢样本；多数样本都慢 → 中位数也慢 → 照样红。
+          go test -tags=integration -run '^$' -bench BenchmarkApplyUpsert500 -benchtime=40x -count=5 ./internal/pgsink/ | tee /tmp/bench.txt
           # `|| true`：没匹配到时也要走到下面的显式判空（否则 set -e/pipefail 会静默退出，
           # 红是红了，但日志里没有「为什么」）。
-          rates=$(grep 'batch=500' /tmp/bench.txt | grep -oE '[0-9]+ rows/s' | grep -oE '^[0-9]+' | sort -n || true)
+          # 样本提取：兼容 Go 在 ≥1e6 时打印的科学计数法（`1.2e+06 rows/s`）。
+          # 这种样本按 1e6 这个**下限**参与比较（真实值只会更大，所以方向偏保守，不会放松门禁）。
+          toks=$(grep 'batch=500' /tmp/bench.txt | grep -oE '[0-9][0-9.e+]* rows/s' | sed 's/ rows\/s//' || true)
+          rates=''
+          for tok in $toks; do
+            # 数值解析，不硬映射：Go 在 ≥1e6 时打印 `1.2e+06 rows/s`，
+            # 也可能出现 `1.5e+05`——硬当 1e6 会**高估**（偏松）。printf %.0f 直接把两种写法都转成整数。
+            v=$(printf '%.0f' "$tok" 2>/dev/null || true)
+            [ -n "$v" ] || { echo "❌ 吞吐样本 %s 解析不出数值（benchmark 输出格式变了）——这不算通过" "$tok"; exit 1; }
+            rates="$rates$(printf '\n%s' "$v")"
+          done
+          rates=$(printf '%s\n' "$rates" | sed '/^$/d' | sort -n || true)
           n=$(echo "$rates" | grep -c . || true)
           echo "batch=500 实测 $n 次: $(echo "$rates" | tr '\n' ' ')"
           # 样本数按**实际**取，不假定正好 3 个：输出格式一变被正则丢掉一两个，
