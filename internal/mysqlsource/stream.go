@@ -538,6 +538,16 @@ func (s *Source) RunStream(ctx context.Context, start Position, asm *Assembler) 
 
 	parser := NewParser()
 	parser.SetFile(start.File)
+	// 把「哪一列按字节存」从 catalog 补进 TABLE_MAP（5.7 的 binlog 没有排序规则）。
+	// 回调里只读 s.known，不产生副作用：它跑在解析路径上，每个 TABLE_MAP 一次。
+	parser.OnTableMap = func(tm *TableMap) {
+		s.knownMu.Lock()
+		known, ok := s.known[tm.Schema+"."+tm.Table]
+		s.knownMu.Unlock()
+		if ok {
+			FillColumnKinds(tm, &known)
+		}
+	}
 	if !start.GTID.IsEmpty() {
 		asm.SetExecutedGTID(start.GTID)
 	}

@@ -329,13 +329,8 @@ func (s *Sink) ResetChunks(ctx context.Context) error {
 	return nil
 }
 
-// TruncateTable 清空目标表（recreate/重搬路径用）。
-func (s *Sink) TruncateTable(ctx context.Context, ref source.TableRef) error {
-	if _, err := s.db.ExecContext(ctx, "TRUNCATE TABLE "+s.qualifiedOn(ref)); err != nil {
-		return fmt.Errorf("清空 %s 失败: %w", qualified(ref), err)
-	}
-	return nil
-}
+// TruncateTable 已挪到 truncate.go（带所有权闸门）：留这行注释指路，
+// 免得有人在 state.go 里再写一个裸 TRUNCATE。
 
 // RecordObject 登记「这个对象是本任务建的」（孤儿判定与 recopy fail-closed 的依据）。
 //

@@ -143,10 +143,13 @@ func TestLooseSameType(t *testing.T) {
 		why             string
 	}{
 		{"bigint", "bigint", true, "一模一样"},
-		{"varchar(256)", "varchar(64)", true, "utf8mb4 的字符数×4 = binlog 的字节数"},
-		{"varchar(192)", "varchar(64)", true, "utf8mb3 ×3"},
-		{"varchar(64)", "varchar(64)", true, "latin1，字节=字符"},
-		{"char(40)", "char(10)", true, "CHAR 的长度同样是字节（Owl II 实测 char(10) 报 char(40)）"},
+		{"varchar(64)", "varchar(64)", true, "换算之后两边都是字符，逐字相等"},
+		// 没换算的字节串**不许**当成同一列：允许多倍等于给「真改了长度」开静默通道。
+		// （换算在 enrichRelation 里按 catalog 字符集做：`bytesToCharsType`）
+		{"varchar(256)", "varchar(64)", false, "未换算的字节 vs 字符：宁可多暂停一次"},
+		{"varchar(192)", "varchar(64)", false, "同上（utf8mb3 ×3 也不放行）"},
+		{"char(40)", "char(10)", false, "CHAR 未换算时同样不放行"},
+		{"varchar(128)", "varchar(64)", false, "latin1 的字节恰好 ×2 —— 最容易被误放行的形态"},
 		{"text", "text", true, "一致"},
 		{"blob", "text", true, "TEXT 与 BLOB 共用类型字节，MINIMAL 下分不开——不能因此判成改类型"},
 		{"mediumblob", "mediumtext", true, "同尺寸档"},
@@ -160,6 +163,101 @@ func TestLooseSameType(t *testing.T) {
 	for _, c := range cases {
 		if got := looseSameType(c.binlog, c.catalog); got != c.same {
 			t.Errorf("looseSameType(%q, %q) = %v，应为 %v —— %s", c.binlog, c.catalog, got, c.same, c.why)
+		}
+	}
+}
+
+// 5.7 的 TABLE_MAP 不带列字符集，只能按字节报长度；换算必须靠 catalog 的字符集。
+// 这一格钉住换算本身与误差方向（宁可多暂停，不可漏暂停）。
+func TestBytesToCharsType(t *testing.T) {
+	cases := []struct {
+		in, charset, want, why string
+	}{
+		{"varchar(256)", "utf8mb4", "varchar(64)", "utf8mb4 的 VARCHAR(64)"},
+		{"varchar(192)", "utf8mb3", "varchar(64)", "utf8mb3 的 VARCHAR(64)"},
+		{"char(40)", "utf8mb4", "char(10)", "CHAR 的长度也是字节"},
+		{"varchar(64)", "latin1", "varchar(64)", "latin1 一字一字节，换算后不变"},
+		{"varchar(256)", "", "varchar(256)", "拿不到字符集：原样返回，不猜"},
+		{"varbinary(32)", "utf8mb4", "varbinary(32)", "VARBINARY 本来就是字节计，不许除"},
+		{"text", "utf8mb4", "text", "TEXT 的长度是尺寸档，不是字符数"},
+		{"varchar(255)", "utf8mb4", "varchar(255)", "除不尽（不该发生）：原样返回，不猜"},
+	}
+	for _, c := range cases {
+		if got := bytesToCharsType(c.in, c.charset); got != c.want {
+			t.Errorf("bytesToCharsType(%q, %q) = %q，应为 %q —— %s", c.in, c.charset, got, c.want, c.why)
+		}
+	}
+}
+
+// enrichRelation 的 5.7 路径：binlog 没有字符集、catalog 有 → 按 catalog 换算成字符，
+// 且换算后与 catalog 一致（不触发假暂停）。
+func TestEnrichRelationConverts5_7ByteLengths(t *testing.T) {
+	s := &Source{}
+	s.SetKnownTables([]source.Table{{
+		TableRef: source.TableRef{Schema: "app", Table: "orders"},
+		Columns: []source.Column{
+			{Name: "id", Type: "bigint"},
+			{Name: "name", Type: "varchar(64)", Charset: "utf8mb4", Collation: "utf8mb4_0900_ai_ci"},
+		},
+		PrimaryKey: []string{"id"}, HasStablePK: true,
+	}})
+
+	// 5.7：只有字节长度，没有字符集（Charset 为空）。
+	rel := &source.Table{
+		TableRef: source.TableRef{Schema: "app", Table: "orders"},
+		Columns: []source.Column{
+			{Name: "col_1", Type: "bigint"},
+			{Name: "col_2", Type: "varchar(256)"},
+		},
+	}
+	got := s.enrichRelation(rel)
+	if got.Columns[1].Type != "varchar(64)" {
+		t.Fatalf("应按 catalog 字符集把字节换算成字符（varchar(256) → varchar(64)），实际 %q", got.Columns[1].Type)
+	}
+	if got.Columns[1].Charset != "utf8mb4" {
+		t.Fatalf("字符集应补自 catalog，实际 %q", got.Columns[1].Charset)
+	}
+	// 换算后与 catalog 同型 → 不该判成改类型（否则 5.7 上每张多字节字符列都假暂停）。
+	if !columnsLooseSame(got.Columns, []source.Column{
+		{Name: "id", Type: "bigint"},
+		{Name: "name", Type: "varchar(64)"},
+	}) {
+		t.Fatal("换算之后应判成同一列（否则 5.7 上会一直假暂停）")
+	}
+}
+
+// 5.7 上 BINARY 与 CHAR 在 binlog 里分不开（共用类型字节、没有排序规则），
+// 类型串只能靠 catalog 纠正基名——否则「改类型」判定会把 binary 与 char 看成同一列。
+// 长度仍按 binlog（这样长度变化照样看得见）。
+func TestEnrichRelationFixesBinaryBaseOn57(t *testing.T) {
+	s := &Source{}
+	s.SetKnownTables([]source.Table{{
+		TableRef: source.TableRef{Schema: "app", Table: "t"},
+		Columns: []source.Column{
+			{Name: "b4", Type: "binary(4)"},                     // MySQL 不给字符集（NULL）
+			{Name: "vb", Type: "varbinary(8)"},                  // 同上
+			{Name: "bl", Type: "blob"},                          // 同上
+			{Name: "c10", Type: "char(10)", Charset: "utf8mb4"}, // 有字符集
+			{Name: "tx", Type: "text", Charset: "utf8mb4"},      // 有字符集
+		},
+		PrimaryKey: []string{"b4"}, HasStablePK: true,
+	}})
+	// 5.7 的 binlog：全部落在「字符家族」的基名上，长度是字节。
+	rel := &source.Table{
+		TableRef: source.TableRef{Schema: "app", Table: "t"},
+		Columns: []source.Column{
+			{Name: "col_1", Type: "char(4)"},
+			{Name: "col_2", Type: "varchar(8)"},
+			{Name: "col_3", Type: "text"},
+			{Name: "col_4", Type: "char(40)"},
+			{Name: "col_5", Type: "text"},
+		},
+	}
+	got := s.enrichRelation(rel)
+	want := []string{"binary(4)", "varbinary(8)", "blob", "char(10)", "text"}
+	for i, w := range want {
+		if got.Columns[i].Type != w {
+			t.Errorf("第 %d 列应是 %q，实际 %q（catalog 的 binary/字符家族是权威基名）", i+1, w, got.Columns[i].Type)
 		}
 	}
 }

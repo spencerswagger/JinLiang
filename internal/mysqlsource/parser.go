@@ -39,6 +39,13 @@ type Parser struct {
 	file       string
 	headerErr  error
 	lastOffset uint32
+
+	// OnTableMap 在 TABLE_MAP 解析完、**行事件解码之前**回调一次。
+	//
+	// 存在的唯一理由：把「哪一列按字节存」从 catalog 补进 TableMap（5.7 的 binlog
+	// 没有排序规则，靠内容猜会把 BINARY('abcd') 判成字符串）。回调里只允许写
+	// ColumnKinds 这类纯元数据，不许产生副作用——它跑在解析路径上。
+	OnTableMap func(*TableMap)
 }
 
 // NewParser returns an empty parser.
@@ -152,6 +159,9 @@ func (p *Parser) decode(h Header, body []byte, depth int) ([]*Event, error) {
 			return nil, err
 		}
 		p.tables[tm.TableID] = tm
+		if p.OnTableMap != nil {
+			p.OnTableMap(tm)
+		}
 		ev.TableMap = tm
 	case evWriteRowsV1, evUpdateRowsV1, evDeleteRowsV1:
 		rows, err := parseRows(body, rowsKind(h.Type), 1, p.tables)
