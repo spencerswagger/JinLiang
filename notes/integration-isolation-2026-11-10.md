@@ -84,6 +84,17 @@ nightly 的 `integration` job 早就用「逐包串行调用」绕开这一条�
 - `TestMain`（`main_integration_test.go`）：包开跑/收尾各回收一次源库里**空闲**的 `jl_%` 书签，
   把上一轮泄漏的清掉——这样「连跑两次」才是可重复的。
 
+两条使用约束（写给以后加用例的人，别踩）：
+
+1. **`JINLIANG_TEST_PG_SRC_DSN` 必须是测试专用库**：`reclaimSlots` 删的是源库里**所有空闲的 `jl_%` 槽**。
+   CI 里每个 job 自己 `docker run` 一套 PG，独占没问题；但如果有人把这个变量指向有真实任务的库，
+   或者本地用 `go test ./...`（包级并行）跑，就会把别的包/别人的空闲槽一起收走（对方下一次连流会报槽不存在）。
+2. **新加的 fixture 必须自己对 `trackJobSlots`**：`TestMain` 只在包首尾兜，救不了**轮内**泄漏。
+   新用例（比如 MySQL 源、resync 那些同样会建槽的）忘了挂，就会在同一轮里重新吃满 10 个槽。
+
+将来把 §6 第 1 条落成门禁时，判据用「残留 ≤ 2 **且** `53400` = 0 次」，别写「= 0」（实测就是 0~2，写死会让新门禁自己 flaky）；
+断言要**独立成一步**（`TestMain` 只能清、不能判红）。
+
 没做（留给下一步，别混进这个 PR）：
 
 - `public._jl_*` 的按包隔离（要给 pgsink 传 `Options.Schema`、给 engine 传 `TargetDoc.Schema`，
