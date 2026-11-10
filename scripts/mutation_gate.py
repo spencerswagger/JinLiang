@@ -132,16 +132,33 @@ MUTATIONS = [
         note="移除位点持久化",
     ),
     dict(
-        name="register-pause-neutered",
+        name="pause-registration-succeeds",
         tier="engine",
-        file="internal/engine/engine.go",
-        find="func (r *runner) registerPause(ctx context.Context, err error) error {\n",
-        replace="func (r *runner) registerPause(ctx context.Context, err error) error {\n\treturn nil // SABOTAGE: 不登记暂停\n",
+        file="internal/pgsink/paused.go",
+        find="func (s *Sink) PauseTable(ctx context.Context, ref source.TableRef, rec PausedTable) error {\n",
+        replace="func (s *Sink) PauseTable(ctx context.Context, ref source.TableRef, rec PausedTable) error {\n\treturn nil // SABOTAGE: 登记无条件成功（跳过了但没记下）\n",
         cmd=["go", "test", "-tags=integration", "-count=1", "-run",
              "^TestPauseRegistrationFailureFailsWholeBatch$", "./internal/engine/"],
         requires="TestPauseRegistrationFailureFailsWholeBatch",
-        signal="TestPauseRegistrationFailureFailsWholeBatch FAIL（登记被跳过→错误退化成原始类型不一致，没有「登记失败」这条根因）",
-        note="跳过 DDL 暂停的登记（不写 paused_tables）",
+        signal="TestPauseRegistrationFailureFailsWholeBatch FAIL（登记变成无条件成功＝跳过了但没记下，A3 要防的静默缺数据）",
+        # 别注入 `registerPause` 整个置空：那只是「不登记」，pauseSink 重试后会再撞
+        # 同一个 PausableError 并上抛，整轮照样失败——用例天然绿（实测过）。
+        # 真正要注入的是**吞掉登记失败**，即让 PauseTable 无条件成功。
+        note="PauseTable 无条件成功（不是 registerPause 置空，置空不会红）",
+    ),
+    dict(
+        name="classifyerror-uses-pgwire",
+        tier="engine",
+        file="internal/engine/engine.go",
+        find="func classifyError(err error) (code core.Code, classified bool) {\n",
+        # 不复刻「加 import」：engine.go 现在不 import pgwire，直接引用会编译失败，
+        # AST 守卫根本没机会跑。这里用一个同名局部值造出**同样的标识符引用**，
+        # 守卫要抓的就是 `pgwire.X` 这种 selector（注释/字符串不算）。
+        replace="func classifyError(err error) (code core.Code, classified bool) {\n\tpgwire := struct{ SQLState func(error) string }{} // SABOTAGE: 把按 SQLSTATE 的判据加回来\n\t_ = pgwire.SQLState(nil)\n",
+        cmd=["go", "test", "-count=1", "-run", "^TestClassifyErrorUsesConnectorSemanticsNotConnectorPackages$", "./internal/engine/"],
+        requires="TestClassifyErrorUsesConnectorSemanticsNotConnectorPackages",
+        signal="TestClassifyErrorUsesConnectorSemanticsNotConnectorPackages FAIL（classifyError 里引用了 pgwire.SQLState，契约 §4.4）",
+        note="把 pgwire 判据加回 classifyError（AST 守卫必须报「引用了 pgwire.SQLState」）",
     ),
     dict(
         name="chunk-resume-degraded",

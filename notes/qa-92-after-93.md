@@ -55,13 +55,13 @@ CI 复跑（PR #92，run 42877072433，8.4 腿，20000 行）：
 | mysql-mysql    | 8.4.13 | 20000 | 330ccea0293f33177530c2a6933dad45 | 9.17s  | incremental=ok |
 ```
 
-5.7 / 8.0 / 8.4 三格全绿；`反向注入（engine）` 也绿（6/6）。
+5.7 / 8.0 / 8.4 三格全绿；`反向注入（engine）` 也绿（8/8）。
 
 ## 3. 反向注入翻转（`scripts/mutation_gate.py`）
 
 `pgsink.Apply` 的暂停判定已搬到 `internal/engine/pause_skip.go`，原注入
 `ddl-pause-skipped`（把 `registerPause` 置空）在新语义下**存活**——不再成立。
-现在 engine 档 6 条，本地 `--tier engine` **6/6 全部被抓住**：
+现在 engine 档 8 条，本地 `--tier engine` **8/8 全部被抓住**：
 
 | 注入 | 检测器 | 结果 |
 |---|---|---|
@@ -69,20 +69,25 @@ CI 复跑（PR #92，run 42877072433，8.4 腿，20000 行）：
 | `forced-recopy-neutered`：`applyForcedRecopy` 直接 return | `TestApplyForcedRecopy*`（两条） | KILLED |
 | `commit-plan-alias`：`r.plan = *plan` 放在 `applyForcedRecopy` 之前 | 同上 | KILLED |
 | `reconcile-clears-early`：对齐就 `ClearPausedTable`（旧判据） | `TestReconcilePausedMarksRecopyAndKeepsRecord` | KILLED |
+| `pause-registration-succeeds`：`PauseTable` 无条件成功（**不是** registerPause 置空） | `TestPauseRegistrationFailureFailsWholeBatch` | KILLED |
+| `classifyerror-uses-pgwire`：classifyError 里引用 `pgwire.SQLState` | `TestClassifyErrorUsesConnectorSemanticsNotConnectorPackages`（AST 守卫） | KILLED |
 | `position-not-persisted` / `chunk-resume-degraded`（原有） | 各自用例 | KILLED |
 
-`--tier logic` 6/6、`gofmt -l` 空、`go vet ./...`、`go test ./...`、
+`--tier logic` 7/7、`gofmt -l` 空、`go vet ./...`、`go test ./...`、
 `validate_schema.py examples/*.yaml` 全绿。
 
-## 4. 还需要别人收的两条（我没改）
+## 4. 后续与遗留
 
-1. **A3 没有用例**：`registerPause` 返回 nil（=跳过了但没登记）现在没有用例能抓住。
-   旧注入 `ddl-pause-skipped` 存活的原因就是它——契约 §1.5「登记先行」要求
-   「登记失败 → 整批失败、目标端 0 行、位点不动」，Core 需要一个注入型用例。
-   我把它从 mutation 清单里拿掉了（留着会天天红），但缺口记在这里。
-2. **`PAUSE-01` 的 OK 文案还是旧口径**：`internal/preflight/b0.go:152` 写
-   「结构对不上的表会被记录并停下来，位点不推进」——#93 之后位点是照常前进的。
-   建议 Core 改成「只暂停该表，其它表继续、位点照常前进；结构对齐后整表重搬补齐」。
-3. **契约文件没在 main 上**：`docs/CONTRACT-PAUSE-AND-POSITION.md` 只在
+1. **A3 注入已改对**：`registerPause` 置空只会「不登记」，pauseSink 重试后仍撞同一个
+   `PausableError` 上抛，整轮照样失败 → 用例天然绿。现在注入 `PauseTable` 无条件成功
+   （=吞掉登记失败），检测器 `TestPauseRegistrationFailureFailsWholeBatch` 会红。
+   PR #101 还补了整轮集成用例（`TestPauseRegistrationFailureFailsRunAndWritesNothing`，
+   触发器造 `_jl_meta` 写失败）——那是端到端那半，不替代批级这条。
+2. **契约文件没在 main 上**：`docs/CONTRACT-PAUSE-AND-POSITION.md` 只在
    `contract/pause-and-position`（PR #90 仍 OPEN），而 #93 的提交信息与代码注释都在引用它。
    要么合 #90，要么把契约随 #92 之前先落 main，否则 main 里是一条悬空引用。
+3. **退出码占用（给 ExitPaused=3 的清单）**：`2` 已被「用法错误」占（`cmd/jinliang/main.go:52`
+   无参数、`:93` 不认识的命令，以及所有 `flag.ExitOnError` 的解析失败）；`5` 已被
+   `verify` 的「校验发现不一致」占（`cmd/jinliang/commands.go:746`）；`130` = 手动停止
+   （`engine.ExitStopped`），`1` = 失败、`0` = 正常。**3 空着可用**；若 `run --verify`
+   可能同时命中「有暂停」和「校验不一致」，建议 5 优先于 3。
