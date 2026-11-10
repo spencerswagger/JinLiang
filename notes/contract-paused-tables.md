@@ -1,57 +1,157 @@
-# 契约：按表暂停（`paused_tables`）
+# 按表暂停（`paused_tables`）实现契约
 
-> **状态**：骨架。本文件先按已下发的三条契约与红线落盘，等 Ark 的契约全文到齐后**逐字替换**（本文件是 `notes/plan-64-ddl-type-change.md` §2 引用的目标，先建立以免引用断链）。
+基线：main `b71eae89a3e15db1d8e299fca5f9f009788ea1a4`（#64 已合入）。
+本文件是 B1/B2 的实现依据；任务书与六条验收判据见 `notes/plan-64-ddl-type-change.md`。
+分支策略：不 rebase `#68`（旧语义 commit 不进历史），从 `b71eae89` 重开，只搬可复用件（`paused_tables` 列、`TablePausedError`、暂停缓存）。
+
+---
 
 ## §1 形状与跨轮语义
 
-**存储**：`_jl_meta.paused_tables`，**一列 JSON 文本**（不建新表；老库用 `ALTER TABLE … ADD COLUMN IF NOT EXISTS`）。一行一个 `job_key`：
+### 1.1 形状
+
+`_jl_meta.paused_tables` 是**一列 JSON 文本**（不是新表），一行一个 `job_key`：
 
 ```json
-{"orders":{"reason":"type_changed","at":"2026-11-10T08:59:00Z","detail":"v: 目标 text / 源 bigint"}}
+{
+  "orders": {
+    "reason": "type_changed",
+    "at": "2026-11-10T08:59:00Z",
+    "detail": "v: 目标 text / 源 bigint"
+  }
+}
 ```
 
-- `key` = **规范化后的裸表名**，与 `_jl_chunk.table_name` **逐字节相同**（不带 schema、不用源端原始大小写）。
-- `reason` 只放稳定码：`type_changed` / `schema_drift`。
-- `at` 记**第一次**登记的时间，后续不覆盖。
-- `detail` 给人看（哪一列、两端各是什么）。
+| 字段 | 语义 | 约束 |
+|---|---|---|
+| key | **规范化后的裸表名** | 与 `_jl_chunk.table_name` **逐字节相同**；不带 schema 前缀、不用源端原始大小写 |
+| `reason` | 稳定原因码 | 只允许 `type_changed` / `schema_drift`；**不写中文句子**，机器按它判等 |
+| `at` | 第一次被暂停的时刻 | UTC RFC3339；**后续不覆盖**（第一次的最有价值） |
+| `detail` | 给人看的说明 | 建议「列名: 目标类型 / 源类型」；不参与判等 |
 
-**写点唯一**：`PauseTable`。**读点**：`LoadPausedTables`（prepare 后一次）、`PausedTables`（status/doctor/UI）、`isPausedLocked`（写路径快检）。
+老库/新库都要能补列：`ALTER TABLE … ADD COLUMN IF NOT EXISTS paused_tables text`（`CREATE TABLE IF NOT EXISTS` 不会给已存在的表加列；`#68` 已经踩过这个坑并修好了，别退回去）。
 
-**跨轮存活**当且仅当：`job_key` 未变 + `job_hash` 未变 + 该表仍在本轮 `tables`。任一条不成立就在本轮 prepare 结束时清掉并发 note；因此**一轮结束后 `keys ⊆ 本轮表集合`**。
+### 1.2 谁写、谁读
 
-**位点**：暂停登记是**独立一条** `UPDATE _jl_meta SET paused_tables=…, updated_at=…`，发生在数据事务**已回滚之后**；**绝不与 `position` 同条 UPDATE**；位点不推进（判据：暂停前后 `SELECT position` 逐字节相等）。`runs` 记 failed，`last_error` 点名表与列。
+| 角色 | 方法 | 说明 |
+|---|---|---|
+| **唯一写点** | `pgsink.PauseTable(ctx, ref, reason, detail)` | B2 后加 `mysqlsink` 同构实现；**引擎/HTTP/CLI 不得直接改这一列** |
+| 读（每轮一次） | `LoadPausedTables(ctx)` | `prepare` 末尾（`EnsureMeta` 之后、`EnsureSchema` 之前）读进内存缓存 |
+| 读（展示） | `PausedTables(ctx)` | `status` / doctor / UI 用 |
+| 读（写路径快检） | `isPausedLocked(ref)` | 仅用于**留痕与整批拒绝**，**不用于跳过写行** |
 
-## §2 清表 × 暂停
+### 1.3 跨轮存活判据
 
-**「清表不清记录，搬成清该表，搬败留记录」**。
+记录跨轮保留，**当且仅当三条同时成立**：
 
-- `copyFresh` 只清数据 + `_jl_chunk`，**保留**暂停记录（清表时有记录 → 保留 + note）。
-- 某表重搬成功后**只清该表**记录；失败保留。
-- 解除挂在「`EnsureSchema` 通过 **+ 存量搬完**」，不是只 `EnsureSchema` 通过。
-- 重搬中途崩 → 记录保留、判定不看记录。
-- `on_exists=recreate` 同上。
-- 记录指向的表已不在源端/范围 → prepare 清掉 + note。
-- 既暂停又在 `Recopy` 列表 → 不跳过，先清后搬。
-- 流式暂停 → 整 run 失败、位点不推进。
-- 脏 JSON → 按「无暂停」继续，但发 note。
+1. 同一个 `job_key`（范围/源/目标变了就是新任务，见 `DECISIONS #8`）；
+2. `job_hash` 未变（没走过 `--accept-change`）；
+3. 该表仍在本轮选中的 `tables` 里。
 
-**红线**：清表路径不许 `DELETE FROM _jl_meta`；不许整列覆盖（只删一个 key，先读后写）；不许用内存表集合重建整个 JSON；`planCopy` 判定输入**不许**读 `paused_tables`；中间态必须能只靠「块进度 + 位点」重建。
+**任一条不成立 → 本轮 `prepare` 结束时删掉该记录，并发一条 note（「表 X 已不在同步范围（或任务指纹变了），清除其暂停记录」）。**
+因此恒有：**一轮结束后 `keys(paused_tables) ⊆ 本轮选中的表名集合`**。
 
-## §3 E1015 措辞与语义边界
+### 1.4 与 `_jl_meta` / `_jl_chunk` 的关系与事务边界
 
-- `Message` 不变：`表结构不一致`。
-- `Why` 覆盖两个时机（prepare 的 `EnsureSchema` 类型不一致 / 运行时 `EvDDL` 改类型、改名、删列），并说明「具体哪种、哪张表哪一列看 `last_error`」。
-- `Next` 三条：① 看 `last_error` 点名的表列、目标端对齐结构后重跑（位点没推进，不会重搬历史）② 暂时不处理也行，但整 run 会失败、位点不推进 ③ 不想跟这张表就从清单里去掉（按新范围重算 `job_key`，需要 `--accept-change`）。
-- `Risk`：整条同步停在这里、位点不推进、一条变更都不会丢；该表后续变更不写入，**其它表也不会继续推进**；最常见误判是当单表问题不管。
-- **三处「若当前版本已支持按表暂停」括注全部删除**（不是改，是删）。
-- 边界：缺表缺列走 **E1013**，不许走 E1015；`last_error` 必须到字段级；`Next` 不许出现 `--resync`；统一 grep 短语「其它表也不会继续推进」。
+- `_jl_meta`：一行/job，放 `phase` / `position` / `watermark` / `snapshot_id` / **`paused_tables`**。
+- `_jl_chunk`：多行/(job, table, chunk_no)，放块进度（`range_to` 是续跑锚点、`chunk_no=0` 是表完成标记）。
+- **暂停登记 = 一条独立的 `UPDATE _jl_meta SET paused_tables=$1, updated_at=now() WHERE job_key=$2`**，发生在**数据事务已回滚之后**（`Apply` 失败 → batcher 登记 → 上抛错误 → 整 run 失败）。
+- 它**不与数据、位点同事务**，也**绝不与 `position` 写在同一条 UPDATE 里**。
 
-## 与实现的对齐（本 PR 落地情况）
+为什么不是同事务：暂停是「拒绝写入」的留痕，必须在数据事务回滚后仍然存在；一旦绑进同一个事务，回滚就把留痕一起抹掉，用户只会看到「失败」，看不到「哪张表结构不对」。
 
-| 条目 | 落在哪 |
+为什么放一列不放新表：它和 `phase`/`position` 同属「一个 job 的运行时事实」；加表要多一套迁移与 `gc` 判定，加列只需一次 `ADD COLUMN IF NOT EXISTS`。
+
+### 1.5 暂停期间位点是否推进：**不推进**
+
+- 语义：遇到结构不一致 → **整 run 失败**、`position` **不动**、`paused_tables` 留痕、`last_error` 点名表与列。位点表达不了「跳过某表」，返回 nil 就会让位点越过被丢弃的事件 = **数据静默缺失**（失败有人看，缺数据没人看）。
+- 检查方式（可证伪，不是「看起来没动」）：
+  1. 代码层：暂停路径只允许一条 `UPDATE`，且 SQL 里**不出现 `position`**；
+  2. 数据层：暂停前后 `SELECT position FROM _jl_meta WHERE job_key=$1` **逐字节相等**；
+  3. 结果层：`runs` 结局为 failed、`last_error` 含表名与列名；
+  4. 恢复层：在目标端对齐结构后重跑 → 该批写入成功、`position` 此时才前进、**不重搬历史**。
+- 解析失败（脏 JSON）：行为上按「没有暂停」继续（少写而不是多写），但**必须发一条 note**说明读不出来，不许静默。
+
+### 1.6 本节的实现红线（详版见 §4）
+
+1. 暂停登记的 UPDATE 只碰 `paused_tables` / `updated_at`。
+2. 登记失败必须上抛，不许吞。
+3. `planCopy`（续跑判定）**不读** `paused_tables`。
+
+---
+
+## §2 清表 × 暂停（`cleanAll` 优先级）
+
+### 2.1 判定式
+
+> **「清表」与「暂停」互不改写，各管各的**：`copyFresh` 清表只动**数据 + `_jl_chunk`**，**保留** `paused_tables` 记录；某表重搬**成功后**只清**该表**的暂停记录（对齐即解除），失败则保留原记录（含第一次的 `at`/`reason`）。
+>
+> 一句话：**清表不清记录，搬成清该表，搬败留记录。**
+
+### 2.2 边界穷举（8 条，每条都要能写成用例或代码注释）
+
+| # | 情形 | 结论 |
+|---|---|---|
+| 1 | `copyFresh` 清表时该表有暂停记录 | 记录**保留**；清表后该表是「空表 + 仍暂停」→ 发 note「表 X 已清空待重搬，结构仍不一致 → 本轮会失败」，不许静默 |
+| 2 | 重搬该表**成功**（`EnsureSchema` 通过 + 存量搬完） | 只清**该表**那一个 key（不是整列），发 note「表 X 结构已对齐，解除暂停」 |
+| 3 | 重搬中途崩（kill -9 / 断电） | 记录保留、块标记部分推进；重启后**判定不看记录**（只看块 + 位点），按既有 `copyFresh`/续跑逻辑走 |
+| 4 | `on_exists=recreate` | 清表本就是用户显式同意的重建 → 记录同样保留；重搬成功后同样只清该表记录 |
+| 5 | 目标端 MySQL / 无同构列（B2 之前） | **不许静默**：`PauseTable` 明确失败（四段式，`E1014` 家族「本版本不支持这个方向」），`plan` 标注「目标端不支持按表暂停：遇到结构不一致会整 run 失败、且不留暂停记录」。**严禁「UPDATE 影响 0 行当成功」** |
+| 6 | 记录指向的表已从源端消失 / 用户改了范围 | 本轮 `prepare` 比对范围时**删掉**该记录 + note；删后仍满足 `keys ⊆ 本轮表集合` |
+| 7 | 某表既暂停、又在本轮 `Recopy` 列表里 | **不跳过**：先清后搬。跳过会留下「目标表空着、用户以为还在同步」的更坏状态 |
+| 8 | 暂停发生在流式（非 copyFresh 路径） | 整 run 失败、位点不推进；下一轮 `prepare` 读回记录 → 仍整 run 失败，直到结构对齐；不重搬历史 |
+
+### 2.3 为什么
+
+- 清表是**动作**（这一轮要重建），暂停是**后果记录**（结构对不上）；维度与生命周期都不同。绑在一起会造出两种坏状态：「清了但没搬回来、还显示在同步」和「结构已对齐却永远显示暂停」。
+- 「搬成才解除」而不是「`EnsureSchema` 通过就解除」：只看建表通过会在半途崩溃时留下「以为恢复了、其实表是空的」。只有「结构核对通过 **且** 存量搬完」才等于既对齐又有数据。
+- 暂停不能当 `copyFresh` 的跳过条件：跳过 → 表被清空后没人搬 → 数据缺失且无人报错。
+
+---
+
+## §3 E1015 的措辞与语义边界
+
+### 3.1 措辞定稿（可直接粘贴进 `internal/core/codes.go`）
+
+```go
+Code: CodeSchemaMismatch, Class: UserAction,
+// 同一件事在两个时机：prepare 的 EnsureSchema 类型不一致，和运行时 EvDDL 的类型变化/改名/删列。
+// 码只写类别，具体哪张表哪一列由 last_error 说（同一个码要覆盖两个时机）。
+Why: "目标表与源端结构对不上：prepare 补列时类型不一致（type_changed），" +
+     "或跑起来后源端改类型/改名/删列（schema_drift）——两种情况含义相同；" +
+     "具体哪种、哪张表哪一列看 last_error",
+Next: []string{
+    "看 last_error 点名的表与列；在目标端对齐结构后重跑（位点没推进，不会重搬历史）",
+    "暂时不处理也行：该表会被记进 paused_tables，但本轮 run 会整体失败、位点不推进——对齐结构后重跑即可继续",
+    "不想跟这张表：把它从 content 的表清单里去掉后重跑（会按新范围重算 job_key，需要 --accept-change）",
+},
+Risk: "整条同步会停在这里（位点不推进，一条变更都不会丢）；该表后续变更不会被写入，" +
+      "其它表也不会继续推进。最常见误判是当成单表问题不管，于是整条同步停住——" +
+      "先看 last_error 是否点名了具体表与列",
+```
+
+**原「若当前版本已支持按表暂停」三处括注全部删除**（`Why` / `Next[2]` / `Risk` 三处，一次改完）：按 B1 的终态，「其它表继续跑」不存在，留着括注等于承诺一个不存在的功能。`codes_test.go` 里那条断言（原来 grep「若当前版本已支持按表暂停」）同步改成 grep 新短语 **`其它表也不会继续推进`**，机制不变（一个短语定位三处）。
+
+### 3.2 什么算 E1015、什么不算
+
+| 算 E1015 | 条件 |
 |---|---|
-| §1 存储/写点/读点/位点不推进 | `internal/pgsink/paused.go`；用例 `TestPauseTableRegistersKeyKeepsPositionAndRecovers` |
-| §1 跨轮存活 + `keys ⊆ 本轮表集合` | `internal/engine/engine.go` 的 `reconcilePaused`；用例断言 `at` 跨轮不变 |
-| §2 清表 × 暂停 | `cleanBeforeRecopy` 不清记录；`snapshot()` 搬成后 `ClearPausedTable`（只删该 key）；pgsink 用例断言「删 a 之后 b 的记录仍在」 |
-| §3 E1015 | `internal/core/codes.go` + `codes_test.go`（`TestSchemaMismatchSaysWholeRunStops`） |
-| 写路径快检 | `pgsink.Apply` 遇到暂停表整批拒绝（`TablePausedError`）；pgsink 用例 `TestApplyRefusesPausedTable` |
+| `prepare` 阶段 `EnsureSchema` 发现目标列类型 ≠ 源端 | 我们**主动判定**、原因明确、且**不跟随**（类型变化） |
+| 运行时 EvDDL 发现源端改类型 / 改名 / 删列 | 同上，`type_changed` / `schema_drift` 两个稳定码 |
+
+| **不算** E1015 | 该给什么 |
+|---|---|
+| 源端**加列**（DDL 第②步已支持，自动对齐） | 正常，不报错 |
+| 源端**加索引**（DDL 第①步已支持） | 正常，不报错 |
+| 目标端缺表 / 缺列（对象不存在） | `E1013`（动作是建对象/改配置，与「改结构」不同） |
+| 没有权限 | `E1012` |
+| 位点与变更流水接不上 | `E3001`（动作是 `--resync`，语义完全不同） |
+| 我们没见过的驱动原始报错 | 未分类（E1015 只留给「机器能判等的明确失败」） |
+
+### 3.3 用户看到这句话该做什么
+
+1. 看 `last_error`：里面有**表名 + 列名 + 两端类型**；
+2. 在目标端把结构对齐（手工 `ALTER`，或把该列从 `content` 里排除）；
+3. 重跑。位点没推进 → 不重搬历史、不重复写。
+
+**不要**：去 `--resync`（那是 E3001 的动作，会把全量重搬一遍）；等「其它表继续」（本版本不会）；把它当成单表小问题放着（整条同步已经停住）。
