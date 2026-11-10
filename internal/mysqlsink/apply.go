@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/spencerswagger/jinliang/internal/sink"
 	"github.com/spencerswagger/jinliang/internal/source"
 )
 
@@ -35,10 +36,16 @@ func (s *Sink) Apply(ctx context.Context, evs []source.Event, pos source.Positio
 	// 而不是带着新关系往一张结构没对齐的表里写。只查内存集合，不产生 IO。
 	// pausedCache 为空（没调过 LoadPausedTables）时这段是空转，不影响别的路径。
 	for _, ev := range evs {
-		if _, paused := s.pausedCache[ev.Table.Table]; paused {
-			return fmt.Errorf("引擎没有过滤掉暂停表 %s 的事件（内部错误：按表暂停的判定权在引擎，"+
-				"不该把这张表的行交到这里）", ev.Table.Table)
+		if _, paused := s.pausedCache[ev.Table.Table]; !paused {
+			continue
 		}
+		// 整表重搬窗口内**故意**写这张表（契约 §1.6 步 3）：记录要留到搬成才解除，
+		// 所以这里按上下文放行，而不是要求引擎先删记录（那会打开崩溃窗口）。
+		if sink.InRecopy(ctx, ev.Table.Table) {
+			continue
+		}
+		return fmt.Errorf("引擎没有过滤掉暂停表 %s 的事件（内部错误：按表暂停的判定权在引擎，"+
+			"不该把这张表的行交到这里）", ev.Table.Table)
 	}
 
 	if !batchHasImplicitCommit(evs) {
@@ -493,7 +500,7 @@ func (s *Sink) writePosition(ctx context.Context, tx *sql.Tx, position string) e
 		INSERT INTO _jl_meta (job_key, name, instance_id, schema_version, job_hash, phase, position, started_at, updated_at)
 		VALUES (?, ?, ?, 1, ?, 'continuous', ?, NOW(6), NOW(6))
 		ON DUPLICATE KEY UPDATE position = VALUES(position), updated_at = NOW(6)`,
-		s.opt.JobKey, s.opt.Name, s.opt.InstanceID, s.opt.JobKey, position)
+		s.opt.JobKey, s.opt.Name, s.opt.InstanceID, "", position)
 	if err != nil {
 		return fmt.Errorf("写位点失败（本次数据不提交）: %w", err)
 	}

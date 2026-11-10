@@ -201,7 +201,8 @@ func (p *Postgres) Catalog(ctx context.Context, scope source.Scope) (source.Cata
 	const qCols = `
 		SELECT c.relname, a.attname, format_type(a.atttypid, a.atttypmod),
 		       NOT a.attnotnull, pg_get_expr(d.adbin, d.adrelid), col_description(c.oid, a.attnum),
-		       CASE WHEN a.attcollation <> t.typcollation THEN co.collname END
+		       CASE WHEN a.attcollation <> t.typcollation THEN co.collname END,
+		       a.atttypid::bigint
 		FROM pg_attribute a
 		JOIN pg_class c ON c.oid = a.attrelid
 		JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -218,8 +219,9 @@ func (p *Postgres) Catalog(ctx context.Context, scope source.Scope) (source.Cata
 	for crows.Next() {
 		var table, col, typ string
 		var nullable bool
+		var typeOID int64
 		var def, comment, collation sql.NullString
-		if err := crows.Scan(&table, &col, &typ, &nullable, &def, &comment, &collation); err != nil {
+		if err := crows.Scan(&table, &col, &typ, &nullable, &def, &comment, &collation, &typeOID); err != nil {
 			crows.Close()
 			return source.Catalog{}, err
 		}
@@ -228,7 +230,7 @@ func (p *Postgres) Catalog(ctx context.Context, scope source.Scope) (source.Cata
 			continue
 		}
 		c := source.Column{Name: col, Type: typ, Nullable: nullable, Comment: comment.String,
-			Collation: collation.String}
+			Collation: collation.String, TypeOID: typeOID}
 		if def.Valid {
 			s := def.String
 			c.Default = &s
