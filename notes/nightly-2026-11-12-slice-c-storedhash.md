@@ -20,6 +20,12 @@
 func (s *Sink) StoredJobHash(ctx context.Context) (string, error)
 ```
 
+**评审修的一条（关键）**：`EnsureMeta` 原来在冲突分支里刷新 `job_hash`，于是**读回来恒等于本轮 hash**，
+`sameJob := stored == "" || stored == hashOf(doc)` 恒真——判据空转（PG 侧的 `EnsureMeta` 不刷新，
+MySQL 照抄就成了 no-op）。已去掉 `job_hash=VALUES(job_hash)`，并补了「h1 → h2 → 读回仍是 h1」那一格
+（原来只有「写一次能读回」，抓不到覆盖）。顺带修掉 `writePosition` 把 `job_key` 当 `job_hash` 传的旧笔误
+（与 pgsink 对齐成空串）。
+
 **与 `paused_tables` 的写入是不是同事务**：不是，也不需要。`job_hash` 由 `EnsureMeta` 在 prepare 写、
 `paused_tables` 由 `PauseTable` 单独事务写；判据是「读回来的 hash 是否等于本轮 hash」，
 读晚一点只会更准（本轮 hash 在 prepare 就定了）。真正要保证的是「读得到」——
@@ -56,13 +62,22 @@ func (v PauseView) Lines() []string               // status / doctor 直接拼�
 三个附加事实缺一不可：`Dirty`（JSON 坏了、已按无暂停继续）、`Enforcement`（写路径认不认）、
 `ReadErr`（读失败**绝不**返回空集合假装「没有暂停」）。
 
+**`Enforcement` 由引擎填，不由 sink 自报**（评审改的）：sink 不可能知道引擎有没有把它包进
+`pauseSink`，让它自报「我被绑定了没有」就是替别人声明，而且绑定时忘了改也不会红（preflight
+PAUSE-01 刚踩过同一个坑）。所以 Data 侧只给词汇表（`PauseEnforcementStorageOnly/EngineBound`）
+与纯函数 `RenderPauseView(v PauseView) []string`，值由调用方（引擎）填。
+
 **输出样例**（`TestIntegrationPauseViewWhenEngineNotBound` 真库日志原文）：
 
 ```
 暂停记录     1 张表：jl_b3_view_tbl
               ⚠ 这些记录**只存在存储层**（pause enforcement=storage-only）：当前目标端的引擎侧尚未接管暂停，被记录的表**仍在被写入**，目标端数据可能与源端不一致。
-              结构对齐后请重跑：本轮会整表重搬补齐，搬成之后记录才会解除。
+              本版**不会**自动重搬、也不会自动解除这些记录：请手工把结构对齐并核对数据；引擎侧接管之后才会走「整表重搬补齐 → 搬成解除」。
 ```
+
+（第一版这句写的是「重跑即可，本轮会整表重搬补齐」——storage-only 下那是**假话**：引擎不认这些记录，
+重跑既不 `MarkTableRecopyPending` 也不重搬。评审抓到并用例现在**反向钉住**：storage-only 文案里
+不许出现「重跑即可 / 本轮会整表重搬补齐」，engine-bound 那一支才允许。）
 
 读失败时（`_jl_meta` 被删/权限被收）：
 
@@ -73,10 +88,10 @@ func (v PauseView) Lines() []string               // status / doctor 直接拼�
 用例：`TestIntegrationPauseViewWhenEngineNotBound`（PASS 0.11s，断言含表名 / `storage-only` / 「仍在被写入」/
 「整表重搬补齐」）、`TestIntegrationPauseViewReadFailureIsNotSilent`（PASS 0.22s，断言「别当成没有暂停」）。
 
-**当前接线状态（必须说清，不能假装已经有了）**：`jinliang status` 今天**根本没有暂停小节**——
-`engine.StatusFor` 只走 `pgsink.ReadState`（PG 专用），MySQL 目标端那一支连 `_jl_meta` 都不读，
-`err != nil` 时统一写一句「目标端还没有运行状态（还没跑过）」（对 MySQL 目标端是误导：任务其实跑过）。
-也就是说：**不是「返回空集合假装无暂停」，而是「整段不显示」**——同样是静默，风险一样。
+**当前接线状态（比「没有暂停小节」更严重）**：`engine.StatusFor` **无条件**调
+`pgsink.ReadState`（PG 专用），MySQL 目标端必然失败 → `Note="目标端还没有运行状态（还没跑过）"`、
+phase/position 全空。也就是说，对一个**正在跑的 MySQL 任务**，`jinlang status` 会说「还没跑过」。
+这不是「整段不显示」，是**给出了错的结论**。
 `PauseSummary/Lines` 就是给 `status`/`doctor`（契约 §1.8，Core 的清单）现成的一段，接上去一行调用即可；
 在那之前，Data 侧只有这个方法能看见状态。
 

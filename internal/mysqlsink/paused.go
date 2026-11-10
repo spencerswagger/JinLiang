@@ -68,44 +68,40 @@ func (s *Sink) StoredJobHash(ctx context.Context) (string, error) {
 	return h.String, nil
 }
 
-// PauseEnforcement 报告这个目标端的暂停**执行面**做到哪一步。
+// 暂停的**执行面**（写路径到底认不认这些记录）——这个值**由引擎回答，不由 sink 回答**。
 //
-// MySQL 目标端今天是 `storage-only`：记录能写、能读、能清（六个方法都实现了），
-// 但**引擎侧的暂停判定还没绑到这条路径上**（`pauseReg` 故意不绑，Core #99 的理由：
-// 恢复路径 reconcile/强制重搬/搬成解除仍在 PG 侧，绑上去就是「流式期暂停永不解除」）。
-//
-// 这句话必须能被 `status` / `doctor` 读出来并转述给用户，否则最危险的形态会静默发生：
-// **存储层有记录，但写路径根本不理它** —— 用户看到「已登记暂停」以为表停了，
-// 实际还在写，目标端与源端不一致。
-//
-// 片 C 落地（pauseReg 绑定 + 恢复路径搬层就位）之后把这里改成 `engine-bound`，
-// `TestIntegrationPauseViewWhenEngineNotBound` 会逼着改（它断言当前值）。
+// 为什么不在 sink 上判断：sink 根本不知道引擎有没有把它包进 `pauseSink`
+// （MySQL 目标端今天故意不绑，Core #99 的理由是恢复路径仍在 PG 侧）。让 sink 自报
+// 「我被绑定了没有」就是替别人声明，而且绑定时忘了改它也不会红——同一个坑
+// preflight 的 PAUSE-01 刚踩过。所以这里只给词汇表，值由调用方填进 `PauseView`。
 const (
+	// PauseEnforcementStorageOnly：记录能写能读能清，但引擎侧没接管——**被记录的表仍在被写入**。
 	PauseEnforcementStorageOnly = "storage-only"
+	// PauseEnforcementEngineBound：引擎按表跳过已生效（片 C 绑定之后）。
 	PauseEnforcementEngineBound = "engine-bound"
 )
-
-// PauseEnforcement 见常量注释。
-func (s *Sink) PauseEnforcement() string { return PauseEnforcementStorageOnly }
 
 // PauseView 是「暂停」这件事**面向展示**的完整状态（status / doctor / UI 都读它）。
 //
 // 为什么不是直接返回 `map[string]PausedTable`：那样调用方只能看到记录，看不到
 // 「这些记录到底管不管用」。三个附加事实缺一不可——
 //   - Dirty：库里的 JSON 坏了（已按「无暂停」继续，但用户必须知道）；
-//   - Enforcement：写路径认不认这些记录（storage-only 时**不认**）；
+//   - Enforcement：写路径认不认这些记录（**由引擎填**，见上面的常量）；
 //   - ReadErr：读失败时把错误原样带出来，绝不返回空集合假装「没有暂停」。
 type PauseView struct {
-	Records     map[string]pgsink.PausedTable
-	Tables      []string
-	Dirty       bool
+	Records map[string]pgsink.PausedTable
+	Tables  []string
+	Dirty   bool
+	// Enforcement 由**引擎**填（storage-only / engine-bound）；留空时按「不知道」处理。
 	Enforcement string
 	ReadErr     error
 }
 
 // PauseSummary 汇总本任务的暂停状态（读失败也返回一个 PauseView，错误放在 ReadErr 里）。
+//
+// 注意 `Enforcement` 这里**不填**：它取决于引擎有没有接管，Data 侧无法也不该判断。
 func (s *Sink) PauseSummary(ctx context.Context) PauseView {
-	v := PauseView{Enforcement: s.PauseEnforcement()}
+	v := PauseView{}
 	rec, dirty, err := s.readPaused(ctx)
 	if err != nil {
 		v.ReadErr = err
@@ -116,11 +112,15 @@ func (s *Sink) PauseSummary(ctx context.Context) PauseView {
 	return v
 }
 
-// Lines 把 PauseView 渲染成给人看的几行（status / doctor 直接拼进输出）。
+// RenderPauseView 把 PauseView 渲染成给人看的几行（status / doctor 直接拼进输出）。
 //
-// 文案原则：**先说记录，再说它管不管用**。storage-only 时必须有一句
-// 「仍在被写入」，否则「已暂停」三个字本身就是假话。
-func (v PauseView) Lines() []string {
+// 做成**纯函数**：Core 那侧不用连库就能测文案；`Enforcement` 由调用方填。
+//
+// 文案原则：**先说记录，再说它管不管用**，而且两句都不能撒谎——
+//   - storage-only 时「仍在被写入」必须说（否则「已暂停」三个字本身就是假话）；
+//   - storage-only 时**不能**说「重跑会重搬/会自动解除」：引擎不认这些记录，
+//     重跑既不 `MarkTableRecopyPending` 也不重搬，更不会解除。只能让用户手工对齐并核对数据。
+func RenderPauseView(v PauseView) []string {
 	if v.ReadErr != nil {
 		return []string{"暂停记录     读不到：" + v.ReadErr.Error() +
 			"（不要当成「没有暂停」——先修权限/连接再判断）"}
@@ -132,11 +132,19 @@ func (v PauseView) Lines() []string {
 		return nil
 	}
 	out := []string{fmt.Sprintf("暂停记录     %d 张表：%s", len(v.Tables), strings.Join(v.Tables, "、"))}
-	if v.Enforcement == PauseEnforcementStorageOnly {
+	switch v.Enforcement {
+	case PauseEnforcementStorageOnly:
 		out = append(out,
 			"              ⚠ 这些记录**只存在存储层**（pause enforcement="+PauseEnforcementStorageOnly+"）："+
 				"当前目标端的引擎侧尚未接管暂停，被记录的表**仍在被写入**，目标端数据可能与源端不一致。",
-			"              结构对齐后请重跑：本轮会整表重搬补齐，搬成之后记录才会解除。")
+			"              本版**不会**自动重搬、也不会自动解除这些记录：请手工把结构对齐并核对数据；"+
+				"引擎侧接管之后才会走「整表重搬补齐 → 搬成解除」。")
+	case PauseEnforcementEngineBound:
+		out = append(out,
+			"              结构对齐后重跑即可：本轮会整表重搬补齐，搬成之后记录才会解除。")
+	default:
+		out = append(out,
+			"              （写路径是否已接管暂停未知：调用方没有给出 enforcement 值）")
 	}
 	return out
 }

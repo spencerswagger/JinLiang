@@ -493,7 +493,7 @@ func (s *Sink) writePosition(ctx context.Context, tx *sql.Tx, position string) e
 		INSERT INTO _jl_meta (job_key, name, instance_id, schema_version, job_hash, phase, position, started_at, updated_at)
 		VALUES (?, ?, ?, 1, ?, 'continuous', ?, NOW(6), NOW(6))
 		ON DUPLICATE KEY UPDATE position = VALUES(position), updated_at = NOW(6)`,
-		s.opt.JobKey, s.opt.Name, s.opt.InstanceID, s.opt.JobKey, position)
+		s.opt.JobKey, s.opt.Name, s.opt.InstanceID, "", position)
 	if err != nil {
 		return fmt.Errorf("写位点失败（本次数据不提交）: %w", err)
 	}

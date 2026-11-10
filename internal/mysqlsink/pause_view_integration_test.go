@@ -34,8 +34,13 @@ func TestIntegrationStoredJobHashSurvivesRestart(t *testing.T) {
 	}
 
 	// 写一个 hash（prepare 就是这么写的），再「重启」读回。
+	// 先清掉状态行：`job_hash` 与 pgsink 同口径，**只在插入时写**，冲突时不覆盖
+	// （覆盖 = 读回来恒等于本轮 hash = 跨轮存活判据恒真 = 换了语义旧暂停也清不掉）。
 	const want = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 	b := openSink(t, nil)
+	if _, err := b.db.ExecContext(ctx, "DELETE FROM `_jl_meta` WHERE job_key = ?", b.opt.JobKey); err != nil {
+		t.Fatalf("清状态行失败: %v", err)
+	}
 	if err := b.EnsureMeta(ctx, want, "streaming", "", ""); err != nil {
 		t.Fatalf("写状态行失败: %v", err)
 	}
@@ -48,6 +53,16 @@ func TestIntegrationStoredJobHashSurvivesRestart(t *testing.T) {
 	}
 	if got != want {
 		t.Fatalf("重启后读回的 hash 不对：%q，应为 %q（reconcile 的跨轮存活判据靠它）", got, want)
+	}
+
+	// 已存在状态行时再 `EnsureMeta`：hash **不覆盖**（这就是 Owl II 要求的那一格——
+	// 只有「写一次能读回」的用例抓不到覆盖）。
+	if err := c.EnsureMeta(ctx, "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+		"streaming", "", ""); err != nil {
+		t.Fatalf("第二次 EnsureMeta 失败: %v", err)
+	}
+	if got3, _ := c.StoredJobHash(ctx); got3 != want {
+		t.Fatalf("EnsureMeta 覆盖了 job_hash：%q（必须保持首次那个 %q，否则跨轮判据恒真）", got3, want)
 	}
 
 	// 登记暂停（单独事务）**不许**顺手改掉 hash：两个写互不干扰。
@@ -71,8 +86,8 @@ func TestIntegrationPauseViewWhenEngineNotBound(t *testing.T) {
 	t.Cleanup(func() { _ = s.ClearPausedTable(ctx, ref) })
 
 	// 空记录：不该输出任何行（也不该假装有个「暂停 0 张」）。
-	if v := s.PauseSummary(ctx); len(v.Lines()) != 0 {
-		t.Fatalf("没有记录时不该有输出行：%v", v.Lines())
+	if v := s.PauseSummary(ctx); len(RenderPauseView(v)) != 0 {
+		t.Fatalf("没有记录时不该有输出行：%v", RenderPauseView(v))
 	}
 
 	if err := s.PauseTable(ctx, ref, pgsink.PausedTable{
@@ -86,20 +101,32 @@ func TestIntegrationPauseViewWhenEngineNotBound(t *testing.T) {
 	if v.ReadErr != nil {
 		t.Fatalf("读暂停状态失败: %v", v.ReadErr)
 	}
-	if v.Enforcement != PauseEnforcementStorageOnly {
-		t.Fatalf("MySQL 目标端今天必须自报 storage-only（片 C 绑上才改），实际 %q", v.Enforcement)
-	}
 	if len(v.Tables) != 1 || v.Tables[0] != ref.Table {
 		t.Fatalf("记录里应有这张表：%v", v.Tables)
 	}
-	lines := v.Lines()
+	// Enforcement 由**引擎**填（Data 侧不替它声明）：这里模拟引擎在 MySQL 目标端未绑时给出的值。
+	v.Enforcement = PauseEnforcementStorageOnly
+	lines := RenderPauseView(v)
 	joined := strings.Join(lines, "\n")
-	for _, want := range []string{ref.Table, "storage-only", "仍在被写入", "整表重搬补齐"} {
+	for _, want := range []string{ref.Table, "storage-only", "仍在被写入", "不会**自动重搬"} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("展示文案里应有 %q（用户必须知道「记录在但写路径不认」）：\n%s", want, joined)
 		}
 	}
+	// **不许**承诺「重跑会重搬/会自动解除」——引擎不认这些记录时那两句都是假话。
+	for _, bad := range []string{"重跑即可", "本轮会整表重搬补齐"} {
+		if strings.Contains(joined, bad) {
+			t.Fatalf("storage-only 下不许出现 %q（引擎不认记录，重跑既不重搬也不解除）：\n%s", bad, joined)
+		}
+	}
 	t.Logf("status/doctor 在「MySQL 目标端未绑 pauseReg」时的输出样例：\n%s", joined)
+
+	// 对照组：引擎接管之后，同一份记录该给的是「重跑即可」。
+	v.Enforcement = PauseEnforcementEngineBound
+	bound := strings.Join(RenderPauseView(v), "\n")
+	if !strings.Contains(bound, "整表重搬补齐") || strings.Contains(bound, "仍在被写入") {
+		t.Fatalf("engine-bound 下的文案应承诺重搬且不再说「仍在被写入」：\n%s", bound)
+	}
 }
 
 // 读失败时**不许**返回空集合假装没有暂停：错误必须原样带出来。
@@ -119,7 +146,7 @@ func TestIntegrationPauseViewReadFailureIsNotSilent(t *testing.T) {
 	if v.ReadErr == nil && len(v.Tables) == 0 {
 		t.Fatal("读不到状态时绝不能安静返回「没有暂停」")
 	}
-	lines := strings.Join(v.Lines(), "\n")
+	lines := strings.Join(RenderPauseView(v), "\n")
 	if v.ReadErr != nil && !strings.Contains(lines, "不要当成「没有暂停」") {
 		t.Fatalf("读失败的输出要明确写「别当成没有暂停」：\n%s", lines)
 	}
