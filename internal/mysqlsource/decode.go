@@ -245,6 +245,12 @@ func decodeStringCell(col int, data []byte, maxLen int, binaryCol bool) (source.
 	}
 	raw := data[prefix : prefix+length]
 	// 二进制列（VARBINARY / binary 字符集）原样交字节；其余按字符串。
+	//
+	// 待办（已知缺口，下一轮）：`binaryCol` 现在由调用方按**类型字节**判断，
+	// 而真正的判据是「这一列的排序规则是不是 binary」——TABLE_MAP 的
+	// `collationFor(col)==63`（FULL 与 MINIMAL 都有）。所以 `BINARY(4)='abcd'`
+	// 这种「内容恰好是合法 UTF-8 的二进制列」仍会被当字符串（pgsink 侧走
+	// `$n::text::bytea`，值以反斜杠开头时会被 PG 静默改写）。见 notes §5.4。
 	if binaryCol {
 		return source.Value{Kind: source.KindBytes, B: append([]byte(nil), raw...)}, prefix + length, nil
 	}

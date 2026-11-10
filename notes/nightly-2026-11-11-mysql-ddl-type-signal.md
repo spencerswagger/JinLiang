@@ -1,7 +1,7 @@
 # 夜班 2026-11-11 ① MySQL 源 → 引擎的 DDL/类型信号 + 三组合真数字
 
-接 22:05 那轮（23:41:51 容器被外部重建切断，不是 OOM、不是代码崩）。
-分支 `feat/mysql-ddl-type-signal`，基线 main `67db571`。
+接 22:05 那轮（23:41:51 容器被外部重建切断，不是 OOM、不是代码崩）。三段接续：先修信号与类型，再按裁决 A 改判据。
+分支 `feat/mysql-ddl-type-signal`，已 rebase 到裁决 A 之后的 main（`b2642a9`，含 #93）。
 
 ---
 
@@ -141,6 +141,9 @@ TEXT 与 BLOB 按尺寸档视为同类；**其余一律不同型 → 保留 binl
 `decodeStringCell` 按「内容是不是可打印 UTF-8」决定 Kind，而可打印判定只看 U+FFFD：
 `\x00\x01` 这种值被判成字符串，写给 PG 的 bytea 时 `cannot find encode plan`（真库实测，整块数据失败）。
 修法：VARBINARY **按定义就是字节**（不看内容），可打印判定拒绝控制字符。
+**仍有缺口（下一轮）**：判据仍是「类型字节 + 内容」，而准的判据是 `TABLE_MAP.collationFor(col)==63`
+（binary 排序规则，FULL 与 MINIMAL 都有）。所以 `BINARY(4)='abcd'` 这种「内容合法的二进制列」
+仍会被当字符串，pgsink 侧 `$n::text::bytea` 遇到以反斜杠开头的值会被 PG **静默改写**（Owl II 的对抗例）。
 判据：类型改类型用例里加了一张 `engine_my_chartypes`（CHAR/TEXT/VARBINARY/VARCHAR 四列），
 全量与增量都必须原样过去（`encode(vb,'hex')='0001'`、`c='中文十'`、`t='文本'`）。
 

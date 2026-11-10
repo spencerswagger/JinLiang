@@ -296,17 +296,17 @@ func myJobKey(t *testing.T, conn *pgx.Conn) string {
 	return k
 }
 
-// waitRows 等目标端某张表到 n 行（流真的跑起来了才动 DDL）。
-func waitRows(t *testing.T, conn *pgx.Conn, table string, n int, d time.Duration) {
+// waitRowsQuiet 等目标端某张表到 n 行，只回报结果（调用方自己决定打印什么）。
+func waitRowsQuiet(t *testing.T, conn *pgx.Conn, table string, n int, d time.Duration) bool {
 	t.Helper()
 	deadline := time.Now().Add(d)
 	for time.Now().Before(deadline) {
 		if pgCount(t, conn, table) >= n {
-			return
+			return true
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	t.Fatalf("等 %s 到 %d 行超时（实际 %d）：增量流没有跑起来", table, n, pgCount(t, conn, table))
+	return false
 }
 
 // pgHasRow 报告目标表里有没有满足条件的那一行。
@@ -318,17 +318,4 @@ func pgHasRow(t *testing.T, conn *pgx.Conn, table, where string) bool {
 		t.Fatalf("查 %s 的行失败: %v", table, err)
 	}
 	return n > 0
-}
-
-// waitRowsQuiet 与 waitRows 相同，但只回报结果（调用方自己决定打印什么）。
-func waitRowsQuiet(t *testing.T, conn *pgx.Conn, table string, n int, d time.Duration) bool {
-	t.Helper()
-	deadline := time.Now().Add(d)
-	for time.Now().Before(deadline) {
-		if pgCount(t, conn, table) >= n {
-			return true
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	return false
 }
