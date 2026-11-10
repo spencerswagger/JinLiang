@@ -92,7 +92,9 @@ func TestApplyForcedRecopyRescuesSingleTableCopySkip(t *testing.T) {
 	}
 	plan := planCopy(in)
 	if plan.Kind != copySkip {
-		t.Logf("（前提变了）planCopy 对「零块标记的单表」不再判 copySkip，得到 %s", plan.Kind)
+		// 前提变了就红：这条用例的全部意义是「单表 + 零块标记 → copySkip → 搬运阶段整个不跑」，
+		// planCopy 的老状态分支一改，留着 Logf 会让这条用例安静地什么都不证明。
+		t.Fatalf("前提变了：planCopy 对「零块标记的单表」不再判 copySkip，得到 %s", plan.Kind)
 	}
 	r := &runner{forceRecopy: map[string]source.TableRef{"orders": ref}}
 	r.applyForcedRecopy(&plan)

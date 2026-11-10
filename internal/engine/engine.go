@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"path"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -667,6 +668,7 @@ func (r *runner) recopyOne(ctx context.Context, ref source.TableRef) error {
 		return fmt.Errorf("清空 %s 准备整表重来时失败: %w", ref.Table, err)
 	}
 	if why == recopyPaused {
+		r.clearedTables = append(r.clearedTables, ref.Table)
 		r.note(ctx, "表 "+ref.Table+" 整表重搬：先清空目标端再从头读（暂停窗口里的删除只能这样补掉）")
 	} else {
 		r.note(ctx, ref.Table+" 没有稳定的主键，只能整表重来（不清其它表）")
@@ -1005,7 +1007,6 @@ func (r *runner) prepare(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	r.applyForcedRecopy(&plan)
 	// 结构对不上的表：这一轮**连存量都不搬**（契约 §6 硬口径 2）。
 	// 它们仍留在 r.tables 里——跨轮存活判据要用「这张表还在不在范围内」，
 	// 把它从表集合里拿掉会让 reconcilePaused 认为「已出范围」而把暂停记录清掉。
@@ -1058,6 +1059,11 @@ func (r *runner) prepare(ctx context.Context) error {
 			}
 		}
 	}
+	// 欠重搬的表必须在 `--resync` 之后接进计划：`applyResync` 会 `p.Recopy = nil`
+	// 并按 `CleanNames` 重排清理名单，先接的话会被它清掉——于是「不清空、不重搬」，
+	// 收尾还会发一句「已恢复：整表重搬完成」。而 `--resync` 恰恰是结构对不上时最会按的键。
+	r.applyForcedRecopy(&plan)
+	r.needSnapshot = plan.Kind != copySkip
 	// 续跑时**不重建书签、不导出视图**：书签得留着才能从原来的位点重放变更。
 	prep, err := src.Prepare(ctx, r.needSnapshot && plan.Kind != copyResume)
 	if err != nil {
@@ -1233,12 +1239,34 @@ func (r *runner) applyForcedRecopy(plan *chunkPlan) {
 			plan.Recopy = append(plan.Recopy, ref)
 		}
 	}
+	if plan.Clean != cleanNone {
+		// 从头搬（once / full_interval / 位点追不回 / --resync）的清理名单是按
+		// **清块标记之前**的块进度算的（`plan.Written`），刚被 reconcilePaused 清过的
+		// 这张表不在里面 → 会「不搬也不清」，暂停期间的删除全留成幻行。
+		for key := range r.forceRecopy {
+			if !containsName(plan.CleanNames, key) {
+				plan.CleanNames = append(plan.CleanNames, key)
+			}
+		}
+	}
 	if plan.Kind == copySkip {
 		// 搬运阶段由 Kind 决定跑不跑：copySkip 会让 snapshot 整个跳过。
 		// 有表欠重搬就必须跑一趟，`Recopy` 分支自己会把它们清干净。
 		plan.Kind = copyResume
-		plan.Why = "" // 老状态那句「存量已搬完」已经不成立
+		// 老状态那句「存量已搬完」已经不成立，换一句真话（prepare 会把它当 note 发出去；
+		// 置空会发一条空 note）。
+		plan.Why = "有 " + strconv.Itoa(len(r.forceRecopy)) + " 张表因为结构不一致暂停过、" +
+			"现在结构已对齐：本轮清空它们并整表重搬（跳过窗口里的删除只能这样补掉）"
 	}
+}
+
+func containsName(names []string, want string) bool {
+	for _, n := range names {
+		if n == want {
+			return true
+		}
+	}
+	return false
 }
 
 func containsTable(refs []source.TableRef, table string) bool {
@@ -1506,6 +1534,12 @@ func (r *runner) cleanBeforeRecopy(ctx context.Context) error {
 		return nil
 	}
 	for _, name := range r.plan.CleanNames {
+		if r.skippedTables[name] {
+			// 本轮刚发现结构对不上、正在暂停：契约 §6 口径是「连存量都不搬」——
+			// 清它比不搬更糟（用户去读目标表会读到空表）。尤其 `resume=manual` 的表，
+			// 清它会撞 reusedTableRecopyError，把「只停该表」又打回「整轮停」。
+			continue
+		}
 		ref, ok := r.tableByName(name)
 		if !ok {
 			continue

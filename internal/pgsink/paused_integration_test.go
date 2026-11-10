@@ -166,15 +166,16 @@ func openRaw(t *testing.T) *pgx.Conn {
 	return conn
 }
 
-// TestApplyNoLongerRefusesPausedTable：**写路径不再做暂停判定**（契约 §1.5 第 1 条）。
+// TestApplyRejectsLeftoverPausedRows：**sink 不做暂停判定，但绝不当成没看见**。
 //
-// 旧行为是「命中暂停表 → 整批拒绝、位点不动」，后果是一张表坏了、几十张无关表一起停。
-// 现在判定权在引擎（`internal/engine/pause_skip.go`）：引擎把暂停表的事件整条丢掉、
-// 保留 Begin/Commit、让位点照常前进，欠账由「结构对齐后整表重搬」还。
+// 判定权在引擎（契约 §1.5 第 1 条）：引擎按表把暂停表的事件整条丢掉、其它表照写、
+// 位点照常前进。所以走到 `Apply` 的批次里**不该**有暂停表的行——如果还有，那是引擎漏了
+// （表名口径变了、新写路径没包 `pauseSink`、snapshot 漏了某张跳过表）。
 //
-// 所以这条用例钉的是**sink 的边界**：给它什么就写什么，它不再替引擎做决定。
-// 引擎那一半（丢了谁、位点前进没有）在 `internal/engine/integration_paused_test.go`。
-func TestApplyNoLongerRefusesPausedTable(t *testing.T) {
+// 这时必须立刻炸：带着新 Relation 往一张结构没对齐的表里写，`alignRelationTx` 还会顺手补列，
+// 写进去就没人知道了。所以这条用例断言的是「**报错 + 目标端 0 行**」，不是「写进去」——
+// 契约 §5-1 对这条用例的要求就是「引擎过滤后 sink 收到的批次里没有暂停表的行」。
+func TestApplyRejectsLeftoverPausedRows(t *testing.T) {
 	ctx := context.Background()
 	table := "paused_apply"
 	dropPausedFixtures(t, table)
@@ -195,22 +196,26 @@ func TestApplyNoLongerRefusesPausedTable(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 另一个实例从库里读回记录（跨进程可见），然后照常写：sink 不再拒绝。
+	// 另一个实例从库里读回记录（跨进程可见），然后**故意**把这张表的行交给它。
 	second := openPausedSink(t, table, "pausedapply")
 	if err := second.LoadPausedTables(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if err := second.Apply(ctx, pausedInsertEvents(table, 3), nil); err != nil {
-		t.Fatalf("sink 不该再按暂停表整批拒绝（判定权在引擎）：%v", err)
+	err := second.Apply(ctx, pausedInsertEvents(table, 3), nil)
+	if err == nil {
+		t.Fatal("引擎漏过滤时必须炸：写进一张结构没对齐的表就是静默脏数据")
+	}
+	if !strings.Contains(err.Error(), "引擎没有过滤掉暂停表") {
+		t.Fatalf("报错要指向真正的责任方（引擎没过滤），得到：%v", err)
 	}
 	var n int
 	if err := first.conn.QueryRow(ctx, "SELECT count(*) FROM "+pausedSchema+"."+table).Scan(&n); err != nil {
 		t.Fatal(err)
 	}
-	if n != 3 {
-		t.Fatalf("sink 收到什么写什么：应为 3 行，实际 %d 行", n)
+	if n != 0 {
+		t.Fatalf("报错就是一行都不写，实际 %d 行", n)
 	}
-	t.Logf("写路径不再做暂停判定：sink 收到 3 行就写 3 行（是否跳过由引擎决定）")
+	t.Logf("最后一道防线：另一实例读回记录后收到暂停表的行 → 报「引擎没过滤」+ 目标端 0 行")
 }
 
 // 老库补列：`_jl_meta` 是 #76 之前的列集合（没有 paused_tables），Open 之后必须补上，
