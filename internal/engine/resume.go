@@ -326,6 +326,7 @@ func (r *runner) decideCopyPlan(ctx context.Context, src runSource,
 	if err != nil {
 		return chunkPlan{}, fmt.Errorf("读目标端的块进度失败: %w", err)
 	}
+	r.progressByTable = prog
 	in := copyInputs{
 		Mode:       r.mode(),
 		AlwaysCopy: r.mode() == "once" || r.mode() == "full_interval",
