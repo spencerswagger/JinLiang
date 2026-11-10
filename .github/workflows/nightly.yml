@@ -55,12 +55,16 @@ jobs:
             -e POSTGRES_USER=jinliang -e POSTGRES_PASSWORD=jinliang -e POSTGRES_DB=jinliang_src \
             -p 5432:5432 postgres:${{ matrix.pg }} \
             -c wal_level=logical -c max_replication_slots=40 -c max_wal_senders=40
-          # 不能只等 pg_isready：initdb 期间会先起一个临时实例应答，随后重启，
+          # 不能只等 pg_isready：initdb 期间会先起一个临时实例应答，随后立刻重启，
           # 紧接着的 psql 会撞上 "the database system is shutting down"。
-          # 直接轮询真查询，能查通才算起好（与 ci.yml 的 b1-engine 同一修法）。
+          # 所以要求**连续两次**真查询都成功（间隔 2s）才算起好——单次成功会撞上
+          # 那个临时实例（PG 17 上实测撞过一次）。
           ok=0
           for _ in $(seq 1 90); do
-            if docker exec pg-src psql -U jinliang -d postgres -tAc "select 1" >/dev/null 2>&1; then ok=1; break; fi
+            if docker exec pg-src psql -U jinliang -d postgres -tAc "select 1" >/dev/null 2>&1; then
+              sleep 2
+              if docker exec pg-src psql -U jinliang -d postgres -tAc "select 1" >/dev/null 2>&1; then ok=1; break; fi
+            fi
             sleep 2
           done
           [ "$ok" = 1 ] || { echo "--- pg-src 没起来 ---"; docker logs pg-src; exit 1; }
@@ -68,18 +72,22 @@ jobs:
         run: |
           set -euo pipefail
           fail() { echo "❌ 缺数据库前提：$*"; exit 1; }
+          # 库可能还在启动尾巴上（"the database system is shutting down"）：
+          # 这是**启动竞态**，不是缺前提，重试 15 次再判。
+          pgq() { for _ in $(seq 1 15); do if out=$(docker exec pg-src psql -U jinliang -d postgres -tAc "$1" 2>/dev/null); then echo "$out"; return 0; fi; sleep 2; done; return 1; }
+          myq() { for _ in $(seq 1 30); do if out=$(mysql -h 127.0.0.1 -uroot -proot -N -B -e "$1" 2>/dev/null); then echo "$out"; return 0; fi; sleep 2; done; return 1; }
 
-          wl=$(docker exec pg-src psql -U jinliang -d postgres -tAc "show wal_level")
-          slots=$(docker exec pg-src psql -U jinliang -d postgres -tAc "show max_replication_slots")
-          senders=$(docker exec pg-src psql -U jinliang -d postgres -tAc "show max_wal_senders")
+          wl=$(pgq "show wal_level") || fail "连不上 pg-src"
+          slots=$(pgq "show max_replication_slots") || fail "连不上 pg-src"
+          senders=$(pgq "show max_wal_senders") || fail "连不上 pg-src"
           echo "PG ${{ matrix.pg }}: wal_level=$wl max_replication_slots=$slots max_wal_senders=$senders"
           [ "$wl" = "logical" ] || fail "PG 的 wal_level=$wl（要 logical）：B1 引擎建逻辑书签会报 SQLSTATE 55000。services 传不了启动参数，必须 docker run … -c wal_level=logical"
           [ "$slots" -ge 20 ] || fail "max_replication_slots=$slots（要 ≥20）：多任务同时建书签会撞上限"
           [ "$senders" -ge 20 ] || fail "max_wal_senders=$senders（要 ≥20）"
 
-          logbin=$(mysql -h 127.0.0.1 -uroot -proot -N -B -e "select @@log_bin")
-          fmt=$(mysql -h 127.0.0.1 -uroot -proot -N -B -e "select @@binlog_format")
-          img=$(mysql -h 127.0.0.1 -uroot -proot -N -B -e "select @@binlog_row_image")
+          logbin=$(myq "select @@log_bin") || fail "连不上 MySQL"
+          fmt=$(myq "select @@binlog_format") || fail "连不上 MySQL"
+          img=$(myq "select @@binlog_row_image") || fail "连不上 MySQL"
           echo "MySQL: log_bin=$logbin binlog_format=$fmt binlog_row_image=$img"
           [ "$logbin" = "1" ] || fail "MySQL log_bin=$logbin（要 1）：没有 binlog 就没有变更流水"
           [ "$fmt" = "ROW" ] || fail "MySQL binlog_format=$fmt（要 ROW）"
@@ -140,9 +148,13 @@ jobs:
             --log-bin=mysql-bin \
             --binlog-format=ROW \
             --binlog-row-image=FULL
+          # 同样要求连续两次 ping 都通：initialize 阶段会先起一个临时实例。
           ok=0
-          for i in $(seq 1 90); do
-            if mysqladmin ping -h 127.0.0.1 -uroot -proot --silent 2>/dev/null; then ok=1; break; fi
+          for _ in $(seq 1 90); do
+            if mysqladmin ping -h 127.0.0.1 -uroot -proot --silent 2>/dev/null; then
+              sleep 3
+              if mysqladmin ping -h 127.0.0.1 -uroot -proot --silent 2>/dev/null; then ok=1; break; fi
+            fi
             sleep 2
           done
           [ "$ok" = 1 ] || { echo "--- my-src 没起来 ---"; docker logs my-src; exit 1; }
@@ -153,9 +165,14 @@ jobs:
             -e POSTGRES_USER=jinliang -e POSTGRES_PASSWORD=jinliang -e POSTGRES_DB=jinliang_src \
             -p 5432:5432 postgres:16 \
             -c wal_level=logical -c max_replication_slots=40 -c max_wal_senders=40
+          # 不能只等 pg_isready：initdb 期间会先起一个临时实例应答，随后立刻重启。
+          # 要求连续两次真查询都成功（间隔 2s）才算起好。
           ok=0
           for _ in $(seq 1 90); do
-            if docker exec pg-src psql -U jinliang -d postgres -tAc "select 1" >/dev/null 2>&1; then ok=1; break; fi
+            if docker exec pg-src psql -U jinliang -d postgres -tAc "select 1" >/dev/null 2>&1; then
+              sleep 2
+              if docker exec pg-src psql -U jinliang -d postgres -tAc "select 1" >/dev/null 2>&1; then ok=1; break; fi
+            fi
             sleep 2
           done
           [ "$ok" = 1 ] || { echo "--- pg-src 没起来 ---"; docker logs pg-src; exit 1; }
@@ -163,18 +180,22 @@ jobs:
         run: |
           set -euo pipefail
           fail() { echo "❌ 缺数据库前提：$*"; exit 1; }
+          # 库可能还在启动尾巴上（"the database system is shutting down"）：
+          # 这是**启动竞态**，不是缺前提，重试 15 次再判。
+          pgq() { for _ in $(seq 1 15); do if out=$(docker exec pg-src psql -U jinliang -d postgres -tAc "$1" 2>/dev/null); then echo "$out"; return 0; fi; sleep 2; done; return 1; }
+          myq() { for _ in $(seq 1 30); do if out=$(mysql -h 127.0.0.1 -uroot -proot -N -B -e "$1" 2>/dev/null); then echo "$out"; return 0; fi; sleep 2; done; return 1; }
 
-          logbin=$(mysql -h 127.0.0.1 -uroot -proot -N -B -e "select @@log_bin")
-          fmt=$(mysql -h 127.0.0.1 -uroot -proot -N -B -e "select @@binlog_format")
-          img=$(mysql -h 127.0.0.1 -uroot -proot -N -B -e "select @@binlog_row_image")
-          sid=$(mysql -h 127.0.0.1 -uroot -proot -N -B -e "select @@server_id")
+          logbin=$(myq "select @@log_bin") || fail "连不上 MySQL"
+          fmt=$(myq "select @@binlog_format") || fail "连不上 MySQL"
+          img=$(myq "select @@binlog_row_image") || fail "连不上 MySQL"
+          sid=$(myq "select @@server_id") || fail "连不上 MySQL"
           echo "MySQL ${{ matrix.mysql }}: log_bin=$logbin binlog_format=$fmt binlog_row_image=$img server_id=$sid"
           [ "$logbin" = "1" ] || fail "MySQL ${{ matrix.mysql }} 的 log_bin=$logbin（要 1）：5.7 默认关闭，必须 docker run 带 --log-bin"
           [ "$fmt" = "ROW" ] || fail "MySQL 的 binlog_format=$fmt（要 ROW）"
           [ "$img" = "FULL" ] || fail "MySQL 的 binlog_row_image=$img（要 FULL）"
           [ "$sid" != "0" ] || fail "MySQL 的 server_id=0：binlog 事件没法归组"
 
-          wl=$(docker exec pg-src psql -U jinliang -d postgres -tAc "show wal_level")
+          wl=$(pgq "show wal_level") || fail "连不上 pg-src"
           echo "PG: wal_level=$wl"
           [ "$wl" = "logical" ] || fail "PG 的 wal_level=$wl（要 logical）"
       - name: 第二套库 + 复制权限
@@ -233,11 +254,15 @@ jobs:
             -e POSTGRES_USER=jinliang -e POSTGRES_PASSWORD=jinliang -e POSTGRES_DB=jinliang_src \
             -p 5432:5432 postgres:16 \
             -c wal_level=logical -c max_replication_slots=40 -c max_wal_senders=40
-          # 不能只等 pg_isready：initdb 期间会先起一个临时实例应答，随后重启，
+          # 不能只等 pg_isready：initdb 期间会先起一个临时实例应答，随后立刻重启，
           # 紧接着的 psql 会撞上 "the database system is shutting down"。
+          # 要求连续两次真查询都成功（间隔 2s）才算起好。
           ok=0
           for _ in $(seq 1 90); do
-            if docker exec pg-src psql -U jinliang -d postgres -tAc "select 1" >/dev/null 2>&1; then ok=1; break; fi
+            if docker exec pg-src psql -U jinliang -d postgres -tAc "select 1" >/dev/null 2>&1; then
+              sleep 2
+              if docker exec pg-src psql -U jinliang -d postgres -tAc "select 1" >/dev/null 2>&1; then ok=1; break; fi
+            fi
             sleep 2
           done
           [ "$ok" = 1 ] || { echo "--- pg-src 没起来 ---"; docker logs pg-src; exit 1; }
@@ -245,18 +270,22 @@ jobs:
         run: |
           set -euo pipefail
           fail() { echo "❌ 缺数据库前提：$*"; exit 1; }
+          # 库可能还在启动尾巴上（"the database system is shutting down"）：
+          # 这是**启动竞态**，不是缺前提，重试 15 次再判。
+          pgq() { for _ in $(seq 1 15); do if out=$(docker exec pg-src psql -U jinliang -d postgres -tAc "$1" 2>/dev/null); then echo "$out"; return 0; fi; sleep 2; done; return 1; }
+          myq() { for _ in $(seq 1 30); do if out=$(mysql -h 127.0.0.1 -uroot -proot -N -B -e "$1" 2>/dev/null); then echo "$out"; return 0; fi; sleep 2; done; return 1; }
 
-          wl=$(docker exec pg-src psql -U jinliang -d postgres -tAc "show wal_level")
-          slots=$(docker exec pg-src psql -U jinliang -d postgres -tAc "show max_replication_slots")
-          senders=$(docker exec pg-src psql -U jinliang -d postgres -tAc "show max_wal_senders")
+          wl=$(pgq "show wal_level") || fail "连不上 pg-src"
+          slots=$(pgq "show max_replication_slots") || fail "连不上 pg-src"
+          senders=$(pgq "show max_wal_senders") || fail "连不上 pg-src"
           echo "PG: wal_level=$wl max_replication_slots=$slots max_wal_senders=$senders"
           [ "$wl" = "logical" ] || fail "PG 的 wal_level=$wl（要 logical）：engine 建逻辑书签会报 SQLSTATE 55000"
           [ "$slots" -ge 20 ] || fail "max_replication_slots=$slots（要 ≥20）"
           [ "$senders" -ge 20 ] || fail "max_wal_senders=$senders（要 ≥20）"
 
-          logbin=$(mysql -h 127.0.0.1 -uroot -proot -N -B -e "select @@log_bin")
-          fmt=$(mysql -h 127.0.0.1 -uroot -proot -N -B -e "select @@binlog_format")
-          img=$(mysql -h 127.0.0.1 -uroot -proot -N -B -e "select @@binlog_row_image")
+          logbin=$(myq "select @@log_bin") || fail "连不上 MySQL"
+          fmt=$(myq "select @@binlog_format") || fail "连不上 MySQL"
+          img=$(myq "select @@binlog_row_image") || fail "连不上 MySQL"
           echo "MySQL: log_bin=$logbin binlog_format=$fmt binlog_row_image=$img"
           [ "$logbin" = "1" ] || fail "MySQL log_bin=$logbin（要 1）"
           [ "$fmt" = "ROW" ] || fail "MySQL binlog_format=$fmt（要 ROW）"
@@ -312,13 +341,17 @@ jobs:
             -e POSTGRES_USER=jinliang -e POSTGRES_PASSWORD=jinliang -e POSTGRES_DB=jinliang_src \
             -p 5432:5432 postgres:16 \
             -c wal_level=logical -c max_replication_slots=40 -c max_wal_senders=40
+          # 连续两次真查询都成功才算起好（initdb 的临时实例会应答一次就重启）。
           ok=0
           for _ in $(seq 1 90); do
-            if docker exec pg-src psql -U jinliang -d postgres -tAc "select 1" >/dev/null 2>&1; then ok=1; break; fi
+            if docker exec pg-src psql -U jinliang -d postgres -tAc "select 1" >/dev/null 2>&1; then
+              sleep 2
+              if docker exec pg-src psql -U jinliang -d postgres -tAc "select 1" >/dev/null 2>&1; then ok=1; break; fi
+            fi
             sleep 2
           done
           [ "$ok" = 1 ] || { echo "--- pg-src 没起来 ---"; docker logs pg-src; exit 1; }
-          wl=$(docker exec pg-src psql -U jinliang -d postgres -tAc "show wal_level")
+          wl=$(pgq "show wal_level") || fail "连不上 pg-src"
           echo "PG: wal_level=$wl"
           [ "$wl" = "logical" ] || { echo "❌ PG 的 wal_level=$wl（要 logical）"; exit 1; }
       - name: 第二套库
