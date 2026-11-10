@@ -268,6 +268,11 @@ func tableFromMapWith(tm *TableMap, collations map[uint64]collation) *source.Tab
 		// （utf8mb4 的 VARCHAR(64) 记的是 256），按字节报给用户就是 `varchar(256)` ——
 		// 用户明明写的是 64。类型字典比对与暂停提示都吃这个字符串，错一个字就全错。
 		col.Type = mysqlTypeName(typ, meta, unsigned, col.Charset)
+		// 基名也要对：5.7 的 binlog 分不开 CHAR/BINARY、VARCHAR/VARBINARY、TEXT/BLOB
+		// （共用类型字节，又没有排序规则）。catalog 的 kind 已经补进 ColumnKinds，
+		// 这里就地纠正——否则所有拿到 Relation 的路径（引擎、测试、将来的调用方）
+		// 都会看到 `char(4)` 而 catalog 是 `binary(4)`。
+		col.Type = rerenderForKind(col.Type, tm.columnBinaryKind(i))
 		t.Columns[i] = col
 	}
 	for _, idx := range tm.PrimaryKey {

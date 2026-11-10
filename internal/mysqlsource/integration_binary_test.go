@@ -64,14 +64,20 @@ func TestIntegrationBinaryVsTextDecoding(t *testing.T) {
 		t.Fatalf("取起点失败: %v", err)
 	}
 
-	batches := make(chan Tx, 16)
-	asm := NewAssembler(func(ctx context.Context, tx Tx) error {
-		batches <- tx
-		return nil
-	})
+	// 用 **Stream**（生产路径）而不是 RunStream：前者会走 enrichRelation
+	// （补列名、按 catalog 字符集把字节换算成字符、纠正 binary/char 基名）。
+	// 引擎用的就是这条路；用它才验得到「Relation 长什么样」这件事。
+	events := make(chan source.Event, 64)
 	streamCtx, stop := context.WithCancel(ctx)
 	defer stop()
-	go func() { _ = s.RunStream(streamCtx, start, asm) }()
+	go func() {
+		_ = s.Stream(streamCtx, start, func(ctx context.Context, ev source.Event) error {
+			if ev.Table.Table == table {
+				events <- ev
+			}
+			return nil
+		})
+	}()
 	time.Sleep(700 * time.Millisecond)
 
 	// 两行：一行内容是可打印 ASCII（内容启发式最容易判错的那种），
@@ -86,16 +92,14 @@ func TestIntegrationBinaryVsTextDecoding(t *testing.T) {
 	deadline := time.After(30 * time.Second)
 	for len(got) < 2 {
 		select {
-		case b := <-batches:
-			for _, ev := range b.Events {
-				if ev.Table.Table != table || ev.Kind != source.EvInsert {
-					continue
-				}
-				if ev.Relation != nil {
-					rel = ev.Relation
-				}
-				got[int(ev.New.Values[0].I)] = append([]source.Value(nil), ev.New.Values...)
+		case ev := <-events:
+			if ev.Kind != source.EvInsert {
+				continue
 			}
+			if ev.Relation != nil {
+				rel = ev.Relation
+			}
+			got[int(ev.New.Values[0].I)] = append([]source.Value(nil), ev.New.Values...)
 		case <-deadline:
 			t.Fatalf("30s 内没读到两行（拿到 %d 行：%v）", len(got), keysOf(got))
 		}

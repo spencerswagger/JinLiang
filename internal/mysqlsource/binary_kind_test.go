@@ -51,6 +51,15 @@ func TestFillColumnKindsCovers57(t *testing.T) {
 	if v.Kind != source.KindBytes || string(v.B) != "abcd" {
 		t.Fatalf("BINARY(4)='abcd' 应按字节交，实际 Kind=%v 值=%q", v.Kind, v.B)
 	}
+	// 类型串的基名同样要按 kind 纠正（5.7 的 binlog 只说 char/varchar）。
+	rel := tableFromMap(tm)
+	want := []string{"binary(4)", "varbinary(8)", "varchar(64)"}
+	for i, w := range want {
+		if rel.Columns[i].Type != w {
+			t.Errorf("第 %d 列类型应是 %q，实际 %q（catalog 的 binary 家族是权威基名）", i+1, w, rel.Columns[i].Type)
+		}
+	}
+
 	// 字符列仍然是字符串。
 	v2, _, err := decodeCell(tm, 2, append([]byte{3}, []byte("abc")...))
 	if err != nil {
