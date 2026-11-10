@@ -246,8 +246,18 @@ func (r *runner) executeGeneric(ctx context.Context, res *Result) error {
 	//
 	// 第三种「要搬」：有表**欠一次整表重搬**（结构刚对齐、或一直在暂停）。
 	// 不搬它就没有解除路径——那才是真正的静默缺数据（Owl II 必改 2）。
+	// 与 PG 路径**同一套判据**（`planCopy`）：块进度 + 位点可重放性 + 模式。
+	// 原来这里只看「有没有位点」，所以 MySQL 目标端全量中断一次就只能整轮重搬
+	// （Owl II 在 #92 的 killcopy 格实测：重启重搬 4000 行）。
+	plan, err := r.decideGenericCopyPlan(ctx, r.src, priorPhase, rawPos)
+	if err != nil {
+		return err
+	}
 	r.planGenericRecopy(ctx)
-	needCopy := fresh || r.mode() == "full_interval" || len(r.forceRecopy) > 0
+	// 暂停恢复（整表重搬）与中断续跑（按块续跑）是**两件事**：
+	// commitPlan 只把「欠一次重搬」的表从 From 里摘掉、塞进 Recopy，其余表照旧按块续。
+	r.commitPlan(&plan)
+	needCopy := r.plan.Kind != copySkip
 
 	// ② 源端准备（PG 源要建书签+发布；MySQL 源要开一致性快照）。必须在取位点之前：
 	// 全量的读视图与增量起点是同一瞬间定下来的。
@@ -479,7 +489,9 @@ func (r *runner) cleanBeforeGenericCopy(ctx context.Context, st stateCapable, fr
 // copyGeneric 把选中的表按页搬到非 PG 目标端（不写位点：全量期间的变更靠后续重放吸收）。
 func (r *runner) copyGeneric(ctx context.Context) error {
 	chunkRows := r.chunkRows()
-	_, err := r.src.SnapshotChunksFrom(ctx, source.SnapshotOpt{ChunkRows: chunkRows, Conns: 1}, nil,
+	// 续跑起点来自 `r.plan.From`（`copyResume` 时非空）：与 PG 路径同一个来源，
+	// 不在这里另造一套「从第几块接着搬」的判据。
+	_, err := r.src.SnapshotChunksFrom(ctx, source.SnapshotOpt{ChunkRows: chunkRows, Conns: 1}, r.plan.From,
 		func(c context.Context, chRef source.TableRef, chNo int, rows [][]any, from, to string) error {
 			// 一页可能十万行：按小批喂给 Apply，避免一条超大 INSERT 撞 max_allowed_packet。
 			const perBatch = 500

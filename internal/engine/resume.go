@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/spencerswagger/jinliang/internal/mysqlsink"
 	"github.com/spencerswagger/jinliang/internal/pgsink"
 	"github.com/spencerswagger/jinliang/internal/source"
 	"github.com/spencerswagger/jinliang/internal/state"
@@ -394,6 +395,66 @@ func (r *runner) decideCopyPlan(ctx context.Context, src runSource,
 		return plan, &unreplayableSlotError{stored: pos}
 	}
 	return plan, nil
+}
+
+// decideGenericCopyPlan 是**非 PG 目标端**的同一套判据（契约三口径共用一份 planCopy）。
+//
+// 与 `decideCopyPlan` 的唯一差别是「块进度从哪读」：PG 从 `pgsink.ChunkProgress`，
+// 通用路径从目标端的可选能力 `ChunkProgress`（mysqlsink 有，Data #95 落地的）。
+// 目标端不记块进度（没有这个能力）时 `Capable=false`——`planCopy` 会按「不记块 → 整轮重搬」
+// 处理，这正是接入块记账之前的行为，不是静默降级。
+func (r *runner) decideGenericCopyPlan(ctx context.Context, src runSource, phase, pos string) (chunkPlan, error) {
+	prog, capable, err := r.genericChunkProgress(ctx)
+	if err != nil {
+		return chunkPlan{}, err
+	}
+	r.progressByTable = prog
+	in := copyInputs{
+		Mode:       r.mode(),
+		AlwaysCopy: r.mode() == "once" || r.mode() == "full_interval",
+		Tables:     r.selectedTables(),
+		Progress:   prog,
+		StoredCP:   pos,
+		PriorPhase: phase,
+		Capable:    capable,
+	}
+	if in.Mode == "interval" || in.Mode == "continuous" || pos == "" || !capable {
+		return planCopy(in), nil
+	}
+	cp, err := src.ParsePosition(pos)
+	if err != nil {
+		r.note(ctx, "目标端的一致性位点读不懂（"+pos+"）：这一轮不会续跑。原因："+err.Error())
+		return planCopy(in), nil
+	}
+	st, err := src.Replay(ctx, cp)
+	if err != nil {
+		return chunkPlan{}, fmt.Errorf("读源端的可重放性失败: %w", err)
+	}
+	in.SlotReplayable = st.OK
+	in.SlotCP = posString(st.Confirmed)
+	in.SlotWhy = st.Why
+	in.SlotAhead = st.Ahead
+	return planCopy(in), nil
+}
+
+// genericChunkProgress 读非 PG 目标端的块进度，并翻成 `pgsink.ChunkProgress`
+// （两种目标端的结构体字段一一对应；判据只认这一份形状，别在 planCopy 里认两种）。
+func (r *runner) genericChunkProgress(ctx context.Context) (map[string]pgsink.ChunkProgress, bool, error) {
+	rd, ok := r.gsink.(interface {
+		ChunkProgress(context.Context) (map[string]mysqlsink.ChunkProgress, error)
+	})
+	if !ok {
+		return nil, false, nil
+	}
+	raw, err := rd.ChunkProgress(ctx)
+	if err != nil {
+		return nil, false, fmt.Errorf("读目标端的块进度失败: %w", err)
+	}
+	out := make(map[string]pgsink.ChunkProgress, len(raw))
+	for k, v := range raw {
+		out[k] = pgsink.ChunkProgress{Done: v.Done, LastNo: v.LastNo, Cursor: v.Cursor, Rows: v.Rows}
+	}
+	return out, true, nil
 }
 
 // unreplayableSlotError 是「已经同步过，但源端那段变更再也拿不到了」。
