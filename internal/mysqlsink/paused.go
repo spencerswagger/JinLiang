@@ -82,7 +82,11 @@ func (s *Sink) PauseTable(ctx context.Context, ref source.TableRef, rec pgsink.P
 			// （第二次因为别的原因又停一次，把 type_changed 改成 schema_drift 会让对账口径漂）。
 			// resume 跟着本次判定走（所有权可能变了）；detail 用新的（用户要看的是当前差异）。
 			rec.At = old.At
-			rec.Reason = old.Reason
+			if old.Reason != "" {
+				// 旧记录没有原因码（手写进库/更早的版本）时不要把空码钉死：
+				// 空 reason 在本文件的不变量里等于「没登记过」。
+				rec.Reason = old.Reason
+			}
 			if rec.Resume == "" {
 				rec.Resume = old.Resume
 			}

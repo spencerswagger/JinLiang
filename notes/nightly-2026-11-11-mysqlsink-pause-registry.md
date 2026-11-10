@@ -87,6 +87,19 @@ MySQL 目标端不支持按表暂停：给 `_jl_meta` 补 `paused_tables` 列失
 「支持（老库缺列会先补；补不上会明确失败并说明原因）」；`executeGeneric` 在 `EnsureMeta`
 之后主动问一次 `PauseRegistryReady`，补不上就发 note（不致命：这条任务可能整轮用不到暂停）。
 
+## 6.5 三条已知差别（评审指出，先记下来）
+
+1. **`reason` 的更新语义两边不同**：本 PR 的 MySQL 侧**保留第一次的原因码**（第二次登记只更新
+   `detail`），而 `pgsink`（main）第二次登记会**覆盖** `reason`。JSON 形状同构、语义暂时不同。
+   要么下一张小 PR 把 PG 一起改成「保留」并向 Ark 确认 §1.4，要么在契约里写清「reason 以最新为准」。
+   我先按「保留」实现，因为它与同文件里 `at 永不覆盖` 的理由是同一个。
+2. **`chunk_no=0` 的 `rows` 在重放后不刷新**：`ON DUPLICATE KEY UPDATE done=1` 不重算 rows，
+   所以「重放使某块变大」时完成标记仍是旧合计。`pgsink` 同病——要改就两边一起改，别只改一半
+   （消费者的 `ChunkProgress.Rows` 读的是各块之和，不是完成标记那一行）。
+3. **「数据先落、标记后落」的顺序没有崩溃用例兜住**：新加的引擎断言只能证明「记账接线了」，
+   证明不了顺序。要真验得在块写完之后、记账之前 kill -9，看下一轮是否重搬而不是误判搬完——
+   这条留给下一轮（与 Core 的暂停接线一起做更划算）。
+
 ## 7. 仍未接的一段（不在本 PR，属 Core）
 
 引擎的暂停集合与写路径（`pause_skip.go`、`r.paused *pgsink.PausedTable`、`r.sink *pgsink.Sink`）
