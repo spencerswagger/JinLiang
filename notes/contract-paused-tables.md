@@ -25,7 +25,7 @@
 | 字段 | 语义 | 约束 |
 |---|---|---|
 | key | **规范化后的裸表名** | 与 `_jl_chunk.table_name` **逐字节相同**；不带 schema 前缀、不用源端原始大小写 |
-| `reason` | 稳定原因码 | 只允许 `type_changed` / `schema_drift`；**不写中文句子**，机器按它判等 |
+| `reason` | 稳定原因码 | 只允许 `type_changed` / `schema_drift`；**不写中文句子**，机器按它判等。映射以 main 的 #72 更正为准：`type_changed` = 列类型变了（**prepare 与 streaming 两个时机都会出现**）；`schema_drift` = 改名/删列（**只在 streaming**） |
 | `at` | 第一次被暂停的时刻 | UTC RFC3339；**后续不覆盖**（第一次的最有价值） |
 | `detail` | 给人看的说明 | 建议「列名: 目标类型 / 源类型」；不参与判等 |
 
@@ -117,9 +117,13 @@
 Code: CodeSchemaMismatch, Class: UserAction,
 // 同一件事在两个时机：prepare 的 EnsureSchema 类型不一致，和运行时 EvDDL 的类型变化/改名/删列。
 // 码只写类别，具体哪张表哪一列由 last_error 说（同一个码要覆盖两个时机）。
-Why: "目标表与源端结构对不上：prepare 补列时类型不一致（type_changed），" +
-     "或跑起来后源端改类型/改名/删列（schema_drift）——两种情况含义相同；" +
-     "具体哪种、哪张表哪一列看 last_error",
+// 原因码与时机**不是一一对应**（以 main 里 #72 的更正为准）：
+// type_changed 在 prepare（目标列类型与源端不一致）和 streaming（源端把列类型改了）两处都会出现；
+// schema_drift 只出现在 streaming（改名/删列）。
+Why: "目标表与源端的结构对不上，有两种原因码：**type_changed**（列类型变了——" +
+     "prepare 补列时发现目标端与源端类型不一致，或跑起来后源端把列类型改了）、" +
+     "**schema_drift**（列被改名或删掉，只在跑起来后发现）。两种情况含义相同——这张表没法继续跟。" +
+     "具体是哪一种、哪张表哪一列，last_error 里会写明（到列级）",
 Next: []string{
     "看 last_error 点名的表与列；在目标端对齐结构后重跑（位点没推进，不会重搬历史）",
     "暂时不处理也行：该表会被记进 paused_tables，但本轮 run 会整体失败、位点不推进——对齐结构后重跑即可继续",

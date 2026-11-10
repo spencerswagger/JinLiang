@@ -224,3 +224,95 @@ func continuousJobBoth(t *testing.T, srcDSN, dstDSN, name string, tables ...stri
 	}
 	return store, job.ID
 }
+
+// §3 判据 1/3：改类型的两种形态（bigint→text、varchar 放宽）与改类型后的增量。
+//
+// 1) 目标端列类型与源端一致：改类型前后各查一次 information_schema（两侧都查）；
+// 3) 增量继续可用：改类型后继续写 N 行 → 行数相等、位点前进、runs.code 为空。
+func TestTypeChangeTextAndVarcharWideningThenIncremental(t *testing.T) {
+	srcDSN, dstDSN := dsns(t)
+	srcDB := mustConn(t, srcDSN)
+	dstDB := mustConn(t, dstDSN)
+	table := "type_txt_varchar"
+	ctx := context.Background()
+
+	exec(t, srcDB, "DROP TABLE IF EXISTS "+table)
+	exec(t, srcDB, "CREATE TABLE "+table+" (id bigint PRIMARY KEY, v bigint, s varchar(20))")
+	exec(t, srcDB, "INSERT INTO "+table+" SELECT g, g, 'x'||g FROM generate_series(1,500) g")
+	exec(t, dstDB, "DROP TABLE IF EXISTS "+table)
+	exec(t, dstDB, "DROP TABLE IF EXISTS _jl_meta, _jl_chunk, _jl_lease, _jl_object, _jl_instance")
+
+	store, jobID := continuousJobBoth(t, srcDSN, dstDSN, "type-txt-varchar", table)
+	if _, err := engine.Run(ctx, engine.Options{Store: store, JobID: jobID, SnapshotOnly: true}); err != nil {
+		t.Fatalf("首搬失败: %v", err)
+	}
+	before := [2][2]string{
+		{columnType(t, srcDB, table, "v"), columnType(t, srcDB, table, "s")},
+		{columnType(t, dstDB, table, "v"), columnType(t, dstDB, table, "s")},
+	}
+	if before[0] != before[1] {
+		t.Fatalf("首搬后两端列类型应一致：源 %v / 目标 %v", before[0], before[1])
+	}
+
+	// 源端两种改法各一例：bigint→text（类型族都变了）、varchar(20)→varchar(60)（放宽）
+	exec(t, srcDB, "ALTER TABLE "+table+" ALTER COLUMN v TYPE text")
+	exec(t, srcDB, "ALTER TABLE "+table+" ALTER COLUMN s TYPE varchar(60)")
+	srcAfter := [2]string{columnType(t, srcDB, table, "v"), columnType(t, srcDB, table, "s")}
+
+	// 目标端故意只对齐第一列：第二列仍窄 → 本轮必须拒绝（不许静默按旧类型写）
+	exec(t, dstDB, "ALTER TABLE "+table+" ALTER COLUMN v TYPE text")
+	res, err := engine.Run(ctx, engine.Options{Store: store, JobID: jobID, SnapshotOnly: true})
+	if err == nil {
+		t.Fatal("目标端 varchar 仍比源端窄：必须拒绝（收窄会截断），不能静默通过")
+	}
+	run, gerr := store.GetRun(ctx, res.RunID)
+	if gerr != nil {
+		t.Fatal(err)
+	}
+	if run.Code != string(core.CodeSchemaMismatch) {
+		t.Fatalf("收窄应挂 E1015，得到 %q；last_error=%s", run.Code, run.LastError)
+	}
+	if !strings.Contains(run.LastError, table) || !strings.Contains(run.LastError, "s") {
+		t.Fatalf("last_error 要点名表与列，得到：%s", run.LastError)
+	}
+
+	// 对齐第二列之后：两侧类型一致 + 增量继续可用（判据 3）
+	exec(t, dstDB, "ALTER TABLE "+table+" ALTER COLUMN s TYPE varchar(60)")
+	if _, err := engine.Run(ctx, engine.Options{Store: store, JobID: jobID, SnapshotOnly: true}); err != nil {
+		t.Fatalf("对齐后重跑应成功: %v", err)
+	}
+	dstAfter := [2]string{columnType(t, dstDB, table, "v"), columnType(t, dstDB, table, "s")}
+	if srcAfter != dstAfter {
+		t.Fatalf("改类型后两端列类型应一致：源 %v / 目标 %v", srcAfter, dstAfter)
+	}
+	var posBeforeIncr string
+	job, _ := store.GetJob(ctx, jobID)
+	if err := dstDB.QueryRow(ctx, "SELECT COALESCE(position,'') FROM _jl_meta WHERE job_key=$1", job.JobKey).Scan(&posBeforeIncr); err != nil {
+		t.Fatal(err)
+	}
+
+	// 改类型后继续写 20 行
+	exec(t, srcDB, "INSERT INTO "+table+" SELECT g, 'v'||g, 'y'||g FROM generate_series(501,520) g")
+	if _, err := engine.Run(ctx, engine.Options{Store: store, JobID: jobID, IdleAfter: 700 * time.Millisecond}); err != nil {
+		t.Fatalf("改类型后的增量应能跑: %v", err)
+	}
+	var srcN, dstN int
+	if err := srcDB.QueryRow(ctx, "SELECT count(*) FROM "+table).Scan(&srcN); err != nil {
+		t.Fatal(err)
+	}
+	if err := dstDB.QueryRow(ctx, "SELECT count(*) FROM "+table).Scan(&dstN); err != nil {
+		t.Fatal(err)
+	}
+	if srcN != dstN || srcN != 520 {
+		t.Fatalf("改类型后增量应把 20 行也写进去：源 %d / 目标 %d（应各 520）", srcN, dstN)
+	}
+	var posAfterIncr string
+	if err := dstDB.QueryRow(ctx, "SELECT COALESCE(position,'') FROM _jl_meta WHERE job_key=$1", job.JobKey).Scan(&posAfterIncr); err != nil {
+		t.Fatal(err)
+	}
+	if posAfterIncr == posBeforeIncr {
+		t.Fatal("增量写成功之后位点必须前进")
+	}
+	t.Logf("§3-1 改类型前 %v → 改类型后 %v（两端一致）；§3-3 之后写 20 行，两端各 %d 行，位点 %s → %s",
+		before[0], srcAfter, dstN, posBeforeIncr, posAfterIncr)
+}
