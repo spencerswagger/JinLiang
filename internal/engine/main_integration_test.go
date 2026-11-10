@@ -15,7 +15,9 @@ package engine_test
 
 import (
 	"context"
+	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -29,21 +31,78 @@ import (
 // 任务的库，或者本地用 `go test ./...`（包级并行）跟别人共用一套 PG，就会把别人的空闲槽一起
 // 收走——对方下一次连流直接报「槽不存在」，甚至在流上被 pg_terminate_backend 打断成 57P01。
 // CI 的集成步骤里显式设 JINLIANG_TEST_RECLAIM_SLOTS=1（那里源库是 job 独占的）。
-func reclaimEnabled() bool { return os.Getenv("JINLIANG_TEST_RECLAIM_SLOTS") == "1" }
+// 只认 1/true/on/yes（大小写不敏感、容忍空格）；写成别的值当关闭，但会**喊一声**——
+// 静默失效最坑：本地写 =true 或带空格，开关没开、过一会儿撞 53400，还不知道为什么。
+func reclaimEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("JINLIANG_TEST_RECLAIM_SLOTS"))) {
+	case "1", "true", "on", "yes":
+		return true
+	default:
+		return false
+	}
+}
 
 func TestMain(m *testing.M) {
-	if reclaimEnabled() {
-		if dsn := os.Getenv("JINLIANG_TEST_PG_SRC_DSN"); dsn != "" {
-			reclaimSlots(dsn)
-		}
+	dsn := os.Getenv("JINLIANG_TEST_PG_SRC_DSN")
+	if raw := strings.TrimSpace(os.Getenv("JINLIANG_TEST_RECLAIM_SLOTS")); raw != "" && !reclaimEnabled() {
+		fmt.Printf("[engine-it] JINLIANG_TEST_RECLAIM_SLOTS=%q 不被识别（只认 1/true/on/yes），按关闭处理\n", raw)
 	}
+	beforeReclaim(dsn)
 	code := m.Run()
+	afterRun(dsn)
+	os.Exit(code)
+}
+
+// beforeReclaim：开着就回收；关着就**只数不删**，把「忘开开关 / 新 job 漏注入」从
+// 神秘 53400 变成一眼可见的提示。
+func beforeReclaim(dsn string) {
+	if dsn == "" {
+		return
+	}
 	if reclaimEnabled() {
-		if dsn := os.Getenv("JINLIANG_TEST_PG_SRC_DSN"); dsn != "" {
-			reclaimSlots(dsn)
+		reclaimSlots(dsn)
+		return
+	}
+	n, names := idleSlots(dsn)
+	if n > 0 {
+		fmt.Printf("[engine-it] 发现 %d 个未回收的空闲书签（%s）：本轮不回收（默认关）。\n"+
+			"[engine-it] 若这套库是测试独占的，设 JINLIANG_TEST_RECLAIM_SLOTS=1 让包首尾自动回收，否则容易撞 "+
+			"\"all replication slots are in use (SQLSTATE 53400)\"；也可以手动 SELECT pg_drop_replication_slot(name)。\n",
+			n, strings.Join(names, ", "))
+	}
+}
+
+// afterRun：包跑完同样只在开着时回收。
+func afterRun(dsn string) {
+	if dsn == "" || !reclaimEnabled() {
+		return
+	}
+	reclaimSlots(dsn)
+}
+
+// idleSlots 数一下源库里空闲的 `jl_%` 书签（不删），给上面的提示用。
+func idleSlots(dsn string) (int, []string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		return 0, nil
+	}
+	defer conn.Close(context.Background())
+	rows, err := conn.Query(ctx,
+		`SELECT slot_name FROM pg_replication_slots WHERE slot_name LIKE 'jl\_%' AND NOT active ORDER BY slot_name`)
+	if err != nil {
+		return 0, nil
+	}
+	var names []string
+	for rows.Next() {
+		var n string
+		if rows.Scan(&n) == nil {
+			names = append(names, n)
 		}
 	}
-	os.Exit(code)
+	rows.Close()
+	return len(names), names
 }
 
 // reclaimSlots 删掉源库里**空闲**的 `jl_%` 书签（上一轮留下来的）。

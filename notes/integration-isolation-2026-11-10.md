@@ -91,7 +91,11 @@ nightly 的 `integration` job 早就用「逐包串行调用」绕开这一条�
    CI 的集成步骤里显式打开（那里每个 job 自己 `docker run` 一套 PG、独占）；本地默认不回收，
    避免把别人的空闲槽一起收走——对方下一次连流会报槽不存在，更糟的是流上被 `pg_terminate_backend`
    打断成 `57P01`（已在共用 PG 上真实发生过）。
-2. **新加的 fixture 必须自己对 `trackJobSlots`**：`TestMain` 只在包首尾兜，救不了**轮内**泄漏。
+2. **新增「跑 `internal/engine` 集成用例」的 job 必须同样注入 `JINLIANG_TEST_RECLAIM_SLOTS=1`**
+   （目前是 `ci.yml` 的 `b1-engine` 集成步骤、`nightly.yml` 的「全量集成」步骤）。漏注入不会静默：
+   `TestMain` 会数一遍空闲 `jl_%` 书签并打印「发现 N 个未回收的空闲书签 + 怎么开」；开关值只认
+   `1/true/on/yes`（容忍空格/大小写），写成别的会打印「不被识别，按关闭处理」。
+3. **新加的 fixture 必须自己对 `trackJobSlots`**：`TestMain` 只在包首尾兜，救不了**轮内**泄漏。
    新用例（比如 MySQL 源、resync 那些同样会建槽的）忘了挂，就会在同一轮里重新吃满 10 个槽。
 
 将来把 §6 第 1 条落成门禁时，判据用「残留 ≤ 2 **且** `53400` = 0 次」，别写「= 0」（实测就是 0~2，写死会让新门禁自己 flaky）；
