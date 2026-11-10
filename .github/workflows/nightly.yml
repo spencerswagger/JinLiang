@@ -344,7 +344,7 @@ jobs:
           docker run -d --name pg-src \
             -e POSTGRES_USER=jinliang -e POSTGRES_PASSWORD=jinliang -e POSTGRES_DB=jinliang_src \
             -p 5432:5432 postgres:16 \
-            -c wal_level=logical -c max_replication_slots=40 -c max_wal_senders=40
+            
           # 连续两次真查询都成功才算起好（initdb 的临时实例会应答一次就重启）。
           ok=0
           for _ in $(seq 1 90); do
