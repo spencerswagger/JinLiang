@@ -13,6 +13,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/spencerswagger/jinliang/internal/core"
 	"github.com/spencerswagger/jinliang/internal/engine"
@@ -39,7 +40,12 @@ func TestPrepareDriftOwnTableGetsE1015(t *testing.T) {
 	ensureStateTables(t, store, dstDSN, jobID)
 	markTableCreatedByJob(t, store, dstDB, jobID, table) // 登记成「本任务建的」
 
-	res, err := engine.Run(ctx, engine.Options{Store: store, JobID: jobID, SnapshotOnly: true})
+	// **锁重入的防回归**：`reconcileColumns` 由已持 `s.mu` 的 `EnsureSchema` 调用，
+	// 里面若误用加锁版 `DidCreateTable` 会自死锁（曾经实测挂到 300s 超时才被发现）。
+	// 这里给 30s 上限：真死锁时立刻红，而不是把整包测试拖到超时。
+	runCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	res, err := engine.Run(runCtx, engine.Options{Store: store, JobID: jobID, SnapshotOnly: true})
 	if err == nil {
 		t.Fatal("我们建的表多出源端没有的列：prepare 必须报结构漂移，不能静默加列")
 	}
