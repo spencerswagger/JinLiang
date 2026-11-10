@@ -33,6 +33,7 @@ func TestIsLocalCloseAcceptsOurOwnCancel(t *testing.T) {
 func TestIsLocalCloseRejectsRealFailures(t *testing.T) {
 	cases := []error{
 		nil,
+		errors.New("EOF"),            // 对端发了 FIN：那是「对端走了」，不是「我们按了停」
 		errors.New("unexpected EOF"), // 对端在报文中间断了
 		errors.New("read tcp: connection reset by peer"), // 对端/网络的问题
 		errors.New("write tcp: broken pipe"),

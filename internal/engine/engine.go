@@ -1128,13 +1128,19 @@ func (r *runner) prepare(ctx context.Context) error {
 // 现在只有一条路：`MarkTableRecopyPending` 清掉该表的块标记 → `planCopy` 自然把它排进本轮重搬
 // → 搬成（`MarkTableDone`）之后 `snapshot()` 里才删这个 key。**先重搬，后解除。**
 func (r *runner) reconcilePaused(ctx context.Context) error {
-	rec, err := r.sink.PausedTables(ctx)
+	reg := r.pauseRegistryOf()
+	if reg == nil {
+		return nil // 这个目标端还没有暂停存储：没什么可收口的
+	}
+	rec, err := reg.PausedTables(ctx)
 	if err != nil {
 		return fmt.Errorf("读暂停表失败: %w", err)
 	}
 	if len(rec) == 0 {
 		return nil
 	}
+	// `StoredJobHash` **不在** `pauseRegistry` 里（mysqlsink 也还没有这个方法）：
+	// 片 C 真正要补的是它，不是「把那三行绑定放回来」。今天只有 PG 路径调这里。
 	stored, err := r.sink.StoredJobHash(ctx)
 	if err != nil {
 		return fmt.Errorf("读任务指纹失败: %w", err)
@@ -1149,7 +1155,7 @@ func (r *runner) reconcilePaused(ctx context.Context) error {
 		if sameJob && inScope[key] {
 			continue
 		}
-		if err := r.pauseReg.ClearPausedTable(ctx, source.TableRef{Schema: r.targetSchema(), Table: key}); err != nil {
+		if err := reg.ClearPausedTable(ctx, source.TableRef{Schema: r.targetSchema(), Table: key}); err != nil {
 			return fmt.Errorf("清掉不再适用的暂停记录 %s 失败: %w", key, err)
 		}
 		r.forgetPaused(key)
@@ -1180,7 +1186,7 @@ func (r *runner) reconcilePaused(ctx context.Context) error {
 		// 永远停在暂停里（`planCopy` 在这两种模式下不会排存量），所以结构一通过就恢复。
 		// 代价必须说出来：解除暂停 ≠ 两侧已经一致——这两种模式不会替你重搬，差异要人看。
 		if r.mode() == "interval" || r.mode() == "continuous" {
-			if err := r.pauseReg.ClearPausedTable(ctx, source.TableRef{Schema: r.targetSchema(), Table: key}); err != nil {
+			if err := reg.ClearPausedTable(ctx, source.TableRef{Schema: r.targetSchema(), Table: key}); err != nil {
 				return fmt.Errorf("解除 %s 的暂停失败: %w", key, err)
 			}
 			r.forgetPaused(key)
@@ -1196,7 +1202,7 @@ func (r *runner) reconcilePaused(ctx context.Context) error {
 			continue
 		}
 		ref := r.targetRef(source.TableRef{Schema: r.targetSchema(), Table: key})
-		if err := r.pauseReg.MarkTableRecopyPending(ctx, ref); err != nil {
+		if err := reg.MarkTableRecopyPending(ctx, ref); err != nil {
 			return fmt.Errorf("把 %s 标成待重搬失败: %w", key, err)
 		}
 		if r.forceRecopy == nil {
@@ -1499,7 +1505,10 @@ func (r *runner) snapshot(ctx context.Context) error {
 				r.note(ctx, "表 "+ref.Table+" 仍在暂停（目标端既有表，需你决定：重建 / 手工清空 / 移出范围）")
 				continue
 			}
-			if err := r.pauseReg.ClearPausedTable(ctx, ref); err != nil {
+			if reg := r.pauseRegistryOf(); reg != nil {
+				err = reg.ClearPausedTable(ctx, ref)
+			}
+			if err := err; err != nil {
 				return fmt.Errorf("解除 %s 的暂停失败: %w", t.Table, err)
 			}
 			r.forgetPaused(ref.Table)
@@ -1825,6 +1834,21 @@ func pauseHead(base string, pe pgsink.PausableError) string {
 	return fmt.Sprintf("%s（原因码 %s）", base, pe.Reason())
 }
 
+// pauseRegistryOf 返回本轮可用的暂停存储。
+//
+// `pauseReg` 是显式绑定的那份（PG 在 prepare 里、MySQL 目前故意不绑）；
+// 没绑时退回 `r.sink`——pgsink 本身就实现了那六个方法，所以单测/老路径构造的
+// `runner{sink: …}` 也能用（不加这层，`r.pauseReg` 是 nil，直接调用会 SIGSEGV）。
+func (r *runner) pauseRegistryOf() pauseRegistry {
+	if r.pauseReg != nil {
+		return r.pauseReg
+	}
+	if r.sink != nil {
+		return r.sink
+	}
+	return nil
+}
+
 // registerPause 把「这张表要暂停」记进目标端的 paused_tables。
 //
 // 目标端不支持（MySQL 没有那条状态列）时**明确失败**：绝不能「UPDATE 影响 0 行当成功」，
@@ -1834,7 +1858,8 @@ func (r *runner) registerPause(ctx context.Context, err error) error {
 	if !errors.As(err, &pe) || pe.Table() == "" {
 		return nil
 	}
-	if r.pauseReg == nil {
+	reg := r.pauseRegistryOf()
+	if reg == nil {
 		// 目标端没有暂停存储（还没实现那六个方法）：**明确失败**，不许「假装登记成功」。
 		return &pauseUnsupportedError{kind: r.tgtEP.Kind, table: pe.Table(), inner: err}
 	}
@@ -1843,7 +1868,7 @@ func (r *runner) registerPause(ctx context.Context, err error) error {
 	if len(detail) > 500 {
 		detail = detail[:500] + "…"
 	}
-	if perr := r.pauseReg.PauseTable(ctx, ref, pgsink.PausedTable{
+	if perr := reg.PauseTable(ctx, ref, pgsink.PausedTable{
 		Reason: pe.Reason(),
 		Detail: detail,
 		Resume: r.resumeModeFor(ctx, ref),
@@ -1865,7 +1890,7 @@ func (r *runner) registerPause(ctx context.Context, err error) error {
 // 判据用 `_jl_object`（谁建的表），不是配置：同一份 yaml 里可能两种表都有。
 // 查不出结论时按 manual——**宁可停下来问，不可替用户删数据**。
 func (r *runner) resumeModeFor(ctx context.Context, ref source.TableRef) string {
-	if r.pauseReg == nil {
+	if r.pauseRegistryOf() == nil {
 		return pgsink.ResumeManual
 	}
 	// 「这张表是不是本任务建的」两边的目标端都有这个能力（`targetSink` 接口里的 DidCreateTable）。

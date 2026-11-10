@@ -148,9 +148,8 @@ func (r *runner) prepareGeneric(ctx context.Context) error {
 	// 所以 Way 1（Owl 建议的安全收尾）：接口抽好、MySQL 侧**继续明确失败**
 	//（写行时报 MySQLError → 整轮失败，响的），等恢复路径一起上再绑。
 	//
-	// TODO(片 C 收尾)：恢复路径搬到与目标端无关的层之后，把下面三行放回来——
-	//   if reg, ok := gs.(pauseRegistry); ok { r.pauseReg = reg; reg.LoadPausedTables(ctx); r.loadPausedSet(ctx) }
-	_ = gs
+	// TODO(片 C 收尾)：恢复路径搬到与目标端无关的层之后，在这里绑 `pauseReg`
+	//   （`gs.(pauseRegistry)` 已经能命中；**还要补 `StoredJobHash`**，它不在那六个方法里）。
 	src, err := r.openSource(ctx)
 	if err != nil {
 		return err
