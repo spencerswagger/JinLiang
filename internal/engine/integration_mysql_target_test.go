@@ -21,6 +21,7 @@ import (
 	"github.com/spencerswagger/jinliang/internal/dsn"
 	"github.com/spencerswagger/jinliang/internal/engine"
 	"github.com/spencerswagger/jinliang/internal/mysqlsink"
+	"github.com/spencerswagger/jinliang/internal/source"
 )
 
 func mysqlTargetDSNs(t *testing.T) (src, dst string) {
@@ -715,5 +716,89 @@ func TestMySQLTargetDeleteByTemporalKey(t *testing.T) {
 	}
 	if gone != 0 {
 		t.Fatal("被删的那一行还在目标端")
+	}
+}
+
+// 不变量：**空表**永远不该被硬停，哪怕 phase 还停在 'snapshot'。
+//
+// 两种来路都会走到这里：
+//  1. 我们清表成功后、`phaseTo(prepare)` 之前崩 —— 表已空，下一轮必须照常重搬；
+//  2. 用户自己的表本来就是空的，上一轮在写第一行之前就崩了 —— 下一轮同样必须照常搬。
+//
+// 成立的唯一原因：`cleanBeforeGenericCopy` 的判定顺序是 `Count==0 → continue`，
+// **排在所有权与 phase 判定之前**。把这条提前跳过去掉，第 2 种就会掉进
+// 「不是我们的表 + fresh + phase=='snapshot' → 硬停」，把「防止静默跳过」换成
+// 「卡死不可恢复」——用户手里只有一张空表，却被告知「要重搬就得先清空它」。
+func TestMySQLTargetEmptyTableWithSnapshotPhaseStillCopies(t *testing.T) {
+	srcDSN, dstDSN := mysqlTargetDSNs(t)
+	src := mustConn(t, srcDSN)
+	dst := mustMySQLTarget(t, dstDSN)
+	table := "engine_my_empty_snapshot"
+
+	exec(t, src, "DROP TABLE IF EXISTS "+table)
+	exec(t, src, "CREATE TABLE "+table+" (id bigint PRIMARY KEY, payload text)")
+	exec(t, src, "INSERT INTO "+table+" SELECT g, 'row-'||g FROM generate_series(1,10) g")
+	t.Cleanup(func() { exec(t, src, "DROP TABLE IF EXISTS "+table) })
+
+	ctx := context.Background()
+	_, _ = dst.ExecContext(ctx, "DROP TABLE IF EXISTS `"+table+"`")
+	dropMySQLState(t, dst)
+
+	store, jobID := newMySQLTargetJob(t, srcDSN, dstDSN, "my-empty-snapshot", table, "once")
+	job, err := store.GetJob(ctx, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 造中间态：**用户自己的表**（不在 _jl_object 里）、空、phase='snapshot'、位点空。
+	my := myConfigOf(t, dstDSN)
+	if _, err := dst.ExecContext(ctx,
+		"CREATE TABLE `"+table+"` (id BIGINT PRIMARY KEY, payload TEXT)"); err != nil {
+		t.Fatalf("建用户表失败: %v", err)
+	}
+	t.Cleanup(func() { _, _ = dst.ExecContext(context.Background(), "DROP TABLE IF EXISTS `"+table+"`") })
+	seed, err := mysqlsink.Open(ctx, mysqlsink.Options{
+		DSN: myEndpoint(my), JobKey: job.JobKey, Name: job.Name,
+		InstanceID: "crashed-instance", OnExists: mysqlsink.OnExists("append"),
+	})
+	if err != nil {
+		t.Fatalf("打开种子句柄失败: %v", err)
+	}
+	if err := seed.EnsureMeta(ctx, "seed", "prepare", "", ""); err != nil {
+		t.Fatalf("种 _jl_meta 失败: %v", err)
+	}
+	if err := seed.SetPhase(ctx, "snapshot"); err != nil {
+		t.Fatalf("种阶段失败: %v", err)
+	}
+	// 前置断言：确实是「不是我们建的表 + 空 + phase=snapshot + 无位点」
+	ours, err := seed.DidCreateTable(ctx, source.TableRef{Schema: my.db, Table: table})
+	if err != nil {
+		t.Fatal(err)
+	}
+	phase, pos, err := seed.State(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = seed.Close()
+	if ours || phase != "snapshot" || pos != "" {
+		t.Fatalf("前置没造对：ours=%v phase=%q pos=%q", ours, phase, pos)
+	}
+	if n := myCount(t, dst, table); n != 0 {
+		t.Fatalf("前置：表应为空，实际 %d 行", n)
+	}
+
+	// 下一轮：必须继续搬（空表不该硬停）
+	if _, err := engine.Run(ctx, engine.Options{Store: store, JobID: jobID}); err != nil {
+		t.Fatalf("空表 + phase=snapshot 时下一轮必须继续搬，实际报错: %v", err)
+	}
+	if n := myCount(t, dst, table); n != 10 {
+		t.Fatalf("应搬满 10 行，实际 %d（卡在硬停上就没搬）", n)
+	}
+	run, err := store.LatestRun(ctx, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.Code != "" {
+		t.Fatalf("这一轮不该带错误码，实际 %q（last_error=%q）", run.Code, run.LastError)
 	}
 }
