@@ -23,6 +23,22 @@ import (
 	"github.com/spencerswagger/jinliang/internal/source"
 )
 
+// pauseRegistry 是「按表暂停的存储层」——PG 目标端是 pgsink，MySQL 目标端是 mysqlsink。
+//
+// 两边的 JSON 形状与语义完全同构（`PausedTable` 就是同一个结构体），所以引擎只认这六个方法：
+// 具体是哪一种目标端、表建在哪儿，都不该漏到写路径里。
+// **抽这个接口的原因**（维护者 2026-08-11 指出的验收缺口）：`r.sink` 原来是 pgsink 专属类型，
+// 于是 `streamGeneric`（MySQL 目标端那条）根本没法包 `pauseSink` —— MySQL 目标端「只停一张表」
+// 就一直做不出来，而存储层其实早就就绪了。
+type pauseRegistry interface {
+	LoadPausedTables(ctx context.Context) error
+	PausedTables(ctx context.Context) (map[string]pgsink.PausedTable, error)
+	PauseTable(ctx context.Context, ref source.TableRef, rec pgsink.PausedTable) error
+	NoteSkipped(ctx context.Context, ref source.TableRef, rows int64, pos string) error
+	ClearPausedTable(ctx context.Context, ref source.TableRef) error
+	MarkTableRecopyPending(ctx context.Context, ref source.TableRef) error
+}
+
 // maxPausePerBatch 是一批里最多新登记几张表：正常情况下是 0–1 张（一次 DDL 只改一张表），
 // 给到 8 是为了容纳「一批里恰好跨了几张表的 DDL」，同时把病态情况挡在死循环之外。
 const maxPausePerBatch = 8
@@ -41,8 +57,10 @@ func newPauseSink(inner applier, r *runner) *pauseSink {
 }
 
 func (p *pauseSink) Apply(ctx context.Context, evs []source.Event, pos source.Position) error {
-	if p.r.sink == nil {
-		return p.inner.Apply(ctx, evs, pos) // 非 PG 目标端：暂停能力还没落地（契约 §6 片 C）
+	if p.r.pauseReg == nil {
+		// 目标端还没有暂停存储（例如没实现这六个方法的连接器）：原样透传。
+		// **不是**「静默跳过」——真遇到结构不一致时，写路径自己会报错，上层按失败处理。
+		return p.inner.Apply(ctx, evs, pos)
 	}
 	for attempt := 0; ; attempt++ {
 		kept, skipped, rows := p.filter(evs)
@@ -121,7 +139,7 @@ func (p *pauseSink) tableKey(ref source.TableRef) string {
 // 这时把 run 判失败反而制造「写成功了却报失败」的假象；账错了顶多数字不准，不影响正确性。
 func (p *pauseSink) noteSkipped(ctx context.Context, skipped map[string]int64, rows map[string]int64, pos source.Position) {
 	for key, n := range skipped {
-		if err := p.r.sink.NoteSkipped(ctx, source.TableRef{Schema: p.r.targetSchema(), Table: key},
+		if err := p.r.pauseReg.NoteSkipped(ctx, source.TableRef{Schema: p.r.targetSchema(), Table: key},
 			rows[key], posString(pos)); err != nil {
 			p.r.note(ctx, "记录表 "+key+" 的跳过窗口失败（不影响同步，只是数字不准）："+err.Error())
 		}
@@ -134,7 +152,7 @@ func (p *pauseSink) noteSkipped(ctx context.Context, skipped map[string]int64, r
 // loadPausedSet 把目标端那份记录读进内存。prepare 读一次就够：写路径每批都要判，
 // 不能每批查库；本轮里它只在「新登记一张表」和「某表重搬搬成」两处变化。
 func (r *runner) loadPausedSet(ctx context.Context) error {
-	rec, err := r.sink.PausedTables(ctx)
+	rec, err := r.pauseReg.PausedTables(ctx)
 	if err != nil {
 		return err
 	}
