@@ -316,5 +316,5 @@ jobs:
             echo "### MySQL→MySQL（ROWS=20000，双实例）"
             echo "- 全量+增量：见上一步日志"
             echo "- kill -9：判据「重启重搬 0 行」"
-            echo "- killcopy：判据「_jl_chunk > 0 且重启重搬 ≤ 1 块」——当前已知红（mysqlsink 块记账待补）"
+            echo "- killcopy：判据「_jl_chunk > 0 且重启重搬 ≤ 1 块」——块记账已落（#95，_jl_chunk 有行），续跑接线未落（重启仍整轮重搬）→ 仍为已知红，台账由 verify 步骤对账"
           } >> "$GITHUB_STEP_SUMMARY"
