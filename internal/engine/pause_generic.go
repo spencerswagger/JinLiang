@@ -126,14 +126,6 @@ func (r *runner) truncateForcedRecopy(ctx context.Context, st stateCapable) erro
 			return fmt.Errorf("清掉 %s 的块标记失败: %w", key, err)
 		}
 		r.clearedTables = append(r.clearedTables, key)
-		// **必须先摘掉暂停记录再写**：目标端 sink 有一道「最后一道防线」——
-		// 收到暂停表的行就报「引擎没有过滤掉」，那是防静默脏写的。而整表重搬的
-		// 写入是**故意**写这张表的，所以要在写之前把记录摘掉（失败时会还原，见
-		// restorePausedAfterFailedRecopy：不能因为一次失败就丢掉恢复路径）。
-		if err := r.pauseReg.ClearPausedTable(ctx, tref); err != nil {
-			return fmt.Errorf("重搬前摘掉 %s 的暂停记录失败: %w", key, err)
-		}
-		r.forgetPaused(key)
 		r.note(ctx, "表 "+key+" 整表重搬：先清空目标端再从头读（暂停窗口里的删除只能这样补掉）")
 	}
 	return nil
@@ -147,8 +139,14 @@ func (r *runner) finishGenericRecopy(ctx context.Context) error {
 	if r.pauseReg == nil || len(r.forceRecopy) == 0 {
 		return nil
 	}
-	for key := range r.forceRecopy {
+	for key, ref := range r.forceRecopy {
+		tref := r.targetRef(ref)
+		// 搬成才解除（契约 §1.6 步 4）：记录一直留到这一步，中途崩了下一轮还会重搬。
+		if err := r.pauseReg.ClearPausedTable(ctx, tref); err != nil {
+			return fmt.Errorf("解除 %s 的暂停失败: %w", key, err)
+		}
 		rec := r.recopyRecords[key]
+		r.forgetPaused(key)
 		msg := "表 " + key + " 已恢复：整表重搬完成"
 		if rec.SkippedRows > 0 {
 			msg += fmt.Sprintf("，跳过窗口的 %d 行已补齐", rec.SkippedRows)

@@ -303,6 +303,14 @@ func (r *runner) executeGeneric(ctx context.Context, res *Result) error {
 		return err
 	}
 	if needCopy {
+		// 哨兵：只要没走到 `finishGenericRecopy`（清空失败 / 重搬失败 / 途中崩在 defer 之前），
+		// 就把暂停记录放回去。不放的话下一轮既不会重搬也不会暂停——目标端停在半张表上、
+		// 退出码 0（最坏的静默缺数据）。
+		defer func() {
+			if !r.recopyFinished {
+				r.restorePausedAfterFailedRecopy(context.WithoutCancel(ctx))
+			}
+		}()
 		if err := r.phaseTo(ctx, state.Snapshot); err != nil {
 			return err
 		}
@@ -320,6 +328,7 @@ func (r *runner) executeGeneric(ctx context.Context, res *Result) error {
 		if err := r.finishGenericRecopy(ctx); err != nil {
 			return err
 		}
+		r.recopyFinished = true
 		// 全量结束把**起点位点**写进目标端：不写的话下次会当成首次又整表重搬一遍。
 		// 用空批 Apply 写位点，与 batcher.AdvanceTo 是同一个机制。
 		if err := r.gsink.Apply(ctx, nil, from); err != nil {
@@ -480,6 +489,11 @@ func (r *runner) copyGeneric(ctx context.Context) error {
 			// （`SnapshotChunksFrom` 的入参里没有表集合），所以这里丢掉。
 			if r.skippedTables[ref.Table] {
 				return nil
+			}
+			// 整表重搬窗口：告诉写路径「这几张表的写入是重搬，放行」
+			// （暂停记录还留着——它要留到搬成才解除）。
+			if _, forced := r.forceRecopy[ref.Table]; forced {
+				c = sink.WithRecopy(c, ref.Table)
 			}
 			rel := r.targetRelation(chRef)
 			for i := 0; i < len(rows); i += perBatch {

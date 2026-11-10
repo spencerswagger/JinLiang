@@ -100,7 +100,10 @@ func canonType(s string) string {
 		strings.HasPrefix(s, "int") || strings.HasPrefix(s, "smallint") || strings.HasPrefix(s, "tinyint") ||
 		strings.HasPrefix(s, "mediumint")) {
 		// int 系的显示宽度不改变类型身份（5.7 有、8.0 没有）。
-		return s[:i] + s[strings.Index(s, ")"):]
+		// 注意从 i 往后找 `)`：用整串的下标会撞上类型后面的括号（虽然当前输入不会）。
+		if j := strings.Index(s[i:], ")"); j >= 0 {
+			return s[:i] + s[i+j+1:]
+		}
 	}
 	return s
 }

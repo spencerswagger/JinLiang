@@ -384,6 +384,8 @@ type runner struct {
 	// recopyRecords 记住「欠一次重搬」那些表当时的暂停记录：重搬前要先摘记录
 	// （目标端的最后一道防线会拦住暂停表的写入），失败时要还原。
 	recopyRecords map[string]pgsink.PausedTable
+	// recopyFinished 表示这一轮的重搬已经收尾（记录已按契约解除）。哨兵据此决定要不要还原。
+	recopyFinished bool
 	// skippedTables 是「本轮结构对不上、连存量也不搬」的表（prepare 期发现的）。
 	// 它们仍在 r.tables 里（跨轮存活判据要它），但不进 copy plan 的搬运名单。
 	skippedTables map[string]bool
