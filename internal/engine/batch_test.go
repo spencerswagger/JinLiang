@@ -16,6 +16,7 @@ import (
 
 	"github.com/spencerswagger/jinliang/internal/control"
 	"github.com/spencerswagger/jinliang/internal/dsn"
+	"github.com/spencerswagger/jinliang/internal/mysqlsink"
 	"github.com/spencerswagger/jinliang/internal/pgsource"
 	"github.com/spencerswagger/jinliang/internal/source"
 	"github.com/spencerswagger/jinliang/internal/state"
@@ -797,53 +798,123 @@ func TestToValuePropagatesValuerError(t *testing.T) {
 // preflight 的阻断口径：**只拦数组**（会被映成 json、元素可能没有 JSON 表示 → 静默写错），
 // 不拦 timestamptz 之类「丢时区但知情可接受」的 NeedsConfirm——否则几乎所有真实任务都跑不起来。
 
-// 增量闸门：两种「不能跑」要说清是哪一种，且都显式拒绝（不静默降级成只搬一次）。
-func TestIncrementalGateExplainsWhatIsMissing(t *testing.T) {
-	// PG 目标端：增量是完整实现的，全模式都放行
-	r := &runner{tgtEP: dsn.Endpoint{Kind: dsn.KindPostgres}}
-	r.doc.Mode.Frequency = "continuous+initial"
-	if err := r.incrementalGate(); err != nil {
-		t.Fatalf("PG 目标端不该被拦：%v", err)
-	}
-
-	// MySQL 目标端 + 状态能力已就绪（mysqlsink 满足 stateCapable）：
-	m := &runner{tgtEP: dsn.Endpoint{Kind: dsn.KindMySQL}, gsink: mustMySQLSink(t)}
-	m.doc.Mode.Frequency = "continuous+initial"
-	err := m.incrementalGate()
+// 增量闸门（新形状）：状态能力缺失要显式拒绝；interval 不许静默退化成整表重搬。
+func TestGenericStateRejectsTargetWithoutStateTables(t *testing.T) {
+	// 只有全量能力的假目标端：没有租约/位点 → 明确说清缺什么，不静默降级成只搬一次。
+	r := &runner{tgtEP: dsn.Endpoint{Kind: dsn.KindMySQL}, gsink: sinkOnly{}}
+	_, err := r.genericState()
 	if err == nil {
-		t.Fatal("非 PG 增量本版还没接，必须显式拒绝")
+		t.Fatal("缺状态能力必须显式拒绝（静默降级成只搬一次最坏：用户以为在持续同步）")
 	}
-	if !strings.Contains(err.Error(), "状态表已经就绪") {
-		t.Fatalf("有状态能力时应说「能力有了、路径没接」，得到：%v", err)
+	if !strings.Contains(err.Error(), "没有租约/位点能力") {
+		t.Fatalf("要说清缺的是什么，得到：%v", err)
 	}
+}
 
-	// 只有全量的目标端（不满足 stateCapable）：说「没有状态能力」
-	only := &runner{tgtEP: dsn.Endpoint{Kind: dsn.KindMySQL}, gsink: sinkOnly{}}
-	only.doc.Mode.Frequency = "continuous+initial"
-	err = only.incrementalGate()
-	if err == nil || !strings.Contains(err.Error(), "还没有租约/位点能力") {
-		t.Fatalf("缺状态能力时应说清缺什么，得到：%v", err)
+// interval 在非 PG 目标端：明确拒绝，**不许**悄悄变成「每轮整表重搬」。
+func TestGenericIntervalIsRejectedNotSilentlyRecopied(t *testing.T) {
+	r := &runner{tgtEP: dsn.Endpoint{Kind: dsn.KindMySQL}, gsink: mustMySQLSink(t)}
+	r.doc.Mode.Frequency = "interval"
+	err := r.genericIntervalUnsupported()
+	if err == nil {
+		t.Fatal("interval 在 MySQL 目标端必须拒绝")
 	}
-
-	// full_interval / once 不受影响
-	for _, mode := range []string{"once", "full_interval"} {
-		ok := &runner{tgtEP: dsn.Endpoint{Kind: dsn.KindMySQL}, gsink: sinkOnly{}}
-		ok.doc.Mode.Frequency = mode
-		if err := ok.incrementalGate(); err != nil {
-			t.Fatalf("%s 不该被拦：%v", mode, err)
+	for _, want := range []string{"不支持 interval", "整表重搬", "continuous+initial"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("四段式里缺 %q：%v", want, err)
 		}
 	}
 }
 
-// MySQL 目标端上 interval / continuous 都必须被同一道闸门拒绝，
-// 而且**建议里不能再出现 interval**（照建议改完会撞回同一句拒绝——那是把人引向无效动作）。
-func TestMySQLIntervalIsRejectedWithUsableAdvice(t *testing.T) {
-	for _, mode := range []string{"interval", "continuous+initial", "continuous"} {
+// ack 守卫必须 **fail-closed**：目标端没声明持久化语义、或声明了不认识的取值，
+// 一律报错并给出「期望 vs 实际」。降级成「没有守卫继续跑」等于允许「位点没落盘就 ack」，
+// 源端会清掉还能重放的流水 —— 目标端一回滚就永久缺数据。
+func TestInstallAckGuardIsFailClosed(t *testing.T) {
+	// ① 没实现 PositionDurability：必须报错，且说清期望类型与实际类型
+	r := &runner{tgtEP: dsn.Endpoint{Kind: dsn.KindMySQL}, gsink: sinkOnly{}}
+	err := r.installAckGuard(&batcher{})
+	if err == nil {
+		t.Fatal("目标端没有声明位点持久化语义时必须报错（不许静默不装守卫）")
+	}
+	if !strings.Contains(err.Error(), "PositionDurability") || !strings.Contains(err.Error(), "sinkOnly") {
+		t.Fatalf("错误里要写期望的接口与实际的类型，得到：%v", err)
+	}
+
+	// ② 声明了不认识的语义：也必须报错
+	r2 := &runner{tgtEP: dsn.Endpoint{Kind: dsn.KindMySQL}, gsink: durabilitySink{mode: "eventually"}}
+	if err := r2.installAckGuard(&batcher{}); err == nil ||
+		!strings.Contains(err.Error(), "eventually") {
+		t.Fatalf("不认识的持久化语义必须报错并带上取值，得到：%v", err)
+	}
+
+	// ③ same_tx：不需要守卫（数据与位点同一个事务）
+	r3 := &runner{tgtEP: dsn.Endpoint{Kind: dsn.KindMySQL}, gsink: durabilitySink{mode: "same_tx"}}
+	b3 := &batcher{}
+	if err := r3.installAckGuard(b3); err != nil {
+		t.Fatalf("same_tx 不该报错：%v", err)
+	}
+	if b3.ackGuard != nil {
+		t.Fatal("same_tx 不需要 ack 守卫（Apply 返回即落盘）")
+	}
+
+	// ④ staged_phases：守卫装上，且位点没落盘时**拒绝 ack**
+	r4 := &runner{tgtEP: dsn.Endpoint{Kind: dsn.KindMySQL}, gsink: durabilitySink{mode: "staged_phases", state: mysqlsink.PositionBehind}}
+	b4 := &batcher{}
+	if err := r4.installAckGuard(b4); err != nil {
+		t.Fatalf("staged_phases 必须能装上守卫：%v", err)
+	}
+	if b4.ackGuard == nil {
+		t.Fatal("staged_phases 必须装守卫")
+	}
+	if err := b4.ackGuard(context.Background(), mustPGPos(t, "0/100")); err == nil {
+		t.Fatal("位点没落盘（behind）时必须拒绝 ack")
+	}
+	// 落盘了才放行
+	r4.gsink = durabilitySink{mode: "staged_phases", state: mysqlsink.PositionDurable}
+	_ = r4.installAckGuard(b4)
+	if err := b4.ackGuard(context.Background(), mustPGPos(t, "0/100")); err != nil {
+		t.Fatalf("位点已落盘时应放行：%v", err)
+	}
+	// 位点是别的值：立刻停（不能覆盖别人的进度）
+	r4.gsink = durabilitySink{mode: "staged_phases", state: mysqlsink.PositionDifferent}
+	_ = r4.installAckGuard(b4)
+	if err := b4.ackGuard(context.Background(), mustPGPos(t, "0/100")); err == nil ||
+		!strings.Contains(err.Error(), "别的值") {
+		t.Fatalf("位点是别的值时必须停下并说清，得到：%v", err)
+	}
+}
+
+// durabilitySink 是一个「声明了位点持久化语义」的假目标端（不需要真库）。
+type durabilitySink struct {
+	sinkOnly
+	mode  string
+	state mysqlsink.PositionState
+}
+
+func (d durabilitySink) PositionDurability() string { return d.mode }
+
+func (d durabilitySink) PositionDurable(context.Context, string) (mysqlsink.PositionState, error) {
+	return d.state, nil
+}
+
+func mustPGPos(t *testing.T, payload string) source.Position {
+	t.Helper()
+	p, err := pgsource.ParsePayload(payload)
+	if err != nil {
+		t.Fatalf("位点解析失败: %v", err)
+	}
+	return p
+}
+
+// MySQL 目标端：缺状态能力时 continuous* 必须拒绝，且建议里不能出现 interval
+// （照建议改完会撞回同一句拒绝——那是把人引向无效动作）。
+func TestMySQLContinuousWithoutStateTablesSuggestsUsablePaths(t *testing.T) {
+	for _, mode := range []string{"continuous+initial", "continuous"} {
 		r := &runner{tgtEP: dsn.Endpoint{Kind: dsn.KindMySQL}, gsink: sinkOnly{}}
 		r.doc.Mode.Frequency = mode
-		err := r.incrementalGate()
+		_, err := r.genericState()
 		if err == nil {
-			t.Fatalf("%s 在 MySQL 目标端必须被拒", mode)
+			t.Fatalf("%s 在缺状态能力的 MySQL 目标端必须被拒", mode)
 		}
 		msg := err.Error()
 		if strings.Contains(msg, "改用 interval") || strings.Contains(msg, "用 interval") {

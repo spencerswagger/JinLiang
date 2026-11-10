@@ -11,3 +11,7 @@
 # B6：本地性能基线产物（基线本身 bench/baseline.json 要入库）
 /benchapply
 bench/latest.json
+
+# 本地草稿/临时日志（曾经误提交过：commit message 草稿与整份测试日志）
+/.gitmsg
+.work/

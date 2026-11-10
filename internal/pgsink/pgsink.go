@@ -1688,8 +1688,12 @@ func (s *Sink) RecordObject(ctx context.Context, name, kind string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// 冲突时连 job_key 一起更新：`_jl_object` 的主键是 object_name（两边同构），
+	// 表被上一个任务软删、这个任务重新建出来时，只清 dropped_at 会让「谁建的」停在旧任务上。
 	q := fmt.Sprintf(`INSERT INTO %s (object_name, object_kind, job_key, instance_id)
-		VALUES ($1,$2,$3,$4) ON CONFLICT (object_name) DO UPDATE SET dropped_at=NULL`,
+		VALUES ($1,$2,$3,$4) ON CONFLICT (object_name) DO UPDATE SET
+		object_kind=EXCLUDED.object_kind, job_key=EXCLUDED.job_key,
+		instance_id=EXCLUDED.instance_id, dropped_at=NULL`,
 		s.stateTable("_jl_object"))
 	_, err := s.conn.Exec(ctx, q, name, kind, s.opt.JobKey, s.opt.InstanceID)
 	return err
@@ -1698,7 +1702,9 @@ func (s *Sink) RecordObject(ctx context.Context, name, kind string) error {
 // recordObjectLocked is RecordObject for callers that already hold mu.
 func (s *Sink) recordObjectLocked(ctx context.Context, name, kind string) error {
 	q := fmt.Sprintf(`INSERT INTO %s (object_name, object_kind, job_key, instance_id)
-		VALUES ($1,$2,$3,$4) ON CONFLICT (object_name) DO UPDATE SET dropped_at=NULL`,
+		VALUES ($1,$2,$3,$4) ON CONFLICT (object_name) DO UPDATE SET
+		object_kind=EXCLUDED.object_kind, job_key=EXCLUDED.job_key,
+		instance_id=EXCLUDED.instance_id, dropped_at=NULL`,
 		s.stateTable("_jl_object"))
 	_, err := s.conn.Exec(ctx, q, name, kind, s.opt.JobKey, s.opt.InstanceID)
 	return err
