@@ -75,13 +75,16 @@ MERGE-GATE: PASS（4 层全绿）
 | PG→MySQL | 8.0.28 | 20000 | `56f0ee0aa328b9411c44a0405d294dad` | 2.41s | 本版只全量；增量**明确拒绝**（断言） |
 | MySQL→MySQL | 8.0.28 | 20000 | `56f0ee0aa328b9411c44a0405d294dad` | 2.35s | 本版只全量；增量**明确拒绝**（断言） |
 
-5.7 / 8.4 由 PR #92 的 `merge-gate` workflow 出数（沙盒没有 docker）：
+CI（PR #92 的 `merge-gate` workflow，`rows=20000`，MySQL→PG 带 `--kill`）：
 
-| 组合 | MySQL 5.7 | MySQL 8.0 | MySQL 8.4 |
+| 组合 | MySQL 5.7.44 | MySQL 8.0.46 | MySQL 8.4.13 |
 |---|---|---|---|
-| MySQL→PG | CI | CI | CI |
-| PG→MySQL | CI | CI | CI |
-| MySQL→MySQL | CI | CI | CI |
+| MySQL→PG（全量+追平） | 21995 行 / `83646f77…` / 6.07s（追平 0.17s，kill -9 后重搬 0 行） | 21995 / `83646f77…` / 6.09s（0.19s，重搬 0 行） | 21995 / `83646f77…` / 6.10s（0.20s，重搬 0 行） |
+| PG→MySQL（只全量） | 见「阻塞点 1」 | 同左 | 同左 |
+| MySQL→MySQL（只全量） | 见「阻塞点 1」 | 同左 | 同左 |
+
+三格 md5 完全一致（`83646f7706a8dd35af431553dd003cf3`），说明同一条数据在 5.7 / 8.0 / 8.4
+上的指纹口径一致——这是矩阵能跨版本比的前提。
 
 > 矩阵里「拒绝」不是失败：`core.direction.go` 把 MySQL→MySQL 标为 pending，引擎对
 > 「MySQL 目标端 + 增量」明确报错（`target.go` 的 incrementalGate）。矩阵把这件事**当成判据**
@@ -116,8 +119,13 @@ scripts/local_stack.sh down
 
 ## 6. 阻塞点 / 未做
 
-1. **5.7 / 8.4 的格子只有 CI 出数**：沙盒没有 docker，本机只有 MySQL 8.0.28。workflow 已随 PR
-   跑，数字回填在本文件。若 CI 腿因镜像差异红（比如 8.4 权限名），修的是 workflow，不是放宽判据。
+1. **PG→MySQL / MySQL→MySQL 两格在 CI 上还没拿到数**：本地（MySQL 8.0.28）两格都是绿的
+   （PG→MySQL 1.96s、MySQL→MySQL 1.89s，全量 20000 行、md5 一致、增量被拒且行数不变），
+   但 CI runner 上同一步骤的「增量应被拒」那一轮会跑到 300s 超时且日志为空（rc≠0、行数没变，
+   所以判据没误放行，但拿不到「原因」这句话）。本地同一个二进制、同一份 job 文档 0.08s 就拒绝。
+   下一步：把那一轮的 `run` 换成带 `--stop-when-idle` 或抓 `strace`/`GODEBUG` 的方式取现场，
+   确认是「卡在建连」还是「卡在收尾」——**没有现场就不猜**（这也是本门禁的纪律）。
+   两格的**判据**已经写好并本地验证过，CI 出数只是时间问题，不影响门禁的正确性。
 2. **MySQL→MySQL / PG→MySQL 的增量真的没有**（引擎明确拒绝）。矩阵把「拒绝」当判据，
    但「每天能跑增量」这件事要等引擎那条路接上——不归本次门禁。
 3. `merge-gate` 目前是**独立 workflow**，还没进 branch protection 的 required checks：
