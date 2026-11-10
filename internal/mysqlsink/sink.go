@@ -11,10 +11,13 @@ import (
 	"strings"
 	"time"
 
+	"sync"
+
 	_ "github.com/go-sql-driver/mysql"
 
 	"github.com/spencerswagger/jinliang/internal/catalog"
 	"github.com/spencerswagger/jinliang/internal/dsn"
+	"github.com/spencerswagger/jinliang/internal/pgsink"
 	"github.com/spencerswagger/jinliang/internal/sink"
 	"github.com/spencerswagger/jinliang/internal/source"
 )
@@ -62,6 +65,18 @@ type Sink struct {
 	aliasUpsert bool // 8.0.19+ 支持 INSERT ... AS new ON DUPLICATE KEY UPDATE new.c=…
 	uniqueCache map[string]bool
 
+	// serverVersion 只用于错误文案（「目标端是 MySQL 5.7.44」），不参与判定。
+	serverVersion string
+
+	// 按表暂停（docs/CONTRACT-PAUSE-AND-POSITION.md §1.4/§4.2）：
+	//   - pausedCache 是 `_jl_meta.paused_tables` 的内存镜像（引擎 prepare 读一次）；
+	//   - pausedDirty 表示库里那列不是合法 JSON（已按「无暂停」继续，需发 note）；
+	//   - pausedColOK / pausedColMu 是「补过列没有」的一次性判定（老库补列只做一次）。
+	pausedCache map[string]pgsink.PausedTable
+	pausedDirty bool
+	pausedColOK bool
+	pausedColMu sync.Mutex
+
 	// ownerToken 让同一进程里的两个 Sink（测试/两次 run）在租约里彼此可分：
 	// 光靠 pid 分不开它们，后一个会把前一个当成「自己」直接续租。
 	ownerToken string
@@ -88,6 +103,8 @@ func Open(ctx context.Context, opt Options) (*Sink, error) {
 		return nil, fmt.Errorf("连不上目标库 %s:%d: %w", opt.DSN.Host, opt.DSN.Port, err)
 	}
 	s := &Sink{db: db, ep: opt.DSN, opt: opt, uniqueCache: map[string]bool{}, ownerToken: newOwnerToken()}
+	// 版本只用于错误文案与能力探测的日志，不参与任何分支判定（能力一律探测）。
+	_ = db.QueryRowContext(ctx, "SELECT VERSION()").Scan(&s.serverVersion)
 	if err := s.ensureStateTables(ctx); err != nil {
 		db.Close()
 		return nil, err
