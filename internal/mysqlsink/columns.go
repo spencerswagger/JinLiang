@@ -94,8 +94,15 @@ func (s *Sink) columnTypes(ctx context.Context, ref source.TableRef) (map[string
 func canonType(s string) string {
 	s = strings.ToLower(strings.TrimSpace(s))
 	s = strings.ReplaceAll(s, " ", "")
-	s = strings.TrimSuffix(s, "unsigned")
-	s = strings.TrimSuffix(s, "zerofill")
+	// 后缀要**循环**削：`BIGINT(20) UNSIGNED ZEROFILL` 两个都有，各削一次只剩一个
+	// （Owl II 实测：`bigintunsigned` 会让一张正常的 append 表被误停）。
+	for {
+		trimmed := strings.TrimSuffix(strings.TrimSuffix(s, "unsigned"), "zerofill")
+		if trimmed == s {
+			break
+		}
+		s = trimmed
+	}
 	if i := strings.Index(s, "("); i > 0 && (strings.HasPrefix(s, "bigint") ||
 		strings.HasPrefix(s, "int") || strings.HasPrefix(s, "smallint") || strings.HasPrefix(s, "tinyint") ||
 		strings.HasPrefix(s, "mediumint")) {

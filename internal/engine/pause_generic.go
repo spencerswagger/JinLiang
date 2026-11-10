@@ -313,9 +313,11 @@ func relationDiff(want *source.Table, got *source.Table) (string, bool) {
 
 // restorePausedAfterFailedRecopy 在整表重搬失败时把暂停记录**放回去**。
 //
-// 为什么必须还原：`truncateForcedRecopy` 已经把记录摘掉（否则目标端的「最后一道防线」
-// 会拦住重搬的写入）。如果重搬失败就停在这里，记录也没了 → 下一轮既不会重搬、也不会暂停，
-// 目标端停在一张**清空了一半**的表上，而退出码、界面一切正常。那是最坏的一种静默缺数据。
+// 什么时候会走到：**记录本来一直留着**（契约 §1.6 步 4：搬成才解除），所以这个函数只服务
+// 「这一轮已经进了重搬窗口、但没走到 finish」的半途情况——清空到一半失败、重搬中途返回。
+// 那时库里记录还在、但内存的 forceRecopy 已经没走完；把内存集合也补回去，下一轮才会继续重搬。
+// 不补的话：本轮 `needCopy` 已经过去、表被清了一半，而下一轮读到的是「记录在」——
+// 这条路径本身是安全的（planGenericRecopy 会重新收它），所以这里只是把「半途」也做干净。
 func (r *runner) restorePausedAfterFailedRecopy(ctx context.Context) {
 	if r.pauseReg == nil {
 		return
