@@ -77,6 +77,12 @@ type tableInfo struct {
 	ref   source.TableRef
 	cols  []string
 	types []string
+	// srcTypes[i] 是**源端原文**的类型（`bigint` / `varchar(64)` / `datetime(6)`），
+	// types[i] 是映射到目标端的类型。两者都要留：
+	//   - 写 SQL 用 types（目标端方言）；
+	//   - 报「源端改了什么类型」只能用 srcTypes —— 拿 types 报会把 MySQL 的
+	//     `varchar(32)→varchar(64)` 说成「源端原来是 text，现在是 text」，用户没法行动。
+	srcTypes []string
 	// collations[i] 是第 i 列的排序规则（空 = 用类型/库的默认）。跨库必须带上：
 	// 排序规则不同会让唯一索引判重与 ORDER BY 结果悄悄变样。
 	collations []string
@@ -197,6 +203,7 @@ func buildTables(cat source.Catalog, srcKind catalog.Engine) (map[string]*tableI
 			ti.colIndex[c.Name] = len(ti.cols)
 			ti.cols = append(ti.cols, c.Name)
 			ti.types = append(ti.types, targetType(srcKind, c.Type))
+			ti.srcTypes = append(ti.srcTypes, c.Type)
 			ti.collations = append(ti.collations, c.Collation)
 		}
 		for _, name := range ti.pk {
@@ -1294,12 +1301,14 @@ func (s *Sink) alignRelationTx(ctx context.Context, tx pgx.Tx, ev source.Event) 
 	// **colIndex 必须一起重建**——只改 cols/types 会让按列名找下标的路径错位。
 	ti.cols = ti.cols[:0]
 	ti.types = ti.types[:0]
+	ti.srcTypes = ti.srcTypes[:0]
 	ti.collations = ti.collations[:0]
 	ti.colIndex = map[string]int{}
 	for _, c := range ev.Relation.Columns {
 		ti.colIndex[c.Name] = len(ti.cols)
 		ti.cols = append(ti.cols, c.Name)
 		ti.types = append(ti.types, targetType(s.opt.SourceKind, c.Type))
+		ti.srcTypes = append(ti.srcTypes, c.Type)
 		ti.collations = append(ti.collations, c.Collation)
 	}
 	ti.pkIdx = ti.pkIdx[:0]
@@ -1323,9 +1332,14 @@ func (s *Sink) alignRelationTx(ctx context.Context, tx pgx.Tx, ev source.Event) 
 //
 // 只比列数会把后两种悄悄放过——缓存留着旧类型/旧名字继续写，静默写错。
 func relationMatches(ti *tableInfo, rel *source.Table, src catalog.Engine) (sameNames, sameTypes, keptAll bool, typeDiff, nameDiff string) {
+	// 两份：目标端映射后的类型（判等用）与源端原文（**给人看**用）。
+	// 只留映射后的那份时，跨引擎的「改类型」提示会写成两句目标端类型，
+	// 用户拿着 `text → text` 完全不知道源端到底改了什么。
 	byName := map[string]string{}
+	srcByName := map[string]string{}
 	for _, c := range rel.Columns {
 		byName[c.Name] = targetType(src, c.Type)
+		srcByName[c.Name] = c.Type
 	}
 	sameNames = len(rel.Columns) == len(ti.cols)
 	if sameNames {
@@ -1352,9 +1366,23 @@ func relationMatches(ti *tableInfo, rel *source.Table, src catalog.Engine) (same
 		}
 		if i < len(ti.types) && typ != ti.types[i] {
 			sameTypes = false
-			// 这条路两端都是**源端**类型：ti.types = 建表时从源端 catalog 拿到的旧类型，
-			// typ = 事件里 Relation 带来的新类型。写成「目标端」会把用户引去改错的一端。
-			tparts = append(tparts, fmt.Sprintf("列 %s：源端原来是 %s，现在是 %s", name, ti.types[i], typ))
+			// 判等按**目标端映射后**的类型（那才是写进去的），提示按**源端原文**（那是用户改的）。
+			// 两边都说清楚：跨引擎时目标端类型可能一直没变（MySQL varchar→text 都是 text），
+			// 只说目标端等于没说；只说源端又解释不了为什么要停。
+			var srcFrom, srcTo string
+			if i < len(ti.srcTypes) {
+				srcFrom = ti.srcTypes[i]
+			}
+			srcTo = srcByName[name]
+			switch {
+			case srcFrom != "" && srcTo != "" && srcFrom != srcTo && srcFrom != typ && srcTo != typ:
+				tparts = append(tparts, fmt.Sprintf("列 %s：源端 %s → %s（目标端映射 %s → %s）",
+					name, srcFrom, srcTo, ti.types[i], typ))
+			case srcFrom != "" && srcTo != "" && srcFrom != srcTo:
+				tparts = append(tparts, fmt.Sprintf("列 %s：源端 %s → %s", name, srcFrom, srcTo))
+			default:
+				tparts = append(tparts, fmt.Sprintf("列 %s：源端原来是 %s，现在是 %s", name, ti.types[i], typ))
+			}
 		}
 		if i < len(rel.Columns) && rel.Columns[i].Name != name {
 			renames = append(renames, fmt.Sprintf("第 %d 列：原 %s → 现 %s", i+1, name, rel.Columns[i].Name))

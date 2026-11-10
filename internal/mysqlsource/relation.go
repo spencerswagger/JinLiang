@@ -107,14 +107,14 @@ func tableFromMapWith(tm *TableMap, collations map[uint64]collation) *source.Tab
 		if i < len(tm.Meta) {
 			meta = tm.Meta[i]
 		}
-		col := source.Column{
-			Name:     name,
-			Type:     mysqlTypeName(typ, meta, unsigned),
-			Nullable: nullable,
-		}
+		col := source.Column{Name: name, Nullable: nullable}
 		if id := tm.collationFor(i); id != 0 {
 			col.Charset, col.Collation = lookupCollation(collations, id)
 		}
+		// **先拿字符集再渲染类型**：binlog 里 VARCHAR 的长度是**字节**上限
+		// （utf8mb4 的 VARCHAR(64) 记的是 256），按字节报给用户就是 `varchar(256)` ——
+		// 用户明明写的是 64。类型字典比对与暂停提示都吃这个字符串，错一个字就全错。
+		col.Type = mysqlTypeName(typ, meta, unsigned, charsetMaxLen(col.Charset))
 		t.Columns[i] = col
 	}
 	for _, idx := range tm.PrimaryKey {
@@ -194,8 +194,8 @@ func relationSignature(tm *TableMap) string {
 // ("bigint unsigned", "varchar(64)", "datetime(6)").
 //
 // 这里只做「照实描述」，不做跨库映射：映射归类型字典（internal/catalog，Ark 的）。
-func mysqlTypeName(t byte, meta uint16, unsigned bool) string {
-	name, args := typeNameAndArgs(t, meta)
+func mysqlTypeName(t byte, meta uint16, unsigned bool, maxLen int) string {
+	name, args := typeNameAndArgs(t, meta, maxLen)
 	if unsigned {
 		switch name {
 		case "tinyint", "smallint", "mediumint", "int", "bigint", "decimal", "float", "double":
@@ -205,7 +205,31 @@ func mysqlTypeName(t byte, meta uint16, unsigned bool) string {
 	return name + args
 }
 
-func typeNameAndArgs(t byte, meta uint16) (string, string) {
+// charsetMaxLen 是字符集的**单字符最大字节数**（mbmaxlen）。
+//
+// 只用来把 binlog 的「字节上限」换算回「字符数」。取不到字符集时返回 1：
+// 字节数当字符数报，与 5.7/8.0 的 latin1 列一致；宁可保守，不要凭猜除出来一个假长度。
+func charsetMaxLen(charset string) int {
+	switch strings.ToLower(charset) {
+	case "utf8mb4":
+		return 4
+	case "utf8mb3", "utf8":
+		return 3
+	case "ucs2", "utf16", "utf16le", "utf32":
+		if strings.EqualFold(charset, "ucs2") {
+			return 2
+		}
+		return 4
+	case "gbk", "big5", "sjis", "cp932", "euckr", "gb2312":
+		return 2
+	case "gb18030":
+		return 4
+	default:
+		return 1
+	}
+}
+
+func typeNameAndArgs(t byte, meta uint16, maxLen int) (string, string) {
 	fsp := int(meta & 0xff)
 	switch t {
 	case typeTiny:
@@ -257,8 +281,14 @@ func typeNameAndArgs(t byte, meta uint16) (string, string) {
 			return "blob", ""
 		}
 	case typeVarchar:
+		// meta 是**字节**上限：utf8mb4 的 VARCHAR(64) 在这里是 256。
+		// 除不尽（理论上不该发生）就按字节报，并让调用方从字符串里看得出来。
+		if maxLen > 1 && int(meta)%maxLen == 0 {
+			return "varchar", fmt.Sprintf("(%d)", int(meta)/maxLen)
+		}
 		return "varchar", fmt.Sprintf("(%d)", meta)
 	case typeVarString:
+		// VARBINARY 没有字符集（按字节），不许除。
 		return "varbinary", fmt.Sprintf("(%d)", meta)
 	case typeString:
 		realTyp, length := realType(typeString, meta)
