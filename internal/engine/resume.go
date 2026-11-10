@@ -418,7 +418,10 @@ func (r *runner) decideGenericCopyPlan(ctx context.Context, src runSource, phase
 		PriorPhase: phase,
 		Capable:    capable,
 	}
-	if in.Mode == "interval" || in.Mode == "continuous" || pos == "" || !capable {
+	// 注意**不要**在这里把 continuous 挡掉：它正是「位点追不回就硬停」那条判据的对象
+	// （continuous 不搬存量，`planCopy` 自己会判 copySkip，所以普通情况行为不变）。
+	// interval 没有位点要重放，保留早退。
+	if in.Mode == "interval" || pos == "" || !capable {
 		return planCopy(in), nil
 	}
 	cp, err := src.ParsePosition(pos)

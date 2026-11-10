@@ -11,8 +11,10 @@ package engine
 //   - 暂停恢复 = 整表重搬（进 `plan.Recopy`，`From` 里**没有**它）。
 
 import (
+	"strings"
 	"testing"
 
+	"github.com/spencerswagger/jinliang/internal/control"
 	"github.com/spencerswagger/jinliang/internal/pgsink"
 	"github.com/spencerswagger/jinliang/internal/source"
 )
@@ -89,4 +91,29 @@ func TestForcedRecopyIsNotChunkResume(t *testing.T) {
 	if containsTable(r.plan.Recopy, "healthy_b") {
 		t.Fatal("健康表不许被拉进整表重搬")
 	}
+}
+
+// 「位点追不回 + continuous」必须**硬停**，不能从新位置起流（那段变更会静默丢掉）。
+// 这条判据原来在 `decideGenericCopyPlan` 里不可达（early return 先把 continuous 挡掉了），
+// 是 Owl II 用「条件互斥」读出来的；这里把它钉死。
+func TestGenericPlanStopsWhenSlotUnreplayableInContinuous(t *testing.T) {
+	r := &runner{doc: control.JobDoc{Mode: control.ModeDoc{Frequency: "continuous"}}}
+	in := copyInputs{
+		Mode:     "continuous",
+		Tables:   []source.Table{{TableRef: source.TableRef{Schema: "public", Table: "orders"}, HasStablePK: true}},
+		Progress: map[string]pgsink.ChunkProgress{"orders": {Done: true, LastNo: 1}},
+		StoredCP: "postgres:v1:0/100",
+		Capable:  true,
+		// 书签追不回位点
+		SlotReplayable: false, SlotWhy: "WAL 段已被删除",
+	}
+	plan := planCopy(in)
+	if plan.Kind != copySkip {
+		t.Fatalf("continuous 不搬存量，应判 copySkip，得到 %s", plan.Kind)
+	}
+	err := &unreplayableSlotError{stored: "postgres:v1:0/100"}
+	if err == nil || !strings.Contains(err.Error(), "--resync") {
+		t.Fatalf("硬停的文案必须给出 --resync 这条唯一出路，得到 %v", err)
+	}
+	_ = r
 }
