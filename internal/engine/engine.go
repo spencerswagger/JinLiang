@@ -58,6 +58,9 @@ type Options struct {
 	LagThreshold int64
 	// Verify compares source and target fingerprints when the run finishes.
 	Verify bool
+	// Resync 是**显式整轮重搬**：重建书签/位点，先清本任务建的表再整表重搬。
+	// 语义与边界见 resync.go 顶部；它只作用于「这一轮」，不能配 --watch 循环跑。
+	Resync bool
 	// LeaseTTL defaults to 30s.
 	LeaseTTL time.Duration
 	// HeartbeatEvery 覆盖心跳间隔（测试用；默认 control.DefaultHeartbeatInterval/2）。
@@ -75,6 +78,8 @@ type Result struct {
 	Elapsed    time.Duration
 	Mismatches []string
 	Note       string
+	// Resync 非空表示这一轮做了整轮重搬（里面有旧位点与清掉的表，见 ResyncReport）。
+	Resync *ResyncReport
 }
 
 // ErrHeldByOther means another instance holds the job's lease (E1005).
@@ -304,6 +309,10 @@ type runner struct {
 	priorPhase      string
 	// plan 是这次全量「接着搬 / 从头搬 / 不用搬」的结论（见 resume.go）。
 	plan chunkPlan
+	// resyncReport 记录这一轮 --resync 实际清了什么（Result 与 CLI 都读它）。
+	resyncReport *ResyncReport
+	// snapshotDone 只用于 `--resync` 的收尾断言：说了整轮重搬就必须真的搬过。
+	snapshotDone bool
 
 	rowsCopied int64
 	rowsStream int64
@@ -335,8 +344,13 @@ func (r *runner) execute(parent context.Context, res *Result) error {
 		res.RowsStream = r.rowsStream
 		res.Position = posString(r.lastPos)
 		res.ExitCode = r.exitCode
+		res.Resync = r.resyncReport
 	}()
 
+	if err := r.checkResync(); err != nil {
+		// 先判再动：--resync 用在不支持的目标端/模式上时，一个字节都不该被改。
+		return r.fail(ctx, err)
+	}
 	if err := r.preflight(ctx); err != nil {
 		return r.fail(ctx, err)
 	}
@@ -385,6 +399,12 @@ func (r *runner) execute(parent context.Context, res *Result) error {
 			}
 			return r.fail(ctx, err)
 		}
+	}
+	// 「说了整轮重搬却没搬」是一种比失败更糟的成功：退出码 0、用户以为已重建，
+	// 数据其实一行都没重搬。判据留在收尾这里，任何一处漏改（needSnapshot 判据、
+	// applyResync、Clean 名单）都会让用例直接红，而不是悄悄放过去。
+	if r.opt.Resync && r.plan.Kind == copyFresh && !r.snapshotDone {
+		return r.fail(ctx, errResyncWithoutSnapshot)
 	}
 
 	if r.opt.SnapshotOnly || r.mode() == "once" {
@@ -572,6 +592,7 @@ const (
 	recopyNoPK                         // 无主键表，只能整表重来
 	recopyOnce                         // once / full_interval：每轮整轮重搬，必须清空重建
 	recopyNoPos                        // 搬过，但目标端没留下位点（一块都没搬完）
+	recopyResync                       // --resync：用户显式要求整轮重搬
 )
 
 func (w recopyReason) sentence() string {
@@ -585,6 +606,8 @@ func (w recopyReason) sentence() string {
 		return "这个任务是 once / full_interval 模式，每一轮都整轮重搬（目标端结果要等于源端当前状态）"
 	case recopyNoPos:
 		return "之前搬过但目标端没留下一致性位点（很可能一块都没搬完就断了）"
+	case recopyResync:
+		return "你显式要求了 --resync（整轮重搬）：这一轮先从零重建，目标端结果要等于源端当前状态"
 	default:
 		return "上次全量搬到一半就断了"
 	}
@@ -817,8 +840,38 @@ func (r *runner) prepare(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if r.opt.Resync {
+		// --resync 改的是**判据**（不看上次搬到哪，直接整轮重来），不是另写一套搬运。
+		if err := r.applyResync(&plan, phaseInTarget, posInTarget); err != nil {
+			return err
+		}
+	}
 	r.plan = plan
 	r.needSnapshot = plan.Kind != copySkip
+	if r.opt.Resync {
+		// 清位点必须在 src.Prepare 之前、更要在清表之前：
+		//   - 在 EnsureMeta 之前：它的 position 是 COALESCE 语义，晚清会被写回的旧位点盖掉；
+		//   - 在清表之前：清表发生在 snapshot()。反过来（先清表、后清位点）一旦崩在中间，
+		//     库里就是「位点说有进度、表却是空的」→ 下次按位点续跑 → 数据永久缺失且没人报错。
+		if err := r.sink.ClearProgress(ctx); err != nil {
+			return fmt.Errorf("清位点失败，已停下（目标表一行都没动）: %w", err)
+		}
+		if err := r.auditResync(ctx); err != nil {
+			return err
+		}
+		// continuous 没有存量：--resync 的动作全在「换一条书签」上。
+		// 不做这一步的话，Prepare 会**复用**旧书签，位点根本不会动——审计写了
+		// 「已清空位点」，实际却原样写回，正是「跑了但没重建」。
+		if r.mode() == "continuous" {
+			rb, ok := r.src.(slotRebuilder)
+			if !ok {
+				return fmt.Errorf("内部错误：%s 源没有重建书签的能力，但 checkResync 放行了", r.srcEP.Kind)
+			}
+			if err := rb.RebuildSlot(ctx); err != nil {
+				return err
+			}
+		}
+	}
 	// 续跑时**不重建书签、不导出视图**：书签得留着才能从原来的位点重放变更。
 	prep, err := src.Prepare(ctx, r.needSnapshot && plan.Kind != copyResume)
 	if err != nil {
@@ -1031,6 +1084,13 @@ func (r *runner) snapshot(ctx context.Context) error {
 	r.emit(ctx, control.Event{Type: "note",
 		Message: fmt.Sprintf("全量完成：%d 行，%d 块，%d 张表，用时 %s（%.0f 行/秒）",
 			r.rowsCopied, chunks, tables, elapsed.Truncate(time.Millisecond), rate)})
+	r.snapshotDone = true
+	if r.opt.Resync {
+		// 搬成才解除按表暂停：清表时那些记录是**故意**留着的（结构可能还没对齐）。
+		if err := r.clearPauseRecords(ctx); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 

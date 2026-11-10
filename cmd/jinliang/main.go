@@ -29,6 +29,7 @@ func main() {
   jinliang import   --file job.yaml [--dry-run] [--data-dir DIR]
   jinliang export   [--job ID|NAME] [--out FILE] [--all] [--data-dir DIR]
   jinliang run      --job ID|NAME [--json] [--snapshot-only] [--stop-when-idle DUR] [--verify] [--data-dir DIR]
+                    [--resync [--yes]]   重建书签/位点并整轮重搬（E3001 的出路；不可撤销）
   jinliang status   [--job ID|NAME] [--json] [--verify] [--data-dir DIR]
   jinliang doctor   [--source DSN] [--target DSN] [--job-key KEY] [--json] [--data-dir DIR]
   jinliang verify   --source DSN --target DSN --tables a,b [--level all] [--job-key KEY] [--json]

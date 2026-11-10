@@ -312,11 +312,18 @@ func cmdRun(args []string) error {
 	watch := fs.Bool("watch", false, "按 mode.interval 一轮轮跑（interval / full_interval 用）；Ctrl-C 停止")
 	verify := fs.Bool("verify", false, "跑完对比源端与目标端的行数与指纹")
 	batchRows := fs.Int("batch-rows", 0, "每批行数（默认取任务的 reliability.batch_rows）")
+	resync, yes := registerResyncFlags(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if strings.TrimSpace(*jobRef) == "" {
 		return errors.New("缺 --job（可用 id 或名字，jinliang export --all 能看到）")
+	}
+	if *resync && *watch {
+		// --resync 是「这一轮从零重来」，--watch 是「一轮轮跑」：把两者放一起，
+		// 要么每一轮都清表（等于持续删目标端数据），要么只有第一轮生效却没写在文档里。
+		return errors.New("--resync 不能和 --watch 一起用：先跑一次 --resync（单轮），再起 --watch。" +
+			"风险：没有（什么都没动）")
 	}
 	store, err := openStore(dataDir(*dir), *keyFile, true)
 	if err != nil {
@@ -329,6 +336,13 @@ func cmdRun(args []string) error {
 	job, err := store.ResolveJob(ctx, *jobRef)
 	if err != nil {
 		return fmt.Errorf("找不到任务 %q: %w", *jobRef, err)
+	}
+	// 确认放在解析之后：先把「哪个任务」查清楚再问，避免用户对着一个拼错的
+	// --job 回答 yes，然后在下一步才看到「找不到任务」。
+	if *resync && !*yes {
+		if err := confirmResync(job.Name); err != nil {
+			return err
+		}
 	}
 
 	enc := newEventPrinter(*jsonOut, os.Stdout)
@@ -373,6 +387,7 @@ func cmdRun(args []string) error {
 		LagThreshold: *maxLag,
 		Verify:       *verify,
 		BatchRows:    *batchRows,
+		Resync:       *resync,
 	})
 	time.Sleep(30 * time.Millisecond) // 让最后几条事件先打印出来
 	cancel()
@@ -390,6 +405,12 @@ func cmdRun(args []string) error {
 		if res.Note != "" {
 			fmt.Println("说明：" + res.Note)
 		}
+		if rep := res.Resync; rep != nil {
+			// 「谁触发了、重建了哪个位点、清了哪些表」——用户回头查的正是这三件事。
+			// 引擎已把同一份写进 audit（action=job.resync）；这里让当场的输出也对得上。
+			fmt.Printf("--resync：书签 %s，旧位点 %q 已清空，清了 %d 张表：%s\n",
+				rep.Slot, rep.OldPosition, len(rep.Tables), strings.Join(rep.Tables, ", "))
+		}
 		if res.ExitCode == engine.ExitStopped {
 			fmt.Println("（手动停止用 Ctrl-C 也可以：会在提交完手上这个事务后收尾）")
 		}
@@ -399,6 +420,48 @@ func cmdRun(args []string) error {
 	}
 	if runErr != nil {
 		return runErr
+	}
+	return nil
+}
+
+// registerResyncFlags 是 --resync / --yes 的**唯一注册点**。
+//
+// 单独抽出来是为了让「文案承诺」能被机器验证：E3001 的 Next 里写着
+// `jinliang run --job <任务名> --resync`，用例拿着这句话来这个函数上问
+// 「这个旗标真的注册了吗」——而不是靠人记得在两处同步。
+func registerResyncFlags(fs *flag.FlagSet) (resync, yes *bool) {
+	resync = fs.Bool("resync", false, "重建同步书签/位点，先清空本任务建的表再整轮重搬（不可撤销）")
+	yes = fs.Bool("yes", false, "危险动作（--resync）不再交互确认；容器/CI 里必须显式带上")
+	return resync, yes
+}
+
+// confirmResync 是 --resync 的二次确认。
+//
+// 为什么非交互环境**必须**显式给 --yes，而不是读到 EOF 就当取消：容器/CI 里
+// stdin 常常是空的，静默取消会让「脚本以为跑了、其实什么都没做」——那和
+// 「跑了但没重建」是同一类错。所以这里直接拒绝，把决定权交回给人。
+func confirmResync(jobRef string) error {
+	info, err := os.Stdin.Stat()
+	if err != nil {
+		return fmt.Errorf("读不到标准输入，无法确认 --resync；非交互环境请显式加 --yes（风险：不会重建、也不会清表）: %w", err)
+	}
+	if info.Mode()&os.ModeCharDevice == 0 {
+		return errors.New("--resync 会清空本任务建的目标表，非交互环境（stdin 不是终端）必须显式加 --yes。" +
+			"风险：没有（什么都没动）")
+	}
+	fmt.Printf(`即将整轮重搬任务 %q：
+  - 重建源端同步书签：旧的会被删掉，变更流从新起点开始
+  - 清空本任务在目标端建的每一张表，然后从零重搬（搬到一半期间目标端是部分数据，不是旧但完整）
+  - 不动任务身份（job_key），也不删运行历史与审计
+这一步不可撤销。确认请输入 yes：`, jobRef)
+	var answer string
+	if _, err := fmt.Scanln(&answer); err != nil {
+		// EOF（容器/CI 的 /dev/null、或者终端里 Ctrl-D）**不能**当成「用户取消」：
+		// 静默取消会让脚本以为已经重搬过。这里一律按「没确认」拒绝，并指名 --yes。
+		return fmt.Errorf("没读到确认（--resync 已取消，什么都没动）：非交互环境请显式加 --yes 再跑: %w", err)
+	}
+	if strings.ToLower(strings.TrimSpace(answer)) != "yes" {
+		return errors.New("已取消：什么都没动")
 	}
 	return nil
 }

@@ -272,8 +272,14 @@ var specs = []Spec{
 		Code: CodePositionGap, Class: Fatal,
 		Message: "同步进度和源库的变更流水接不上了",
 		Why:     "源库把还没读到的变更清理掉了（保留时间太短或书签被删）",
-		Next:    []string{"重新初始化一次：jinliang run job.yaml --resync", "长远解决：把源库变更流水保留时间调长"},
-		Risk:    "resync 会重搬全量，期间目标端数据可能短暂不一致",
+		// 命令必须是**真的能跑**的那一条：写成 job.yaml 或别的旗标，用户照着敲只会
+		// 撞「unknown flag/command」——唯一的自救路径就成了空头承诺。
+		// 用例 TestResyncTextNamesARealCLIFlag 拿着这句话去问 CLI 有没有这个旗标。
+		Next: []string{
+			"重新初始化一次：jinliang run --job <任务名> --resync（会重建书签并整轮重搬）",
+			"长远解决：把源库变更流水保留时间调长",
+		},
+		Risk: "resync 会清空本任务建的目标表并重搬全量，期间目标端可能短暂只有部分数据",
 	},
 	{
 		Code: CodeSchemaTooNew, Class: Fatal,
