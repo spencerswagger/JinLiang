@@ -120,36 +120,48 @@ func TestObjectMissingNextIsLayeredByCase(t *testing.T) {
 	}
 }
 
-// TestSchemaMismatchPauseCaveatInAllThreePlaces：括注「若当前版本已支持按表暂停」在
-// Why / Next / Risk 三处**同生同灭**。
+// TestSchemaMismatchSaysWholeRunStops：E1015 的三句话必须与实现一致。
 //
-// 这次真实的错：Why 与 Next 都加了括注，唯独 Risk 漏了——而 Risk 是唯一陈述后果的那句，
-// 于是文案变成「其它表不受影响」，用户据此不管，实际整轮 run 会失败。
-// 第③步上线后三处要一起删：只删一处时这条用例会红，逼你三处一起动。
-func TestSchemaMismatchPauseCaveatInAllThreePlaces(t *testing.T) {
-	const caveat = "若当前版本已支持按表暂停"
+// 曾经的错：Why / Next 都写了「若当前版本已支持按表暂停」，Risk 漏了——于是文案变成
+// 「其它表不受影响」，用户据此不管，而实际整轮 run 会失败。按表暂停落地后，三处括注
+// **全部删掉**，并把「其它表也不会继续推进」这句固定下来（grep 短语，谁改都得带上它）。
+func TestSchemaMismatchSaysWholeRunStops(t *testing.T) {
 	spec, ok := Lookup(CodeSchemaMismatch)
 	if !ok {
 		t.Fatal("E1015 必须在码表里")
 	}
-	if !strings.Contains(spec.Why, caveat) {
-		t.Errorf("Why 缺括注 %q", caveat)
+	if spec.Message != "表结构不一致" {
+		t.Errorf("Message 不该改，得到 %q", spec.Message)
 	}
-	found := false
+	const caveat = "若当前版本已支持按表暂停"
+	if strings.Contains(spec.Why, caveat) || strings.Contains(spec.Risk, caveat) {
+		t.Fatal("三处括注必须全删（Why / Next / Risk 都不许再出现）")
+	}
 	for _, n := range spec.Next {
 		if strings.Contains(n, caveat) {
-			found = true
+			t.Fatal("Next 里还留着括注")
+		}
+		if strings.Contains(n, "--resync") {
+			t.Fatalf("Next 不许出现 --resync（位点没推进，重搬全量是错的下一步）：%q", n)
 		}
 	}
-	if !found {
-		t.Errorf("Next 里缺括注 %q（按表暂停还没实现，不能让用户以为会暂停）", caveat)
+	// Why 要覆盖两个时机，并说清「具体看 last_error」。
+	for _, want := range []string{"prepare", "改类型", "last_error"} {
+		if !strings.Contains(spec.Why, want) {
+			t.Errorf("Why 应含 %q（两个时机都要覆盖，具体到表列看 last_error）", want)
+		}
 	}
-	if !strings.Contains(spec.Risk, caveat) {
-		t.Errorf("Risk 缺括注 %q —— Risk 是唯一陈述后果的那句，漏了会诱导用户不管", caveat)
+	if len(spec.Next) < 2 || len(spec.Next) > 3 {
+		t.Errorf("Next 要 1~3 步，得到 %d 步", len(spec.Next))
 	}
-	// 同一份事实的当前真相：第③步未实现时整轮会失败。这句必须写在 Risk 里。
-	if !strings.Contains(spec.Risk, "整轮 run 会失败") {
-		t.Error("Risk 必须写明「在此之前整轮 run 会失败」——这才是今天实际发生的事")
+	if !strings.Contains(spec.Next[2], "--accept-change") {
+		t.Errorf("「不想跟这张表」这一步要给出真实可执行的开关（--accept-change），得到 %q", spec.Next[2])
+	}
+	if !strings.Contains(spec.Risk, "其它表也不会继续推进") {
+		t.Error("Risk 必须写明「其它表也不会继续推进」——位点只有一个，这是实际后果")
+	}
+	if !strings.Contains(spec.Risk, "位点不推进") {
+		t.Error("Risk 必须写明位点不推进（用户的定心丸：一条都不会丢）")
 	}
 }
 

@@ -97,6 +97,10 @@ type Sink struct {
 	mu     sync.Mutex
 	tables map[string]*tableInfo
 	order  []string
+	// pausedCache 是 paused_tables 的内存镜像（写路径每批都要判，不能每批查库）。
+	// 由 LoadPausedTables 装好；pausedDirty 表示库里那列不是合法 JSON（按无暂停继续）。
+	pausedCache map[string]PausedTable
+	pausedDirty bool
 
 	// ownerToken 让「同一个进程里的两个 Sink」也彼此可分（否则它们同 pid、
 	// 同 instance_id，第二个会把第一个的租约抢走）。
@@ -246,10 +250,16 @@ func (s *Sink) ensureStateTables(ctx context.Context) error {
 			phase          text NOT NULL,
 			position       text,
 			watermark      text,
+			-- 按表暂停：一列 JSON 文本（key = 目标端裸表名，与 _jl_chunk.table_name 同源）。
+			-- 不建新表：老库要能 ADD COLUMN IF NOT EXISTS 平滑加上；一行一个 job_key。
+			paused_tables  text,
 			snapshot_id    text,
 			started_at     timestamptz NOT NULL DEFAULT now(),
 			updated_at     timestamptz NOT NULL DEFAULT now()
 		)`, s.stateTable("_jl_meta"), SchemaVersion),
+		// 老库补列：CREATE TABLE IF NOT EXISTS 不会给已存在的表加列。
+		fmt.Sprintf(`ALTER TABLE %s ADD COLUMN IF NOT EXISTS paused_tables text`,
+			s.stateTable("_jl_meta")),
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
 			job_key     text PRIMARY KEY,
 			instance_id text NOT NULL,
@@ -700,14 +710,83 @@ var ErrTargetTableExists = errors.New("目标端已经有同名表")
 // differently — upsert 判重会静默走偏，必须当成结构不兼容处理。
 var ErrCollationMismatch = errors.New("目标表的列排序规则和源端不一致")
 
+// compatibleType 判断目标端现有列能不能承载源端这一列。
+//
+// 只比 base 是不够的：**收窄的参数会让数据静默变形**——
+//
+//	源 numeric(12,3) / 目标 numeric(12,2)  → 第三位小数被四舍五入；
+//	源 timestamp(6)  / 目标 timestamp(0)   → 微秒被截断；
+//	源 varchar(200)  / 目标 varchar(20)    → 截断或直接报错（取决于值）。
+//
+// 三种都不报错、退出 0，用户看到的是「同步成功」。所以：**宽了放行、窄了判不兼容**
+// （判不兼容就会走 E1015，让用户显式对齐），拿不准参数含义的（比如 interval 的
+// fields、bit 的长度）一律按「窄了」处理——宁可让人确认一次，不要静默改数。
 func compatibleType(have, want string) bool {
-	hb, _ := splitType(have)
-	wb, _ := splitType(want)
+	hb, hargs := splitType(have)
+	wb, wargs := splitType(want)
 	if hb != wb {
 		return false
 	}
-	// 参数不同（numeric(12,2) vs numeric）不拦：目标端能存下就行，预检会报类型映射。
-	return true
+	if hargs == "" || wargs == "" {
+		// 任一端没写参数：目标端是「无界」就是宽，源端无界而目标有界则可能是窄。
+		// 无界的那端按最大处理：源端无界 / 目标有界 → 可能收窄 → 不兼容。
+		return wargs == ""
+	}
+	return !typeNarrowed(hb, hargs, wargs)
+}
+
+// typeNarrowed 判断目标端参数（have）比源端要求的（want）更窄。
+//
+//	返回 true 表示「目标装不下源端的精度/长度」→ 判不兼容。
+func typeNarrowed(base, have, want string) bool {
+	h, hok := parseTypeArgs(have)
+	w, wok := parseTypeArgs(want)
+	if !hok || !wok {
+		// 解析不了（interval 'day to second'、bit varying 之类）：只有在两侧字面不同
+		// 时才判窄——同样的字面当然兼容。
+		return normalizeType(have) != normalizeType(want)
+	}
+	switch base {
+	case "numeric", "decimal":
+		// (precision[, scale])：任一维变小都算窄。
+		if len(h) >= 1 && len(w) >= 1 && h[0] < w[0] {
+			return true
+		}
+		hs, ws := 0, 0
+		if len(h) >= 2 {
+			hs = h[1]
+		}
+		if len(w) >= 2 {
+			ws = w[1]
+		}
+		return hs < ws
+	case "timestamp", "timestamptz", "time", "timetz":
+		// 小数秒位数：变小 = 截断微秒/毫秒。
+		if len(h) >= 1 && len(w) >= 1 {
+			return h[0] < w[0]
+		}
+		return false
+	default:
+		// 字符/二进制/bit 这类：第一个参数是长度上限，变小就是窄。
+		if len(h) >= 1 && len(w) >= 1 {
+			return h[0] < w[0]
+		}
+		return false
+	}
+}
+
+// parseTypeArgs 把 "12,2" 拆成整数列表；解析不了就 false。
+func parseTypeArgs(args string) ([]int, bool) {
+	parts := strings.Split(args, ",")
+	out := make([]int, 0, len(parts))
+	for _, p := range parts {
+		n, err := strconv.Atoi(strings.TrimSpace(p))
+		if err != nil {
+			return nil, false
+		}
+		out = append(out, n)
+	}
+	return out, true
 }
 
 var typeAliases = map[string]string{
@@ -1222,6 +1301,27 @@ const (
 	PauseReasonTypeChanged = "type_changed" // 源端改了列类型
 	PauseReasonSchemaDrift = "schema_drift" // 改名 / 删列
 )
+
+// TablePausedError 表示「这张表已被标记暂停」：整批拒绝、位点不推进。
+// 与 TypeChangedError 同族（PausableError）——要能按表识别、要能挂码。
+type TablePausedError struct {
+	TableName string
+	// Detail 说明这张表为什么还停着（对齐结构之后重跑才会解除）。
+	Detail string
+}
+
+func (e *TablePausedError) Error() string {
+	if e.Detail != "" {
+		return fmt.Sprintf("表 %s 仍处于暂停状态（%s）：本批不写入，位点未推进", e.TableName, e.Detail)
+	}
+	return fmt.Sprintf("表 %s 仍处于暂停状态：本批不写入，位点未推进", e.TableName)
+}
+
+// Reason 实现 PausableError。
+func (e *TablePausedError) Reason() string { return PauseReasonTypeChanged }
+
+// Table 实现 PausableError。
+func (e *TablePausedError) Table() string { return e.TableName }
 
 // TypeChangedError 表示源端改了列类型——本版不跟随（会截断或静默变更语义）。
 // 单独成类型，方便第③步把它降级成「只暂停这张表」而不是整个任务。
