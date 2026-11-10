@@ -161,20 +161,33 @@ func TestTypeNames(t *testing.T) {
 		typ      byte
 		meta     uint16
 		unsigned bool
+		charset  string
 		want     string
 	}{
-		{typeTiny, 0, true, "tinyint unsigned"},
-		{typeInt24, 0, false, "mediumint"},
-		{typeNewDecimal, 10<<8 | 2, false, "decimal(10,2)"},
-		{typeDateTime2, 6, false, "datetime(6)"},
-		{typeBit, 1<<8 | 3, false, "bit(11)"},
-		{typeJSON, 4, false, "json"},
-		{typeVarchar, 255, false, "varchar(255)"},
-		{typeBlob, 3, false, "mediumblob"},
+		{typeTiny, 0, true, "", "tinyint unsigned"},
+		{typeInt24, 0, false, "", "mediumint"},
+		{typeNewDecimal, 10<<8 | 2, false, "", "decimal(10,2)"},
+		{typeDateTime2, 6, false, "", "datetime(6)"},
+		{typeBit, 1<<8 | 3, false, "", "bit(11)"},
+		{typeJSON, 4, false, "utf8mb4", "json"},
+		// VARCHAR 的 meta 是**字节**上限：latin1 的 VARCHAR(255) 是 255，
+		// utf8mb4 的 VARCHAR(64) 是 256，utf8mb3 的 VARCHAR(100) 是 300。
+		{typeVarchar, 255, false, "latin1", "varchar(255)"},
+		{typeVarchar, 256, false, "utf8mb4", "varchar(64)"},
+		{typeVarchar, 300, false, "utf8mb3", "varchar(100)"},
+		// VARBINARY 没有字符集，按字节，不许除。
+		{typeVarString, 64, false, "utf8mb4", "varbinary(64)"},
+		{typeBlob, 3, false, "binary", "mediumblob"},
+		// TEXT 与 BLOB 共用类型字节，只有字符集能分开
+		{typeBlob, 2, false, "utf8mb4", "text"},
+		// CHAR 的长度也是字节
+		{typeString, 0xFE<<8 | 40, false, "utf8mb4", "char(10)"},
+		// VARBINARY 走 VARCHAR 的类型字节 + binary 字符集
+		{typeVarchar, 32, false, "binary", "varbinary(32)"},
 	}
 	for _, c := range cases {
-		if got := mysqlTypeName(c.typ, c.meta, c.unsigned); got != c.want {
-			t.Fatalf("类型 %d/%d → %q，期望 %q", c.typ, c.meta, got, c.want)
+		if got := mysqlTypeName(c.typ, c.meta, c.unsigned, c.charset); got != c.want {
+			t.Fatalf("类型 %d/%d/charset=%q → %q，期望 %q", c.typ, c.meta, c.charset, got, c.want)
 		}
 	}
 }
@@ -214,8 +227,10 @@ func TestRelationFillsCharsetAndCollation(t *testing.T) {
 	// 这两项原来只能丢掉或塞进 Type，现在按契约填进 Column.Charset/Collation。
 	tm := &TableMap{
 		TableID: 3, Schema: "s", Table: "t", Columns: 3,
-		Types:              []byte{typeLong, typeVarchar, typeVarchar},
-		Meta:               []uint16{0, 64, 64},
+		Types: []byte{typeLong, typeVarchar, typeVarchar},
+		// VARCHAR 的 meta 是**字节**上限：utf8mb4 的 64 字符 = 256 字节。
+		// 之前这里写 64 是照「字符数」写造的假数据，真 binlog 从来不这么给。
+		Meta:               []uint16{0, 256, 256},
 		Names:              []string{"id", "name", "note"},
 		Nullable:           []bool{false, true, true},
 		DefaultCollation:   45,                    // utf8mb4_general_ci

@@ -1008,7 +1008,9 @@ func TestDDLTypeChangeIsRefusedNotSilent(t *testing.T) {
 		t.Fatalf("应返回 TypeChangedError（第③步要按类型降级成「只暂停该表」），得到 %T: %v", err, err)
 	}
 	// ① 方向必须无歧义。这条路（streaming）两端都是**源端**类型：旧 → 新。
-	if !strings.Contains(err.Error(), "源端原来是 bigint") || !strings.Contains(err.Error(), "现在是 text") {
+	//    句式统一成「列 X：源端 旧 → 新（目标端映射 …）」，跨引擎时括号里那段才会出现
+	//    （见 pgsink.relationMatches：判等按目标端映射、提示按源端原文）。
+	if !strings.Contains(err.Error(), "源端 bigint → text") {
 		t.Fatalf("streaming 路要标清「源端原来/现在」各是什么：%v", err)
 	}
 	// ② typed error 只带事实：动作与风险交给码表（否则同一条错误两段动作）

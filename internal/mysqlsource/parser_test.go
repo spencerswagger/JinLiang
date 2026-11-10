@@ -81,8 +81,10 @@ func TestParseUpdateKeepsOldAndNew(t *testing.T) {
 		t.Fatalf("解析更新失败: %v", err)
 	}
 	ch := events[0].Rows.Changes[0]
-	if ch.Old.Row.Values[1].S != "old" {
-		t.Fatalf("前镜像丢了: %#v", ch.Old.Row.Values[1])
+	// VARBINARY 列按定义交字节（不再按内容猜成字符串）：`\x00\x01` 这种值
+	// 被当成 Go 字符串时写 bytea 会直接编码失败。
+	if v := ch.Old.Row.Values[1]; v.Kind != source.KindBytes || string(v.B) != "old" {
+		t.Fatalf("前镜像丢了: %#v", v)
 	}
 	if ch.New.Present[1] {
 		t.Fatalf("后镜像里没写 name，不该标记为存在")

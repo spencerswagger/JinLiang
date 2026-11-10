@@ -278,14 +278,26 @@ func (a *Assembler) applyQuery(ctx context.Context, ev *Event) error {
 }
 
 // statementEvent wraps a logged statement as a source event.
+//
+// **表名必须解析出来**：binlog 的 Query 事件只有「默认库 + 语句原文」，
+// 而引擎按 `schema.表` 判断这条 DDL 在不在同步范围里。不解析就是现在这个样子——
+// 表名恒为空、判定恒落空、源端 DDL 被**静默丢掉**（连"本版不搬 DDL"那声提示都没有）。
+// 解析不出（多表语句等）时保持空表名：宁可不提示，也不要把 DDL 记到错的表头上。
 func statementEvent(verb string, ev *Event, txID string, commitTS time.Time) source.Event {
 	kind := source.EvDDL
 	if verb == "TRUNCATE" {
 		kind = source.EvTruncate
 	}
+	ref := source.TableRef{Schema: ev.Query.Schema}
+	if schema, table, ok := ddlTargetTable(ev.Query.Query); ok {
+		if schema != "" {
+			ref.Schema = schema
+		}
+		ref.Table = table
+	}
 	return source.Event{
 		Kind:     kind,
-		Table:    source.TableRef{Schema: ev.Query.Schema},
+		Table:    ref,
 		DDL:      ev.Query.Query,
 		TxID:     txID,
 		CommitTS: commitTS,
