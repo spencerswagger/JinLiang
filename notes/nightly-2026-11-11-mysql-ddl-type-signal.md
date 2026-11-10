@@ -87,7 +87,8 @@ MySQL→PG 那条的位点（本轮改成真断言之后）：`675108 → 719304
 
 > 下面这段是**裁决 A 之前**（旧契约）真跑抓到的输出，留作对照：那时一条 DDL 改类型会
 > 让整 run 以 E1015 失败（退出码 1）、位点不动。现在的行为见 §6 与「契约已冻结」一节：
-> 只停这张表、其它表照写、位点照常前进，有暂停表时按控制面裁决退 `ExitNeedsAction=3`。
+> 只停这张表、其它表照写、位点照常前进；收尾**按控制面裁决应为** `ExitNeedsAction=3`
+> （「跑完了但有欠账」），该常量尚未落地，见后面的「实现状态」。
 
 ```
 [实时同步中] 源端 DDL 没有搬到目标端（本版不搬 DDL）：ALTER TABLE engine_my_type_change MODIFY COLUMN v VARCHAR(64) NULL。
@@ -160,8 +161,11 @@ TEXT 与 BLOB 按尺寸档视为同类；**其余一律不同型 → 保留 binl
 ### 5.5 `char(10)` vs `character(10)`：一个 CHAR 列就能停掉整轮
 
 MySQL 侧写 `char(10)`，PG 的 `information_schema` 回 `character(10)`；`typeAliases` 里有
-`bpchar→character` 却没有 `char→character`，`compatibleType` 判不兼容 → prepare 期 E1015 整轮失败
-（这一支今天仍是「整轮失败 + 登记暂停」；**流式期**才是裁决 A 的「只停那张表、其它表照写」）。
+`bpchar→character` 却没有 `char→character`，`compatibleType` 判不兼容 → E1015 的**原因码**报出来，
+处置是**只停那张表**（不是整轮失败）：
+- PG 目标端：`pgsink.EnsureSchema` 把 `PausableError` 收进 `pendingPauses` 继续看下一张；
+- MySQL 目标端：`detectPrepareDrift` 登记 + 本轮不搬它的存量（`#102`）。
+「prepare 期一撞就整轮失败」是 `#93` 之前的行为，已作废。
 修法：别名表加 `char → character`。判据：`TestCompatibleType` + 上面那张 chartypes 表的真库用例。
 
 ### 5.2 位点断言空转（我自己的用例，假绿）
@@ -204,9 +208,12 @@ MySQL 侧写 `char(10)`，PG 的 `information_schema` 回 `character(10)`；`typ
 - 跳过的那一行靠**恢复时整表重搬**补回来（不是靠位点重放）；
 - run 的收尾：**跑完了，但有暂停表就是有欠账** —— 按控制面裁决应以 `ExitNeedsAction = 3`
   （「跑完了但有欠账」，有暂停表禁止退 0）收尾。**既不是 0，也不是旧契约的「整 run 以 E1015 失败」**。
-  > 实现状态（写这段时）：`grep ExitNeedsAction` 在树里还是空的（`internal/engine` 只有
-  > `ExitOK=0 / ExitFailed=1 / ExitStopped=130`），所以那一刻的真实输出仍是退出码 0。
-  > 退出码 3 落地后，把这段「实现状态」删掉即可；语义以控制面裁决为准。
+  > 实现状态（**截至 main `64f6bb1`**）：`grep -rn 'ExitNeedsAction\|ExitPaused' internal/engine`
+  > 为空（现有常量只有 `ExitOK=0 / ExitFailed=1 / ExitStopped=130`），所以那一刻的真实输出
+  > 仍是退出码 0。**两个名字**是因为旧笔记里同一个码叫 `ExitPaused`
+  > （`notes/exit-paused-3-checklist.md`、`pause-per-table-A.md:64`），控制面这轮叫
+  > `ExitNeedsAction`——落地时以代码里的常量为准，并顺手把旧笔记标「已更名」。
+  > 常量落地后，把这段「实现状态」整段删掉。
 本 PR 不碰这条写路径，只给它提供「哪张表 + 源端前后类型」。
 
 > 归属：`internal/engine/integration_mysql_type_pause_test.go` 的注释与**退出码断言**
