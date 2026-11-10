@@ -14,7 +14,6 @@ import (
 	"github.com/spencerswagger/jinliang/internal/dsn"
 	"github.com/spencerswagger/jinliang/internal/mysqlsink"
 	"github.com/spencerswagger/jinliang/internal/pgsink"
-	"github.com/spencerswagger/jinliang/internal/pgsource"
 	"github.com/spencerswagger/jinliang/internal/sink"
 	"github.com/spencerswagger/jinliang/internal/source"
 	"github.com/spencerswagger/jinliang/internal/state"
@@ -164,13 +163,12 @@ func (r *runner) executeGenericFullCopy(ctx context.Context, res *Result) error 
 		return err
 	}
 	chunkRows := r.chunkRows()
-	_, err = r.src.SnapshotChunks(ctx, source.SnapshotOpt{ChunkRows: chunkRows, Conns: 1},
-		func(c context.Context, ch pgsource.Chunk) error {
-			rows := ch.Rows
+	_, err = r.src.SnapshotChunksFrom(ctx, source.SnapshotOpt{ChunkRows: chunkRows, Conns: 1}, nil,
+		func(c context.Context, chRef source.TableRef, chNo int, rows [][]any, _, _ string) error {
 			// 一页可能十万行：按小批喂给 Apply，避免一条超大 INSERT 撞 max_allowed_packet。
 			const perBatch = 500
-			ref := r.targetRef(ch.Table)
-			rel := r.relationOf(ch.Table)
+			ref := r.targetRef(chRef)
+			rel := r.relationOf(chRef)
 			for i := 0; i < len(rows); i += perBatch {
 				end := i + perBatch
 				if end > len(rows) {
@@ -180,7 +178,7 @@ func (r *runner) executeGenericFullCopy(ctx context.Context, res *Result) error 
 				for _, row := range rows[i:end] {
 					vals, verr := toValues(row)
 					if verr != nil {
-						return fmt.Errorf("转换 %s 的一行失败（宁可停下也不写错数据）: %w", ch.Table.Table, verr)
+						return fmt.Errorf("转换 %s 的一行失败（宁可停下也不写错数据）: %w", chRef.Table, verr)
 					}
 					evs = append(evs, source.Event{
 						Kind:     source.EvInsert,
@@ -195,7 +193,7 @@ func (r *runner) executeGenericFullCopy(ctx context.Context, res *Result) error 
 				}
 			}
 			r.rowsCopied += int64(len(rows))
-			r.progress(c, fmt.Sprintf("全量：%s 第 %d 块，%d 行", ch.Table.Table, ch.No, len(rows)))
+			r.progress(c, fmt.Sprintf("全量：%s 第 %d 块，%d 行", chRef.Table, chNo, len(rows)))
 			return nil
 		})
 	if err != nil {
@@ -217,11 +215,11 @@ func (r *runner) executeGenericFullCopy(ctx context.Context, res *Result) error 
 // schema（库）名去建表，于是变成 `public`.`t` —— 用户看到的是「CREATE 权限被拒」，
 // 实际是库名不对。目标端 schema 为空时 mysqlsink 会回落到连接里的库。
 func (r *runner) targetCatalog() source.Catalog {
-	targetSchema := strings.TrimSpace(r.doc.Target.Schema)
+	targetSchema := r.targetSchema()
 	out := source.Catalog{}
 	for _, t := range r.selectedTables() {
 		cp := t
-		cp.Schema = targetSchema // 空 = 用连接里的库
+		cp.Schema = targetSchema
 		out.Tables = append(out.Tables, cp)
 	}
 	return out
@@ -230,7 +228,13 @@ func (r *runner) targetCatalog() source.Catalog {
 // targetRef 把源端表引用换成目标端引用（schema 换成目标端的）。
 // 事件里的 Table 会被目标端直接拼进 SQL，必须是目标端的库名。
 func (r *runner) targetRef(ref source.TableRef) source.TableRef {
-	return source.TableRef{Schema: strings.TrimSpace(r.doc.Target.Schema), Table: ref.Table}
+	schema := strings.TrimSpace(r.doc.Target.Schema)
+	if schema == "" {
+		// 空 = 用目标端的默认落点。PG 是 public、MySQL 是连接里的库——这个判断
+		// 只在 schemaOf 里有一份，这里委托它，不另写一套回落逻辑。
+		schema = r.targetSchema()
+	}
+	return source.TableRef{Schema: schema, Table: ref.Table}
 }
 
 // incrementalGate 决定「这个目标端能不能跑增量」。

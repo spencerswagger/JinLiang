@@ -5,7 +5,6 @@ import (
 	"testing"
 
 	"github.com/spencerswagger/jinliang/internal/pgsink"
-	"github.com/spencerswagger/jinliang/internal/pgsource"
 	"github.com/spencerswagger/jinliang/internal/source"
 )
 
@@ -23,7 +22,7 @@ func TestPlanCopy(t *testing.T) {
 		name  string
 		in    copyInputs
 		kind  copyKind
-		from  map[string]pgsource.ChunkResume
+		from  map[string]chunkFrom
 		skip  []string
 		recpy []string
 		why   string // Why 里应出现的片段（空 = 不检查）
@@ -52,7 +51,7 @@ func TestPlanCopy(t *testing.T) {
 					"a": {LastNo: 3, Cursor: "3000", Rows: 3000},
 				}},
 			kind:  copyResume,
-			from:  map[string]pgsource.ChunkResume{"a": {Cursor: "3000", LastNo: 3}},
+			from:  map[string]chunkFrom{"a": {Cursor: "3000", LastNo: 3}},
 			why:   "续跑",
 			clean: cleanNone,
 		},
@@ -67,7 +66,7 @@ func TestPlanCopy(t *testing.T) {
 					"b": {LastNo: 2, Cursor: "2000"},
 				}},
 			kind:  copyResume,
-			from:  map[string]pgsource.ChunkResume{"b": {Cursor: "2000", LastNo: 2}},
+			from:  map[string]chunkFrom{"b": {Cursor: "2000", LastNo: 2}},
 			skip:  []string{"a"},
 			why:   "1 张表已经搬完",
 			clean: cleanNone,
@@ -175,7 +174,7 @@ func TestPlanCopy(t *testing.T) {
 					"pkA2": {},
 				}},
 			kind:  copyResume,
-			from:  map[string]pgsource.ChunkResume{"a": {Cursor: "10", LastNo: 1}},
+			from:  map[string]chunkFrom{"a": {Cursor: "10", LastNo: 1}},
 			recpy: []string{"c"},
 			why:   "无主键表整表重来",
 			clean: cleanNone,

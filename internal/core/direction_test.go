@@ -14,7 +14,8 @@ func TestSupportedDirections(t *testing.T) {
 	}{
 		{"postgres", "postgres", true},
 		{"postgres", "mysql", true},
-		{"mysql", "postgres", false},
+		// MySQL 源已接进引擎主路径（binlog 读流）；MySQL → MySQL 还没接。
+		{"mysql", "postgres", true},
 		{"mysql", "mysql", false},
 		// 大小写与空白不该影响判断（连接类型是用户填的，也可能来自 yaml）
 		{"POSTGRES", "MYSQL", true},

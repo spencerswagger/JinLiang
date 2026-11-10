@@ -7,8 +7,6 @@ import (
 	"time"
 
 	"github.com/spencerswagger/jinliang/internal/control"
-
-	"github.com/spencerswagger/jinliang/internal/pgsource"
 	"github.com/spencerswagger/jinliang/internal/source"
 )
 
@@ -53,12 +51,19 @@ type applier interface {
 	Apply(ctx context.Context, evs []source.Event, pos source.Position) error
 }
 
+// acker 是「源端位点」这一半：ack 与「最后一笔已提交事务的位点」。
+//
+// 位点用 source.Position（不是某一种连接器的类型）：两种源的位点串不同，
+// 但「可判等 + 谁更早」这两件事连接器自己给（Before），批处理只按它做判断。
 type acker interface {
-	Ack(pos pgsource.Position)
-	// LastCommit is the LSN of the last committed source transaction; the
-	// batcher snapshots it on EvCommit (the shared Event struct carries no
-	// position field — that contract belongs to Ark).
-	LastCommit() pgsource.Position
+	Ack(pos source.Position)
+	// LastCommit 是最后一笔已提交源事务的位点；batcher 在 EvCommit 上取它当作
+	// 「这一批要写进目标库的位点」（共享的 Event 结构不带位点字段——那归契约）。
+	LastCommit() source.Position
+	// Before 报告 a 是否严格早于 b（位点回退保护与追平判断都要顺序）。
+	Before(a, b source.Position) bool
+	// IsZero 报告位点是不是「还没定过」。
+	IsZero(p source.Position) bool
 }
 
 type batcher struct {
@@ -78,10 +83,10 @@ type batcher struct {
 	lastTxID string
 	pending  []source.Event // 已提交、还没落库的源事务
 	pendRows int
-	pendPos  pgsource.Position
+	pendPos  source.Position
 
 	applied   int64
-	lastPos   pgsource.Position
+	lastPos   source.Position
 	lastFlush time.Time
 
 	// 单事务缓冲上限（docs/STREAMING.md §1：128 MB / 100 万事件）。
@@ -89,13 +94,13 @@ type batcher struct {
 	maxTxEvents int
 
 	// onFlush fires after a successful commit (used for phase switching).
-	onFlush func(applied int64, pos pgsource.Position)
+	onFlush func(applied int64, pos source.Position)
 	// onApplied reports rows/position to the runner.
-	onApplied func(rows int64, pos pgsource.Position)
+	onApplied func(rows int64, pos source.Position)
 }
 
 func newBatcher(sink applier, src acker, doc control.JobDoc, batchRows int, delay time.Duration,
-	start pgsource.Position, onApplied func(rows int64, pos pgsource.Position)) *batcher {
+	start source.Position, onApplied func(rows int64, pos source.Position)) *batcher {
 	if batchRows < 1 {
 		batchRows = 1
 	}
@@ -112,13 +117,14 @@ func newBatcher(sink applier, src acker, doc control.JobDoc, batchRows int, dela
 // the source is quiet: the stream saw nothing to apply, but the bookmark must
 // still move or it holds WAL forever. It refuses while a transaction is in
 // flight — the position inside an unfinished transaction is not a checkpoint.
-func (b *batcher) AdvanceTo(ctx context.Context, pos pgsource.Position) error {
+func (b *batcher) AdvanceTo(ctx context.Context, pos source.Position) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.inTx || len(b.cur) > 0 || len(b.pending) > 0 {
 		return nil
 	}
-	if pos.Compare(b.lastPos) <= 0 {
+	if !b.src.Before(b.lastPos, pos) {
+		// 不更晚（相等或更早）：不动位点。位点只能往前走。
 		return nil
 	}
 	if err := b.sink.Apply(ctx, nil, pos); err != nil {
@@ -164,7 +170,7 @@ func (b *batcher) Add(ctx context.Context, ev source.Event) error {
 		b.txRows = 0
 		b.inTx = false
 		if b.src != nil {
-			if p := b.src.LastCommit(); p.Compare(b.pendPos) > 0 {
+			if p := b.src.LastCommit(); b.src.Before(b.pendPos, p) {
 				b.pendPos = p
 			}
 		}
@@ -248,7 +254,7 @@ func (b *batcher) Flush(ctx context.Context) error {
 func (b *batcher) flushLocked(ctx context.Context) error {
 	// 空事务也要推进位点：不推进就会让「落后」一直涨，还会让 --stop-after
 	// 收尾时的位点落后于实际已消费的位置。
-	if len(b.pending) == 0 && b.pendPos.Compare(b.lastPos) <= 0 {
+	if len(b.pending) == 0 && !b.src.Before(b.lastPos, b.pendPos) {
 		return nil
 	}
 	pos := b.pendPos
@@ -312,14 +318,14 @@ func (b *batcher) Pending() (rows int, inTx bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	rows = b.pendRows + len(b.cur)
-	if rows == 0 && b.pendPos.Compare(b.lastPos) > 0 {
+	if rows == 0 && b.src.Before(b.lastPos, b.pendPos) {
 		rows = 1 // 有位点没提交：不算 idle
 	}
 	return rows, b.inTx
 }
 
 // Applied reports how many rows this batcher wrote and the last durable position.
-func (b *batcher) Applied() (int64, pgsource.Position) {
+func (b *batcher) Applied() (int64, source.Position) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.applied, b.lastPos

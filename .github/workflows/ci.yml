@@ -194,8 +194,13 @@ jobs:
         env:
           JINLIANG_TEST_PG_SRC_DSN: postgres://jinliang:jinliang@127.0.0.1:55432/jinliang_src?sslmode=disable
           JINLIANG_TEST_PG_DSN: postgres://jinliang:jinliang@127.0.0.1:55433/jinliang_test?sslmode=disable
-        # -v：让 CI 日志里能看见用例名（评审要能确认它真的跑了，而不是被跳过）
-        run: go test -tags=integration -count=1 -v ./internal/engine/ ./internal/pgsink/
+        # -v：让 CI 日志里能看见用例名（评审要能确认它真的跑了，而不是被跳过）。
+        # -skip：MySQL 源那条用例要一个开了 binlog 的 MySQL 源库，本 job 没有——
+        # 它在 b4-mysql-source job 里跑（那边的 DSN 是齐的）。跳过的只是那一条，
+        # 其余用例照旧全跑；这条用例自己缺 DSN 时是**失败**，不是跳过。
+        # -p 1：两个包共用同一个目标库，包级并行时一个包 DROP `_jl_*` 会踩到另一个包
+        # 正在用的租约（TestLeaseNotStolenBySameInstance 就是这么偶发红的）。串行跑。
+        run: go test -tags=integration -count=1 -v -p 1 -skip 'TestMySQLSource' ./internal/engine/ ./internal/pgsink/
       - name: 目标端批量 upsert 吞吐（增量 ≥20k ops/s 峰值 / ≥10k 稳态的门禁依据）
         env:
           JINLIANG_TEST_PG_DSN: postgres://jinliang:jinliang@127.0.0.1:55433/jinliang_test?sslmode=disable
@@ -241,4 +246,97 @@ jobs:
         if: failure()
         run: |
           echo "=== pg-src ==="; docker logs pg-src 2>&1 | tail -50
+          echo "=== pg-dst ==="; docker logs pg-dst 2>&1 | tail -50
+
+  b4-mysql-source:
+    # MySQL 源 → PG 目标：真 binlog 取流 + 真写 PG + 与 PG 源共用同一套块记账/位点语义，
+    # 再跑一遍「快照中途 kill -9 → 从已提交的块边界续跑」。
+    #
+    # 为什么单独一个 job：它要一个开了 binlog（ROW + FULL 行镜像）的 MySQL 源库，
+    # 而 services 没法给容器追加 mysqld 参数（5.7 默认 log_bin=OFF）。
+    #
+    # **`binlog_row_metadata` 故意保持默认（MINIMAL）**：这是 8.0/8.4/9 的开箱配置，
+    # binlog 里只有列类型、没有列名，列名靠 catalog 按序号补（mysqlsource.enrichRelation）。
+    # 用 FULL 跑会把这条最容易出事的路径整段跳过——测的是「更简单的那个世界」。
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.x"
+      - name: 备好 psql / mysql 客户端（验收脚本要连两个库核对指纹）
+        run: |
+          set -e
+          command -v psql >/dev/null 2>&1 || { sudo apt-get update -qq; sudo apt-get install -y -qq postgresql-client; }
+          command -v mysql >/dev/null 2>&1 || { sudo apt-get update -qq; sudo apt-get install -y -qq mysql-client; }
+          psql --version; mysql --version
+      - name: 起 PostgreSQL 目标端
+        run: |
+          set -e
+          docker run -d --name pg-dst             -e POSTGRES_USER=jinliang -e POSTGRES_PASSWORD=jinliang -e POSTGRES_DB=jinliang_test \
+            -p 55433:5432 postgres:16
+          ok=0
+          for _ in $(seq 1 90); do
+            if docker exec pg-dst psql -U jinliang -d postgres -tAc "select 1" >/dev/null 2>&1; then ok=1; break; fi
+            sleep 2
+          done
+          [ "$ok" = 1 ] || { echo "--- pg-dst 没起来 ---"; docker logs pg-dst; exit 1; }
+      - name: 起 MySQL 源端（binlog ROW/FULL 行镜像；列元数据用默认 MINIMAL）
+        run: |
+          set -e
+          docker run -d --name my-src \
+            -e MYSQL_ROOT_PASSWORD=root \
+            -p 3307:3306 \
+            mysql:8.0 \
+            --server-id=1 \
+            --log-bin=mysql-bin \
+            --binlog-format=ROW \
+            --binlog-row-image=FULL
+          for i in $(seq 1 90); do
+            if mysqladmin ping -h 127.0.0.1 -P 3307 -uroot -proot --silent 2>/dev/null; then break; fi
+            sleep 2
+          done
+          mysql -h 127.0.0.1 -P 3307 -uroot -proot -e "
+            CREATE DATABASE IF NOT EXISTS jinliang_src CHARACTER SET utf8mb4;
+            CREATE USER IF NOT EXISTS 'jinliang'@'%' IDENTIFIED WITH mysql_native_password BY 'jinliang';
+            GRANT ALL PRIVILEGES ON *.* TO 'jinliang'@'%';
+            FLUSH PRIVILEGES;
+            SHOW VARIABLES WHERE Variable_name IN
+              ('log_bin','binlog_format','binlog_row_image','binlog_row_metadata');"
+      - name: 引擎/连接器单元测试（位点顺序 / 表名映射 / 类型映射）
+        run: go test ./internal/engine/ ./internal/mysqlsource/ ./internal/pgsink/
+      - name: 真库集成测试（MySQL 源 → PG 目标：全量 + 块记账 + 增量追平删除）
+        env:
+          JINLIANG_TEST_MYSQL_SRC_DSN: mysql://jinliang:jinliang@127.0.0.1:3307/jinliang_src
+          JINLIANG_TEST_PG_DSN: postgres://jinliang:jinliang@127.0.0.1:55433/jinliang_test?sslmode=disable
+        run: go test -tags=integration -count=1 -v -run 'TestMySQLSource' ./internal/engine/
+      - name: 端到端（MySQL → PG：全量 120k 行 + 增量 3 笔 + 指纹一致 + 追平时延）
+        env:
+          JINLIANG_TEST_MYSQL_SRC_DSN: mysql://jinliang:jinliang@127.0.0.1:3307/jinliang_src
+          JINLIANG_TEST_PG_DSN: postgres://jinliang:jinliang@127.0.0.1:55433/jinliang_test?sslmode=disable
+          ROWS: "120000"
+          CHUNK_ROWS: "1000"
+        run: |
+          set -e
+          mkdir -p dist
+          CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o dist/jinliang ./cmd/jinliang
+          scripts/b1_mysql_to_pg.sh ./dist/jinliang
+      - name: 端到端（快照中途 kill -9：从已提交的块边界续跑，不重不丢）
+        env:
+          JINLIANG_TEST_MYSQL_SRC_DSN: mysql://jinliang:jinliang@127.0.0.1:3307/jinliang_src
+          JINLIANG_TEST_PG_DSN: postgres://jinliang:jinliang@127.0.0.1:55433/jinliang_test?sslmode=disable
+          ROWS: "120000"
+          CHUNK_ROWS: "1000"
+        run: scripts/b1_mysql_to_pg.sh ./dist/jinliang kill
+      - name: 端到端（BINARY(16) 主键 + kill -9：块边界保类型，续跑不跳表尾）
+        env:
+          JINLIANG_TEST_MYSQL_SRC_DSN: mysql://jinliang:jinliang@127.0.0.1:3307/jinliang_src
+          JINLIANG_TEST_PG_DSN: postgres://jinliang:jinliang@127.0.0.1:55433/jinliang_test?sslmode=disable
+          ROWS: "20000"
+          CHUNK_ROWS: "1000"
+        run: scripts/b1_mysql_to_pg.sh ./dist/jinliang binpk
+      - name: 失败时把两个库的日志打出来
+        if: failure()
+        run: |
+          echo "=== my-src ==="; docker logs my-src 2>&1 | tail -50
           echo "=== pg-dst ==="; docker logs pg-dst 2>&1 | tail -50
