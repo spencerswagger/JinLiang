@@ -371,6 +371,13 @@ type runner struct {
 	// 而它只能从 _jl_chunk 来，不能从 paused_tables 来）。
 	progressByTable map[string]pgsink.ChunkProgress
 
+	// paused 是本轮的内存暂停集合（key = 目标端裸表名）：写路径每批都要判，不能每批查库。
+	// 由 loadPausedSet 装好，registerPause / snapshot 搬成 两处更新（见 pause_skip.go）。
+	paused map[string]pgsink.PausedTable
+	// skippedTables 是「本轮结构对不上、连存量也不搬」的表（prepare 期发现的）。
+	// 它们仍在 r.tables 里（跨轮存活判据要它），但不进 copy plan 的搬运名单。
+	skippedTables map[string]bool
+
 	rowsCopied int64
 	rowsStream int64
 	exitCode   int
@@ -879,6 +886,11 @@ func (r *runner) prepare(ctx context.Context) error {
 	if err := sink.LoadPausedTables(ctx); err != nil {
 		return err
 	}
+	// 引擎自己持有一份（写路径按表跳过要按它判），与 sink 的缓存分开：
+	// sink 那份只服务「读给引擎与展示」，判定权在引擎（契约 §1.5 第 1 条）。
+	if err := r.loadPausedSet(ctx); err != nil {
+		return err
+	}
 	if sink.PausedDirty() {
 		r.note(ctx, "目标端的暂停表记录不是合法 JSON：本轮按「没有暂停」继续（不影响同步）")
 	}
@@ -896,6 +908,23 @@ func (r *runner) prepare(ctx context.Context) error {
 	for _, a := range actions {
 		r.emit(ctx, control.Event{Type: "note", Message: a.What})
 	}
+	// 结构对不上的表：**登记暂停 + 本轮不搬它的存量**，其它表照常。
+	// 顺序硬要求（契约 §1.5 第 2 条「登记先行」）：先落库，再决定「这一轮不搬它」。
+	// 反过来的话，崩在中间就是「没搬也没记」，用户下一轮看到的是一张空表 + 一切正常。
+	for _, pe := range sink.TakePendingPauses() {
+		ref := r.targetRef(source.TableRef{Schema: r.targetSchema(), Table: pe.Table()})
+		rec := pgsink.PausedTable{Reason: pe.Reason(), Detail: pe.Error(), Resume: r.resumeModeFor(ctx, ref)}
+		if err := sink.PauseTable(ctx, ref, rec); err != nil {
+			return fmt.Errorf("登记表 %s 的暂停失败（本轮一行都没搬）: %w", pe.Table(), err)
+		}
+		r.rememberPaused(ref.Table, rec)
+		if r.skippedTables == nil {
+			r.skippedTables = map[string]bool{}
+		}
+		r.skippedTables[ref.Table] = true
+		r.note(ctx, "表 "+pe.Table()+" 的结构和源端对不上（"+pe.Reason()+"）：暂停这张表，"+
+			"本轮不搬它的存量，其它表照常跑；结构对齐后重跑会整表重搬补齐")
+	}
 	// prepare 阶段降级成提示的判定（用户表多出的列不算漂移）——必须发出来，不许无声。
 	// **位置很关键：必须在 EnsureSchema 之后**——`prepareNotes` 是在它调用的
 	// `reconcileColumns` 里 append 的；放在之前排空，拿到的永远是空列表（实测过：
@@ -903,6 +932,15 @@ func (r *runner) prepare(ctx context.Context) error {
 	// 这里 `EnsureSchema` 已返回并释放了 `s.mu`，`PrepareNotes()` 再加锁不会重入。
 	for _, n := range sink.PrepareNotes() {
 		r.note(ctx, n)
+	}
+	// 暂停记录收口必须在 **EnsureSchema 之后、decideCopyPlan 之前**：
+	//   - 之后：结构已经核对过，此刻「没报 E1015」就等于「结构对齐了」；
+	//   - 之前：对齐的表要在这里被标成「欠一次重搬」（清掉它的块标记），
+	//     晚于 planCopy 就变成「这一轮先按旧计划跳过、下一轮才搬」，多停一轮。
+	// 这替代了旧判据「结构对齐 + copyDoneFor 就解除」——那个判据在暂停前块标记早已 Done 的
+	// 表上会**当场解除**，于是「跳过窗口」永远等不到重搬去补（契约 §1.6 步 1–2）。
+	if err := r.reconcilePaused(ctx); err != nil {
+		return err
 	}
 	src, err := r.openSource(ctx)
 	if err != nil {
@@ -916,11 +954,6 @@ func (r *runner) prepare(ctx context.Context) error {
 	// 别的模式**必须**等 `decideCopyPlan` 之后再收口：`progressByTable` 是那一步才赋值，
 	// 提前调会让 `chunkProgress()` 是空 map → `copyDoneFor` 走 `!ok → true` → 每张表都被判
 	// 「已搬完」→ 暂停记录被无条件清掉（半截拷贝的表显示「已恢复」而数据是半空的）。
-	if r.mode() == "interval" {
-		if err := r.reconcilePaused(ctx); err != nil {
-			return err
-		}
-	}
 	// interval 模式不做逻辑复制（没有书签、没有发布），只要一条普通读连接；
 	// 少建一个 slot 就等于少一份磁盘占用与一项权限要求。
 	if r.mode() == "interval" {
@@ -937,6 +970,16 @@ func (r *runner) prepare(ctx context.Context) error {
 	plan, err := r.decideCopyPlan(ctx, src, phaseInTarget, posInTarget)
 	if err != nil {
 		return err
+	}
+	// 结构对不上的表：这一轮**连存量都不搬**（契约 §6 硬口径 2）。
+	// 它们仍留在 r.tables 里——跨轮存活判据要用「这张表还在不在范围内」，
+	// 把它从表集合里拿掉会让 reconcilePaused 认为「已出范围」而把暂停记录清掉。
+	for key := range r.skippedTables {
+		if plan.Skip == nil {
+			plan.Skip = map[string]bool{}
+		}
+		plan.Skip[key] = true
+		r.note(ctx, "表 "+key+" 暂停中：本轮不搬它的存量（结构对齐后重跑会自动整表重搬）")
 	}
 	if r.opt.Resync {
 		// --resync 改的是**判据**（不看上次搬到哪，直接整轮重来），不是另写一套搬运。
@@ -1026,19 +1069,18 @@ func (r *runner) prepare(ctx context.Context) error {
 		writePos, prep.SnapshotName); err != nil {
 		return err
 	}
-	// 收口必须在 `decideCopyPlan` **之后**：`progressByTable` 是那一步才赋值，
-	// 提前调会让 `chunkProgress()` 是空 map、`copyDoneFor` 走 `!ok → true` → 每张表都被
-	// 判成「已搬完」→ 暂停记录被无条件清掉（半截拷贝的表会显示「已恢复」而数据是半空的）。
-	return r.reconcilePaused(ctx)
+	return nil
 }
 
-// reconcilePaused 收紧本轮的暂停记录。
+// reconcilePaused 收紧本轮的暂停记录，并决定「谁可以恢复写」。
 //
-// 跨轮存活当且仅当：job_key 未变（它就是这个任务）、job_hash 未变、该表仍在本轮表集合里。
-// 任一条不成立 → 清掉并说明；清不掉的（目标端不支持）→ 明确失败，不假装写成功。
+// 三条跨轮存活判据不变（job_key / job_hash / 仍在本轮表集合里）：任一条不成立 → 删记录 + note。
 //
-// 解除挂在「EnsureSchema 通过 + 存量搬完」，不是只 EnsureSchema 通过：
-// 结构对齐了但存量还没搬完，这张表仍然是半截数据，不能当作恢复。
+// **解除判据变了**（docs/CONTRACT-PAUSE-AND-POSITION.md §1.6）：结构对齐**不等于**恢复。
+// 旧实现「EnsureSchema 通过 + copyDoneFor 就解除」在暂停前块标记早已 Done 的表上会当场解除，
+// 于是跳过的那段窗口永远没人补——表显示「已恢复」而数据是旧的。
+// 现在只有一条路：`MarkTableRecopyPending` 清掉该表的块标记 → `planCopy` 自然把它排进本轮重搬
+// → 搬成（`MarkTableDone`）之后 `snapshot()` 里才删这个 key。**先重搬，后解除。**
 func (r *runner) reconcilePaused(ctx context.Context) error {
 	rec, err := r.sink.PausedTables(ctx)
 	if err != nil {
@@ -1064,6 +1106,7 @@ func (r *runner) reconcilePaused(ctx context.Context) error {
 		if err := r.sink.ClearPausedTable(ctx, source.TableRef{Schema: r.targetSchema(), Table: key}); err != nil {
 			return fmt.Errorf("清掉不再适用的暂停记录 %s 失败: %w", key, err)
 		}
+		r.forgetPaused(key)
 		dropped = append(dropped, key)
 	}
 	if len(dropped) > 0 {
@@ -1075,19 +1118,47 @@ func (r *runner) reconcilePaused(ctx context.Context) error {
 			len(dropped), why, strings.Join(dropped, "、")))
 	}
 
-	// 结构已对齐 + 存量已完成 → 解除。存量没搬完的保留，等它搬成那一刻再解除
-	//（snapshot() 里 MarkTableDone 之后 ClearPausedTable）。
 	for _, key := range pgsink.PausedKeys(rec) {
 		if !sameJob || !inScope[key] {
 			continue
 		}
-		if !r.copyDoneFor(key) {
+		if r.skippedTables[key] {
+			// 这一轮 prepare 才刚发现它对不上（所以还停着）：**不能**在这里标成待重搬。
+			// 「EnsureSchema 没报错」在按表暂停下不再等于「结构对齐了」——它只是把不一致
+			// 记进 pendingPauses 交给引擎。这里误标就会当场清掉块标记 → 本轮拿旧结构重搬一遍
+			// → 搬运失败，整轮白跑。
 			continue
 		}
-		if err := r.sink.ClearPausedTable(ctx, source.TableRef{Schema: r.targetSchema(), Table: key}); err != nil {
-			return fmt.Errorf("解除 %s 的暂停失败: %w", key, err)
+		one := rec[key]
+		// interval / continuous 都**没有存量**可搬（契约 §1.2 的例外段）：标成「待重搬」会让它
+		// 永远停在暂停里（`planCopy` 在这两种模式下不会排存量），所以结构一通过就恢复。
+		// 代价必须说出来：解除暂停 ≠ 两侧已经一致——这两种模式不会替你重搬，差异要人看。
+		if r.mode() == "interval" || r.mode() == "continuous" {
+			if err := r.sink.ClearPausedTable(ctx, source.TableRef{Schema: r.targetSchema(), Table: key}); err != nil {
+				return fmt.Errorf("解除 %s 的暂停失败: %w", key, err)
+			}
+			r.forgetPaused(key)
+			r.note(ctx, "表 "+key+" 的结构已对齐：解除暂停（"+r.mode()+" 模式不搬存量，"+
+				"所以「解除」不等于两侧数据已一致——要补齐请跑一次 full 模式）")
+			continue
 		}
-		r.note(ctx, "表 "+key+" 的结构已对齐且存量已完成：解除暂停，接下来会从原位点继续重放")
+		if pgsink.NormalizedResume(one.Resume) == pgsink.ResumeManual {
+			// 用户自己的表：不许自动清空、不许自动重搬。清它等于删用户数据，
+			// 而不清就 upsert 又会把暂停期间被跳过的 DELETE 永久留在目标端（假一致）。
+			r.note(ctx, "表 "+key+" 暂停中，且它是目标端既有表（不是本任务建的）：不会自动清空重搬。"+
+				"请在 `jinliang status` 里按提示选一条——重建这张表 / 手工清空 / 把它移出同步范围")
+			continue
+		}
+		ref := r.targetRef(source.TableRef{Schema: r.targetSchema(), Table: key})
+		if err := r.sink.MarkTableRecopyPending(ctx, ref); err != nil {
+			return fmt.Errorf("把 %s 标成待重搬失败: %w", key, err)
+		}
+		r.rememberPaused(key, one)
+		msg := "表 " + key + " 的结构已对齐：清掉块标记，本轮整表重搬补齐"
+		if one.SkippedRows > 0 {
+			msg += fmt.Sprintf("跳过窗口的 %d 行", one.SkippedRows)
+		}
+		r.note(ctx, msg+"（其它表照常续跑）")
 	}
 	return nil
 }
@@ -1256,6 +1327,12 @@ func (r *runner) snapshot(ctx context.Context) error {
 	_, err := r.src.SnapshotChunksFrom(ctx, opt, r.plan.From,
 		func(c context.Context, ref source.TableRef, no int, rows [][]any, from, to string) error {
 			tref := r.targetRef(ref)
+			// 结构对不上的表：**行读到了也不写**（契约 §6 硬口径 2「暂停表存量也不搬」）。
+			// 源端没法按表过滤（`SnapshotChunksFrom` 的入参里没有表集合，改它要动连接器契约），
+			// 所以这里丢掉——代价是白读一遍这张表，换来的是「不给一张结构不一致的表写半截数据」。
+			if r.skippedTables[tref.Table] {
+				return nil
+			}
 			pos := posString(r.consistentPoint)
 			if err := r.sink.BulkApply(c, r.sink.Table(tref), no, rows, pos, from, to); err != nil {
 				return err
@@ -1276,13 +1353,24 @@ func (r *runner) snapshot(ctx context.Context) error {
 			continue
 		}
 		ref := r.targetRef(source.TableRef{Schema: t.Schema, Table: t.Table})
-		// 搬成 → 解除这张表的暂停（**只删这一个 key**，别的表记录留着）。
-		// 契约：「搬成清该表，搬败留记录」。
-		if err := r.sink.ClearPausedTable(ctx, ref); err != nil {
-			return fmt.Errorf("解除 %s 的暂停失败: %w", t.Table, err)
-		}
-		if err := r.sink.MarkTableDone(ctx, r.targetRef(source.TableRef{Schema: t.Schema, Table: t.Table})); err != nil {
+		// **先盖章、后解除**（契约 §1.6 步 4）：反过来的话崩在两者之间就是
+		// 「记录已删、块标记还说没搬完」——下一轮又重搬一遍（幂等，不丢数据但白搬）；
+		// 这个顺序崩了只会「标记已搬完、记录还在」，下一轮照「结构对齐 → 重搬」再来一次。
+		if err := r.sink.MarkTableDone(ctx, ref); err != nil {
 			return fmt.Errorf("记录 %s 的搬完标记失败: %w", t.Table, err)
+		}
+		// 搬成 → 解除这张表的暂停（**只删这一个 key**，别的表记录留着）。
+		// 契约：「搬成清该表，搬败留记录」。没有记录时 Clear 是幂等的（本来就没键）。
+		if rec, paused := r.pausedRecord(ref.Table); paused {
+			if err := r.sink.ClearPausedTable(ctx, ref); err != nil {
+				return fmt.Errorf("解除 %s 的暂停失败: %w", t.Table, err)
+			}
+			r.forgetPaused(ref.Table)
+			msg := "表 " + t.Table + " 已恢复：整表重搬完成"
+			if rec.SkippedRows > 0 {
+				msg += fmt.Sprintf("，跳过窗口的 %d 行已补齐", rec.SkippedRows)
+			}
+			r.note(ctx, msg)
 		}
 		tables++
 	}
@@ -1383,7 +1471,9 @@ func (r *runner) stream(ctx context.Context, res *Result) error {
 	r.mu.Unlock()
 
 	// 事件里的表名是源端的，目标端只认自己的 schema：这里统一换一次（恒等映射时无副作用）。
-	b := newBatcher(newRefMappedSink(r.sink, r.targetRef), r.src, r.doc, r.batchRows(), r.batchDelay(), from, func(rows int64, pos source.Position) {
+	// 按表暂停的过滤包在**映射之后**：paused_tables 的 key 是目标端裸表名，
+	// 事件里带的是源端名字（见 pause_skip.go）。非 PG 目标端时它原样透传。
+	b := newBatcher(newPauseSink(newRefMappedSink(r.sink, r.targetRef), r), r.src, r.doc, r.batchRows(), r.batchDelay(), from, func(rows int64, pos source.Position) {
 		r.rowsStream += rows
 		r.mu.Lock()
 		r.lastPos = pos
@@ -1601,11 +1691,34 @@ func (r *runner) registerPause(ctx context.Context, err error) error {
 	if len(detail) > 500 {
 		detail = detail[:500] + "…"
 	}
-	if perr := r.sink.PauseTable(ctx, ref, pe.Reason(), detail); perr != nil {
+	if perr := r.sink.PauseTable(ctx, ref, pgsink.PausedTable{
+		Reason: pe.Reason(),
+		Detail: detail,
+		Resume: r.resumeModeFor(ctx, ref),
+	}); perr != nil {
 		return fmt.Errorf("%w（另外：登记这张表的暂停状态也失败了：%v）", err, perr)
 	}
-	r.note(ctx, "已登记暂停：表 "+pe.Table()+"（原因码 "+pe.Reason()+"），位点没有推进")
+	r.rememberPaused(ref.Table, pgsink.PausedTable{Reason: pe.Reason(), Detail: detail})
+	r.note(ctx, "已暂停表 "+pe.Table()+"（原因码 "+pe.Reason()+"）：这张表的事件不再写入，其它表继续；"+
+		"跳过窗口会在结构对齐后由整表重搬补齐")
 	return nil
+}
+
+// resumeModeFor 决定这张表解除暂停时怎么恢复（契约 §1.4/§1.6）：
+//   - 本任务建的表 → recopy：结构对齐后清表 + 从新视图整表重搬；
+//   - 用户自己的表（on_exists=append/keep）→ manual：不许自动清空，停下来问。
+//
+// 判据用 `_jl_object`（谁建的表），不是配置：同一份 yaml 里可能两种表都有。
+// 查不出结论时按 manual——**宁可停下来问，不可替用户删数据**。
+func (r *runner) resumeModeFor(ctx context.Context, ref source.TableRef) string {
+	if r.sink == nil {
+		return pgsink.ResumeManual
+	}
+	ours, err := r.sink.DidCreateTable(ctx, ref)
+	if err != nil || !ours {
+		return pgsink.ResumeManual
+	}
+	return pgsink.ResumeRecopy
 }
 
 // pauseUnsupportedError：目标端不支持按表暂停（本版只有 PG 目标端有那条状态列）。
@@ -1618,7 +1731,7 @@ type pauseUnsupportedError struct {
 func (e *pauseUnsupportedError) Error() string {
 	return "表 " + e.table + " 的结构和源端对不上，需要按表暂停；而当前目标端（" + e.kind + "）" +
 		"还没有暂停记录这一列，本版无法登记。\n" +
-		"你现在能做什么：1) 把目标端的表结构手工对齐后重跑（位点没推进，不会重搬历史）；" +
+		"你现在能做什么：1) 把目标端的表结构手工对齐后重跑（这张表会整表重搬补齐）；" +
 		"2) 或者把这张表移出同步范围。\n" +
 		"风险：不对齐就继续写会让数据与列错位；而我们不会「假装登记成功」。原始原因：" + e.inner.Error()
 }
