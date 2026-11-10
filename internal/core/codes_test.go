@@ -120,12 +120,16 @@ func TestObjectMissingNextIsLayeredByCase(t *testing.T) {
 	}
 }
 
-// TestSchemaMismatchSaysWholeRunStops：E1015 的三句话必须与实现一致。
+// TestSchemaMismatchSaysOnlyThatTableStops：E1015 的三句话必须与实现一致。
 //
-// 曾经的错：Why / Next 都写了「若当前版本已支持按表暂停」，Risk 漏了——于是文案变成
-// 「其它表不受影响」，用户据此不管，而实际整轮 run 会失败。按表暂停落地后，三处括注
-// **全部删掉**，并把「其它表也不会继续推进」这句固定下来（grep 短语，谁改都得带上它）。
-func TestSchemaMismatchSaysWholeRunStops(t *testing.T) {
+// 这条用例翻过一次面：**第一次**错在「文案说其它表不受影响、实现却是整轮失败」，于是把
+// 「其它表也不会继续推进」grep 进 Risk；**第二次**是按表暂停真落地之后（契约
+// docs/CONTRACT-PAUSE-AND-POSITION.md §1.5/§1.6）——命中暂停表的行整条跳过、其它表照写、
+// 位点照常前进、恢复=整表重搬。旧短语变成**假话**，必须删掉并钉住新事实：
+// 「其它表照常继续」+「会清空这张表再整表重搬」。
+//
+// 谁再改文案，两条 grep 短语都必须还在——它们是用户判断「要不要现在处理」的唯一依据。
+func TestSchemaMismatchSaysOnlyThatTableStops(t *testing.T) {
 	spec, ok := Lookup(CodeSchemaMismatch)
 	if !ok {
 		t.Fatal("E1015 必须在码表里")
@@ -174,11 +178,22 @@ func TestSchemaMismatchSaysWholeRunStops(t *testing.T) {
 	if !strings.Contains(spec.Why, "prepare") || !strings.Contains(spec.Why, "本任务建的表") {
 		t.Fatalf("E1015 的 Why 必须写清 prepare 期只在本任务建的表上判漂移，得到：%s", spec.Why)
 	}
-	if !strings.Contains(spec.Risk, "其它表也不会继续推进") {
-		t.Error("Risk 必须写明「其它表也不会继续推进」——位点只有一个，这是实际后果")
+	if strings.Contains(spec.Risk, "其它表也不会继续推进") || strings.Contains(spec.Risk, "位点不推进") {
+		t.Error("旧口径（整轮停 / 位点不推进）已经是假话：按表暂停落地后其它表照常继续、位点照常前进")
 	}
-	if !strings.Contains(spec.Risk, "位点不推进") {
-		t.Error("Risk 必须写明位点不推进（用户的定心丸：一条都不会丢）")
+	if !strings.Contains(spec.Risk, "其它表照常继续") {
+		t.Error("Risk 必须写明「其它表照常继续」——这是用户决定「现在处理还是等等」的依据")
+	}
+	if !strings.Contains(spec.Risk, "整表重搬") {
+		t.Error("Risk 必须写明恢复代价：结构对齐后会**清空这张表再整表重搬**（用户要知道这是一次全量）")
+	}
+	for _, n := range spec.Next {
+		if strings.Contains(n, "不会重搬历史") {
+			t.Errorf("旧口径「不会重搬历史」已不成立（恢复=整表重搬）：%q", n)
+		}
+	}
+	if !strings.Contains(spec.Next[1], "其它表继续") {
+		t.Errorf("Next 必须说明「只停这一张表、其它表继续」，得到 %q", spec.Next[1])
 	}
 }
 

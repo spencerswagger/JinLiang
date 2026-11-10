@@ -37,6 +37,31 @@ type PausedTable struct {
 	At string `json:"at"`
 	// Detail 给人看：哪一列、两端各是什么。
 	Detail string `json:"detail"`
+	// Resume 决定恢复路径（docs/CONTRACT-PAUSE-AND-POSITION.md §1.4/§1.6）：
+	//   recopy —— 本任务建的表，结构对齐后**整表重搬**（清表 + 清块标记 + 从新视图搬）；
+	//   manual —— 用户自己的表（on_exists=append/keep），不许自动清空，停下来问。
+	// 未知值一律按 recopy 处理（宁可多搬一次，不可留下一张永远不一致的表）。
+	Resume string `json:"resume,omitempty"`
+	// 跳过窗口的记账：只用于展示与排障，**不参与正确性判定**。
+	// 跳过期间那些行没进目标端，等整表重搬补齐——账要让人看得见。
+	SkippedRows    int64  `json:"skipped_rows,omitempty"`
+	SkippedFrom    string `json:"skipped_from,omitempty"`
+	LastSkippedPos string `json:"last_skipped_pos,omitempty"`
+}
+
+// 恢复路径的取值（稳定码，机器判等；不写中文句子）。
+const (
+	ResumeRecopy = "recopy"
+	ResumeManual = "manual"
+)
+
+// NormalizedResume 把「没写 / 写错」的 resume 一律归成 recopy：
+// 未知值当成「不重搬」就等于把一张不一致的表永久留在那里。
+func NormalizedResume(v string) string {
+	if strings.TrimSpace(v) == ResumeManual {
+		return ResumeManual
+	}
+	return ResumeRecopy
 }
 
 // StoredJobHash 读回状态行里记的 job_hash（第一次建行时写的那个）。
@@ -83,11 +108,12 @@ func (s *Sink) LoadPausedTables(ctx context.Context) error {
 // PauseTable 登记一张表的暂停——**唯一的写点**。
 //
 // key 用 ref.Table（目标端裸表名）：与 `_jl_chunk.table_name` 同源，逐字节一致。
-func (s *Sink) PauseTable(ctx context.Context, ref source.TableRef, reason, detail string) error {
-	if strings.TrimSpace(reason) == "" {
+func (s *Sink) PauseTable(ctx context.Context, ref source.TableRef, rec PausedTable) error {
+	if strings.TrimSpace(rec.Reason) == "" {
 		// 原因码是机器判等的凭据，空值等于没登记。
 		return fmt.Errorf("内部错误：登记暂停表 %s 时没有原因码", ref.Table)
 	}
+	rec.Resume = NormalizedResume(rec.Resume)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -102,10 +128,20 @@ func (s *Sink) PauseTable(ctx context.Context, ref source.TableRef, reason, deta
 		return err
 	}
 	at := time.Now().UTC().Format(time.RFC3339)
-	if old, ok := cur[ref.Table]; ok && old.At != "" {
-		at = old.At // 第一次登记的时间不覆盖：用户要能看出「停了多久」
+	if old, ok := cur[ref.Table]; ok {
+		if old.At != "" {
+			at = old.At // 第一次登记的时间不覆盖：用户要能看出「停了多久」
+		}
+		// 跳过窗口的账不能因为「又登记一次」而清零：那是同一段欠账。
+		rec.SkippedRows = old.SkippedRows
+		rec.SkippedFrom = old.SkippedFrom
+		rec.LastSkippedPos = old.LastSkippedPos
+		if rec.Resume == "" {
+			rec.Resume = NormalizedResume(old.Resume)
+		}
 	}
-	cur[ref.Table] = PausedTable{Reason: reason, At: at, Detail: detail}
+	rec.At = at
+	cur[ref.Table] = rec
 	if err := s.writePausedTxLocked(ctx, tx, cur); err != nil {
 		return err
 	}
@@ -158,13 +194,65 @@ func (s *Sink) PrepareNotes() []string {
 	return out
 }
 
-// isPausedLocked 是写路径上的快速判定（调用方已持锁；缓存由 LoadPausedTables 装好）。
-func (s *Sink) isPausedLocked(table string) bool {
-	if s.pausedCache == nil {
-		return false
+// NoteSkipped 记一笔「这段区间里这张表被跳过了多少行」。
+//
+// 只记账，**不参与任何正确性判定**（契约 §1.4）：真正的欠账由「整表重搬」还。
+// 为什么还要记：用户问「停着的这张表欠了多少」时，要有数字可答；没有数字的静默缺失
+// 与「同步正常」在界面上长得一模一样。
+//
+// 与 PauseTable 一样先读后写单 key：绝不拿内存表集合重建整列。
+func (s *Sink) NoteSkipped(ctx context.Context, ref source.TableRef, rows int64, pos string) error {
+	if rows <= 0 && pos == "" {
+		return nil
 	}
-	_, ok := s.pausedCache[table]
-	return ok
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	tx, err := s.conn.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	cur, _, err := s.readPausedTxLocked(ctx, tx)
+	if err != nil {
+		return err
+	}
+	rec, ok := cur[ref.Table]
+	if !ok {
+		// 没登记过的表不该出现跳过记录：宁可不写，也不凭空造一条「暂停」。
+		return nil
+	}
+	rec.SkippedRows += rows
+	if rec.SkippedFrom == "" {
+		rec.SkippedFrom = pos // 第一次的缺口起点最有价值，不覆盖
+	}
+	if pos != "" {
+		rec.LastSkippedPos = pos
+	}
+	cur[ref.Table] = rec
+	if err := s.writePausedTxLocked(ctx, tx, cur); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	if s.pausedCache != nil {
+		s.pausedCache[ref.Table] = rec
+	}
+	return nil
+}
+
+// TakePendingPauses 交出（并清空）prepare 期发现的「结构对不上」的表。
+//
+// 与 PrepareNotes 同一形态：sink 只负责**发现**，登记与发 note 由引擎做
+// （登记的 resume 字段要问 `_jl_object` 判所有权，那是引擎的语义）。
+func (s *Sink) TakePendingPauses() []PausableError {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := s.pendingPauses
+	s.pendingPauses = nil
+	return out
 }
 
 // readPausedLocked 读整列并解析。dirty=true 表示存的不是合法 JSON：

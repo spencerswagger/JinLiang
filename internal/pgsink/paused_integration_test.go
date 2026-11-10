@@ -4,12 +4,11 @@ package pgsink
 
 // 暂停记录的两条硬约束，必须能用真库证伪：
 //  1. 只删一个 key —— 删 a 之后 b 的记录**仍在**（防「拿内存表集合重建整列」）；
-//  2. 写路径遇到暂停表 → 整批拒绝、**目标端 0 行**（删掉这条判定就该红）。
+//  2. 写路径**不做**暂停判定：sink 收到什么写什么（判定权在引擎，契约 §1.5）。
 
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"os"
 	"strconv"
 	"strings"
@@ -37,16 +36,16 @@ func TestPausedTableOnlyClearsOneKey(t *testing.T) {
 	a := source.TableRef{Schema: "public", Table: "a_orders"}
 	b := source.TableRef{Schema: "public", Table: "b_orders"}
 
-	if err := s.PauseTable(ctx, a, PauseReasonTypeChanged, "列 v：目标端当前是 text，源端是 bigint"); err != nil {
+	if err := s.PauseTable(ctx, a, PausedTable{Reason: PauseReasonTypeChanged, Detail: "列 v：目标端当前是 text，源端是 bigint"}); err != nil {
 		t.Fatal(err)
 	}
 	atA := time.Now()
 	time.Sleep(1100 * time.Millisecond) // RFC3339 是秒级：至少要跨一秒才能看出「没被刷新」
-	if err := s.PauseTable(ctx, b, PauseReasonSchemaDrift, "第 2 列：原 v → 现 w"); err != nil {
+	if err := s.PauseTable(ctx, b, PausedTable{Reason: PauseReasonSchemaDrift, Detail: "第 2 列：原 v → 现 w"}); err != nil {
 		t.Fatal(err)
 	}
 	// 再登记一次 a：reason/detail 更新，但 at 必须还是第一次那个
-	if err := s.PauseTable(ctx, a, PauseReasonTypeChanged, "列 v：目标端当前是 text，源端是 numeric(12,2)"); err != nil {
+	if err := s.PauseTable(ctx, a, PausedTable{Reason: PauseReasonTypeChanged, Detail: "列 v：目标端当前是 text，源端是 numeric(12,2)"}); err != nil {
 		t.Fatal(err)
 	}
 	rec, err := s.PausedTables(ctx)
@@ -167,12 +166,20 @@ func openRaw(t *testing.T) *pgx.Conn {
 	return conn
 }
 
-func TestApplyRefusesPausedTable(t *testing.T) {
+// TestApplyRejectsLeftoverPausedRows：**sink 不做暂停判定，但绝不当成没看见**。
+//
+// 判定权在引擎（契约 §1.5 第 1 条）：引擎按表把暂停表的事件整条丢掉、其它表照写、
+// 位点照常前进。所以走到 `Apply` 的批次里**不该**有暂停表的行——如果还有，那是引擎漏了
+// （表名口径变了、新写路径没包 `pauseSink`、snapshot 漏了某张跳过表）。
+//
+// 这时必须立刻炸：带着新 Relation 往一张结构没对齐的表里写，`alignRelationTx` 还会顺手补列，
+// 写进去就没人知道了。所以这条用例断言的是「**报错 + 目标端 0 行**」，不是「写进去」——
+// 契约 §5-1 对这条用例的要求就是「引擎过滤后 sink 收到的批次里没有暂停表的行」。
+func TestApplyRejectsLeftoverPausedRows(t *testing.T) {
 	ctx := context.Background()
 	table := "paused_apply"
 	dropPausedFixtures(t, table)
 
-	// 第一个实例：登记暂停（跨轮要能被**另一个进程/实例**读到，所以这里换实例验）
 	first := openPausedSink(t, table, "pausedapply")
 	if _, err := first.EnsureSchema(ctx, pausedCatalog(table)); err != nil {
 		t.Fatalf("建目标表失败: %v", err)
@@ -181,35 +188,34 @@ func TestApplyRefusesPausedTable(t *testing.T) {
 		t.Fatalf("建状态行失败: %v", err)
 	}
 	ref := source.TableRef{Schema: pausedSchema, Table: table}
-	if err := first.PauseTable(ctx, ref, PauseReasonTypeChanged, "列 v：目标端当前是 text，源端是 bigint"); err != nil {
+	if err := first.PauseTable(ctx, ref, PausedTable{
+		Reason: PauseReasonTypeChanged,
+		Detail: "列 v：目标端当前是 text，源端是 bigint",
+		Resume: ResumeRecopy,
+	}); err != nil {
 		t.Fatal(err)
 	}
 
-	// 第二个实例（模拟下一轮/另一个进程）：**必须靠 LoadPausedTables 从库里读回来**
+	// 另一个实例从库里读回记录（跨进程可见），然后**故意**把这张表的行交给它。
 	second := openPausedSink(t, table, "pausedapply")
 	if err := second.LoadPausedTables(ctx); err != nil {
 		t.Fatal(err)
 	}
-	evs := pausedInsertEvents(table, 3)
-	if err := second.Apply(ctx, evs, nil); err == nil {
-		t.Fatal("暂停表必须整批拒绝（跳过写 = 把这批变更永久丢掉）")
-	} else {
-		var pe PausableError
-		if !errors.As(err, &pe) {
-			t.Fatalf("应是 PausableError（要能按表识别），得到 %T：%v", err, err)
-		}
-		if pe.Table() != table {
-			t.Fatalf("错误要带上是哪张表，得到 %q", pe.Table())
-		}
+	err := second.Apply(ctx, pausedInsertEvents(table, 3), nil)
+	if err == nil {
+		t.Fatal("引擎漏过滤时必须炸：写进一张结构没对齐的表就是静默脏数据")
+	}
+	if !strings.Contains(err.Error(), "引擎没有过滤掉暂停表") {
+		t.Fatalf("报错要指向真正的责任方（引擎没过滤），得到：%v", err)
 	}
 	var n int
 	if err := first.conn.QueryRow(ctx, "SELECT count(*) FROM "+pausedSchema+"."+table).Scan(&n); err != nil {
 		t.Fatal(err)
 	}
 	if n != 0 {
-		t.Fatalf("暂停表不许写入任何行，实际 %d 行", n)
+		t.Fatalf("报错就是一行都不写，实际 %d 行", n)
 	}
-	t.Logf("暂停表写路径：另一个实例读回记录后整批拒绝、目标端 0 行")
+	t.Logf("最后一道防线：另一实例读回记录后收到暂停表的行 → 报「引擎没过滤」+ 目标端 0 行")
 }
 
 // 老库补列：`_jl_meta` 是 #76 之前的列集合（没有 paused_tables），Open 之后必须补上，
@@ -265,7 +271,7 @@ func TestOldStateTableGetsPausedColumn(t *testing.T) {
 		t.Fatalf("老库状态行写不进去: %v", err)
 	}
 	ref := source.TableRef{Schema: schema, Table: table}
-	if err := s.PauseTable(ctx, ref, PauseReasonTypeChanged, "v: 目标 text / 源 bigint"); err != nil {
+	if err := s.PauseTable(ctx, ref, PausedTable{Reason: PauseReasonTypeChanged, Detail: "v: 目标 text / 源 bigint"}); err != nil {
 		t.Fatalf("老库上 PauseTable 必须能写: %v", err)
 	}
 	got, err := s.PausedTables(ctx)

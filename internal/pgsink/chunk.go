@@ -144,6 +144,23 @@ func (s *Sink) StartFreshCopy(ctx context.Context, pos string) error {
 	return tx.Commit(ctx)
 }
 
+// MarkTableRecopyPending 把一张表标成「欠一次整表重搬」：**只清块标记，不动数据**。
+//
+// 与 ResetTableChunks 的区别：那个连数据一起清（在搬运的那一刻），这个只让
+// `planCopy` 重新把这张表排进「存量要搬」。顺序必须是先标再搬：
+// 先清数据后标，中间崩一次就是「数据没了、标记还写着搬完了」——静默丢行。
+//
+// 只清这一张表（含 `chunk_no=0` 完成标记）：别的表照旧续跑。
+func (s *Sink) MarkTableRecopyPending(ctx context.Context, ref source.TableRef) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	q := fmt.Sprintf(`DELETE FROM %s WHERE job_key=$1 AND table_name=$2`, s.stateTable("_jl_chunk"))
+	if _, err := s.conn.Exec(ctx, q, s.opt.JobKey, ref.Table); err != nil {
+		return fmt.Errorf("把 %s 标成待重搬失败: %w", ref.Table, err)
+	}
+	return nil
+}
+
 // ResetTableChunks puts one table back to the start: empty the table and drop
 // its chunk markers **in one transaction**.
 //

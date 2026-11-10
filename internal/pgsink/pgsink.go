@@ -105,6 +105,10 @@ type Sink struct {
 	// prepareNotes 收集「降级成提示」的判定（例如用户表多出的列不算漂移），
 	// 由引擎在 prepare 后统一 emit 出去——不许无声。
 	prepareNotes []string
+	// pendingPauses 收集 prepare 期发现的「这张表结构对不上」。
+	// **不在第一张就返回**（契约 §6 硬口径 2）：一次收全，本轮把这些表全部登记暂停，
+	// 其它表照常跑。撞到第一张就停会让「其它表继续」退化成「每次重跑多暂停一张」。
+	pendingPauses []PausableError
 
 	// ownerToken 让「同一个进程里的两个 Sink」也彼此可分（否则它们同 pid、
 	// 同 instance_id，第二个会把第一个的租约抢走）。
@@ -570,7 +574,19 @@ func (s *Sink) EnsureSchema(ctx context.Context, _ source.Catalog) ([]source.Act
 				})
 			} else {
 				if err := s.reconcileColumns(ctx, ti); err != nil {
-					return actions, err
+					var pe PausableError
+					if !errors.As(err, &pe) {
+						return actions, err
+					}
+					// 结构对不上：**记下来继续看下一张表**，由引擎统一登记暂停。
+					s.pendingPauses = append(s.pendingPauses, pe)
+					actions = append(actions, source.Action{
+						ID: "pause:" + key, What: "表 " + ti.ref.Table + " 的结构和源端对不上（" +
+							pe.Reason() + "）：本轮暂停这张表，其它表继续",
+						Applied: false,
+						Reason:  "按表暂停（docs/CONTRACT-PAUSE-AND-POSITION.md §1.2）",
+					})
+					continue
 				}
 				continue
 			}
@@ -1040,18 +1056,22 @@ func (s *Sink) Apply(ctx context.Context, evs []source.Event, pos source.Positio
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// 已被暂停的表：**整批拒绝**，位点一点都不动。
-	//
-	// 为什么不能「跳过它、让位点前进」：整条任务只有一个位点，跳过等于把这批变更永久丢掉，
-	// 而界面上一切正常。按表暂停的含义是**这条同步停下来**（位点共用，别的表也走不动），
-	// 重跑时幂等补上——失败会有人看，静默缺数据不会。
+	// **最后一道防线**（不是判定）：判定权在引擎（契约 §1.5 第 1 条），但万一引擎那边漏了
+	// ——表名口径变了、新写路径没包 pauseSink、snapshot 漏了某张跳过表——这里要立刻炸，
+	// 而不是带着新 Relation 往一张结构没对齐的表里写（`alignRelationTx` 还会顺手补列，
+	// 写进去就没人知道了）。只查内存集合，不产生 IO。
 	for _, ev := range evs {
-		if !s.isPausedLocked(ev.Table.Table) {
+		if _, paused := s.pausedCache[ev.Table.Table]; !paused {
 			continue
 		}
-		rec := s.pausedCache[ev.Table.Table]
-		return &TablePausedError{TableName: ev.Table.Table, Detail: rec.Detail, ReasonCode: rec.Reason}
+		return fmt.Errorf("引擎没有过滤掉暂停表 %s 的事件（内部错误：按表暂停的判定权在引擎，"+
+			"不该把这张表的行交到这里）", ev.Table.Table)
 	}
+
+	// 写路径**不再做暂停判定**（docs/CONTRACT-PAUSE-AND-POSITION.md §1.5 第 1 条）：
+	// 判定权在引擎——引擎按表丢掉暂停表的事件、保留 Begin/Commit、让位点照常前进，
+	// 欠账由「解除暂停时整表重搬」还。这里再来一次整批拒绝就会把别的表的行也挡住，
+	// 正是「一张表坏了、几十张无关表一起停」那个被否决的行为。
 
 	tx, err := s.conn.Begin(ctx)
 	if err != nil {
@@ -1363,7 +1383,9 @@ const (
 	PauseReasonSchemaDrift = "schema_drift" // 改名 / 删列
 )
 
-// TablePausedError 表示「这张表已被标记暂停」：整批拒绝、位点不推进。
+// TablePausedError 表示「这张表已被标记暂停」。**写路径不再产生它**（判定权在引擎，
+// 见 docs/CONTRACT-PAUSE-AND-POSITION.md §1.5 第 1 条）；类型留着是为了兼容旧调用方
+// 与「按表识别错误」的形状（`PausableError` 的一个实现）。
 // 与 TypeChangedError 同族（PausableError）——要能按表识别、要能挂码。
 type TablePausedError struct {
 	TableName string
