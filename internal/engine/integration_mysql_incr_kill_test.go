@@ -175,10 +175,15 @@ func TestMySQLSourceIncrementalResumeAfterSIGKILL(t *testing.T) {
 	myExec(t, my, "DELETE FROM "+table+" WHERE id BETWEEN 200 AND 249")
 
 	srcKill := mySourceCount(t, my, table)
-	t.Logf("kill -9：目标端 %d 行（源端此刻 %d 行），中断时位点 %s；停机期间源端又写了 %d 行",
-		rowsKill, srcKill, posKill, downtime)
-	if rowsKill >= srcKill {
-		t.Fatalf("目标端 %d 行已经追平源端 %d 行：这一轮没测到续跑", rowsKill, srcKill)
+	t.Logf("kill -9：目标端 %d 行（源端此刻 %d 行 / 本轮写入 %d 行），中断时位点 %s；停机期间源端又写了 %d 行",
+		rowsKill, srcKill, atomic.LoadInt64(&wrote), posKill, downtime)
+	// 断言「kill 那一刻目标端确实落后」必须用**上界**比，不能用停机写完之后才数的
+	// srcKill：它必然 ≥ kill 时刻的源端行数 ≥ rowsKill，那个比较恒假（Owl II P3）。
+	// kill 时刻源端最多 myIncrRows+myIncrExtra 行（停机那 500 行是之后才写的），
+	// 目标端到不了这个上界才说明流还在半路上——这条是可能红的。
+	if rowsKill >= myIncrRows+myIncrExtra {
+		t.Fatalf("目标端 %d 行已经追平源端上界 %d 行：这一轮没测到续跑",
+			rowsKill, myIncrRows+myIncrExtra)
 	}
 
 	// ── 第 3 轮：重启，从落库的位点接着流 ────────────────────────────

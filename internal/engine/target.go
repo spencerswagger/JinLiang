@@ -543,7 +543,12 @@ func (r *runner) streamGeneric(ctx context.Context, st stateCapable, from source
 		return b.Add(c, ev)
 	})
 	cancelStream()
+	// 先取根因再 Flush（见 engine.go 同一处的理由）：Flush 失败时别让重试错误盖住根因。
+	cause := b.Err()
 	if err := b.Flush(context.Background()); err != nil {
+		if cause != nil {
+			return cause
+		}
 		return err
 	}
 	// 后台提交失败过就是失败：报真原因，不报「流被打断」。

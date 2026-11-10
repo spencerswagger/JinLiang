@@ -336,12 +336,23 @@ func (b *batcher) flushLoop(ctx context.Context) {
 				continue
 			}
 			err := b.flushLocked(ctx)
-			if err != nil {
+			// 我方取消引起的失败**不是**「后台提交失败」：按停 / 收尾 / 叫停时调用方
+			// 会 cancel 这个 ctx 去打断在途提交，驱动回的是 `context canceled` /
+			// `invalid connection` 之类。记进 b.err 就会让「正常收尾」被判成失败，
+			// 正是本 PR 要消灭的那类误报（Owl II P1）。
+			// 判据只看「ctx 已经结束」，不看错误长相：真提交失败时 ctx 是活的。
+			// 代价（有意取舍）：取消与真错误撞在同一瞬间时按「我们自己要停的」算——
+			// 位点是按批提交的，重启从落库位点重放，不丢数据。
+			canceled := ctx.Err() != nil
+			if err != nil && !canceled {
 				b.setErrLocked(err)
 			}
 			onErr := b.onError
 			b.mu.Unlock()
 			if err != nil {
+				if canceled {
+					return
+				}
 				if onErr != nil {
 					onErr(err)
 				}
