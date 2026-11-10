@@ -1738,6 +1738,9 @@ type TableNotFoundError struct {
 func (e *TableNotFoundError) Error() string {
 	msg := fmt.Sprintf("源端找不到表 %s（schema %s）：可能表名写错、被改名，或不在这个 schema 下",
 		e.Table, orDash(e.Schema))
+	// MySQL 源这条会误判：元数据可见，但**账号对该表没有 SELECT** 时，清单里也可能看不到它。
+	// 一句话把「其实有表、只是没权限」这条路指出来，别让人一直改表名。
+	msg += "。若你确认这张表存在，检查账号对它是否有 SELECT 权限（MySQL 源的元数据会按权限过滤）"
 	if len(e.Available) > 0 {
 		// 只列**源端表名**（不列列名、不列数据），信息暴露边界写在这里。
 		msg += "。源端相近的表名：" + strings.Join(e.Available, "、")

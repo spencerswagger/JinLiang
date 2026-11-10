@@ -1368,16 +1368,29 @@ func TestTypeChangeAlignThenIncrementalWorks(t *testing.T) {
 func TestMissingTableRunGetsE1013(t *testing.T) {
 	srcDSN, dstDSN := dsns(t)
 	srcDB := mustConn(t, srcDSN)
+	dstDB := mustConn(t, dstDSN)
 	ctx := context.Background()
 	exec(t, srcDB, "DROP TABLE IF EXISTS ghost_table_xyz")
 
 	store, jobID := tableJob(t, srcDSN, dstDSN, "ghost-job", "ghost_table_xyz")
+	// 「位点没动」要可证伪、不靠读代码：跑前跑后 position 都为空（或没有状态行）。
+	job0, jerr := store.GetJob(ctx, jobID)
+	if jerr != nil {
+		t.Fatal(jerr)
+	}
+	posBefore := metaPosition(t, dstDB, job0.JobKey)
+	if posBefore != "" {
+		t.Fatalf("还没开始搬就不该有位点，得到 %q", posBefore)
+	}
 	res, err := engine.Run(ctx, engine.Options{Store: store, JobID: jobID, SnapshotOnly: true})
 	if err == nil {
 		t.Fatal("选不存在的表必须失败")
 	}
 	if res.ExitCode == 0 {
 		t.Fatal("失败时退出码不能是 0")
+	}
+	if posAfter := metaPosition(t, dstDB, job0.JobKey); posAfter != posBefore {
+		t.Fatalf("表在源端清单里找不到：位点不该动（%q → %q）", posBefore, posAfter)
 	}
 	run, gerr := store.GetRun(ctx, res.RunID)
 	if gerr != nil {
@@ -1428,4 +1441,15 @@ func tableJob(t *testing.T, srcDSN, dstDSN, name, table string) (*control.Store,
 		t.Fatalf("建任务失败: %v", err)
 	}
 	return store, job.ID
+}
+
+// metaPosition 读目标端 _jl_meta.position（没有状态行时返回空串）。
+func metaPosition(t *testing.T, conn *pgx.Conn, jobKey string) string {
+	t.Helper()
+	var pos string
+	if err := conn.QueryRow(context.Background(),
+		`SELECT COALESCE(position,'') FROM _jl_meta WHERE job_key=$1`, jobKey).Scan(&pos); err != nil {
+		return "" // 没有状态行：也算「位点为空」
+	}
+	return pos
 }
