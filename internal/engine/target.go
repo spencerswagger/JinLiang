@@ -136,6 +136,20 @@ func (r *runner) prepareGeneric(ctx context.Context) error {
 		return err
 	}
 	r.gsink = gs
+	// **故意先不绑 `pauseReg`**（Owl II 必改 2，维护者止损指令）。
+	//
+	// 存储层（Data #95）已经同构就绪，但**恢复路径只在 PG 侧**：
+	// `reconcilePaused` / `forceRecopy` / `MarkTableRecopyPending` / 搬成时 `ClearPausedTable`
+	// 都长在 `prepare()` + `snapshot()` 里，`prepareGeneric` 一个都没调。
+	// 现在把 `pauseReg` 绑上去的后果是：流式期某张表被暂停之后**没有任何解除路径**——
+	// 用户对齐结构、重跑、`EnsureSchema` 通过，这张表仍被 `pauseSink` 静默跳过，
+	// `skipped_rows` 一直涨而这一轮"成功"；这正是「静默缺数据」。
+	//
+	// 所以 Way 1（Owl 建议的安全收尾）：接口抽好、MySQL 侧**继续明确失败**
+	//（写行时报 MySQLError → 整轮失败，响的），等恢复路径一起上再绑。
+	//
+	// TODO(片 C 收尾)：恢复路径搬到与目标端无关的层之后，在这里绑 `pauseReg`
+	//   （`gs.(pauseRegistry)` 已经能命中；**还要补 `StoredJobHash`**，它不在那六个方法里）。
 	src, err := r.openSource(ctx)
 	if err != nil {
 		return err
@@ -520,8 +534,10 @@ func (r *runner) targetRelation(ref source.TableRef) *source.Table {
 
 // streamGeneric 是「非 PG 目标端」的持续流：与 PG 路径同一套 batcher 规则。
 func (r *runner) streamGeneric(ctx context.Context, st stateCapable, from source.Position) error {
+	// 按表暂停的过滤包在**映射之后**（paused_tables 的 key 是目标端裸表名）。
+	// `pauseReg` 为 nil 时 pauseSink 原样透传：MySQL 目标端暂不绑（见 prepareGeneric 的说明）。
 	mapped := newRefMappedSink(r.gsink, r.targetRef)
-	b := newBatcher(mapped, r.src, r.doc, r.batchRows(), r.batchDelay(), from,
+	b := newBatcher(newPauseSink(mapped, r), r.src, r.doc, r.batchRows(), r.batchDelay(), from,
 		func(rows int64, pos source.Position) {
 			r.rowsStream += rows
 			r.mu.Lock()
@@ -613,16 +629,21 @@ func (r *runner) streamGeneric(ctx context.Context, st stateCapable, from source
 			if idleHit.Load() {
 				code = ExitOK
 			}
-		case errors.Is(streamErr, context.Canceled) || isUserStop(ctx, streamErr):
+		case (errors.Is(streamErr, context.Canceled) || isUserStop(ctx, streamErr)) && isLocalClose(streamErr):
+			// 与 engine.go 那条同一口径：`isUserStop` 只看「父 ctx 被取消」，不看错误形状。
+			// 用户按 Ctrl-C 撞上一条真错误时，只判前者会把真错误记成「已停止」。
 			code = ExitStopped
 			if idleHit.Load() {
 				code = ExitOK
 			}
-		case stopHit.Load() || idleHit.Load():
+		case (stopHit.Load() || idleHit.Load()) && isLocalClose(streamErr):
 			// 我们自己要求收尾（按停 / 到达 --stop-after / 已追平）后 cancel ctx 打断阻塞读，
 			// 有的连接器会把这个中断冒成一个网络错误（MySQL 源的
-			// `use of closed network connection`）。判据是「**我们先要停的**」，
-			// 不是错误长什么样：真实写入错误不会同时把 stopHit/idleHit 置起来。
+			// `use of closed network connection`）。这里的判据是**两个条件同时成立**：
+			//   ① 我们先要停的；② 错误本身长得像「本地主动关闭」（`isLocalClose`）。
+			// 只判 ① 会把「停止请求之后才到的真实错误」（目标库断连 / 权限被回收 / 解码失败）
+			// 记成「已停止」、退出码 0 —— 用户以为一切正常，实际数据停在半路。
+			// 后台提交失败（`b.Err()`）在调用点更早就已返回，不会走到这里。
 			code = ExitStopped
 			if idleHit.Load() {
 				code = ExitOK

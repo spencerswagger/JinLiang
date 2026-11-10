@@ -373,6 +373,9 @@ type runner struct {
 	// paused 是本轮的内存暂停集合（key = 目标端裸表名）：写路径每批都要判，不能每批查库。
 	// 由 loadPausedSet 装好，registerPause / snapshot 搬成 两处更新（见 pause_skip.go）。
 	paused map[string]pgsink.PausedTable
+	// pauseReg 是「按表暂停的存储层」：PG 目标端是 pgsink，MySQL 目标端是 mysqlsink。
+	// 为 nil 表示这个目标端还没有暂停存储（写路径原样透传，遇不一致就报错）。
+	pauseReg pauseRegistry
 	// forceRecopy 是「欠一次整表重搬」的表（结构刚从不对齐变成对齐）。
 	// 它们由 reconcilePaused 收集，decideCopyPlan 之后接进 plan.Recopy——
 	// 那条分支会「查所有权 → 清空表 + 清块标记 → 从表头重读」，正是契约 §1.6 步 2–3 要的。
@@ -917,6 +920,8 @@ func (r *runner) prepare(ctx context.Context) error {
 	// 只读一次：写路径每批都要判定，不能每批查库；这一列只在本轮 prepare 与
 	// 「某表搬成」两处变化。**顺序还有一条硬的：EnsureSchema 必须早于 cleanBeforeRecopy**
 	//（否则会「先清空、后报结构不对」）。三条一起看，这段位置就是唯一正确的。
+	// 先绑存储层：PG 目标端就是 pgsink 自己（它实现了那六个方法）。
+	r.pauseReg = sink
 	if err := sink.LoadPausedTables(ctx); err != nil {
 		return err
 	}
@@ -982,7 +987,7 @@ func (r *runner) prepare(ctx context.Context) error {
 	}
 	r.src = src
 	// **只有 interval 在这里收口**：它既不清表、也不走 Apply，且 `prepare` 早退后
-	// 再也走不到下面那一次调用；interval 没有「存量」概念，`copyDoneFor` 恒真是设计如此
+	// 再也走不到下面那一次调用；interval 没有「存量」概念（不搬历史，靠水位列追）
 	//（契约 §1.2 例外段）。
 	//
 	// 别的模式**必须**等 `decideCopyPlan` 之后再收口：`progressByTable` 是那一步才赋值，
@@ -1123,13 +1128,19 @@ func (r *runner) prepare(ctx context.Context) error {
 // 现在只有一条路：`MarkTableRecopyPending` 清掉该表的块标记 → `planCopy` 自然把它排进本轮重搬
 // → 搬成（`MarkTableDone`）之后 `snapshot()` 里才删这个 key。**先重搬，后解除。**
 func (r *runner) reconcilePaused(ctx context.Context) error {
-	rec, err := r.sink.PausedTables(ctx)
+	reg := r.pauseRegistryOf()
+	if reg == nil {
+		return nil // 这个目标端还没有暂停存储：没什么可收口的
+	}
+	rec, err := reg.PausedTables(ctx)
 	if err != nil {
 		return fmt.Errorf("读暂停表失败: %w", err)
 	}
 	if len(rec) == 0 {
 		return nil
 	}
+	// `StoredJobHash` **不在** `pauseRegistry` 里（mysqlsink 也还没有这个方法）：
+	// 片 C 真正要补的是它，不是「把那三行绑定放回来」。今天只有 PG 路径调这里。
 	stored, err := r.sink.StoredJobHash(ctx)
 	if err != nil {
 		return fmt.Errorf("读任务指纹失败: %w", err)
@@ -1144,7 +1155,7 @@ func (r *runner) reconcilePaused(ctx context.Context) error {
 		if sameJob && inScope[key] {
 			continue
 		}
-		if err := r.sink.ClearPausedTable(ctx, source.TableRef{Schema: r.targetSchema(), Table: key}); err != nil {
+		if err := reg.ClearPausedTable(ctx, source.TableRef{Schema: r.targetSchema(), Table: key}); err != nil {
 			return fmt.Errorf("清掉不再适用的暂停记录 %s 失败: %w", key, err)
 		}
 		r.forgetPaused(key)
@@ -1175,7 +1186,7 @@ func (r *runner) reconcilePaused(ctx context.Context) error {
 		// 永远停在暂停里（`planCopy` 在这两种模式下不会排存量），所以结构一通过就恢复。
 		// 代价必须说出来：解除暂停 ≠ 两侧已经一致——这两种模式不会替你重搬，差异要人看。
 		if r.mode() == "interval" || r.mode() == "continuous" {
-			if err := r.sink.ClearPausedTable(ctx, source.TableRef{Schema: r.targetSchema(), Table: key}); err != nil {
+			if err := reg.ClearPausedTable(ctx, source.TableRef{Schema: r.targetSchema(), Table: key}); err != nil {
 				return fmt.Errorf("解除 %s 的暂停失败: %w", key, err)
 			}
 			r.forgetPaused(key)
@@ -1191,7 +1202,7 @@ func (r *runner) reconcilePaused(ctx context.Context) error {
 			continue
 		}
 		ref := r.targetRef(source.TableRef{Schema: r.targetSchema(), Table: key})
-		if err := r.sink.MarkTableRecopyPending(ctx, ref); err != nil {
+		if err := reg.MarkTableRecopyPending(ctx, ref); err != nil {
 			return fmt.Errorf("把 %s 标成待重搬失败: %w", key, err)
 		}
 		if r.forceRecopy == nil {
@@ -1290,18 +1301,6 @@ func containsTable(refs []source.TableRef, table string) bool {
 		}
 	}
 	return false
-}
-
-// copyDoneFor 表示这张表的存量已经搬完（有完成标记）。查的是目标端的块进度，
-// 不看 paused_tables 本身 —— 判定输入必须能只靠「块进度 + 位点」重建。
-func (r *runner) copyDoneFor(table string) bool {
-	pr, ok := r.chunkProgress()[table]
-	if !ok {
-		// 一条块标记都没有：这张表本来就没有「存量要搬」（比如 continuous 只接增量，
-		// 或者上次停在第一块之前）。把它当成「存量已完成」，否则暂停永远解不开。
-		return true
-	}
-	return pr.Done
 }
 
 // chunkProgress 是本轮 prepare 时读到的那份块进度（decideCopyPlan 里装好的）。
@@ -1506,7 +1505,10 @@ func (r *runner) snapshot(ctx context.Context) error {
 				r.note(ctx, "表 "+ref.Table+" 仍在暂停（目标端既有表，需你决定：重建 / 手工清空 / 移出范围）")
 				continue
 			}
-			if err := r.sink.ClearPausedTable(ctx, ref); err != nil {
+			if reg := r.pauseRegistryOf(); reg != nil {
+				err = reg.ClearPausedTable(ctx, ref)
+			}
+			if err := err; err != nil {
 				return fmt.Errorf("解除 %s 的暂停失败: %w", t.Table, err)
 			}
 			r.forgetPaused(ref.Table)
@@ -1750,13 +1752,18 @@ func (r *runner) stream(ctx context.Context, res *Result) error {
 		if errors.As(streamErr, &stopped) {
 			return stopped
 		}
-		if idleDone.Load() {
+		// `--stop-when-idle` 到点后我们 cancel 掉读；**只有错误像本地关闭**才算正常收尾。
+		// 无条件判 idleDone 会把「到点之后才到的真错误」（源库断连 / 解码失败）记成
+		// 「已追平并收尾」、退出码 0 —— 止损指令点名的就是这条（Owl II 必改 1 的另一格）。
+		if idleDone.Load() && isLocalClose(streamErr) {
 			return &stoppedError{ok: true, msg: fmt.Sprintf("已经追平且安静了 %s：按 --stop-when-idle 正常收尾", r.opt.IdleAfter)}
 		}
-		if stopHit.Load() {
+		// 同 target.go：只有「我们先要停」+「错误像本地关闭」同时成立才算正常收尾。
+		// 只判 stopHit 会把停止之后才到的真实错误吞成退出码 0。
+		if stopHit.Load() && isLocalClose(streamErr) {
 			return &stoppedError{msg: fmt.Sprintf("到达本次运行的时间上限（%s），已收尾", r.opt.StopAfter)}
 		}
-		if ctx.Err() != nil {
+		if ctx.Err() != nil && isLocalClose(streamErr) {
 			return &stoppedError{msg: "收到停止信号：已把手上这个事务提交完"}
 		}
 		return streamErr
@@ -1827,6 +1834,21 @@ func pauseHead(base string, pe pgsink.PausableError) string {
 	return fmt.Sprintf("%s（原因码 %s）", base, pe.Reason())
 }
 
+// pauseRegistryOf 返回本轮可用的暂停存储。
+//
+// `pauseReg` 是显式绑定的那份（PG 在 prepare 里、MySQL 目前故意不绑）；
+// 没绑时退回 `r.sink`——pgsink 本身就实现了那六个方法，所以单测/老路径构造的
+// `runner{sink: …}` 也能用（不加这层，`r.pauseReg` 是 nil，直接调用会 SIGSEGV）。
+func (r *runner) pauseRegistryOf() pauseRegistry {
+	if r.pauseReg != nil {
+		return r.pauseReg
+	}
+	if r.sink != nil {
+		return r.sink
+	}
+	return nil
+}
+
 // registerPause 把「这张表要暂停」记进目标端的 paused_tables。
 //
 // 目标端不支持（MySQL 没有那条状态列）时**明确失败**：绝不能「UPDATE 影响 0 行当成功」，
@@ -1836,18 +1858,17 @@ func (r *runner) registerPause(ctx context.Context, err error) error {
 	if !errors.As(err, &pe) || pe.Table() == "" {
 		return nil
 	}
-	if r.tgtEP.Kind != dsn.KindPostgres {
+	reg := r.pauseRegistryOf()
+	if reg == nil {
+		// 目标端没有暂停存储（还没实现那六个方法）：**明确失败**，不许「假装登记成功」。
 		return &pauseUnsupportedError{kind: r.tgtEP.Kind, table: pe.Table(), inner: err}
-	}
-	if r.sink == nil {
-		return nil // 还没开目标端：原始错误照常上抛
 	}
 	ref := r.targetRef(source.TableRef{Schema: r.targetSchema(), Table: pe.Table()})
 	detail := err.Error()
 	if len(detail) > 500 {
 		detail = detail[:500] + "…"
 	}
-	if perr := r.sink.PauseTable(ctx, ref, pgsink.PausedTable{
+	if perr := reg.PauseTable(ctx, ref, pgsink.PausedTable{
 		Reason: pe.Reason(),
 		Detail: detail,
 		Resume: r.resumeModeFor(ctx, ref),
@@ -1869,10 +1890,28 @@ func (r *runner) registerPause(ctx context.Context, err error) error {
 // 判据用 `_jl_object`（谁建的表），不是配置：同一份 yaml 里可能两种表都有。
 // 查不出结论时按 manual——**宁可停下来问，不可替用户删数据**。
 func (r *runner) resumeModeFor(ctx context.Context, ref source.TableRef) string {
-	if r.sink == nil {
+	if r.pauseRegistryOf() == nil {
 		return pgsink.ResumeManual
 	}
-	ours, err := r.sink.DidCreateTable(ctx, ref)
+	// 「这张表是不是本任务建的」两边的目标端都有这个能力（`targetSink` 接口里的 DidCreateTable）。
+	var ours bool
+	var err error
+	switch {
+	case r.sink != nil:
+		ours, err = r.sink.DidCreateTable(ctx, ref)
+	case r.gsink != nil:
+		// `targetSink` 契约里没有「谁建的表」这一项（那是清表所有权判据，走 stateCapable 之外的
+		// 可选能力）：拿不到就按 manual 处理——宁可停下来问，不可替用户删数据。
+		if dc, ok := r.gsink.(interface {
+			DidCreateTable(context.Context, source.TableRef) (bool, error)
+		}); ok {
+			ours, err = dc.DidCreateTable(ctx, ref)
+		} else {
+			return pgsink.ResumeManual
+		}
+	default:
+		return pgsink.ResumeManual
+	}
 	if err != nil || !ours {
 		return pgsink.ResumeManual
 	}
