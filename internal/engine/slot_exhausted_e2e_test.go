@@ -103,6 +103,21 @@ func TestSlotExhaustedEndToEndGetsE1016(t *testing.T) {
 	if !strings.Contains(strings.ToLower(run.LastError), "replication slot") {
 		t.Fatalf("last_error 要保留驱动原始消息（all replication slots are in use），得到：%s", run.LastError)
 	}
-	t.Logf("真造 53400：占满 %d/%d → runs.code=%s，last_error 含 53400 与驱动消息；已恢复名额",
-		afterUsed, maxSlots, run.Code)
+	// 事后恢复的**校验**（不只看「我删了」）：配置没被改、占位书签 0 条。
+	var maxAfter int
+	if err := srcConn.QueryRow(ctx, `SELECT setting::int FROM pg_settings WHERE name='max_replication_slots'`).Scan(&maxAfter); err != nil {
+		t.Fatal(err)
+	}
+	if maxAfter != maxSlots {
+		t.Fatalf("实例配置被留在了别的值：max_replication_slots %d → %d", maxSlots, maxAfter)
+	}
+	var leftover int
+	if err := srcConn.QueryRow(ctx, `SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'jl_fill_%'`).Scan(&leftover); err != nil {
+		t.Fatal(err)
+	}
+	if leftover != 0 {
+		t.Fatalf("占位书签没清干净（残留 %d 条），会害后面的用例", leftover)
+	}
+	t.Logf("真造 53400：占满 %d/%d → runs.code=%s，last_error 含 53400 与驱动消息；"+
+		"事后校验 max_replication_slots 仍 %d、占位书签残留 0", afterUsed, maxSlots, run.Code, maxAfter)
 }
