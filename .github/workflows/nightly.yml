@@ -48,6 +48,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: "1.27.x"
+          cache: true
       - name: 起 PostgreSQL ${{ matrix.pg }}（wal_level=logical）
         run: |
           set -euo pipefail
@@ -135,6 +136,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: "1.27.x"
+          cache: true
       - name: 起 MySQL ${{ matrix.mysql }}（binlog ROW + FULL 行镜像）
         run: |
           set -euo pipefail
@@ -247,6 +249,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: "1.27.x"
+          cache: true
       - name: 起 PostgreSQL 16（wal_level=logical）
         run: |
           set -euo pipefail
@@ -334,6 +337,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: "1.27.x"
+          cache: true
       - name: 起 PostgreSQL 16（wal_level=logical）
         run: |
           set -euo pipefail
@@ -360,8 +364,39 @@ jobs:
           docker exec pg-src psql -U jinliang -d jinliang_src -c 'CREATE DATABASE jinliang_test'
       - name: 性能基线（不达标即红）
         run: scripts/bench.sh --enforce --out bench/latest.json
+      - name: 目标端批量 upsert 吞吐（增量峰值门禁 ≥20k rows/s）
+        # 这道门禁原在 PR 的 b1-engine 里，每次 PR 都跑一遍太贵，挪到 nightly；
+        # 覆盖不丢。三条硬约束（都是「不许静默通过」的具体化）：
+        #   1) pipefail：go test 自己失败必须跟着失败，不能被 `| tee` 吞掉；
+        #   2) 没测到数值＝失败：rate 为空时 `r+0` 会被当成 0，这里先显式判空；
+        #   3) 低于阈值直接红，并把实测数字打进日志。
+        run: |
+          set -euo pipefail
+          go test -tags=integration -run '^$' -bench BenchmarkApplyUpsert500 -benchtime=40x ./internal/pgsink/ | tee /tmp/bench.txt
+          rate=$(awk '/batch=500/ { for (i=1;i<=NF;i++) if ($i=="rows/s") print $(i-1) }' /tmp/bench.txt | tail -1)
+          [ -n "$rate" ] || { echo "❌ 没测到 batch=500 的吞吐数值（benchmark 没跑或输出格式变了）——这不算通过"; tail -30 /tmp/bench.txt; exit 1; }
+          echo "批量路径吞吐: $rate rows/s（阈值 20000）"
+          awk -v r="$rate" 'BEGIN { exit !(r+0 >= 20000) }' || { echo "❌ 批量 upsert 吞吐 $rate 低于 20000 rows/s"; exit 1; }
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: bench-report-${{ github.run_id }}
           path: bench/latest.json
+
+  cross-compile:
+    # 三平台交叉编译原来在 PR 的 control-plane 里（71s），移到 nightly：
+    # PR 只保证本机 linux/amd64 能编译，平台覆盖由 nightly/release 守。
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.x"
+          cache: true
+      - name: 交叉编译（linux/amd64, linux/arm64, darwin/arm64）
+        run: |
+          set -euo pipefail
+          for target in linux/amd64 linux/arm64 darwin/arm64; do
+            echo "building $target"
+            CGO_ENABLED=0 GOOS=${target%/*} GOARCH=${target#*/} go build -trimpath -o /dev/null ./cmd/jinliang
+          done
