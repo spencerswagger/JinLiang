@@ -13,7 +13,6 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/spencerswagger/jinliang/internal/control"
-	"github.com/spencerswagger/jinliang/internal/core"
 	"github.com/spencerswagger/jinliang/internal/engine"
 	"github.com/spencerswagger/jinliang/internal/pgsink"
 )
@@ -186,6 +185,16 @@ func TestPauseTableRegistersKeyKeepsPositionAndRecovers(t *testing.T) {
 		res2.RowsCopied, float64(caughtUp.Milliseconds()))
 }
 
+// readPausedOrFail 是 readPaused 的「读不出来就算失败」版本（用例里到处用）。
+func readPausedOrFail(t *testing.T, conn *pgx.Conn, jobKey string) map[string]pgsink.PausedTable {
+	t.Helper()
+	m, err := readPaused(t, conn, jobKey)
+	if err != nil {
+		t.Fatalf("读暂停记录失败: %v", err)
+	}
+	return m
+}
+
 // readPaused 直接读 _jl_meta.paused_tables 并按 JSON 解析（不经过代码里的缓存），
 // 确认库里存的就是那份形状：key = 裸表名，值带 reason/at/detail。
 func readPaused(t *testing.T, conn *pgx.Conn, jobKey string) (map[string]pgsink.PausedTable, error) {
@@ -281,27 +290,42 @@ func TestTypeChangeTextAndVarcharWideningThenIncremental(t *testing.T) {
 	exec(t, srcDB, "ALTER TABLE "+table+" ALTER COLUMN s TYPE varchar(60)")
 	srcAfter := [2]string{columnType(t, srcDB, table, "v"), columnType(t, srcDB, table, "s")}
 
-	// 目标端故意只对齐第一列：第二列仍窄 → 本轮必须拒绝（不许静默按旧类型写）
+	// 目标端故意只对齐第一列：第二列仍窄 → **这张表被暂停**（不许静默按旧类型写、也不许收窄截断），
+	// 但整轮不再失败（契约 §1.2/§1.5：只停这一张表）。
 	exec(t, dstDB, "ALTER TABLE "+table+" ALTER COLUMN v TYPE text")
-	res, err := engine.Run(ctx, engine.Options{Store: store, JobID: jobID, SnapshotOnly: true})
-	if err == nil {
-		t.Fatal("目标端 varchar 仍比源端窄：必须拒绝（收窄会截断），不能静默通过")
+	if _, err := engine.Run(ctx, engine.Options{Store: store, JobID: jobID, SnapshotOnly: true}); err != nil {
+		t.Fatalf("一张表类型对不上不该打死整轮: %v", err)
 	}
-	run, gerr := store.GetRun(ctx, res.RunID)
-	if gerr != nil {
+	job0, jerr := store.GetJob(ctx, jobID)
+	if jerr != nil {
+		t.Fatal(jerr)
+	}
+	rec0, err := readPaused(t, dstDB, job0.JobKey)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if run.Code != string(core.CodeSchemaMismatch) {
-		t.Fatalf("收窄应挂 E1015，得到 %q；last_error=%s", run.Code, run.LastError)
+	one, ok := rec0[table]
+	if !ok {
+		t.Fatalf("varchar 仍比源端窄 → 必须暂停这张表，得到 %v", rec0)
 	}
-	if !strings.Contains(run.LastError, table) || !strings.Contains(run.LastError, "s") {
-		t.Fatalf("last_error 要点名表与列，得到：%s", run.LastError)
+	if one.Reason != pgsink.PauseReasonTypeChanged {
+		t.Fatalf("原因码应为 %q，得到 %q", pgsink.PauseReasonTypeChanged, one.Reason)
+	}
+	if !strings.Contains(one.Detail, "s") {
+		t.Fatalf("detail 要点名那一列（s），得到 %q", one.Detail)
+	}
+	// 目标端那列**没有被偷偷改宽**：改宽的只能是用户（我们只暂停，不动结构）
+	if typ := columnType(t, dstDB, table, "s"); typ != "character varying" {
+		t.Fatalf("目标端列类型不该被我们改，得到 %s", typ)
 	}
 
-	// 对齐第二列之后：两侧类型一致 + 增量继续可用（判据 3）
+	// 对齐第二列之后：暂停解除（走整表重搬）+ 两侧类型一致 + 增量继续可用（判据 3）
 	exec(t, dstDB, "ALTER TABLE "+table+" ALTER COLUMN s TYPE varchar(60)")
 	if _, err := engine.Run(ctx, engine.Options{Store: store, JobID: jobID, SnapshotOnly: true}); err != nil {
 		t.Fatalf("对齐后重跑应成功: %v", err)
+	}
+	if after := readPausedOrFail(t, dstDB, job0.JobKey); len(after) != 0 {
+		t.Fatalf("结构对齐并重搬之后必须解除暂停，仍有 %v", after)
 	}
 	dstAfter := [2]string{columnType(t, dstDB, table, "v"), columnType(t, dstDB, table, "s")}
 	if srcAfter != dstAfter {

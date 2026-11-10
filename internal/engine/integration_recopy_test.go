@@ -1111,13 +1111,20 @@ func TestEnsureSchemaTypeMismatchIsPausable(t *testing.T) {
 	}
 	defer s.Close()
 
-	_, err = s.EnsureSchema(ctx, source.Catalog{Tables: []source.Table{rel}})
-	if err == nil {
-		t.Fatal("目标列类型与源端不一致时必须报错")
+	// 按表暂停落地后：`EnsureSchema` **不再在第一张不一致的表上返回错误**——它把不一致收进
+	// `TakePendingPauses()`，由引擎统一登记暂停、其它表照常（契约 §6 硬口径 2）。
+	// 所以这里断言的是「收得到那张表 + 原因码对」，而不是「返回一个 error」。
+	if _, err := s.EnsureSchema(ctx, source.Catalog{Tables: []source.Table{rel}}); err != nil {
+		t.Fatalf("结构对不上不该让 EnsureSchema 整轮失败（其它表还要跑）: %v", err)
 	}
-	var pe pgsink.PausableError
-	if !errors.As(err, &pe) {
-		t.Fatalf("必须是 PausableError（第③步按表暂停），得到 %T: %v", err, err)
+	pending := s.TakePendingPauses()
+	if len(pending) != 1 {
+		t.Fatalf("应收到 1 张待暂停的表，得到 %d：%v", len(pending), pending)
+	}
+	pe := pending[0]
+	// 再取一次必须为空（交出去就清空，防止同一张表被登记两遍）
+	if again := s.TakePendingPauses(); len(again) != 0 {
+		t.Fatalf("TakePendingPauses 必须交出并清空，第二次还拿到 %v", again)
 	}
 	if pe.Table() != table {
 		t.Fatalf("要能直接拿到表名，得到 %q", pe.Table())

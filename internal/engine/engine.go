@@ -1461,6 +1461,12 @@ func (r *runner) snapshot(ctx context.Context) error {
 	_, err := r.src.SnapshotChunksFrom(ctx, opt, r.plan.From,
 		func(c context.Context, ref source.TableRef, no int, rows [][]any, from, to string) error {
 			tref := r.targetRef(ref)
+			// 上一轮已经搬完的表：**这一轮不用碰**（`plan.Skip`）。增量会从原位点把它们追平。
+			// 源端没法按表过滤（`SnapshotChunksFrom` 的入参里没有表集合），所以这里丢掉——
+			// 顺带避免「续跑时把已完成的表整表重读一遍再 COPY 回去」这种纯开销。
+			if r.plan.Skip[tref.Table] {
+				return nil
+			}
 			// 结构对不上的表：**行读到了也不写**（契约 §6 硬口径 2「暂停表存量也不搬」）。
 			// 源端没法按表过滤（`SnapshotChunksFrom` 的入参里没有表集合，改它要动连接器契约），
 			// 所以这里丢掉——代价是白读一遍这张表，换来的是「不给一张结构不一致的表写半截数据」。
