@@ -48,7 +48,8 @@ const pausedTableColumn = "paused_tables"
 // （契约 §4.2 只列了六个），所以 MySQL 目标端要单独实现这一个，否则片 C 拼不齐。
 //
 // 与 `paused_tables` 的关系（写清楚免得被误解成「同事务」）：
-//   - `job_hash` 由 `EnsureMeta` 在 prepare 写（`ON DUPLICATE KEY UPDATE` 会刷新它）；
+//   - `job_hash` 由 `EnsureMeta` 在 prepare 写，但**只在插入时写**（冲突分支刻意不刷新它，
+//     否则读回来恒等于本轮 hash，跨轮存活判据就恒真了）；
 //   - `paused_tables` 由 `PauseTable` 单独一个事务写；
 //   - 两者**不在同一个事务**，也不需要：判据是「读回来的 hash 是否等于本轮 hash」，
 //     读晚一点只会更准（本轮 hash 在 prepare 就定了）。真正要保证的是「读得到」——
