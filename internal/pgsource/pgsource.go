@@ -244,6 +244,27 @@ type PrepareResult struct {
 //   - 持久书签（默认）：跨重启保留，重启从位点续跑，源库会为它保留变更流水。
 //   - 临时书签（--slot temporary，B2 起暴露）：进程退出即消失，不留磁盘占用，
 //     但停超过保留期就只能重新全量。
+//
+// RebuildSlot 删掉本任务的书签（不存在就什么都不做）。下一次 Prepare 会建一条新的，
+// 于是「变更流从源端当前位置重新开始」。
+//
+// 为什么单独一个方法而不是给 Prepare 加参数：`--resync` 在 continuous 模式（只接增量、
+// 不做快照）下要的正是「不导出视图、只换书签」，而 Prepare 的 Snapshot 参数同时管着
+// 导出视图；把两件事绑在一起会顺手多开一条永远不会被读的快照连接。
+func (s *Source) RebuildSlot(ctx context.Context) error {
+	_, exists, err := s.slotPosition(ctx)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return nil
+	}
+	if _, err := s.conn.Exec(ctx, `SELECT pg_drop_replication_slot($1)`, s.opt.Slot); err != nil {
+		return fmt.Errorf("重建书签前删除旧书签 %s 失败（可能还有进程连着它）: %w", s.opt.Slot, err)
+	}
+	return nil
+}
+
 func (s *Source) Prepare(ctx context.Context, popt PrepareOptions) (PrepareResult, error) {
 	res := PrepareResult{}
 

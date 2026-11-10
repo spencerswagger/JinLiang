@@ -226,6 +226,7 @@ UPDATE runs SET kind = 'stub' WHERE stub = 1;   -- 回填历史桩运行
 | `jinliang version` / `doctor` | 基础运维 |
 | `jinliang import/export` | 与控制库交换 yaml（GitOps、迁移、备份） |
 | `jinliang run --job <id\|name>` | 无 UI 的 headless 执行（容器/CI/无头环境） |
+| `jinliang run --job <id\|name> --resync [--yes]` | **显式整轮重搬**：重建书签/位点，先清本任务建的表再重搬。E3001 唯一的自救路径；不换 `job_key`、不删历史。属危险动作（不可撤销），非交互环境必须显式 `--yes` |
 | ~~`plan`~~ / ~~`preview`~~ | 已被 UI 的预检与预览取代；CLI 只留 `--json` 版给自动化 |
 
 `job.yaml` 保留为**导入导出格式**，schema 不变（`schema/job.schema.json` 继续维护），但**不再是运行时的真源**。

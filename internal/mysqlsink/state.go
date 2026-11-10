@@ -256,6 +256,19 @@ func (s *Sink) State(ctx context.Context) (phase, position string, err error) {
 // Position 只读位点（没有返回空串）。
 func (s *Sink) Position(ctx context.Context) (string, error) { return s.MetaPosition(ctx) }
 
+// ClearProgress 清掉权威位点、水位与快照 ID（`--resync` 专用）。
+// 与 EnsureMeta 的分工见 pgsink 同名方法的注释：空串在 EnsureMeta 里是「别改」，
+// 不是「清空」——要清空就必须有这个方法，不能让调用方自己拼 UPDATE。
+func (s *Sink) ClearProgress(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx,
+		"UPDATE `_jl_meta` SET position = NULL, watermark = NULL, snapshot_id = NULL, updated_at = NOW(6) WHERE job_key = ?",
+		s.opt.JobKey)
+	if err != nil {
+		return fmt.Errorf("清位点失败: %w", err)
+	}
+	return nil
+}
+
 // DoneChunks 读回已完成的块（table → chunk_no → done）。
 func (s *Sink) DoneChunks(ctx context.Context) (map[string]map[int]bool, error) {
 	rows, err := s.db.QueryContext(ctx,

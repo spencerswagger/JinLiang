@@ -58,6 +58,9 @@ type Options struct {
 	LagThreshold int64
 	// Verify compares source and target fingerprints when the run finishes.
 	Verify bool
+	// Resync 是**显式整轮重搬**：重建书签/位点，先清本任务建的表再整表重搬。
+	// 语义与边界见 resync.go 顶部；它只作用于「这一轮」，不能配 --watch 循环跑。
+	Resync bool
 	// LeaseTTL defaults to 30s.
 	LeaseTTL time.Duration
 	// HeartbeatEvery 覆盖心跳间隔（测试用；默认 control.DefaultHeartbeatInterval/2）。
@@ -75,6 +78,8 @@ type Result struct {
 	Elapsed    time.Duration
 	Mismatches []string
 	Note       string
+	// Resync 非空表示这一轮做了整轮重搬（里面有旧位点与清掉的表，见 ResyncReport）。
+	Resync *ResyncReport
 }
 
 // ErrHeldByOther means another instance holds the job's lease (E1005).
@@ -304,6 +309,12 @@ type runner struct {
 	priorPhase      string
 	// plan 是这次全量「接着搬 / 从头搬 / 不用搬」的结论（见 resume.go）。
 	plan chunkPlan
+	// resyncReport 记录这一轮 --resync 实际清了什么（Result 与 CLI 都读它）。
+	resyncReport *ResyncReport
+	// snapshotDone 只用于 `--resync` 的收尾断言：说了整轮重搬就必须真的搬过。
+	snapshotDone bool
+	// clearedTables 是**真的清空过**的表（cleanBeforeRecopy 每清成一张追加一条）。
+	clearedTables []string
 
 	rowsCopied int64
 	rowsStream int64
@@ -335,8 +346,13 @@ func (r *runner) execute(parent context.Context, res *Result) error {
 		res.RowsStream = r.rowsStream
 		res.Position = posString(r.lastPos)
 		res.ExitCode = r.exitCode
+		res.Resync = r.resyncReport
 	}()
 
+	if err := r.checkResync(); err != nil {
+		// 先判再动：--resync 用在不支持的目标端/模式上时，一个字节都不该被改。
+		return r.fail(ctx, err)
+	}
 	if err := r.preflight(ctx); err != nil {
 		return r.fail(ctx, err)
 	}
@@ -385,6 +401,12 @@ func (r *runner) execute(parent context.Context, res *Result) error {
 			}
 			return r.fail(ctx, err)
 		}
+	}
+	// 「说了整轮重搬却没搬」是一种比失败更糟的成功：退出码 0、用户以为已重建，
+	// 数据其实一行都没重搬。判据留在收尾这里，任何一处漏改（needSnapshot 判据、
+	// applyResync、Clean 名单）都会让用例直接红，而不是悄悄放过去。
+	if r.opt.Resync && r.plan.Kind == copyFresh && !r.snapshotDone {
+		return r.fail(ctx, errResyncWithoutSnapshot)
 	}
 
 	if r.opt.SnapshotOnly || r.mode() == "once" {
@@ -572,6 +594,7 @@ const (
 	recopyNoPK                         // 无主键表，只能整表重来
 	recopyOnce                         // once / full_interval：每轮整轮重搬，必须清空重建
 	recopyNoPos                        // 搬过，但目标端没留下位点（一块都没搬完）
+	recopyResync                       // --resync：用户显式要求整轮重搬
 )
 
 func (w recopyReason) sentence() string {
@@ -585,6 +608,8 @@ func (w recopyReason) sentence() string {
 		return "这个任务是 once / full_interval 模式，每一轮都整轮重搬（目标端结果要等于源端当前状态）"
 	case recopyNoPos:
 		return "之前搬过但目标端没留下一致性位点（很可能一块都没搬完就断了）"
+	case recopyResync:
+		return "你显式要求了 --resync（整轮重搬）：这一轮先从零重建，目标端结果要等于源端当前状态"
 	default:
 		return "上次全量搬到一半就断了"
 	}
@@ -817,8 +842,48 @@ func (r *runner) prepare(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if r.opt.Resync {
+		// --resync 改的是**判据**（不看上次搬到哪，直接整轮重来），不是另写一套搬运。
+		if err := r.applyResync(&plan, phaseInTarget, posInTarget); err != nil {
+			return err
+		}
+	}
 	r.plan = plan
 	r.needSnapshot = plan.Kind != copySkip
+	if r.opt.Resync {
+		// **先问「这几张表能不能清」，再动任何东西**。清位点、重建书签、清表是三步
+		// 破坏性动作；把「不是本任务建的表」这种需要用户决定的失败留到最后一步，
+		// 就等于先把位点和书签毁了再停下：位点没了、旧书签没了、表一行没清，用户
+		// 「再跑一次」会被判成 copySkip 直接进流，把 (旧位点, 新起点] 永久跳过且
+		// 不报错——他明明要的是整轮重搬，代码却替他做了「接受空洞」的决定。
+		if err := r.precheckResyncTables(ctx, plan); err != nil {
+			return err
+		}
+		// 清位点必须在 src.Prepare 之前、更要在清表之前：
+		//   - 在 EnsureMeta 之前：它的 position 是 COALESCE 语义，晚清会被写回的旧位点盖掉；
+		//   - 在清表之前：清表发生在 snapshot()。反过来（先清表、后清位点）一旦崩在中间，
+		//     库里就是「位点说有进度、表却是空的」→ 下次按位点续跑 → 数据永久缺失且没人报错。
+		if err := r.sink.ClearProgress(ctx); err != nil {
+			return fmt.Errorf("清位点失败，已停下（目标表一行都没动）: %w", err)
+		}
+		// 审计写的是**计划**（planned_tables）：真正清完哪些表另有一条
+		// job.resync.cleared，别把计划当已完成报告。
+		if err := r.auditResync(ctx, plan.CleanNames); err != nil {
+			return err
+		}
+		// continuous 没有存量：--resync 的动作全在「换一条书签」上。
+		// 不做这一步的话，Prepare 会**复用**旧书签，位点根本不会动——审计写了
+		// 「已清空位点」，实际却原样写回，正是「跑了但没重建」。
+		if r.mode() == "continuous" {
+			rb, ok := r.src.(slotRebuilder)
+			if !ok {
+				return fmt.Errorf("内部错误：%s 源没有重建书签的能力，但 checkResync 放行了", r.srcEP.Kind)
+			}
+			if err := rb.RebuildSlot(ctx); err != nil {
+				return err
+			}
+		}
+	}
 	// 续跑时**不重建书签、不导出视图**：书签得留着才能从原来的位点重放变更。
 	prep, err := src.Prepare(ctx, r.needSnapshot && plan.Kind != copyResume)
 	if err != nil {
@@ -972,7 +1037,22 @@ func (r *runner) snapshot(ctx context.Context) error {
 		}
 	} else {
 		if err := r.cleanBeforeRecopy(ctx); err != nil {
+			if r.opt.Resync {
+				// 清到一半失败：把**已经清掉的**表落进审计（job.resync.partial），
+				// 让「清了哪几张」在审计里自洽，而不是只活在易失的事件流里。
+				r.resyncReport.Tables = r.clearedTables
+				if aerr := r.auditResyncPartial(ctx, err); aerr != nil {
+					return fmt.Errorf("%w（另：写 job.resync.partial 审计失败：%v）", err, aerr)
+				}
+			}
 			return err
+		}
+		if r.opt.Resync {
+			// 报告与「实清」审计都在这里定稿：清完才填，不拿计划冒充结果。
+			r.resyncReport.Tables = r.clearedTables
+			if err := r.auditResyncCleared(ctx); err != nil {
+				return err
+			}
 		}
 		// 开始一次新的搬：**清块标记 + 推位点，同一个事务**（pgsink.StartFreshCopy）。
 		// 分两次写、还先推位点的话，中间崩一次会留下「新位点 + 上一轮的块标记」，
@@ -1031,6 +1111,13 @@ func (r *runner) snapshot(ctx context.Context) error {
 	r.emit(ctx, control.Event{Type: "note",
 		Message: fmt.Sprintf("全量完成：%d 行，%d 块，%d 张表，用时 %s（%.0f 行/秒）",
 			r.rowsCopied, chunks, tables, elapsed.Truncate(time.Millisecond), rate)})
+	r.snapshotDone = true
+	if r.opt.Resync {
+		// 搬成才解除按表暂停：清表时那些记录是**故意**留着的（结构可能还没对齐）。
+		if err := r.clearPauseRecords(ctx); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -1055,6 +1142,10 @@ func (r *runner) cleanBeforeRecopy(ctx context.Context) error {
 			continue
 		}
 		if err := r.recopyAction(ctx, ref, r.plan.CleanWhy); err != nil {
+			// 非 --resync 路径，这里是**唯一**的判定点（原样报给用户）。
+			// --resync 已经在前置里过了同一道判定；能走到这里还失败，只可能是
+			// 「预检与真清之间所有权变了」（`_jl_object` 被外部改过）——属内部错误面，
+			// 原样上报即可，不另写一套文案（换文案会让人以为是新的用户可修问题）。
 			return err
 		}
 		// 清数据和清标记**必须同一个事务**：中间崩在「数据清了、标记还在」那种
@@ -1062,6 +1153,9 @@ func (r *runner) cleanBeforeRecopy(ctx context.Context) error {
 		if err := r.sink.ResetTableChunks(ctx, r.targetRef(ref)); err != nil {
 			return fmt.Errorf("清空 %s 准备重搬失败: %w", name, err)
 		}
+		// **清成一张记一张**：清到一半崩/失败时，审计里也要能说出「已经清掉哪几张」，
+		// 而不是只在事件流里翻（进程一重启就没了）。
+		r.clearedTables = append(r.clearedTables, name)
 		// 说清维护窗口的形状：清完到搬完之间，目标端是**部分数据**，不是「旧但完整」。
 		r.note(ctx, "清空了 "+name+" 里上次搬进去的行（重搬全量，避免留下源端已删除的行）；"+
 			"从这一刻到这张表搬完之前，目标端是部分数据，不是旧但完整的快照")

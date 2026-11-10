@@ -37,6 +37,22 @@
 - `_jl_chunk(job_key, table_name, chunk_no, done, rows)` 每完成一块更新。
 - 重启：读未完成块继续；快照 id 已失效（源库重启 / 超过 `idle_replication_slot_timeout`）→ 整段重来，并在动作清单里说明原因。
 - MySQL 无主键表：只有表级断点，重来成本要在 `plan` 里标出。
+- **显式整轮重搬**：`jinliang run --job <任务名> --resync`。它不看上面的续跑判据，
+  直接落 `copyFresh`，顺序是：
+  1. **先问「这几张表能不能清」**（`DidCreateTable`；用户自己的表一律停下问，**此时位点与书签都还没动**）；
+  2. 清空 `position/watermark/snapshot_id`（必须在清表之前：反过来崩在中间就是「位点说有进度、表是空的」）；
+  3. 重建书签（`Prepare` 会 drop 旧 slot、按当前位点建新的）；
+  4. 清本任务写过的表 + 该表的块标记（同一个事务），然后从零重搬。
+  不清用户表、不换 `job_key`、不删运行历史。审计分三段，每段只说自己那一刻的事实：
+  - `job.resync`：谁触发（actor）、哪个书签、旧 `phase`/`position`、`planned_tables`（**计划**）；
+  - `job.resync.cleared`：**全部**清完之后写，`cleared_tables` 是实清清单；
+  - `job.resync.partial`：清到一半失败时写，`cleared_tables` 是**已经清掉**的那几张 + 失败原因
+    （没有这条，「清了哪几张」只能翻事件流，而事件流进程一重启就没了）。
+
+  **边界（写在前面，别误解）**：进程被 `SIGKILL` / 断电打断时 `partial` **写不出来**
+  （审计是普通写，没有塞进每张表的 TRUNCATE 事务——那样代价不值）。此时审计里只剩
+  `job.resync` 的 `planned_tables`，语义是「开始过、没确认清完」，**不等于「没清」**：
+  真正的进度以目标端数据为准（表是否为空 / `_jl_chunk` 标记），不要拿「没有 partial」推断没清过。
 
 ## 5. 与增量的接缝
 
