@@ -313,7 +313,7 @@ jobs:
         if: always()
         # 用**这一步的真实 outcome** 判「实现落地没有」：success = 能过了 = 该把断言打开。
         # 只看静态代码（有没有写 _jl_chunk）会误判：#95 落了块记账，但续跑接线还没接。
-        run: python3 scripts/known_red.py verify --id mysqlsink-chunk-accounting --result "${{ steps.killcopy.outcome }}"
+        run: python3 scripts/known_red.py verify --id chunk-resume-wiring --result "${{ steps.killcopy.outcome }}"
       - name: 结果进 job summary
         if: always()
         run: |
