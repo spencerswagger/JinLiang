@@ -142,3 +142,45 @@ scripts/local_stack.sh down
 3. `merge-gate` 目前是**独立 workflow**，还没进 branch protection 的 required checks：
    按 #59 的节奏，先观察一周（advisory），再和 `review-gate` 一起转 required。
 4. 反向注入的 engine 档需要真库；CI 里跑在 `engine-mutation` job，本地靠 `local_stack.sh`。
+
+## 7. 缺口闭合（2026-11-10 夜，第二轮）
+
+三个缺口都是在既有门禁上补，没有重写已通过的部分。
+
+### 7.1 `b1_mysql_to_mysql.sh killcopy` 从「能跑过」改成「能证伪」
+
+| 项 | 内容 |
+|---|---|
+| 用例 | `ROWS=20000 scripts/b1_mysql_to_mysql.sh ./dist/jinliang killcopy`（块 2000 行/块） |
+| 旧行为 | kill 在 4000/20000 行时 `_jl_chunk` **0 行**，重启**整轮重搬 20000 行**，脚本仍 PASS——因为它只比「两端最终一致」，而整轮重搬当然也一致 |
+| 新判据 | ① `_jl_chunk` 行数 > 0（没有块记账 = 谈不上块级续跑）；② 重启重搬行数 ≤ 1 块（`重搬 = 重启搬的行数 − 未搬完的行数`） |
+| 是否先红过 | **是**：本地实跑 `killcopy exit=1`，输出 `FAIL: _jl_chunk 里 0 行 —— 目标端没写块记账` |
+| 现在的行为（诊断用，断言临时旁路） | `结果：阶段 done，复制 20000 行` —— 即整轮重搬；其中 4000 行是已提交块的重搬（`重搬 = 20000 − (20000−4000)`），超过 1 块 2000 行 → 判据会红 |
+| 当前状态 | **挂起（已知红）**：等 Data 补 `mysqlsink` 块记账。断言已写死，落地那天自动变绿；CI 里这一步 `continue-on-error` 且命名写明「已知红」，不会静默 |
+
+### 7.2 MySQL→MySQL 有 CI 格了
+
+| 项 | 内容 |
+|---|---|
+| job | `merge-gate.yml` 的 `mysql-mysql`（两个独立 MySQL 实例：源 53306 / 目标 53307） |
+| 参数 | `ROWS=20000`，与本地一致；三步：全量+增量 / 增量中途 kill -9（重搬 0 行）/ 块级续跑（已知红） |
+| 当前状态 | 全量与 kill 两格**绿**（本地同口径：全量 20000 行 / `20000:ea88a483…`；增量 19996 行 / 重搬 0）；killcopy 方向见 7.1 |
+
+### 7.3 引擎层 kill -9 覆盖 5.7 / 8.4
+
+| 项 | 内容 |
+|---|---|
+| 用例 | `TestMySQLSourceIncrementalResumeAfterSIGKILL`（`internal/engine`，引擎层，不是连接器契约层） |
+| 覆盖 | `acceptance` job 每个 MySQL 腿各跑一遍：5.7.44 / 8.0.46 / 8.4.13，判据「重启重搬 0 行」 |
+| 探测而不是版本号 | 状态语句由 `mysqlsource` 能力探测决定（先 `SHOW BINARY LOG STATUS`，失败退 `SHOW MASTER STATUS`；见 `internal/mysqlsource/capability.go`，单测 `capability_test.go` 覆盖两条路径）。CI 步骤里也把探测结果打出来，红的时候能区分「版本没覆盖」和「行为退化」 |
+| 当前状态 | **绿**（5.7 / 8.0 / 8.4 三腿都 PASS，见 run 42870646277 起的九格表） |
+
+### 7.4 回归：停止请求之后的真实流错误不许被记成「已停止」
+
+| 项 | 内容 |
+|---|---|
+| 用例 | `TestStopRequestDoesNotSwallowLateRealError`（`internal/engine/stop_late_error_test.go`，构建标签 `knownred`） |
+| 触发条件 | ① 流在跑，`--stop-after`（或追平）先把 `stopHit` 置 true 并 cancel ctx；② 连接器在 ctx 取消之后因为**自己的原因**返回真实错误（binlog 被清理 / 复制权限被收回 / 网络断开）；③ `streamGeneric` 的收尾 switch 命中 `case stopHit.Load() \|\| idleHit.Load():`，把真实错误丢掉 |
+| 是否先红过 | **是**：`go test -tags=knownred -run TestStopRequestDoesNotSwallowLateRealError ./internal/engine/` → `真实流错误被记成「正常收尾」（reachedDone）：退出码会变成 130（已停止）` |
+| 为什么用标签不用 Skip | Skip 会让人以为跑过了；`knownred` 保证常规 `go test ./...` 不受影响，而 merge-gate 有一条 `continue-on-error` 的步骤天天跑它——修好后那一步自己变绿，去掉标签即可 |
+| 当前状态 | **挂起（已知红）**，交 Core 修 `target.go` 的收尾判据（建议：先判「错误是否由我们 cancel 引起」，再判 stopHit） |

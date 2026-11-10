@@ -17,6 +17,13 @@ set -euo pipefail
 
 BIN=${1:-./dist/jinliang}
 MODE=${2:-full}
+GC="$(cd "$(dirname "$0")" && pwd)/gate_checks.py"
+# killcopy 要在「块」这一级证伪：表 2 万行、块 2000 行 → 至少 8 个块，
+# kill 之后_已提交的块_不许重搬。块太大（默认 5 万）时一张表只有一个块，
+# 这一格就退化成「整表重搬」也看不出来。
+if [ "$MODE" = "killcopy" ] && [ -z "${CHUNK_ROWS:-}" ]; then
+  CHUNK_ROWS=2000
+fi
 ROWS=${ROWS:-200000}
 SRC=${JINLIANG_TEST_MYSQL_SRC_DSN:-}
 DST=${JINLIANG_TEST_MYSQL_DST_DSN:-${JINLIANG_TEST_MYSQL_DSN:-}}
@@ -135,18 +142,41 @@ if [ "$MODE" = "killcopy" ]; then
   done
   kill -9 "$PID" 2>/dev/null || true
   wait "$PID" 2>/dev/null || true
-  MID=$(dst "SELECT COUNT(*) FROM m2m_orders" || echo 0)
-  echo "   全量中途 kill -9：目标端此刻 $MID/$ROWS 行"
-  echo "   块进度最后一条边界：$(dst "SELECT COALESCE(range_to,'(空)') FROM _jl_chunk ORDER BY chunk_no DESC LIMIT 1" || echo 无)"
+  MID=$(dst "SELECT COUNT(*) FROM m2m_orders" 2>/dev/null || echo 0)
+  CHUNKROWS=$(dst "SELECT COUNT(*) FROM _jl_chunk" 2>/dev/null || echo 0)
+  CHUNKLAST=$(dst "SELECT COALESCE(range_to,'(空)') FROM _jl_chunk ORDER BY chunk_no DESC LIMIT 1" 2>/dev/null || echo 无)
+  echo "   全量中途 kill -9：目标端此刻 $MID/$ROWS 行（块 ${CHUNK_ROWS:-50000} 行/块）"
+  echo "   _jl_chunk 行数：$CHUNKROWS；最后一条边界：$CHUNKLAST"
+
+  # ── 判据 1：块记账必须存在 ─────────────────────────────────────
+  # 没有块记账时，重启只能整轮重搬，而旧脚本只比「两端最终一致」——整轮重搬也能一致，
+  # 于是这一格长期是假绿（kill 在 4000/20000 行时 _jl_chunk 0 行、重启又搬 20000 行，仍 PASS）。
+  if [ "${CHUNKROWS:-0}" -le 0 ]; then
+    echo "FAIL: _jl_chunk 里 0 行 —— 目标端没写块记账（mysqlsink 的块级续跑还没接上）。"
+    echo "      这一格不能算通过：没有块边界，'续跑' 只能是整轮重搬（旧脚本正因此假绿）。"
+    echo "      等块记账落地后这一格会自动变绿；在此之前它**必须红**。"
+    exit 1
+  fi
+
   timeout 600 "$BIN" run --job b4-mysql-to-mysql --data-dir "$DATA" --stop-when-idle 5s > "$WORK/run2.log" 2>&1 || true
+  # 重启这一轮搬了多少行：generic 路径的收尾行是「复制 N 行」。
   RESUME_ROWS=$(grep -oE "复制 [0-9]+ 行" "$WORK/run2.log" | tail -1 | grep -oE "[0-9]+" || echo 0)
-  echo "   续跑重搬 $RESUME_ROWS 行（应为 $((ROWS - MID)) 左右，即只搬没搬完的）"
+  EXPECT=$((ROWS - MID))                 # 没搬完、必须补的行数
+  REBUILD=$((RESUME_ROWS - EXPECT))      # 已提交块被重搬的行数（>0 就是整段重来）
+  echo "   中断 $MID 行 → 重启搬 $RESUME_ROWS 行（应补 $EXPECT 行，多出来的是重搬）"
+  # ── 判据 2：已提交的块不许重搬（只允许中断时正在写的那一块回滚重来）─────────
+  python3 "$GC" recopy --copied "$REBUILD" --allow "${CHUNK_ROWS:-50000}" \
+    --label "块级续跑（允许 1 块内回滚）" || {
+    echo "FAIL: 重启重搬了 $REBUILD 行（超过 1 块 ${CHUNK_ROWS:-50000} 行）：这不是块级续跑，是整轮重搬。"
+    echo "--- run2.log 尾部 ---"; tail -20 "$WORK/run2.log"; exit 1
+  }
+
   T1=$(date +%s.%N)
   echo "   续跑耗时 $(python3 -c "print(f'{$T1-$T0:.2f}')")s"
   S=$(fp src); D=$(fp dst)
   echo "   源端 $S / 目标 $D"
   [ "$S" = "$D" ] || { echo "FAIL: 块级续跑之后两端不一致"; exit 1; }
-  echo "PASS: MySQL → MySQL 全量中途 kill -9，续跑后两端一致 $S"
+  echo "PASS: MySQL → MySQL 全量中途 kill -9，块进度 $CHUNKROWS 行，重启重搬 $REBUILD 行（≤1 块），两端一致 $S"
   exit 0
 fi
 

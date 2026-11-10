@@ -233,7 +233,34 @@ YAML
   emit "mysql-postgres" "$n" "${s_fp#*:}" "$secs" pass "mysql=$ver $extra"
 }
 
-# ── 组合 2：PG → MySQL（本版只全量；增量必须明确拒绝） ───────────
+# 增量验收（三组合共用）：按 #93 之后的实现判，**不再把「被拒」当通过**。
+#
+# 旧脚本的口径是「这三个方向只支持全量，增量必须明确拒绝」——那是 #73/#89 之前的
+# 事实。现在三个方向都接通了增量，`--stop-after` 会把一个正常流式跑的任务杀掉
+# （退出码 130），脚本却把它当成「被拒」，于是 #92 在 #93 合入后红在两格上：
+# 真正的结论是「增量跑起来了，只是判据还在等一句拒绝文案」。
+#
+# 判据只有两条，都可证伪：
+#   ① rc == 0：任务自己追平后收尾，不是被 timeout / Ctrl-C 打断；
+#   ② 源与目标的内容指纹一致（行数 + 逐行 md5）——不是「看起来动了」。
+# 失败时把日志尾巴打出来：不接受「红了但不知道为什么」。
+incr_check() { # $1=job $2=data-dir $3=log $4=label $5=源指纹 $6=目标表名（连接已 split 到目标）
+  local job=$1 data=$2 log=$3 label=$4 s_fp=$5 T=$6 d_fp rc
+  timeout -k 5 180 "$BIN" run --job "$job" --data-dir "$data" --stop-when-idle 3s >"$log" 2>&1
+  rc=$?
+  if [ $rc -ne 0 ]; then
+    echo "FAIL: $label 退出码 $rc（增量没跑成；本版三个方向都已接通，拒绝=回归）"
+    echo "--- $log ---"; tail -20 "$log" 2>/dev/null; echo "--- end ---"
+    return 1
+  fi
+  # 目标指纹必须**跑完再取**：跑前那份还是全量的指纹，拿它比等于拿「跑之前」比「跑之前」，
+  # 增量一行没写也会绿（这条最早就是这么写错的，红了两格才发现）。
+  d_fp=$(fp_mysql "$T")
+  python3 "$GC" fp --src "$s_fp" --dst "$d_fp" --label "$label" || { echo "  源 $s_fp / 目标 $d_fp"; return 1; }
+  return 0
+}
+
+# ── 组合 2：PG → MySQL（全量 + 增量追平） ───────────────────────
 combo_postgres_mysql() {
   local src=${JINLIANG_TEST_PG_SRC_DSN:-} dst=${JINLIANG_TEST_MYSQL_DST_DSN:-${JINLIANG_TEST_MYSQL_DSN:-}}
   [ -n "$src" ] && [ -n "$dst" ] || { echo "EX_CONFIG: 缺 JINLIANG_TEST_PG_SRC_DSN / JINLIANG_TEST_MYSQL_DST_DSN" >&2; return 78; }
@@ -245,6 +272,9 @@ combo_postgres_mysql() {
   myq "DROP TABLE IF EXISTS \`$T\`"
   myq "DROP TABLE IF EXISTS _jl_meta,_jl_chunk,_jl_lease,_jl_object,_jl_instance"
 
+  # 一开始就用 continuous+initial：书签/流在造增量之前就建好，三笔变更一定在流里。
+  # 不能「先 once 全量、再 import 成 continuous」——once 收尾会把位点推到当前，
+  # 两次 import 之间那三笔会落在位点后面，看起来像「增量 0 行」。
   cat > "$job" <<YAML
 version: 1
 job: acc-pg-mysql
@@ -260,56 +290,37 @@ target:
 content:
   tables:
     $T: {}
-mode: {frequency: once}
+mode: {frequency: continuous+initial}
 YAML
   [ -n "${JINLIANG_TEST_MYSQL_DST_DSN:-}" ] || export JINLIANG_TEST_MYSQL_DST_DSN=$dst
   timeout 120 "$BIN" import --file "$job" --data-dir "$data" >/dev/null 2>&1 || { echo "FAIL: import 失败"; return 1; }
 
   local t0 t1 secs s_fp d_fp n rc
-  mark "pg→mysql 全量开始"
+  mark "pg→mysql 全量+追平开始"
   t0=$(now_s)
-  runbin run --job acc-pg-mysql --data-dir "$data" >"$W/run1.log" 2>&1
+  runbin run --job acc-pg-mysql --data-dir "$data" --stop-when-idle 5s >"$W/run1.log" 2>&1
   rc=$?
-  t1=$(now_s); secs=$(elapsed "$t0" "$t1")
-  mark "pg→mysql 全量结束 rc=$rc 用时=${secs}s"
-  [ $rc -eq 0 ] || { echo "FAIL: 全量退出码 $rc"; tail -5 "$W/run1.log"; return 1; }
+  mark "pg→mysql 全量+追平结束 rc=$rc"
+  [ $rc -eq 0 ] || { echo "FAIL: 全量退出码 $rc"; tail -20 "$W/run1.log"; return 1; }
 
   s_fp=$(fp_pg "$src" "$T"); d_fp=$(fp_mysql "$T")
   python3 "$GC" fp --src "$s_fp" --dst "$d_fp" --label "pg→mysql 全量" || { echo "  源 $s_fp / 目标 $d_fp"; return 1; }
 
-  # 增量：本版两条路都可能是真的（有的方向只搬全量、有的已经接了流）。
-  # 判据不猜产品口径，只认可证伪的两件事：
-  #   ① 跑成了 → 源与目标的**内容指纹必须一致**（不是「看起来动了」）；
-  #   ② 没跑成 → 目标端行数一行都不许多（拒绝 = 什么都没写）。
-  local before_n after_n reason incr_state
-  before_n=$(myq "SELECT COUNT(*) FROM \`$T\`")
   pgq "$src" "INSERT INTO $T VALUES ($((ROWS+1)),'inc-insert')" >/dev/null
   pgq "$src" "UPDATE $T SET payload='inc-update' WHERE id=2" >/dev/null
   pgq "$src" "DELETE FROM $T WHERE id=3" >/dev/null
-  sed 's/frequency: once/frequency: continuous+initial/' "$job" > "$W/job2.yaml"
-  timeout 120 "$BIN" import --file "$W/job2.yaml" --data-dir "$data" >/dev/null 2>&1 || true
-  mark "pg→mysql 增量"
-  if timeout -k 5 120 "$BIN" run --job acc-pg-mysql --data-dir "$data" --stop-when-idle 3s >"$W/incr.log" 2>&1; then
-    incr_state=ok
-    s_fp=$(fp_pg "$src" "$T"); d_fp=$(fp_mysql "$T")
-    python3 "$GC" fp --src "$s_fp" --dst "$d_fp" --label "pg→mysql 增量" || { echo "  源 $s_fp / 目标 $d_fp"; return 1; }
-  else
-    incr_state=refused
-    after_n=$(myq "SELECT COUNT(*) FROM \`$T\`")
-    python3 "$GC" rows --src "$before_n" --dst "$after_n" --expect "$before_n" --label "增量被拒后行数不变" || return 1
-    reason=$(grep -oE "只搬全量|还没接上|只支持全量|没开逻辑变更流|定时增量|水位" "$W/incr.log" | head -1)
-    if [ -z "$reason" ]; then
-      echo "FAIL: 增量没跑成，但日志里没有一句原因"
-      echo "--- $W/incr.log ---"; tail -20 "$W/incr.log" 2>/dev/null; echo "--- end ---"
-      return 1
-    fi
-  fi
+  mark "pg→mysql 增量三笔"
+  s_fp=$(fp_pg "$src" "$T")
+  split_mysql "$dst"
+  incr_check acc-pg-mysql "$data" "$W/incr.log" "pg→mysql 增量" "$s_fp" "$T" || return 1
+  t1=$(now_s); secs=$(elapsed "$t0" "$t1")
 
+  split_mysql "$dst"
   n=$(myq "SELECT COUNT(*) FROM \`$T\`")
-  emit "postgres-mysql" "$n" "${s_fp#*:}" "$secs" pass "mysql=$ver incremental=$incr_state"
+  emit "postgres-mysql" "$n" "${s_fp#*:}" "$secs" pass "mysql=$ver incremental=ok"
 }
 
-# ── 组合 3：MySQL → MySQL（本版只全量；增量必须明确拒绝） ────────
+# ── 组合 3：MySQL → MySQL（全量 + 增量追平） ────────────────────
 combo_mysql_mysql() {
   local src=${JINLIANG_TEST_MYSQL_SRC_DSN:-} dst=${JINLIANG_TEST_MYSQL_DST_DSN:-}
   [ -n "$src" ] && [ -n "$dst" ] || { echo "EX_CONFIG: 缺 JINLIANG_TEST_MYSQL_SRC_DSN / JINLIANG_TEST_MYSQL_DST_DSN" >&2; return 78; }
@@ -338,53 +349,34 @@ target:
 content:
   tables:
     $T: {}
-mode: {frequency: once}
+mode: {frequency: continuous+initial}
 YAML
   timeout 120 "$BIN" import --file "$job" --data-dir "$data" >/dev/null 2>&1 || { echo "FAIL: import 失败"; return 1; }
 
   local t0 t1 secs d_fp n rc
-  mark "mysql→mysql 全量开始"
+  mark "mysql→mysql 全量+追平开始"
   t0=$(now_s)
-  runbin run --job acc-mysql-mysql --data-dir "$data" >"$W/run1.log" 2>&1
+  runbin run --job acc-mysql-mysql --data-dir "$data" --stop-when-idle 5s >"$W/run1.log" 2>&1
   rc=$?
-  t1=$(now_s); secs=$(elapsed "$t0" "$t1")
-  mark "mysql→mysql 全量结束 rc=$rc 用时=${secs}s"
-  [ $rc -eq 0 ] || { echo "FAIL: 全量退出码 $rc"; tail -5 "$W/run1.log"; return 1; }
+  mark "mysql→mysql 全量+追平结束 rc=$rc"
+  [ $rc -eq 0 ] || { echo "FAIL: 全量退出码 $rc"; tail -20 "$W/run1.log"; return 1; }
 
   d_fp=$(fp_mysql "$T")
   python3 "$GC" fp --src "$s_fp" --dst "$d_fp" --label "mysql→mysql 全量" || { echo "  源 $s_fp / 目标 $d_fp"; return 1; }
 
-  local before_n after_n reason incr_state s_fp2 d_fp2
-  before_n=$(myq "SELECT COUNT(*) FROM \`$T\`")
-  # 源端三笔（增/改/删），与 MySQL→PG 那格同一套动作。
+  # 源端三笔（增/改/删），与 MySQL→PG / PG→MySQL 同一套动作。
   split_mysql "$src"
   myq "INSERT INTO \`$T\` VALUES ($((ROWS+1)),'inc-insert')"
   myq "UPDATE \`$T\` SET payload='inc-update' WHERE id=2"
   myq "DELETE FROM \`$T\` WHERE id=3"
-  s_fp2=$(fp_mysql "$T")
+  s_fp=$(fp_mysql "$T")
   split_mysql "$dst"
-  sed 's/frequency: once/frequency: continuous+initial/' "$job" > "$W/job2.yaml"
-  timeout 120 "$BIN" import --file "$W/job2.yaml" --data-dir "$data" >/dev/null 2>&1 || true
-  mark "mysql→mysql 增量"
-  if timeout -k 5 120 "$BIN" run --job acc-mysql-mysql --data-dir "$data" --stop-when-idle 3s >"$W/incr.log" 2>&1; then
-    incr_state=ok
-    d_fp2=$(fp_mysql "$T")
-    python3 "$GC" fp --src "$s_fp2" --dst "$d_fp2" --label "mysql→mysql 增量" || { echo "  源 $s_fp2 / 目标 $d_fp2"; return 1; }
-    s_fp=$s_fp2
-  else
-    incr_state=refused
-    after_n=$(myq "SELECT COUNT(*) FROM \`$T\`")
-    python3 "$GC" rows --src "$before_n" --dst "$after_n" --expect "$before_n" --label "增量被拒后行数不变" || return 1
-    reason=$(grep -oE "只搬全量|还没接上|只支持全量|没开逻辑变更流|定时增量|水位" "$W/incr.log" | head -1)
-    if [ -z "$reason" ]; then
-      echo "FAIL: 增量没跑成，但日志里没有一句原因"
-      echo "--- $W/incr.log ---"; tail -20 "$W/incr.log" 2>/dev/null; echo "--- end ---"
-      return 1
-    fi
-  fi
+  mark "mysql→mysql 增量三笔"
+  incr_check acc-mysql-mysql "$data" "$W/incr.log" "mysql→mysql 增量" "$s_fp" "$T" || return 1
+  t1=$(now_s); secs=$(elapsed "$t0" "$t1")
 
   n=$(myq "SELECT COUNT(*) FROM \`$T\`")
-  emit "mysql-mysql" "$n" "${s_fp#*:}" "$secs" pass "mysql=$ver incremental=$incr_state"
+  emit "mysql-mysql" "$n" "${s_fp#*:}" "$secs" pass "mysql=$ver incremental=ok"
 }
 
 LIST="mysql-postgres postgres-mysql mysql-mysql"

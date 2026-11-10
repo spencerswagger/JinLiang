@@ -81,6 +81,15 @@ jobs:
           JINLIANG_TEST_PG_SRC_DSN: postgres://jinliang:jinliang@127.0.0.1:55433/jinliang_src?sslmode=disable
           JINLIANG_TEST_RECLAIM_SLOTS: "1"
         run: python3 scripts/mutation_gate.py --tier engine --json mutation-engine.json
+      - name: 回归（knownred）：停止请求之后的真实流错误不许被记成「已停止」
+        continue-on-error: true
+        env:
+          JINLIANG_TEST_PG_DSN: postgres://jinliang:jinliang@127.0.0.1:55432/jinliang_test?sslmode=disable
+        run: |
+          # 这一格现在是红的（实现还没修，见 internal/engine/stop_late_error_test.go 的触发条件）。
+          # continue-on-error 是「已知红」而不是「放过」：它天天跑，修好后自然变绿，
+          # 届时去掉这个字段并把 knownred 标签去掉即可。
+          go test -tags=knownred -count=1 -v -timeout 5m -run '^TestStopRequestDoesNotSwallowLateRealError$' ./internal/engine/
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -177,12 +186,25 @@ jobs:
           ARGS=(--rows "${ROWS:-20000}" --kill --json "acceptance-${{ matrix.mysql }}.json")
           [ -n "$ONLY" ] && ARGS+=(--only "$ONLY")
           timeout -k 10 900 $FLAG scripts/acceptance_matrix.sh "${ARGS[@]}"
-      - name: ① 的验收用例（MySQL 增量 kill -9 → 重搬 0 行）
+      # 引擎层（不是连接器契约层）的 kill -9 回归：三个版本各跑一遍，判据是「重搬 0 行」。
+      # 这里**不按版本号分支**：源端用哪条状态语句由 `mysqlsource` 的能力探测决定
+      # （先试 SHOW BINARY LOG STATUS，再退 SHOW MASTER STATUS；8.4 删了后者）。
+      # 下面先打印服务端版本与探测结果，红的时候能一眼看出是「版本没覆盖」还是「行为退化」。
+      - name: 引擎层 kill -9（MySQL ${{ matrix.mysql }} → PG，重搬 0 行）
         env:
           JINLIANG_TEST_MYSQL_SRC_DSN: mysql://jinliang:jinliang@127.0.0.1:53306/jinliang_src
           JINLIANG_TEST_PG_DSN: postgres://jinliang:jinliang@127.0.0.1:55433/jinliang_test?sslmode=disable
           JINLIANG_TEST_RECLAIM_SLOTS: "1"
-        run: go test -tags=integration -count=1 -v -timeout 10m -run '^TestMySQLSourceIncrementalResumeAfterSIGKILL$' ./internal/engine/
+        run: |
+          set -e
+          echo "服务端版本：$(docker exec my-src mysql -uroot -proot -N -e 'SELECT VERSION()')"
+          echo "状态语句探测（能力探测，不按版本号分支）："
+          if docker exec my-src mysql -uroot -proot -e 'SHOW BINARY LOG STATUS' >/dev/null 2>&1; then
+            echo "  SHOW BINARY LOG STATUS 可用（8.4+ 路径）"
+          else
+            echo "  SHOW BINARY LOG STATUS 不可用 → 回退 SHOW MASTER STATUS（5.7/8.0 路径）"
+          fi
+          go test -tags=integration -count=1 -v -timeout 10m -run '^TestMySQLSourceIncrementalResumeAfterSIGKILL$' ./internal/engine/
       - name: 结果表进 job summary
         if: always()
         run: |
@@ -192,3 +214,73 @@ jobs:
         with:
           name: acceptance-mysql-${{ matrix.mysql }}
           path: acceptance-${{ matrix.mysql }}.json
+
+  mysql-mysql:
+    name: MySQL→MySQL（双实例：全量 / 增量 kill / 块级续跑）
+    # 参数与本地验收一致：ROWS=20000、两个独立实例（源 53306 / 目标 53307）。
+    # 为什么必须两个实例：同实例时目标端的写入会进源端 binlog，读到自己刚写的行。
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.x"
+      - name: 起 MySQL 源（8.0，开 binlog ROW/FULL）
+        run: |
+          set -e
+          docker run -d --name my-src -p 53306:3306 \
+            -e MYSQL_ROOT_PASSWORD=root -e MYSQL_DATABASE=jinliang_src \
+            -e MYSQL_USER=jinliang -e MYSQL_PASSWORD=jinliang \
+            mysql:8.0 --server-id=1 --log-bin=mysql-bin --binlog-format=ROW --binlog-row-image=FULL
+          for i in $(seq 1 120); do
+            docker exec my-src mysql -uroot -proot -N -e 'select 1' >/dev/null 2>&1 && exit 0
+            sleep 2
+          done
+          docker logs my-src; exit 1
+      - name: 起 MySQL 目标（8.0）
+        run: |
+          set -e
+          docker run -d --name my-dst -p 53307:3306 \
+            -e MYSQL_ROOT_PASSWORD=root -e MYSQL_DATABASE=jinliang_target \
+            -e MYSQL_USER=jinliang -e MYSQL_PASSWORD=jinliang \
+            mysql:8.0 --server-id=2 --log-bin=mysql-bin --binlog-format=ROW --binlog-row-image=FULL
+          for i in $(seq 1 120); do
+            docker exec my-dst mysql -uroot -proot -N -e 'select 1' >/dev/null 2>&1 && exit 0
+            sleep 2
+          done
+          docker logs my-dst; exit 1
+      - name: 补权限
+        run: |
+          set -e
+          docker exec my-src mysql -uroot -proot -e "
+            GRANT ALL PRIVILEGES ON *.* TO 'jinliang'@'%' WITH GRANT OPTION; FLUSH PRIVILEGES;"
+          docker exec my-dst mysql -uroot -proot -e "
+            GRANT ALL PRIVILEGES ON *.* TO 'jinliang'@'%' WITH GRANT OPTION; FLUSH PRIVILEGES;"
+      - name: 构建
+        run: |
+          mkdir -p dist
+          CGO_ENABLED=0 go build -trimpath -o dist/jinliang ./cmd/jinliang
+      - name: 全量 → 增量（20000 行）
+        env: &m2m-env
+          JINLIANG_TEST_MYSQL_SRC_DSN: mysql://jinliang:jinliang@127.0.0.1:53306/jinliang_src
+          JINLIANG_TEST_MYSQL_DST_DSN: mysql://jinliang:jinliang@127.0.0.1:53307/jinliang_target
+          ROWS: "20000"
+        run: timeout -k 10 900 bash scripts/b1_mysql_to_mysql.sh ./dist/jinliang
+      - name: 增量中途 kill -9 → 重搬 0 行
+        env: *m2m-env
+        run: timeout -k 10 900 bash scripts/b1_mysql_to_mysql.sh ./dist/jinliang kill
+      - name: 块级续跑（块进度 > 0 且重启重搬 ≤ 1 块）
+        # ⚠ 现在是**已知红**：mysqlsink 还没写块记账（Data 在补），这一格按设计必须红。
+        # 断言已经写死在脚本里，实现落地这天这一步会自己变绿；届时去掉 continue-on-error。
+        continue-on-error: true
+        env: *m2m-env
+        run: timeout -k 10 900 bash scripts/b1_mysql_to_mysql.sh ./dist/jinliang killcopy
+      - name: 结果进 job summary
+        if: always()
+        run: |
+          {
+            echo "### MySQL→MySQL（ROWS=20000，双实例）"
+            echo "- 全量+增量：见上一步日志"
+            echo "- kill -9：判据「重启重搬 0 行」"
+            echo "- killcopy：判据「_jl_chunk > 0 且重启重搬 ≤ 1 块」——当前已知红（mysqlsink 块记账待补）"
+          } >> "$GITHUB_STEP_SUMMARY"
