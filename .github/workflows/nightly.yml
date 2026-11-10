@@ -304,6 +304,9 @@ jobs:
             GRANT REPLICATION CLIENT, REPLICATION SLAVE ON *.* TO 'jinliang'@'%';
             FLUSH PRIVILEGES;"
       - name: 全量集成（含 engine / mysqlsource）
+        env:
+          # 本 job 独占这套 docker run 起来的 PG，所以允许包首尾回收上一轮泄漏的空闲书签。
+          JINLIANG_TEST_RECLAIM_SLOTS: "1"
         # 资源隔离（不是 -p 1）：mysqlsource 的 Snapshot 枚举整个源库；mysqlsink、
         # engine、pgsink 各自在 public 里建/删 _jl_* 状态表，彼此会抢；verify/gc/
         # doctor/remedy 用独立 schema，可以并行。

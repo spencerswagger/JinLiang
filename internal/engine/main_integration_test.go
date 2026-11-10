@@ -22,13 +22,26 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
+// reclaimEnabled：回收只在**显式开启**时做（JINLIANG_TEST_RECLAIM_SLOTS=1）。
+//
+// 默认关的理由：reclaimSlots 删的是源库里**所有空闲的 `jl_%` 槽**。CI 里每个 job 自己
+// `docker run` 一套 PG、独占，所以没问题；但只要有人把 JINLIANG_TEST_PG_SRC_DSN 指到有真实
+// 任务的库，或者本地用 `go test ./...`（包级并行）跟别人共用一套 PG，就会把别人的空闲槽一起
+// 收走——对方下一次连流直接报「槽不存在」，甚至在流上被 pg_terminate_backend 打断成 57P01。
+// CI 的集成步骤里显式设 JINLIANG_TEST_RECLAIM_SLOTS=1（那里源库是 job 独占的）。
+func reclaimEnabled() bool { return os.Getenv("JINLIANG_TEST_RECLAIM_SLOTS") == "1" }
+
 func TestMain(m *testing.M) {
-	if dsn := os.Getenv("JINLIANG_TEST_PG_SRC_DSN"); dsn != "" {
-		reclaimSlots(dsn)
+	if reclaimEnabled() {
+		if dsn := os.Getenv("JINLIANG_TEST_PG_SRC_DSN"); dsn != "" {
+			reclaimSlots(dsn)
+		}
 	}
 	code := m.Run()
-	if dsn := os.Getenv("JINLIANG_TEST_PG_SRC_DSN"); dsn != "" {
-		reclaimSlots(dsn)
+	if reclaimEnabled() {
+		if dsn := os.Getenv("JINLIANG_TEST_PG_SRC_DSN"); dsn != "" {
+			reclaimSlots(dsn)
+		}
 	}
 	os.Exit(code)
 }
