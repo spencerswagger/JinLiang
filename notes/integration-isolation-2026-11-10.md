@@ -86,9 +86,11 @@ nightly 的 `integration` job 早就用「逐包串行调用」绕开这一条�
 
 两条使用约束（写给以后加用例的人，别踩）：
 
-1. **`JINLIANG_TEST_PG_SRC_DSN` 必须是测试专用库**：`reclaimSlots` 删的是源库里**所有空闲的 `jl_%` 槽**。
-   CI 里每个 job 自己 `docker run` 一套 PG，独占没问题；但如果有人把这个变量指向有真实任务的库，
-   或者本地用 `go test ./...`（包级并行）跑，就会把别的包/别人的空闲槽一起收走（对方下一次连流会报槽不存在）。
+1. **`JINLIANG_TEST_PG_SRC_DSN` 必须是测试专用库，回收默认关**：`reclaimSlots` 删的是源库里
+   **所有空闲的 `jl_%` 槽**，所以现在**只有显式设 `JINLIANG_TEST_RECLAIM_SLOTS=1` 才回收**（`reclaimEnabled()`）。
+   CI 的集成步骤里显式打开（那里每个 job 自己 `docker run` 一套 PG、独占）；本地默认不回收，
+   避免把别人的空闲槽一起收走——对方下一次连流会报槽不存在，更糟的是流上被 `pg_terminate_backend`
+   打断成 `57P01`（已在共用 PG 上真实发生过）。
 2. **新加的 fixture 必须自己对 `trackJobSlots`**：`TestMain` 只在包首尾兜，救不了**轮内**泄漏。
    新用例（比如 MySQL 源、resync 那些同样会建槽的）忘了挂，就会在同一轮里重新吃满 10 个槽。
 
