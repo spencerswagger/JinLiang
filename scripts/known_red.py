@@ -89,22 +89,48 @@ PROBES = {
 
 
 def _yaml():
+    """有 pyyaml 就用它；**没有也不能瘫**（CI 的 logic job 没装 pip 包）。
+
+    没有 pyyaml 时退回逐行扫描：找到 `name: <步骤名>` 之后，到下一个 `- ` 开头的条目之前，
+    只要出现 `continue-on-error: true` 就算挂起。YAML 是缩进结构，对我们这种「只看一步」
+    的用途足够；宁可粗一点，也不要因为缺一个 Python 包就让门禁自己红。
+    """
     try:
         import yaml  # noqa: F401
         return yaml
-    except ImportError:  # pragma: no cover - CI 装了 pyyaml
-        sys.exit("known-red: 需要 pyyaml（pip install pyyaml）")
+    except ImportError:
+        return None
 
 
-def step_suspended(doc, step_name):
-    """工作流里这个步骤还挂着 continue-on-error 吗。找不到步骤 → 报错（台账与 YAML 失联）。
+def step_suspended(doc, step_name, text=None):
+    """工作流里这个步骤还挂着 continue-on-error 吗。找不到步骤 → found=False（台账与 YAML 失联）。
 
-    返回 (found, suspended)。
+    返回 (found, suspended)。doc 为 None 时走逐行扫描（没有 pyyaml 的兜底）。
     """
-    for job in (doc.get("jobs") or {}).values():
-        for st in job.get("steps") or []:
-            if (st.get("name") or "").strip() == step_name.strip():
-                return True, bool(st.get("continue-on-error"))
+    want = step_name.strip()
+    if doc is not None:
+        for job in (doc.get("jobs") or {}).values():
+            for st in job.get("steps") or []:
+                if (st.get("name") or "").strip() == want:
+                    return True, bool(st.get("continue-on-error"))
+        return False, False
+
+    # 兜底：逐行扫描
+    lines = (text or "").splitlines()
+    for i, line in enumerate(lines):
+        key = "name:"
+        if key not in line:
+            continue
+        val = line.split(key, 1)[1].strip()
+        if val.strip('"\'') != want:
+            continue
+        for j in range(i + 1, len(lines)):
+            nxt = lines[j]
+            if nxt.lstrip().startswith("- "):
+                break
+            if "continue-on-error:" in nxt and "true" in nxt.lower():
+                return True, True
+        return True, False
     return False, False
 
 
@@ -126,13 +152,14 @@ def check(only=None, workflow=None, probes=None):
     workflow = workflow or WORKFLOW
     probes = probes or PROBES
     with open(workflow, encoding="utf-8") as f:
-        doc = yaml.safe_load(f)
+        text = f.read()
+    doc = yaml.safe_load(text) if yaml else None
 
     rows, bad = [], 0
     for e in REGISTRY:
         if only and e["id"] != only:
             continue
-        found, suspended = step_suspended(doc, e["step"])
+        found, suspended = step_suspended(doc, e["step"], text)
         if not found:
             rows.append((e, False, False, "步骤不在工作流里（台账与 YAML 失联）", False))
             bad += 1

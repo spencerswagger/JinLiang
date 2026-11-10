@@ -138,11 +138,17 @@ jobs:
       - name: 起 MySQL 源（${{ matrix.mysql }}，开 binlog ROW/FULL）
         run: |
           set -e
-          docker run -d --name my-src -p 53306:3306 \
-            -e MYSQL_ROOT_PASSWORD=root -e MYSQL_DATABASE=jinliang_src \
-            -e MYSQL_USER=jinliang -e MYSQL_PASSWORD=jinliang \
-            mysql:${{ matrix.mysql }} \
-            --server-id=1 --log-bin=mysql-bin --binlog-format=ROW --binlog-row-image=FULL
+          # 端口偶发被占（runner 上残留进程）会让整腿假红：重试 3 次，每次都先清同名容器
+          for attempt in 1 2 3; do
+            docker rm -f my-src >/dev/null 2>&1 || true
+            docker run -d --name my-src -p 53306:3306 \
+              -e MYSQL_ROOT_PASSWORD=root -e MYSQL_DATABASE=jinliang_src \
+              -e MYSQL_USER=jinliang -e MYSQL_PASSWORD=jinliang \
+              mysql:${{ matrix.mysql }} \
+              --server-id=1 --log-bin=mysql-bin --binlog-format=ROW --binlog-row-image=FULL && break
+            echo "第 $attempt 次起 my-src 失败，5s 后重试"; sleep 5
+          done
+          docker inspect my-src >/dev/null
           # 不能用 mysqladmin ping：它在「拒绝访问」时也返回 0（8.x 初始化期间就是这样），
           # 会让我们以为库已就绪，下一步 GRANT 直接 Access denied。
           for i in $(seq 1 120); do
@@ -153,11 +159,16 @@ jobs:
       - name: 起 MySQL 目标（${{ matrix.mysql }}，开 binlog —— 目标端也要能被校验）
         run: |
           set -e
-          docker run -d --name my-dst -p 53307:3306 \
-            -e MYSQL_ROOT_PASSWORD=root -e MYSQL_DATABASE=jinliang_target \
-            -e MYSQL_USER=jinliang -e MYSQL_PASSWORD=jinliang \
-            mysql:${{ matrix.mysql }} \
-            --server-id=2 --log-bin=mysql-bin --binlog-format=ROW --binlog-row-image=FULL
+          for attempt in 1 2 3; do
+            docker rm -f my-dst >/dev/null 2>&1 || true
+            docker run -d --name my-dst -p 53307:3306 \
+              -e MYSQL_ROOT_PASSWORD=root -e MYSQL_DATABASE=jinliang_target \
+              -e MYSQL_USER=jinliang -e MYSQL_PASSWORD=jinliang \
+              mysql:${{ matrix.mysql }} \
+              --server-id=2 --log-bin=mysql-bin --binlog-format=ROW --binlog-row-image=FULL && break
+            echo "第 $attempt 次起 my-dst 失败，5s 后重试"; sleep 5
+          done
+          docker inspect my-dst >/dev/null
           for i in $(seq 1 120); do
             docker exec my-dst mysql -uroot -proot -N -e 'select 1' >/dev/null 2>&1 && exit 0
             sleep 2
@@ -234,10 +245,15 @@ jobs:
       - name: 起 MySQL 源（8.0，开 binlog ROW/FULL）
         run: |
           set -e
-          docker run -d --name my-src -p 53306:3306 \
-            -e MYSQL_ROOT_PASSWORD=root -e MYSQL_DATABASE=jinliang_src \
-            -e MYSQL_USER=jinliang -e MYSQL_PASSWORD=jinliang \
-            mysql:8.0 --server-id=1 --log-bin=mysql-bin --binlog-format=ROW --binlog-row-image=FULL
+          for attempt in 1 2 3; do
+            docker rm -f my-src >/dev/null 2>&1 || true
+            docker run -d --name my-src -p 33306:3306 \
+              -e MYSQL_ROOT_PASSWORD=root -e MYSQL_DATABASE=jinliang_src \
+              -e MYSQL_USER=jinliang -e MYSQL_PASSWORD=jinliang \
+              mysql:8.0 --server-id=1 --log-bin=mysql-bin --binlog-format=ROW --binlog-row-image=FULL && break
+            echo "第 $attempt 次起 my-src 失败，5s 后重试"; sleep 5
+          done
+          docker inspect my-src >/dev/null
           for i in $(seq 1 120); do
             docker exec my-src mysql -uroot -proot -N -e 'select 1' >/dev/null 2>&1 && exit 0
             sleep 2
@@ -246,10 +262,15 @@ jobs:
       - name: 起 MySQL 目标（8.0）
         run: |
           set -e
-          docker run -d --name my-dst -p 53307:3306 \
-            -e MYSQL_ROOT_PASSWORD=root -e MYSQL_DATABASE=jinliang_target \
-            -e MYSQL_USER=jinliang -e MYSQL_PASSWORD=jinliang \
-            mysql:8.0 --server-id=2 --log-bin=mysql-bin --binlog-format=ROW --binlog-row-image=FULL
+          for attempt in 1 2 3; do
+            docker rm -f my-dst >/dev/null 2>&1 || true
+            docker run -d --name my-dst -p 33307:3306 \
+              -e MYSQL_ROOT_PASSWORD=root -e MYSQL_DATABASE=jinliang_target \
+              -e MYSQL_USER=jinliang -e MYSQL_PASSWORD=jinliang \
+              mysql:8.0 --server-id=2 --log-bin=mysql-bin --binlog-format=ROW --binlog-row-image=FULL && break
+            echo "第 $attempt 次起 my-dst 失败，5s 后重试"; sleep 5
+          done
+          docker inspect my-dst >/dev/null
           for i in $(seq 1 120); do
             docker exec my-dst mysql -uroot -proot -N -e 'select 1' >/dev/null 2>&1 && exit 0
             sleep 2
@@ -268,8 +289,8 @@ jobs:
           CGO_ENABLED=0 go build -trimpath -o dist/jinliang ./cmd/jinliang
       - name: 全量 → 增量（20000 行）
         env: &m2m-env
-          JINLIANG_TEST_MYSQL_SRC_DSN: mysql://jinliang:jinliang@127.0.0.1:53306/jinliang_src
-          JINLIANG_TEST_MYSQL_DST_DSN: mysql://jinliang:jinliang@127.0.0.1:53307/jinliang_target
+          JINLIANG_TEST_MYSQL_SRC_DSN: mysql://jinliang:jinliang@127.0.0.1:33306/jinliang_src
+          JINLIANG_TEST_MYSQL_DST_DSN: mysql://jinliang:jinliang@127.0.0.1:33307/jinliang_target
           ROWS: "20000"
         run: timeout -k 10 900 bash scripts/b1_mysql_to_mysql.sh ./dist/jinliang
       - name: 增量中途 kill -9 → 重搬 0 行
