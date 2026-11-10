@@ -163,22 +163,41 @@ func (r *runner) finishGenericRecopy(ctx context.Context) error {
 // 只对 PG 源开启：PG 的 Relation 与 information_schema 都是源端类型文本，可比；
 // MySQL 源在没开 `binlog_row_metadata=FULL` 时根本不给 Relation，类型文本口径也不一致，
 // 硬比会误报（那是 Data 侧要补的能力，不是这里瞎猜）。
-func (r *runner) detectRelationDrift(evs []source.Event) pgsink.PausableError {
+func (r *runner) detectRelationDrift(ctx context.Context, evs []source.Event) pgsink.PausableError {
 	if r.sink != nil || r.srcEP.Kind != dsn.KindPostgres {
 		return nil
 	}
+	seen := map[string]bool{}
 	for _, ev := range evs {
 		rel := ev.Relation
-		if rel == nil || rel.TableRef.Table == "" {
+		if rel == nil || rel.TableRef.Table == "" || seen[rel.TableRef.Table] {
+			continue
+		}
+		seen[rel.TableRef.Table] = true
+		if _, paused := r.pausedRecord(rel.TableRef.Table); paused {
 			continue
 		}
 		want, ok := r.catalogTable(rel.TableRef)
 		if !ok {
-			continue // 不在本任务范围 / 缓存里没有：不在这里判（别的检查会挡住）
+			continue
 		}
-		if diff, changed := relationDiff(&want, rel); changed {
-			return &pgsink.TypeChangedError{TableName: rel.TableRef.Table, Detail: diff}
+		// **触发信号**：事件里的 Relation 与 catalog 的类型身份不同 = 源端这一版变了。
+		// （注意：catalog 是**本轮 prepare** 读的，所以「源端上一轮改的」在这里比不出来——
+		// 那种情况由 prepare 期的对齐检查兜住。这里管的是「跑起来之后才改的」。）
+		if _, changed := relationDiff(&want, rel); !changed {
+			continue
 		}
+		// **判定**：源端变了，目标端对齐了吗？问目标端（ColumnsMatch 用目标端自己那份类型字典）。
+		ok2, why, err := r.targetColumnsAligned(ctx, rel.TableRef)
+		if err != nil {
+			continue // 读不到就不在这里判（下一个检查会响亮失败），绝不猜
+		}
+		if ok2 {
+			// 目标端已经是对的类型（例如用户手工对齐了）：这是「追平」，不是「暂停」。
+			continue
+		}
+		return &pgsink.TypeChangedError{TableName: rel.TableRef.Table,
+			Detail: "源端这一版列类型变了，而目标端还没对齐：" + why}
 	}
 	return nil
 }
