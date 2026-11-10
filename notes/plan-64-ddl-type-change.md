@@ -74,8 +74,9 @@
 7. **`at` / `reason` 不覆盖**：第一次的最有价值；将来加原因码走常量，不在中文句子里判等。
 8. **出清只在三个条件下发生**（同 `job_key`、`job_hash` 未变、仍在本轮表集合里）。
 9. 本轮**不含**：`mysqlsink` 同构列、`docs/` 外壳、`verify --fix`、Owl 在 #75 的两条残余、`#64` 已合部分的复查项。
-10. **写路径快检在引擎层不可达（代码级理由）**：契约 §2.2 第 2 条要求 `prepare` 在「`EnsureSchema` 通过 + 存量搬完」时解除该表记录，而 `reconcilePaused` 里判断「存量搬完」的 `copyDoneFor` 对**已完成**的表恒为真（没有块标记的也算完成，见 continuous 模式）——于是「结构已对齐 + 有暂停记录」的组合在进入写路径之前就被解除，`Apply` 的暂停判定在引擎层拿不到记录。判据 4(d) 因此落在 **pgsink 层**：`TestApplyRefusesPausedTable` 用第二个 Sink 实例、只靠 `LoadPausedTables` 从库里读回，再断言整批拒绝 + 目标端 0 行（变异「删掉 `Apply` 暂停判定」→ 该格红）。要在引擎层钉同一件事，得改解除时机（例如「首次成功批次后才解除」），那是契约变更，不在本 PR。
-
-## §5 教训
-
-合并性结论必须绑基线 SHA、动手前重算，不许写「与今日 main」。
+10. **写路径快检在引擎层不可达（代码级理由，逐状态穷举）**：试过「流式暂停 → 手工对齐 → 同模式重跑」这条路，结论仍是不可达，原因是**三条退出路径各自堵死**：
+    - **结构未对齐**：`EnsureSchema` 在 `prepare` 里就失败（E1015），run 在进入写路径之前结束；
+    - **结构已对齐**：`reconcilePaused` 里 `copyDoneFor(表)` 为真（有 `Done` 标记，或**一条块标记都没有**——`continuous`/`interval` 就是这种）→ 当场 `ClearPausedTable` 并发 note，写路径拿不到记录；
+    - **存量没搬完**（半截拷贝）：`planCopy` 判 `copyResume`/`copyFresh`，写路径排在搬运之后；搬运成功那一刻 `snapshot()` 在 `MarkTableDone` 前调 `ClearPausedTable`，同样先解除；搬运失败则 run 直接结束。
+    因此「结构已对齐 + 记录仍在 + 走到 `Apply`」三件事不能同时成立。判据 4(d) 的落点因此在 **pgsink 层**：`TestApplyRefusesPausedTable`（第二个 Sink 实例、只靠 `LoadPausedTables` 读回 → 整批拒绝 + 目标端 0 行），变异「删掉 `Apply` 暂停判定」→ 该格红。
+    引擎层「不会带着暂停记录继续写」靠**上游三处**：①`EnsureSchema` 结构不一致即失败；②`reconcilePaused` 对齐且存量完成即解除；③搬运成功即解除。`Apply` 的判定是**最后一道闸**（契约 §1.2 的写路径快检），不是主路径——保留它是因为删掉等于撤掉这道闸。
