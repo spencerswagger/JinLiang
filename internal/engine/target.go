@@ -261,7 +261,9 @@ func (r *runner) executeGeneric(ctx context.Context, res *Result) error {
 
 	// ② 源端准备（PG 源要建书签+发布；MySQL 源要开一致性快照）。必须在取位点之前：
 	// 全量的读视图与增量起点是同一瞬间定下来的。
-	prep, err := r.src.Prepare(ctx, needCopy)
+	// 续跑**不重建书签、不导出视图**（与 PG 路径同款）：书签被 drop 之后位点会跳到新 LSN，
+	// 而增量仍从旧位点重放——已搬块在停机窗口里的变更就全丢了。
+	prep, err := r.src.Prepare(ctx, needCopy && r.plan.Kind != copyResume)
 	if err != nil {
 		return fmt.Errorf("准备源端对象失败: %w", err)
 	}
@@ -285,6 +287,8 @@ func (r *runner) executeGeneric(ctx context.Context, res *Result) error {
 	r.mu.Lock()
 	r.lastPos = from
 	r.mu.Unlock()
+	// 全量块要把「本轮全量的起点位点」写进目标端（与 PG 的 BulkApply 同口径）。
+	r.consistentPoint = from
 
 	// ③ 建表：**只要这一轮要搬就对齐一次**（首次，或 full_interval 的每一轮）。
 	//
@@ -300,7 +304,11 @@ func (r *runner) executeGeneric(ctx context.Context, res *Result) error {
 			r.emit(ctx, control.Event{Type: "note", Message: a.What})
 		}
 	}
-	if needCopy {
+	if r.plan.Kind == copyFresh {
+		// **只有从头搬才清**：续跑（copyResume）清了就等于把已搬的块扔掉，
+		// 再从第 N 块的游标接着搬 —— 最终少一截数据且没人报错（Owl II 必改 2）。
+		// 暂停恢复的表由 `truncateForcedRecopy` 单独清（只清本任务建的那几张）。
+		//
 		// 清表判定必须排在**任何阶段写入之前**：phaseTo(Prepare) 会把 `_jl_meta.phase`
 		// 改写成 'prepare'，而它正是这一步要读的事实。写早了，保护就变成 one-shot：
 		// 第一次重跑硬停（phase 已被这轮改成 prepare）→ 第二次重跑读回 prepare →
@@ -501,6 +509,11 @@ func (r *runner) copyGeneric(ctx context.Context) error {
 			if r.skippedTables[ref.Table] {
 				return nil
 			}
+			// 上一轮已经搬完的表：这一轮不用碰（与 PG snapshot 的同款守卫，起因是
+			// 「续跑把已搬完的表整表重读再写一遍」既慢又让 rowsCopied 虚高）。
+			if r.plan.Skip[ref.Table] {
+				return nil
+			}
 			// 整表重搬窗口：告诉写路径「这几张表的写入是重搬，放行」
 			// （暂停记录还留着——它要留到搬成才解除）。
 			if _, forced := r.forceRecopy[ref.Table]; forced {
@@ -536,7 +549,19 @@ func (r *runner) copyGeneric(ctx context.Context) error {
 			// 记不下来要**响亮失败**：没有标记的续跑会让「这张表欠一次重搬」无从表达
 			// （契约 §1.6 步 2 的 MarkTableRecopyPending 清的就是这些标记）。
 			if cc, ok := r.gsink.(chunkChronicker); ok {
-				if err := cc.MarkChunkDone(c, ref, chNo, from, to, int64(len(rows))); err != nil {
+				// **块标记与「全量起点位点」同一个事务**：不写位点的话，kill -9 之后
+				// 目标端「有块进度、没位点」→ planCopy 判「位点缺失 → 从头搬」，续跑退化成整轮重搬。
+				pos := ""
+				if r.consistentPoint != nil {
+					pos = posString(r.consistentPoint)
+				}
+				if ccp, ok := cc.(interface {
+					MarkChunkDoneWithPos(context.Context, source.TableRef, int, string, string, int64, string) error
+				}); ok {
+					if err := ccp.MarkChunkDoneWithPos(c, ref, chNo, from, to, int64(len(rows)), pos); err != nil {
+						return err
+					}
+				} else if err := cc.MarkChunkDone(c, ref, chNo, from, to, int64(len(rows))); err != nil {
 					return err
 				}
 			}

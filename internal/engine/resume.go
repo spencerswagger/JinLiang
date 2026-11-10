@@ -434,7 +434,14 @@ func (r *runner) decideGenericCopyPlan(ctx context.Context, src runSource, phase
 	in.SlotCP = posString(st.Confirmed)
 	in.SlotWhy = st.Why
 	in.SlotAhead = st.Ahead
-	return planCopy(in), nil
+	plan := planCopy(in)
+	// 与 PG 路径同款的硬停：位点追不回、而这一轮又不搬存量（continuous）时，从新位置起流
+	// 等于把 (旧位点, 新位置] 那段变更静默扔掉。让用户显式选「--resync 接受空洞」。
+	if plan.Kind == copySkip && (!in.SlotReplayable || in.SlotAhead) &&
+		in.Mode == "continuous" && !r.opt.Resync {
+		return plan, &unreplayableSlotError{stored: pos}
+	}
+	return plan, nil
 }
 
 // genericChunkProgress 读非 PG 目标端的块进度，并翻成 `pgsink.ChunkProgress`

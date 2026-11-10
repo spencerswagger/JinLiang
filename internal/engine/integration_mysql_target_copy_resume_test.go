@@ -115,10 +115,18 @@ func TestMySQLTargetCopyResumesFromChunkBoundary(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("续跑退出码 %d：\n%s", code, out)
 	}
+	// 判据（与门禁 ``b1_mysql_to_pg.sh`` 的 killcopy 同口径）：
+	//   「重做」(中断前已写 + 重启又搬) 不能超过总行数 + 1 块 —— 超了 = 整轮重搬；
+	//   也不能小于总行数 —— 少了 = 有段被跳过（不是续跑，是漏）。
+	// 注意 `复制 N 行` 是**本轮**搬的行数：续跑本来就要搬剩下的那一大截（本例约 13000），
+	// 所以「copied ≤ 1 块」这种断言在实现完全正确时也会红（Owl II 必改 4）。
 	copied := rowsCopiedRe(t, out)
-	if copied > myTargetChunkRows {
-		t.Fatalf("重启重搬了 %d 行（超过 1 块 %d 行）：这不是块级续跑，是整轮重搬\n%s",
-			copied, myTargetChunkRows, out)
+	if redone := rowsKilled + copied; redone > myTargetCopyRows+myTargetChunkRows {
+		t.Fatalf("重做 %d 行（中断前 %d + 重启 %d）超过总行数 %d + 1 块 %d：这是整轮重搬\n%s",
+			redone, rowsKilled, copied, myTargetCopyRows, myTargetChunkRows, out)
+	} else if redone < myTargetCopyRows {
+		t.Fatalf("重做 %d 行（中断前 %d + 重启 %d）少于总行数 %d：有段被跳过了（不是续跑，是漏）\n%s",
+			redone, rowsKilled, copied, myTargetCopyRows, out)
 	}
 	if got := myCount(t, myDB, table); got != myTargetCopyRows {
 		t.Fatalf("续跑后应有 %d 行，实际 %d", myTargetCopyRows, got)
@@ -127,8 +135,9 @@ func TestMySQLTargetCopyResumesFromChunkBoundary(t *testing.T) {
 		t.Fatalf("两端指纹应一致：MySQL %s / PG %s", got, want)
 	}
 	t.Logf("MySQL 目标端中断续跑：kill 时目标端 %d 行（已提交到第 %d 块，右边界 %q），"+
-		"重启只搬了 %d 行（≤1 块 %d），最终 %d 行、两端指纹一致",
-		rowsKilled, lastNo, lastTo, copied, myTargetChunkRows, myTargetCopyRows)
+		"重启搬了 %d 行 → 重做共 %d 行（总 %d，允许 ≤ 总+1 块 %d），最终 %d 行、两端指纹一致",
+		rowsKilled, lastNo, lastTo, copied, rowsKilled+copied, myTargetCopyRows,
+		myTargetCopyRows+myTargetChunkRows, myTargetCopyRows)
 }
 
 // runBin 跑一次 CLI 并把 (输出, 退出码) 交回来。
