@@ -82,8 +82,32 @@ func TestPrepareDriftUserTableOnlyNotes(t *testing.T) {
 
 	store, jobID := onceJobSingleTable(t, srcDSN, dstDSN, "drift-user", table)
 
+	// 订阅事件流：这条 note 是「用户表降级」唯一的可观测出口，必须真断言到
+	//（第一版只写了「note 由 PrepareNotes 单测覆盖」，而全仓零单测 → 删掉 emit 也全绿）。
+	ch, stopSub := store.Bus().Subscribe(jobID)
+	defer stopSub()
+	sawNote := make(chan string, 64)
+	go func() {
+		for ev := range ch {
+			if ev.Message != "" && strings.Contains(ev.Message, "不判为漂移") {
+				sawNote <- ev.Message
+			}
+		}
+	}()
+
 	if _, err := engine.Run(ctx, engine.Options{Store: store, JobID: jobID, SnapshotOnly: true}); err != nil {
 		t.Fatalf("用户表多出的列不算漂移：不该失败，得到 %v", err)
+	}
+	select {
+	case m := <-sawNote:
+		if !strings.Contains(m, "不是本任务建的") {
+			t.Fatalf("note 要说清「不是本任务建的」，得到：%s", m)
+		}
+		if !strings.Contains(m, table) {
+			t.Fatalf("note 要点名那张表，得到：%s", m)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("用户表多出源端没有的列：必须留下可观测的 note（不许无声）")
 	}
 	// 用户那列的数据不能被我们弄丢
 	var mine string
@@ -93,7 +117,6 @@ func TestPrepareDriftUserTableOnlyNotes(t *testing.T) {
 	if mine != "我的列" {
 		t.Fatalf("用户自己的列被改动了：%q", mine)
 	}
-	// note 的存在由 pgsink.PrepareNotes() 单测覆盖（引擎会把它们 emit 出去）；
-	// 这里钉的是「用户表不判漂移、不报错、用户列不被我们动」。
+	// 这里同时钉三件：用户表不判漂移、不报错、用户列不被我们动 + **note 真的发出去了**。
 	t.Logf("用户表多出的列：不报错、用户列数据完好（%q）", mine)
 }
