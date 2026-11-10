@@ -50,18 +50,51 @@ func (r *runner) planGenericRecopy(ctx context.Context) {
 				"请在 `jinliang status` 里按提示选一条——重建这张表 / 手工清空 / 把它移出同步范围")
 			continue
 		}
-		if r.forceRecopy == nil {
-			r.forceRecopy = map[string]source.TableRef{}
-		}
-		ref := source.TableRef{Schema: r.targetSchema(), Table: key}
+		srcRef := source.TableRef{Schema: r.targetSchema(), Table: key}
 		for _, t := range r.tables {
 			if t.Table == key {
-				ref = t
+				srcRef = t
 				break
 			}
 		}
+		// **先确认目标端列类型真的对齐了**，再决定清空重搬（Owl II P1）。
+		//
+		// 为什么不能省：MySQL 的 `EnsureSchema` 在 append 下只补缺列、不改列类型，
+		// 所以「prepare 跑到这里」并不代表对齐。没对齐就清空重搬 = 把源端的数值写进
+		// 类型不匹配的列，MySQL 会**静默收敛**（1.25 → 1），然后我们发「已恢复：整表重搬完成」。
+		// 那是假恢复：比不恢复坏得多。
+		if ok, why, err := r.targetColumnsAligned(ctx, srcRef); err != nil {
+			return // 读不到就什么都不做：留着暂停记录，人来看（不猜）
+		} else if !ok {
+			r.note(ctx, "表 "+key+" 仍暂停：目标端列类型还没对齐（"+why+"）。"+
+				"对齐之后重跑会自动整表重搬补齐")
+			continue
+		}
+		if r.forceRecopy == nil {
+			r.forceRecopy = map[string]source.TableRef{}
+		}
+		ref := srcRef
 		r.forceRecopy[key] = ref
 	}
+}
+
+// targetColumnsAligned 问目标端：这张表的列类型是不是源端这批列该有的类型。
+//
+// 能力做成**可选接口**：目标端能回答才自动重搬。回答不了就返回 (false, 原因, nil)，
+// 让调用方留着暂停记录——「不知道对齐没对齐就清空重搬」是最坏的组合。
+func (r *runner) targetColumnsAligned(ctx context.Context, ref source.TableRef) (bool, string, error) {
+	matcher, ok := r.pauseReg.(interface {
+		ColumnsMatch(context.Context, source.TableRef, []source.Column) (bool, string, error)
+	})
+	if !ok {
+		return false, "这个目标端还不能回答「列类型对齐了吗」（需要 ColumnsMatch 能力），本版不自动清空重搬", nil
+	}
+	want, ok := r.catalogTable(ref)
+	if !ok {
+		return false, "本轮 catalog 里没有这张表的列定义", nil
+	}
+	// 目标端的 schema 与源端可能不同：按目标端 ref 问。
+	return matcher.ColumnsMatch(ctx, r.targetRef(ref), want.Columns)
 }
 
 // truncateForcedRecopy 在搬之前清空「欠一次重搬」的表。
@@ -85,12 +118,8 @@ func (r *runner) truncateForcedRecopy(ctx context.Context, st stateCapable) erro
 			return fmt.Errorf("清空目标表 %s 准备整表重搬失败: %w", key, err)
 		}
 		// 块标记一并清掉：不清的话 `copyGeneric` 会以为这张表已经搬过（续跑语义）。
-		if reg, ok := r.pauseReg.(interface {
-			MarkTableRecopyPending(context.Context, source.TableRef) error
-		}); ok {
-			if err := reg.MarkTableRecopyPending(ctx, tref); err != nil {
-				return fmt.Errorf("清掉 %s 的块标记失败: %w", key, err)
-			}
+		if err := r.pauseReg.MarkTableRecopyPending(ctx, tref); err != nil {
+			return fmt.Errorf("清掉 %s 的块标记失败: %w", key, err)
 		}
 		r.clearedTables = append(r.clearedTables, key)
 		r.note(ctx, "表 "+key+" 整表重搬：先清空目标端再从头读（暂停窗口里的删除只能这样补掉）")
@@ -154,6 +183,44 @@ func (r *runner) detectRelationDrift(evs []source.Event) pgsink.PausableError {
 	return nil
 }
 
+// sameOIDShape 报告两份表定义的列名与列数是否一致（列名一致才谈得上「比同一个位置的 OID」）。
+func sameOIDShape(want, got *source.Table) bool {
+	if len(want.Columns) != len(got.Columns) {
+		return false
+	}
+	for i := range want.Columns {
+		if want.Columns[i].Name != got.Columns[i].Name {
+			return false
+		}
+		if want.Columns[i].TypeOID == 0 || got.Columns[i].TypeOID == 0 {
+			return false // 有一边拿不到身份：退回文本比较
+		}
+	}
+	return true
+}
+
+func sameOIDs(want, got *source.Table) bool {
+	for i := range want.Columns {
+		if want.Columns[i].TypeOID != got.Columns[i].TypeOID {
+			return false
+		}
+	}
+	return true
+}
+
+// oidDiff 用人话说明哪几列的类型身份变了（带上两边的类型文本，方便用户对照）。
+func oidDiff(want, got *source.Table) string {
+	var diffs []string
+	for i := range want.Columns {
+		w, g := want.Columns[i], got.Columns[i]
+		if w.TypeOID != g.TypeOID {
+			diffs = append(diffs, fmt.Sprintf("列 %s：源端原来是 %s(oid=%d)，现在是 %s(oid=%d)",
+				g.Name, w.Type, w.TypeOID, g.Type, g.TypeOID))
+		}
+	}
+	return strings.Join(diffs, "；")
+}
+
 // catalogTable 在 prepare 读到的 catalog 里找这张表。
 func (r *runner) catalogTable(ref source.TableRef) (source.Table, bool) {
 	for _, t := range r.cat.Tables {
@@ -186,7 +253,20 @@ func canonType(s string) string {
 }
 
 // relationDiff 比较 catalog 与事件里的 Relation，返回人话差异与「是否变了」。
+//
+// **优先比 TypeOID**（类型身份）：pgoutput 的 Relation 消息只带 OID，`buildRelation` 把它填进
+// `Column.TypeOID`；容器 catalog 也从 `pg_type.oid` 取。两边都有 OID 时只比 OID——
+// 这样 `int8`/`bigint`、`numeric`/`numeric(12,2)` 的文本差异不会假红，而「放宽 varchar 长度」
+// （OID 不变）天然放行（契约里那本来就属于「追平」）。OID 拿不到时退回文本比较，并在
+// detail 里注明——这种写法会把别名差异当成「改类型」，宁可停一下，也不静默写错。
 func relationDiff(want *source.Table, got *source.Table) (string, bool) {
+	oidComparable := sameOIDShape(want, got)
+	if oidComparable {
+		if sameOIDs(want, got) {
+			return "", false
+		}
+		return oidDiff(want, got), true
+	}
 	if relationShape(want) == relationShape(got) {
 		return "", false
 	}
