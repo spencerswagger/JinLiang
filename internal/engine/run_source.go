@@ -352,13 +352,21 @@ func (m myRunSource) EndSnapshot() { m.s.EndSnapshot() }
 
 func (m myRunSource) Stream(ctx context.Context, from source.Position, fn source.EventHandler) error {
 	keep := make(map[string]bool, len(m.tables))
+	// lower 只用于 **DDL** 的归属判定（下面写清为什么），数据行一律按精确 key 过滤。
+	lower := make(map[string]string, len(m.tables))
 	for _, t := range m.tables {
-		keep[tableKey(t.TableRef)] = true
+		k := tableKey(t.TableRef)
+		keep[k] = true
+		lower[strings.ToLower(k)] = k
 	}
 	return m.s.Stream(ctx, from, func(c context.Context, ev source.Event) error {
 		switch ev.Kind {
 		case source.EvDDL:
-			if !keep[tableKey(ev.Table)] {
+			// DDL 的表名是从 SQL 原文里解析的，大小写与 information_schema 未必逐字一致
+			// （MySQL 在大小写不敏感的平台/配置上尤其如此）。DDL 这条只用它决定
+			// 「要不要发一声提示」，用精确 key 会漏；数据行仍走精确 key —— 那张表是要写进去的，
+			// 认错表就是把行写进别人家。
+			if !keep[tableKey(ev.Table)] && lower[strings.ToLower(tableKey(ev.Table))] == "" {
 				return nil
 			}
 			// MySQL 的 DDL 语句（`ALTER TABLE ... ENGINE=InnoDB`、`MODIFY COLUMN`）

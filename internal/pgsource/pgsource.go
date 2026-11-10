@@ -73,6 +73,9 @@ func (e *ErrPositionForeignSource) Error() string {
 	return fmt.Sprintf("目标库里的同步进度是 %s 写的，而这次连的是 %s：换回对应的源，或重新开始同步", e.Got, e.Want)
 }
 
+// SourceClass 实现 source.Classified（契约 §4.4）：引擎按接口判类，不 import 本包。
+func (e *ErrPositionForeignSource) SourceClass() source.Class { return source.ClassPositionForeign }
+
 // ParsePayload parses the PG-specific part of a position ("0/16B3748").
 func ParsePayload(payload string) (Position, error) {
 	payload = strings.TrimSpace(payload)
@@ -251,7 +254,8 @@ type PrepareResult struct {
 // 为什么单独一个方法而不是给 Prepare 加参数：`--resync` 在 continuous 模式（只接增量、
 // 不做快照）下要的正是「不导出视图、只换书签」，而 Prepare 的 Snapshot 参数同时管着
 // 导出视图；把两件事绑在一起会顺手多开一条永远不会被读的快照连接。
-func (s *Source) RebuildSlot(ctx context.Context) error {
+func (s *Source) RebuildSlot(ctx context.Context) (err error) {
+	defer func() { err = markClass(err) }()
 	_, exists, err := s.slotPosition(ctx)
 	if err != nil {
 		return err
@@ -265,8 +269,10 @@ func (s *Source) RebuildSlot(ctx context.Context) error {
 	return nil
 }
 
-func (s *Source) Prepare(ctx context.Context, popt PrepareOptions) (PrepareResult, error) {
-	res := PrepareResult{}
+func (s *Source) Prepare(ctx context.Context, popt PrepareOptions) (res PrepareResult, err error) {
+	// 出口统一打语义标记（契约 §4.4）：引擎按 source.ClassOf 判类，不 import 本包。
+	defer func() { err = markClass(err) }()
+	res = PrepareResult{}
 
 	exists, err := s.publicationExists(ctx)
 	if err != nil {
@@ -527,7 +533,10 @@ func (s *Source) SnapshotChunks(ctx context.Context, opt source.SnapshotOpt, fn 
 // 剩下的块读的是一个更晚的视图——这不会丢变更，因为增量仍然从原来的位点重放
 // （见 engine.planCopy 与本文件上层说明）。
 func (s *Source) SnapshotChunksFrom(ctx context.Context, opt source.SnapshotOpt,
-	resume map[string]ChunkResume, fn ChunkHandler) (Position, error) {
+	resume map[string]ChunkResume, fn ChunkHandler) (pos0 Position, err error) {
+	// 全量搬运也会撞结构/权限类错误（例如目标端 COPY 前的读），出口一样要打标记——
+	// 少打一个出口，那条错误在引擎里就退回「未识别」（Owl II P2）。
+	defer func() { err = markClass(err) }()
 	if opt.ChunkRows <= 0 {
 		opt.ChunkRows = 100000
 	}
@@ -747,7 +756,8 @@ type relation struct {
 }
 
 // Stream consumes the change stream from pos until ctx is cancelled.
-func (s *Source) Stream(ctx context.Context, from Position, onEvent source.EventHandler) error {
+func (s *Source) Stream(ctx context.Context, from Position, onEvent source.EventHandler) (err error) {
+	defer func() { err = markClass(err) }()
 	rconn, err := pgwire.ConnectReplication(ctx, s.opt.Source)
 	if err != nil {
 		return err
@@ -1079,6 +1089,29 @@ func IsWalLevelTooLow(err error) bool {
 	return strings.Contains(strings.ToLower(err.Error()), "wal_level")
 }
 
+// markClass 把本包已有的判定翻成 `source.Class`（契约 §4.4：引擎只问 ClassOf）。
+//
+// 这是「连接器自己知道得更多」的落点：SQLSTATE 与消息措辞的判定留在这里，
+// 引擎那边不再出现任何 `pgsource.` 前缀。
+func markClass(err error) error {
+	switch {
+	case err == nil:
+		return nil
+	case IsNoPrivilege(err):
+		return source.Mark(err, source.ClassNoPrivilege)
+	case IsObjectMissing(err):
+		return source.Mark(err, source.ClassObjectMissing)
+	case IsPositionGap(err):
+		return source.Mark(err, source.ClassPositionGap)
+	case IsWalLevelTooLow(err):
+		return source.Mark(err, source.ClassWalLevel)
+	}
+	if pgwire.SQLState(err) == "53400" {
+		return source.Mark(err, source.ClassResourceLimit)
+	}
+	return err
+}
+
 // IsNoPrivilege reports「账号没有被授予这个动作」（SQLSTATE 42501）。
 func IsNoPrivilege(err error) bool {
 	return err != nil && pgwire.SQLState(err) == "42501"
@@ -1101,6 +1134,9 @@ func (e *RetryableError) Error() string { return e.Err.Error() }
 
 // Unwrap exposes the cause.
 func (e *RetryableError) Unwrap() error { return e.Err }
+
+// SourceClass 实现 source.Classified：可重试的传输类错误（连接被重置 / 读流中断）。
+func (e *RetryableError) SourceClass() source.Class { return source.ClassRetryable }
 
 // ── 校验与清理 ───────────────────────────────────────────────
 
@@ -1134,7 +1170,8 @@ func (s *Source) Tables() []source.TableRef {
 
 // Advance moves the slot forward without a running stream (used after a clean
 // shutdown and by gc). It never moves backwards.
-func (s *Source) Advance(ctx context.Context, to Position) error {
+func (s *Source) Advance(ctx context.Context, to Position) (err error) {
+	defer func() { err = markClass(err) }()
 	if to.IsZero() {
 		return nil
 	}

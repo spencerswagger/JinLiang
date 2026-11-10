@@ -213,7 +213,15 @@ func TestMySQLSourceIncrementalResumeAfterSIGKILL(t *testing.T) {
 	}
 
 	// 硬指标③：位点没有回退（本次中断点 → 追平点，只能往前）。
+	//
+	// 比较之前先确认三个位点**都解析得出 binlog 偏移**：解析不出时 myPosLess 恒为 false，
+	// 这两条断言就成了空转（今晚实测踩到过——从别的任务的行里读到了 postgres 位点）。
 	posAfter := myPosition(t, dst)
+	for _, c := range []struct{ name, pos string }{
+		{"全量后", posFull}, {"中断时", posKill}, {"追平后", posAfter},
+	} {
+		mustMySQLPos(t, c.name, c.pos)
+	}
 	if myPosLess(posAfter, posKill) {
 		t.Fatalf("位点回退了：中断时 %s → 追平后 %s（增量会重复一整段）", posKill, posAfter)
 	}
@@ -350,13 +358,38 @@ func pgFingerprint(t *testing.T, conn *pgx.Conn, table string) (string, int) {
 	return strconv.Itoa(n) + ":" + fp, n
 }
 
-// myPosition 读目标端落库的位点（引擎把位点写在 _jl_meta，与源类型无关）。
+// myPosition 读目标端落库的**源端位点**（_jl_meta.position 的唯一权威）。
+//
+// 两个坑，这行 SQL 都是为了绕开它们：
+//  1. **不许 `LIMIT 1` 裸读**：同一套库上跑过别的任务时，_jl_meta 里会有别的行，
+//     `LIMIT 1` 读到谁看运气。读到 PG 源的位点（`postgres:v1:0/…`）时，
+//     myPosLess 解析不出 binlog 偏移 → 比较恒为 false → **位点断言变成空转**，
+//     用例照样绿（今晚实测撞到过：全量后读到的就是别的任务的 postgres 位点）。
+//  2. 所以：只认 `mysql:v1:` 前缀，且必须**正好一行**。0 行 = 没写位点（真失败），
+//     多行 = 库没隔离干净（用例本身不可信）—— 两种都要当场红，不静默。
 func myPosition(t *testing.T, conn *pgx.Conn) string {
 	t.Helper()
-	var pos string
-	if err := conn.QueryRow(context.Background(),
-		"SELECT COALESCE(position,'') FROM _jl_meta LIMIT 1").Scan(&pos); err != nil {
+	rows, err := conn.Query(context.Background(),
+		"SELECT COALESCE(position,'') FROM _jl_meta WHERE COALESCE(position,'') LIKE 'mysql:v1:%'")
+	if err != nil {
 		t.Fatalf("读位点失败: %v", err)
+	}
+	defer rows.Close()
+	var pos string
+	n := 0
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			t.Fatalf("读位点失败: %v", err)
+		}
+		pos, n = p, n+1
+	}
+	if n != 1 {
+		var all string
+		_ = conn.QueryRow(context.Background(),
+			"SELECT COALESCE(string_agg(job_key||'→'||COALESCE(position,'∅'), ' | '),'') FROM _jl_meta").Scan(&all)
+		t.Fatalf("目标端 _jl_meta 里应有且只有 1 行 MySQL 位点，实际 %d 行；库里的行：%s。"+
+			"多行多半是这套库没隔离干净（别的任务的行还在）——位点断言会读错行、变成空转", n, all)
 	}
 	return pos
 }
@@ -366,6 +399,15 @@ var (
 	// 「复制 N 行」是 CLI 的最后一行结果（与 PG 源那条用例同一个解析口径）。
 	myCopiedRe = regexp.MustCompile(`复制 (\d+) 行`)
 )
+
+// mustMySQLPos 断言这个位点确实是 MySQL 的（带 file=/pos=），否则位点比较没有意义。
+func mustMySQLPos(t *testing.T, label, pos string) {
+	t.Helper()
+	if !strings.HasPrefix(pos, "mysql:v1:") || myPosRe.FindStringSubmatch(pos) == nil {
+		t.Fatalf("%s 的位点不是 MySQL 位点：%q。"+
+			"位点比较按 binlog 偏移进行，拿别的位点比会恒为 false（断言空转）", label, pos)
+	}
+}
 
 // myPosLess 比较两个 MySQL 位点的 binlog 偏移（同文件内可比；文件名变大也算前进）。
 func myPosLess(a, b string) bool {

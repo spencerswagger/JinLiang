@@ -140,17 +140,36 @@ func Run(in Input) source.Report {
 	}
 
 	// ── 按表暂停能力 ─────────────────────────────────────────
-	// 只有 PG 目标端有 paused_tables 那条状态列。别的目标端遇到「结构对不上」时
-	// 没法登记暂停——这条要**在 plan 里就说清**，别等用户在半夜撞上 E1015 才知道。
-	if in.TargetKind != "" && in.TargetKind != "postgres" {
+	// 这条要**在 plan 里就说清**，别等用户在半夜撞上 E1015 才知道。
+	//
+	// 两个目标端的能力不同，文案必须各说各的（判据见 docs/CONTRACT-PAUSE-AND-POSITION.md §4.5）：
+	//   - PG：引擎侧的按表跳过已经接（#93），只停这张表、位点照常前进；
+	//   - MySQL：**存储层**已就绪（`_jl_meta.paused_tables` 列 + PauseRegistry 六方法），
+	//     但引擎侧的按表跳过还没接过去（pause_skip / reconcilePaused 在 PG 专属的 prepare 里），
+	//     所以在那之前遇到结构不一致仍是整条同步会停下来等手工对齐。
+	//     这里只说存储层做到了什么，不许替引擎许诺。
+	switch in.TargetKind {
+	case "mysql":
+		add(source.Check{
+			ID: "PAUSE-01", Title: "目标端支持记录按表暂停", Status: source.StatusWarn,
+			Detail: "存储层已就绪：`_jl_meta.paused_tables` 这一列在（老库缺列时开跑会先补，" +
+				"补不上会明确失败并说明原因）。**引擎侧的「只停这张表」还没接**——" +
+				"在那之前遇到表结构不一致，整条同步会停下来、位点不推进，等你手工对齐后重跑",
+		})
+	case "postgres":
+		add(source.Check{ID: "PAUSE-01", Title: "目标端支持按表暂停", Status: source.StatusOK,
+			// 口径（docs/CONTRACT-PAUSE-AND-POSITION.md §1.5/§1.6）：只停**这张表**，
+			// 其它表照常提交、位点照常前进；跳过窗口记账，结构对齐后整表重搬补齐。
+			Detail: "结构对不上的表会被记录并只停它自己：其它表照常同步、位点照常前进，" +
+				"跳过的那段在结构对齐后由整表重搬补齐"})
+	case "":
+		// 没读到目标端类型：不猜，也不吓人。
+	default:
 		add(source.Check{
 			ID: "PAUSE-01", Title: "目标端不支持按表暂停", Status: source.StatusWarn,
 			Detail: fmt.Sprintf("目标端是 %s：还没有暂停记录那一列——遇到表结构不一致时，"+
 				"整条同步会停下来等你手工对齐（不会静默跳过，也不会假装登记成功）", in.TargetKind),
 		})
-	} else if in.TargetKind == "postgres" {
-		add(source.Check{ID: "PAUSE-01", Title: "目标端支持按表暂停", Status: source.StatusOK,
-			Detail: "结构对不上的表会被记录并停下来，位点不推进"})
 	}
 
 	// ── 批次与并发 ───────────────────────────────────────────
