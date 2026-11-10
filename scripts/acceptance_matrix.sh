@@ -23,6 +23,7 @@ set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 GC="$HERE/gate_checks.py"
+EXITC="$HERE/exit_codes.py"
 BIN=${BIN:-$ROOT/.localdb/bin/jinliang}
 ROWS=${ROWS:-20000}
 KILL=0
@@ -64,6 +65,8 @@ myq() { # $1=sql（用当前 split 出来的连接）
 }
 pgq() { timeout 30 psql "$1" -v ON_ERROR_STOP=1 -tAq -c "$2" 2>/dev/null; }
 runbin() { timeout 300 "$BIN" "$@"; }
+# 退出码口径（失败 1 > 停止 130 > 有暂停表 3 > 0）：3 是**欠账不是失败**，报表要标出来。
+classify_rc() { python3 "$EXITC" classify --code "$1" --log "$2" --kind-only 2>/dev/null; }
 mark() { echo "-- $(date -u +%H:%M:%S) $*"; }
 
 fp_mysql() { # $1=表名（当前连接）
@@ -164,10 +167,15 @@ YAML
   mark "mysql→pg 全量开始（$ROWS 行）"
   t0=$(now_s)
   runbin run --job acc-mysql-pg --data-dir "$data" --stop-when-idle 5s >"$W/run1.log" 2>&1
-  local rc=$?
+  local rc=$? KIND paused=0
+  KIND=$(classify_rc "$rc" "$W/run1.log")
+  case "$KIND" in needs_action) paused=1 ;; esac
   t1=$(now_s); secs=$(elapsed "$t0" "$t1")
   copy_seconds=$secs   # 全量+追平；后面的 restart 单独记，别覆盖它（否则三组合的「耗时」不可比）
-  [ $rc -eq 0 ] || { echo "FAIL: 全量+追平退出码 $rc"; tail -5 "$W/run1.log"; return 1; }
+  case "$KIND" in
+    ok|needs_action|stopped) : ;;  # 3 = 有暂停表（欠账），数据面照样校验
+    *) echo "FAIL: 全量+追平退出码 $rc（$KIND）"; tail -5 "$W/run1.log"; return 1 ;;
+  esac
 
   s_fp=$(fp_mysql "$T"); d_fp=$(fp_pg "$dst" "$T")
   python3 "$GC" fp --src "$s_fp" --dst "$d_fp" --label "mysql→pg 全量" || { echo "  源 $s_fp / 目标 $d_fp"; return 1; }
@@ -234,7 +242,7 @@ YAML
   fi
 
   local n; n=$(pgq "$dst" "SELECT count(*) FROM $T")
-  emit "mysql-postgres" "$n" "${s_fp#*:}" "$copy_seconds" pass "mysql=$ver copy_seconds=${copy_seconds} restart_seconds=${restart_seconds:-0} $extra"
+  emit "mysql-postgres" "$n" "${s_fp#*:}" "$copy_seconds" pass "mysql=$ver copy_seconds=${copy_seconds} restart_seconds=${restart_seconds:-0} paused=${paused:-0} $extra"
 }
 
 # 增量验收（三组合共用）：按 #93 之后的实现判，**不再把「被拒」当通过**。
@@ -304,8 +312,9 @@ YAML
   t0=$(now_s)
   runbin run --job acc-pg-mysql --data-dir "$data" --stop-when-idle 5s >"$W/run1.log" 2>&1
   rc=$?
+  local KIND="${KIND:-}"; KIND=$(classify_rc "$rc" "$W/run1.log"); [ "$KIND" = "needs_action" ] && PAUSED_P2M=1 || PAUSED_P2M=0
   mark "pg→mysql 全量+追平结束 rc=$rc"
-  [ $rc -eq 0 ] || { echo "FAIL: 全量退出码 $rc"; tail -20 "$W/run1.log"; return 1; }
+  case "$KIND" in ok|needs_action|stopped) : ;; *) echo "FAIL: 全量退出码 $rc（$KIND）"; tail -20 "$W/run1.log"; return 1 ;; esac
 
   s_fp=$(fp_pg "$src" "$T"); d_fp=$(fp_mysql "$T")
   python3 "$GC" fp --src "$s_fp" --dst "$d_fp" --label "pg→mysql 全量" || { echo "  源 $s_fp / 目标 $d_fp"; return 1; }
@@ -362,8 +371,9 @@ YAML
   t0=$(now_s)
   runbin run --job acc-mysql-mysql --data-dir "$data" --stop-when-idle 5s >"$W/run1.log" 2>&1
   rc=$?
+  local KIND="${KIND:-}"; KIND=$(classify_rc "$rc" "$W/run1.log"); [ "$KIND" = "needs_action" ] && PAUSED_M2M=1 || PAUSED_M2M=0
   mark "mysql→mysql 全量+追平结束 rc=$rc"
-  [ $rc -eq 0 ] || { echo "FAIL: 全量退出码 $rc"; tail -20 "$W/run1.log"; return 1; }
+  case "$KIND" in ok|needs_action|stopped) : ;; *) echo "FAIL: 全量退出码 $rc（$KIND）"; tail -20 "$W/run1.log"; return 1 ;; esac
 
   d_fp=$(fp_mysql "$T")
   python3 "$GC" fp --src "$s_fp" --dst "$d_fp" --label "mysql→mysql 全量" || { echo "  源 $s_fp / 目标 $d_fp"; return 1; }

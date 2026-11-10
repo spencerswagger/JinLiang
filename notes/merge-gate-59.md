@@ -373,3 +373,20 @@ Core #99（`c72f36c`）把 `target.go` 的收尾判定收窄到 `isLocalClose`�
 缺 `责任人` / `转绿用例` / `移除 continue-on-error` 任一项 → `check` 判失败；selftest 加了
 `scripts/testdata/known-red-missing-owner.yml`（故意缺「责任人」）与真 workflow 两条断言；
 注入 `known-red-template-lax`（不要求写责任人）→ selftest 必红 → KILLED。
+
+## 7.14 退出码 3（有欠账不是失败）：断言 / 脚本 / 报表三处
+
+Panel 裁决：新增 `ExitNeedsAction = 3`，派生 `失败 1 > 用户停止 130 > 正常收尾且有暂停表 3 > 0`，
+**有暂停表禁止退 0**。主干目前**没有**这一档（`grep ExitNeedsAction` 为空），所以：
+
+| 落点 | 内容 |
+|---|---|
+| 引擎级断言（**先红**） | `TestPausedRunExitsNeedsAction`（`internal/engine/paused_exit_code_test.go`，`-tags='integration exitcode3'`）：首搬退 0 → 造暂停 → 必须退 3 → 对齐后不再退 3（防「跑过就退 3」）。当前实跑 `有暂停表必须退 3…实际 0`——**这就是那个 bug 的现场** |
+| 门禁摆放 | 独立跟踪步骤 `暂停的 run 必须退 3（欠账不是失败）`（`continue-on-error`，台账 `exit-code-3`，责任人 Panel/Core）；实现落地那刻 `verify` 判「断言未激活」逼着转阻塞 |
+| 口径单点 | `scripts/exit_codes.py`（`classify` / `selftest` 8 条）：`b1_pg_to_mysql.sh` 与 `acceptance_matrix.sh` 都用它，不再各写一套 `grep "退出码 1"` |
+| 脚本判失败 | `b1_pg_to_mysql.sh` 原来 `grep "退出码 1\|阶段 failed"` 会漏报 3 → 改成 `exit_kind`：`3` 打印「跑完了但有欠账（有暂停表），**不是失败**；数据面继续校验」，`1`/`阶段 failed` 才 `exit 1` |
+| 矩阵报表 | 三组合的 run 结果按 `classify` 判；`3` 不判失败，`RESULT` 行多一个 `paused=0/1` 字段，报表不会把「有暂停表」标成失败 |
+| 变异 | `exit3-as-failed`（把 `EXIT_NEEDS_ACTION` 映射成 `failed`）→ `exit_codes.py selftest` 必红 → **KILLED**（logic 9/9）。**引擎层**「删掉 3 那一档」的变异要等 `ExitNeedsAction` 落地才能写（现在无处可删），届时补 `exit-paused-downgraded` |
+
+没动的：`--stop-when-idle` 仍退 0；`verify`(1) 与 `status --verify`(5) 同事实两码本次不碰；
+`internal/engine/integration_mysql_type_pause_test.go` 归 Core，一个字没动。

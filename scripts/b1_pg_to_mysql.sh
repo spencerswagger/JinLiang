@@ -12,6 +12,10 @@ set -euo pipefail
 
 BIN=${1:-./dist/jinliang}
 MODE=${2:-full}
+HERE="$(cd "$(dirname "$0")" && pwd)"
+# 退出码口径只写一处（scripts/exit_codes.py）：失败 1 > 停止 130 > 有暂停表 3 > 0。
+# 原来这里用文本 grep「退出码 1|阶段 failed」，**暂停场景（3）会被漏报**。
+exit_kind() { python3 "$HERE/exit_codes.py" classify --code "$1" --log "$2"; }
 ROWS=${ROWS:-20000}
 SRC=${JINLIANG_TEST_PG_SRC_DSN:-}
 DST=${JINLIANG_TEST_MYSQL_DSN:-}
@@ -113,11 +117,20 @@ if [ "$MODE" = "kill" ]; then
   pg "DELETE FROM $TBL WHERE id BETWEEN 100 AND 199" >/dev/null
   echo "   停机期间源端删除了 100 行（id 100-199），重启后必须消失"
   echo "== 5. 重启：整轮重搬（清表后再搬）=="
-  timeout 600 "$BIN" run --job pg-to-mysql --data-dir "$DATA" --stop-when-idle 5s > "$WORK/run2.log" 2>&1 || true
+  RC=0
+  timeout 600 "$BIN" run --job pg-to-mysql --data-dir "$DATA" --stop-when-idle 5s > "$WORK/run2.log" 2>&1 || RC=$?
   grep -E "清空了|全量完成|复制" "$WORK/run2.log" | head -4 || true
-  if grep -qE "退出码 1|阶段 failed" "$WORK/run2.log"; then
-    echo "--- 重启那一轮失败，日志： ---"; tail -12 "$WORK/run2.log"
-  fi
+  KIND=$(exit_kind "$RC" "$WORK/run2.log")
+  case "$KIND" in
+    failed*)
+      echo "--- 重启那一轮**失败**（$KIND），日志： ---"; tail -12 "$WORK/run2.log"; exit 1 ;;
+    needs_action*)
+      echo "   退出码 3：$KIND —— 跑完了但有欠账（有暂停表），**不是失败**；数据面继续校验" ;;
+    ok*|stopped*)
+      : ;;
+    *)
+      echo "FAIL: 退出码无法判读（$KIND）：$RC"; tail -12 "$WORK/run2.log"; exit 1 ;;
+  esac
   FINAL=$(my_rows)
   SRC_FP=$(fingerprint_pg); DST_FP=$(fingerprint_my)
   echo "   中断行数 $MID / 最终 $FINAL 行（源端 $((ROWS-100)) 行）"

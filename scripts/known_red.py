@@ -33,6 +33,15 @@ WORKFLOW = os.path.join(ROOT, ".github/workflows/merge-gate.yml")
 # 台账。每条都必须是「可对账」的：probe 判「实现落地没有」，step 判「步骤还挂着没有」。
 REGISTRY = [
     dict(
+        id="exit-code-3",
+        step="暂停的 run 必须退 3（欠账不是失败）",
+        owner="Panel/Core",
+        detector="TestPausedRunExitsNeedsAction（-tags='integration exitcode3'）",
+        unblock="引擎派生 ExitNeedsAction=3（失败 1 > 停止 130 > 正常收尾且有暂停表 3 > 0）；"
+                "落地后删掉这一步的 continue-on-error。当前主干没有这一档，暂停场景仍退 0",
+        probe="job:engine-mutation",
+    ),
+    dict(
         id="chunk-resume-wiring",
         step="块级续跑（known-red：单表口径，重启搬 ≈ 未搬完 ±1 块）",
         owner="Core",
@@ -271,7 +280,8 @@ def selftest():
         print("selftest: ok   仍红 + 仍挂起 = 放行（fixture）")
 
     # 三件套模板：真 workflow 必须齐全；故意缺「责任人」的 fixture 必须被点出来。
-    step = REGISTRY[0]["step"]
+    entry = next(e for e in REGISTRY if e["id"] == "chunk-resume-wiring")
+    step = entry["step"]
     real_missing = template_missing(open(WORKFLOW, encoding="utf-8").read(), step)
     fx_missing = template_missing(open(FIXTURE_MISSING, encoding="utf-8").read(), step)
     if real_missing:

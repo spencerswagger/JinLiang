@@ -89,6 +89,16 @@ MUTATIONS = [
         note="把「只暂停该表」放宽成「登记了就行」",
     ),
     dict(
+        name="exit3-as-failed",
+        tier="logic",
+        file="scripts/exit_codes.py",
+        find='    EXIT_NEEDS_ACTION: "needs_action",',
+        replace='    EXIT_NEEDS_ACTION: "failed",  # SABOTAGE: 把「有欠账」当失败',
+        cmd=[sys.executable, "scripts/exit_codes.py", "selftest"],
+        signal="selftest 退出 1（3 必须判 needs_action）",
+        note="把退出码 3 归成失败（暂停场景被误报成失败）",
+    ),
+    dict(
         name="known-red-stale-suspended",
         tier="logic",
         file="scripts/known_red.py",

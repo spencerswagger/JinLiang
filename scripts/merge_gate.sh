@@ -60,6 +60,7 @@ step() { # $1=名称 $2=命令（用 bash -c 跑，输出进日志）
 echo "merge-gate: $(date -u +%FT%TZ) root=$ROOT pr=${PR:-（未指定，只做本地自检）}" | tee -a "$LOG"
 
 step "gate_checks selftest" python3 "$ROOT/scripts/gate_checks.py" selftest
+step "退出码口径自检（1/130/3/0）" python3 "$ROOT/scripts/exit_codes.py" selftest
 # 已知红必须收口：台账由 scripts/known_red.py 维护，输出里永远打印倒计时清单，
 # 实现落地了却还挂着 continue-on-error 就直接判 1（「断言未激活」）。
 step "known-red 台账（已知红收口）" python3 "$ROOT/scripts/known_red.py" check
