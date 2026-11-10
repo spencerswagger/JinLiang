@@ -646,8 +646,11 @@ func (s *Sink) reconcileColumns(ctx context.Context, ti *tableInfo) error {
 		typ, ok := have[col]
 		if ok {
 			if !compatibleType(typ, ti.types[i]) {
-				return fmt.Errorf("%w: 目标表 %s 的列 %s 是 %s，源端是 %s",
-					ErrTypeMismatch, ti.ref.Table, col, typ, ti.types[i])
+				// **同一种失败、两种时机不能有两种行为**：跑起来时发现类型变了 → 暂停该表；
+				// prepare 时发现类型不一致却打死整任务，用户会当成两个 bug。
+				// 所以这里也走 TypeChangedError（同一个原因码），由第③步统一按表暂停。
+				return &TypeChangedError{TableName: ti.ref.Table,
+					Detail: fmt.Sprintf("列 %s：目标端当前是 %s，源端是 %s", col, typ, ti.types[i])}
 			}
 			if want := ti.collation(i); want != "" && haveColl[col] != want {
 				// 排序规则不同 → 唯一索引判重与 ORDER BY 会不一致，而且是静默的。
@@ -672,9 +675,6 @@ func (s *Sink) reconcileColumns(ctx context.Context, ti *tableInfo) error {
 
 // ErrTargetTableExists mirrors core.CodeTargetTableExists (E1002).
 var ErrTargetTableExists = errors.New("目标端已经有同名表")
-
-// ErrTypeMismatch means the target column cannot hold the source value as-is.
-var ErrTypeMismatch = errors.New("目标表的列类型和源端不一致")
 
 // ErrCollationMismatch means the two sides sort/compare the same text column
 // differently — upsert 判重会静默走偏，必须当成结构不兼容处理。
@@ -933,7 +933,7 @@ func (s *Sink) Apply(ctx context.Context, evs []source.Event, pos source.Positio
 			// **DDL 必须在这里执行**。之前这行注释写的是「由引擎处理」——而引擎里
 			// 根本没有 EvDDL 的处理代码（`grep EvDDL internal/engine` 为空），
 			// 于是源端 DDL 从来没搬到目标端：加列后整批行写失败、建索引完全静默、
-			// 改类型下次 EnsureSchema 撞 ErrTypeMismatch 把整个任务打死。
+			// 改类型下次 Prepare 的对列对不上，会以 E1015 拒掉整轮（按表暂停见第③步）。
 			if err := s.applyDDLTx(ctx, tx, ev); err != nil {
 				return err
 			}
@@ -1076,9 +1076,9 @@ func (s *Sink) alignRelationTx(ctx context.Context, tx pgx.Tx, ev source.Event) 
 		// 改类型：本版**不跟随**（改窄会截断、改宽会静默变更语义）。
 		// 第③步会把它降级成「只暂停这张表 + 明确原因码」，其它表继续跑；
 		// 在那之前先响亮拒绝，别让它安静写错。
-		return &TypeChangedError{Table: ev.Table.Table, Detail: typeDiff}
+		return &TypeChangedError{TableName: ev.Table.Table, Detail: typeDiff}
 	case !keptAll:
-		return &SchemaDriftError{Table: ev.Table.Table, Detail: nameDiff}
+		return &SchemaDriftError{TableName: ev.Table.Table, Detail: nameDiff}
 	}
 
 	var added []string
@@ -1157,26 +1157,37 @@ func relationMatches(ti *tableInfo, rel *source.Table, src catalog.Engine) (same
 		}
 	}
 	sameTypes, keptAll = true, true
-	var tparts, nparts []string
+	var tparts, nparts, renames []string
 	for i, name := range ti.cols {
 		typ, ok := byName[name]
 		if !ok {
+			// 可能只是改名（位置上的新名字）。先记下来，等循环末尾判断要不要输出单边说法。
 			keptAll = false
-			nparts = append(nparts, fmt.Sprintf("原 %s 已不存在", name))
+			if i < len(rel.Columns) && rel.Columns[i].Name != name {
+				renames = append(renames, fmt.Sprintf("第 %d 列：原 %s → 现 %s", i+1, name, rel.Columns[i].Name))
+			} else {
+				nparts = append(nparts, fmt.Sprintf("原 %s 已不存在", name))
+			}
 			continue
 		}
 		if i < len(ti.types) && typ != ti.types[i] {
 			sameTypes = false
-			tparts = append(tparts, fmt.Sprintf("%s: %s → %s", name, ti.types[i], typ))
+			// 这条路两端都是**源端**类型：ti.types = 建表时从源端 catalog 拿到的旧类型，
+			// typ = 事件里 Relation 带来的新类型。写成「目标端」会把用户引去改错的一端。
+			tparts = append(tparts, fmt.Sprintf("列 %s：源端原来是 %s，现在是 %s", name, ti.types[i], typ))
 		}
 		if i < len(rel.Columns) && rel.Columns[i].Name != name {
-			nparts = append(nparts, fmt.Sprintf("第 %d 列 原 %s → 现 %s", i+1, name, rel.Columns[i].Name))
+			renames = append(renames, fmt.Sprintf("第 %d 列：原 %s → 现 %s", i+1, name, rel.Columns[i].Name))
 		}
 	}
-	// 「新增」与列数是否变化无关：改名时也是「一个没了、一个多了」，两边都要说清。
-	for _, c := range rel.Columns {
-		if _, ok := ti.colIndex[c.Name]; !ok {
-			nparts = append(nparts, "新增 "+c.Name)
+	// 有「原→现」配对时，那两个单边说法（「原 X 已不存在」「新增 Y」）就是同一件事的重复，
+	// 不再输出——用户只需要知道「第 N 列 原 a → 现 b」。
+	nparts = append(renames, nparts...)
+	if len(renames) == 0 {
+		for _, c := range rel.Columns {
+			if _, ok := ti.colIndex[c.Name]; !ok {
+				nparts = append(nparts, "新增 "+c.Name)
+			}
 		}
 	}
 	typeDiff = strings.Join(tparts, "；")
@@ -1195,60 +1206,51 @@ const (
 // TypeChangedError 表示源端改了列类型——本版不跟随（会截断或静默变更语义）。
 // 单独成类型，方便第③步把它降级成「只暂停这张表」而不是整个任务。
 type TypeChangedError struct {
-	Table  string
-	Detail string
+	TableName string
+	Detail    string
 }
 
 // Reason 实现 PausableError：第③步按它记 paused_tables 的原因码。
 func (e *TypeChangedError) Reason() string { return PauseReasonTypeChanged }
 
+// Table 实现 PausableError。
+func (e *TypeChangedError) Table() string { return e.TableName }
+
 // SchemaDriftError 表示列被改名或删掉（列数可能没变）。
 type SchemaDriftError struct {
-	Table  string
-	Detail string
+	TableName string
+	Detail    string
 }
 
+// Error 同样只带事实（动作与风险交给码表）。
 func (e *SchemaDriftError) Error() string {
-	return fmt.Sprintf("源端表 %s 的列发生变化（改名/删列），本版不跟随：%s。"+
-		"你能做什么：1) 手工把目标表的列改成与源端一致后重跑（位点不动）；"+
-		"2) 或把该表移出同步范围。风险：结构不一致时继续写会让数据与列错位", e.Table, e.Detail)
+	return fmt.Sprintf("表 %s 的列在源端被改名或删掉（%s）", e.TableName, e.Detail)
 }
 
 // Reason 实现 PausableError。
 func (e *SchemaDriftError) Reason() string { return PauseReasonSchemaDrift }
 
+// Table 实现 PausableError。
+func (e *SchemaDriftError) Table() string { return e.TableName }
+
 // PausableError 是「这张表不能继续跟，但其它表可以继续」的错误。
 // 第③步用它把「一张表的 DDL」降级成「只暂停这张表」，而不是打死整个任务。
 type PausableError interface {
 	error
+	// Reason 是稳定原因码（机器判等，不是中文句子）。
 	Reason() string
+	// Table 是被暂停的那张表。放进接口是必须的：paused_tables 要存「表名 + 原因码 + 时间」，
+	// 若表名只藏在各个具体类型里，第③步就得对每个类型各写一次 errors.As——加第三个类型时必漏。
+	Table() string
 }
 
+// Error 只陈述**事实**（表名 + 每列两端各是什么）。
+//
+// 动作与风险交给码表（E1015 的 Next/Risk）：last_error 的落盘格式是
+// `[E1015] <码表 Message>：<err.Error()> 下一步：<码表 Next>`，
+// 这里再写一遍就成了「同一条错误两段动作」。TableNotFoundError 已经是这个形态。
 func (e *TypeChangedError) Error() string {
-	return fmt.Sprintf("源端表 %s 的列类型发生变化，本版不跟随：%s。"+
-		"你能做什么：1) 确认目标端也要改成新类型后，手工执行 ALTER 再重跑（位点不动）；"+
-		"2) 或把该表移出同步范围。"+
-		"风险：类型不一致时继续写，要么被截断、要么报一个看起来像「数据问题」的编码错", e.Table, e.Detail)
-}
-
-func typeDiffText(ti *tableInfo, rel *source.Table) string {
-	var parts []string
-	for i, c := range rel.Columns {
-		if i < len(ti.types) && c.Type != ti.types[i] {
-			parts = append(parts, fmt.Sprintf("%s: %s → %s", c.Name, ti.types[i], c.Type))
-		}
-	}
-	return strings.Join(parts, "；")
-}
-
-func nameDiffText(ti *tableInfo, rel *source.Table) string {
-	var parts []string
-	for i, c := range rel.Columns {
-		if i < len(ti.cols) && c.Name != ti.cols[i] {
-			parts = append(parts, fmt.Sprintf("原 %s → 现 %s", ti.cols[i], c.Name))
-		}
-	}
-	return strings.Join(parts, "；")
+	return fmt.Sprintf("表 %s 与源端的列类型不一致（%s）", e.TableName, e.Detail)
 }
 
 // applyDDLTx 在目标端执行源端的 DDL。

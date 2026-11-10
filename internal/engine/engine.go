@@ -365,10 +365,14 @@ func (r *runner) execute(parent context.Context, res *Result) error {
 		return nil
 	}
 
+	// teardown 要在 prepare **之前**注册：prepare 已经抢了租约、开了连接，它中途失败
+	// （比如目标列类型对不上）时若直接返回，租约就没人放 —— 同一台机器上紧接着再跑一次
+	// 会撞「另一个实例正在跑这个任务」（E1005），而「改完类型重跑」正是错误文案让用户做的
+	// 下一步。teardown 对 nil 的 sink/src 安全，提前注册没有副作用。
+	defer r.teardown()
 	if err := r.prepare(ctx); err != nil {
 		return r.fail(ctx, err)
 	}
-	defer r.teardown()
 
 	if r.needSnapshot {
 		if err := r.snapshot(ctx); err != nil {
@@ -777,6 +781,11 @@ func (r *runner) prepare(ctx context.Context) error {
 	}
 	// 建表要用**目标端**的表定义（schema 换成目标端的）：源端 catalog 里的
 	// schema 是源库名（MySQL 源就是库名），直接拿去建表会变成「目标端没有这个 schema」。
+	// **顺序有要求：EnsureSchema 必须早于 snapshot() 里的 cleanBeforeRecopy。**
+	// 清表这一步要清的表得先存在：EnsureSchema 负责建表并把「这张表是本任务建的」
+	// 记进 _jl_object，cleanBeforeRecopy 正靠它决定能不能 TRUNCATE；反过来就会
+	// 撞上「relation does not exist」，或者把用户的表当成自己的清掉。
+	// 断言在 TestCleanRunsAfterEnsureSchema（真库：目标表不存在 + 需要清表的那一走法）。
 	actions, err := sink.EnsureSchema(ctx, r.targetCatalog())
 	if err != nil {
 		return fmt.Errorf("准备目标表失败: %w", err)
@@ -1293,6 +1302,11 @@ func classifyError(err error) (code core.Code, classified bool) {
 		return core.CodePositionKindMismatch, true
 	case errors.As(err, &tooBig):
 		return core.CodeTxTooLarge, true
+	case errors.As(err, new(pgsink.PausableError)):
+		// 「这张表的结构对不上」：prepare 补列时类型不一致，或跑起来后源端改类型/改名/删列。
+		// 目标写成**接口指针**（不是 *TypeChangedError）：将来第三个实现也能匹配上。
+		// 具体是哪一种、哪张表哪一列由 fail() 拼进 last_error——**码表说类别，运行时说具体**。
+		return core.CodeSchemaMismatch, true
 	case pgsource.IsNoPrivilege(err):
 		// 42501：源端 SELECT 或目标端 DDL/DML 被拒——用户要做的事都是「去要授权」。
 		return core.CodeNoPrivilege, true
@@ -1445,8 +1459,16 @@ func (r *runner) fail(ctx context.Context, err error) error {
 		// 有码也要把方向写进 last_error：历史页在 code 为空时只有这条字符串。
 		// 不写的话，「该怎么处理」只活在事件流里（进程一重启就没了）。
 		if spec, ok := core.Lookup(code); ok {
+			// 「按表暂停」这一族要额外把**表名与原因码**写进去，而且放在**开头**：
+			// 用户拿到这条错误，第一件要问的是「哪张表」，其次才是「怎么办」。
+			// 码表说类别，运行时说具体——这条边界由 Ark 给 E1015 时定下。
+			head := spec.Message
+			var pe pgsink.PausableError
+			if errors.As(err, &pe) {
+				head = fmt.Sprintf("%s（表 %s，原因码 %s）", head, pe.Table(), pe.Reason())
+			}
 			lastError = fmt.Sprintf("[%s] %s：%s 下一步：%s",
-				code, spec.Message, err.Error(), strings.Join(spec.Next, "；"))
+				code, head, err.Error(), strings.Join(spec.Next, "；"))
 		} else {
 			lastError = fmt.Sprintf("[%s] %s", code, err.Error())
 		}
