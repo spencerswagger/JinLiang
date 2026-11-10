@@ -2,17 +2,23 @@
 
 package engine_test
 
-// DDL 改类型 → 只把**那张表**记成暂停、位点不动、对齐后从原位点恢复追平。
+// DDL 改类型 → **只停这一张表**：其它表照写、位点照常前进；结构对齐后整表重搬补齐。
 // 这条用例跑的是**真 MySQL 源**（binlog 的 TABLE_MAP 带新列类型），不是造事件 ——
 // 改类型这条路上最容易骗过自己的就是「造出来的事件长得对」。
 //
-// 判据（每条都对着契约 notes/contract-paused-tables.md §1/§3 写）：
+// 判据（对着契约 docs/CONTRACT-PAUSE-AND-POSITION.md §1.5/§1.6，**与正文断言逐条对应**）：
 //  1. paused_tables 里**只有改类型的那张表**，reason 是稳定码 type_changed，
 //     detail 里同时有**源端前后类型**（bigint → varchar(64)）与目标端映射；
-//  2. run 以 E1015 结束，位点在暂停前后**逐字节相等**（暂停不是位点推进的副作用）；
-//  3. 同批次里另一张表的那一行也**没有**落库（位点只有一个 → 整条同步停下；
-//     这是当前契约，不是疏漏，见用例末尾的断言与注释）；
-//  4. 对齐目标端列类型后重跑：暂停记录消失、位点前进、两张表都与源端一致。
+//  2. **其它表照跑**：同一时段另一张表（旁证）的那一行必须落库（5 行；旧契约下会停在 4 行）；
+//  3. **位点照常前进**（`posBefore < posAfterPause`），被暂停那张表的行**不写**（跳过是事实）——
+//     欠账由恢复时的整表重搬还（不是靠把位点卡住）；
+//  4. run **不失败**，`--stop-when-idle` 正常收尾（退出码 0）；
+//  5. 对齐目标端列类型后重跑：暂停记录清空、**整表重搬**把跳过的那一行补回来、
+//     位点不后退、两张表与源端逐行一致。
+//
+// **别把旧口径写回来**：#90 之前的行为是「整 run 失败、位点不推进、旁证表的行也停」，
+// 那三条已被裁决 A 作废（契约见 docs/CONTRACT-PAUSE-AND-POSITION.md §1.5/§1.6）。
+// 注释与正文断言必须描述同一件事——以正文和契约文档为准。
 
 import (
 	"context"
@@ -200,11 +206,11 @@ func TestMySQLSourceTypeChangePausesOnlyThatTableAndRecovers(t *testing.T) {
 		t.Fatalf("%s 应有 5 行（裁决 A：一张表坏了别的表继续跑；旧契约下是 4 行），实际 %d：\n%s",
 			other, got, out)
 	}
-	// 判据③（裁决 A）：**位点照常前进**（跳过的那段靠恢复时整表重搬补齐，不是靠位点不动）。
+	// 判据③（裁决 A）：**位点照常前进**（跳过的那段靠恢复时整表重搬补齐）。
 	posAfterPause := myPosition(t, dst)
 	mustMySQLPos(t, "暂停后", posAfterPause)
 	if !myPosLess(posBefore, posAfterPause) {
-		t.Fatalf("裁决 A 下位点必须前进：%s → %s（位点不动是旧契约的行为）", posBefore, posAfterPause)
+		t.Fatalf("裁决 A 下位点必须前进：%s → %s（旧契约才要求暂停期间位点不动）", posBefore, posAfterPause)
 	}
 	// 被暂停那张表的行**没有**进目标端（跳过是事实，不能假装写了）。
 	if pgHasRow(t, dst, changed, "id = 11") {
