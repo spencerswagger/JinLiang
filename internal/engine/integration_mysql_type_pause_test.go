@@ -6,7 +6,8 @@ package engine_test
 // 这条用例跑的是**真 MySQL 源**（binlog 的 TABLE_MAP 带新列类型），不是造事件 ——
 // 改类型这条路上最容易骗过自己的就是「造出来的事件长得对」。
 //
-// 判据（对着契约 docs/CONTRACT-PAUSE-AND-POSITION.md §1.5/§1.6，**与正文断言逐条对应**）：
+// 判据（对着契约 docs/CONTRACT-PAUSE-AND-POSITION.md §1.5/§1.6，**与正文断言逐条对应**；
+// 正文里用「判据（…）」标注，顺序按断言的先后，不按这里的编号）：
 //  1. paused_tables 里**只有改类型的那张表**，reason 是稳定码 type_changed，
 //     detail 里同时有**源端前后类型**（bigint → varchar(64)）与目标端映射；
 //  2. **其它表照跑**：同一时段另一张表（旁证）的那一行必须落库（5 行；旧契约下会停在 4 行）；
@@ -178,11 +179,12 @@ func TestMySQLSourceTypeChangePausesOnlyThatTableAndRecovers(t *testing.T) {
 	_ = logFile.Close()
 	body, _ := os.ReadFile(logFile.Name())
 	out := string(body)
+	// 判据（run 不失败）：裁决 A 下「只停该表」不该把整条同步判死。
 	if code != 0 {
 		t.Fatalf("裁决 A 下「只停该表」不该让 run 失败，实际退出码 %d：\n%s", code, out)
 	}
 
-	// 判据①：paused_tables 里**只有**改类型的那张表，且记录可读。
+	// 判据（只有那张表进 paused）：paused_tables 里只有改类型的那张表，且记录可读。
 	if _, bad := readPausedMap(t, dst, jobKey)[other]; bad {
 		t.Fatalf("paused_tables 里出现了没改类型的表 %s：%v", other, readPausedMap(t, dst, jobKey))
 	}
@@ -201,12 +203,12 @@ func TestMySQLSourceTypeChangePausesOnlyThatTableAndRecovers(t *testing.T) {
 		t.Fatalf("detail 应写成「源端 bigint → varchar(N)」这种前后对照，实际 %q", rec.Detail)
 	}
 
-	// 判据②（裁决 A）：**其它表照跑** —— 旁证表那一行必须落库（旧契约下它停在 4 行）。
+	// 判据（其它表照跑）：旁证表那一行必须落库（旧契约下它停在 4 行）。
 	if got := pgCount(t, dst, other); got != 5 {
 		t.Fatalf("%s 应有 5 行（裁决 A：一张表坏了别的表继续跑；旧契约下是 4 行），实际 %d：\n%s",
 			other, got, out)
 	}
-	// 判据③（裁决 A）：**位点照常前进**（跳过的那段靠恢复时整表重搬补齐）。
+	// 判据（位点照常前进）：跳过的那段靠恢复时整表重搬补齐，不靠卡住位点。
 	posAfterPause := myPosition(t, dst)
 	mustMySQLPos(t, "暂停后", posAfterPause)
 	if !myPosLess(posBefore, posAfterPause) {
@@ -240,7 +242,7 @@ func TestMySQLSourceTypeChangePausesOnlyThatTableAndRecovers(t *testing.T) {
 		t.Fatalf("%s 恢复后仍没有 id=11/'abc'：整表重搬没把它补回来，这段变更永久丢失：\n%s", changed, out2)
 	}
 
-	// 判据④：两张表都与源端一致。
+	// 判据（恢复后一致）：整表重搬补齐之后，两张表都与源端逐行一致。
 	for _, tc := range []struct{ tbl, srcQ, dstQ string }{
 		{changed,
 			"SELECT CONCAT(COUNT(*), ':', COALESCE(GROUP_CONCAT(CONCAT(id,'|',COALESCE(v,'∅')) ORDER BY id),'')) FROM " + changed,
