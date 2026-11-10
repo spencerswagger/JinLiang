@@ -85,3 +85,81 @@ func TestEnrichRelationLeavesFullMetadataAlone(t *testing.T) {
 		t.Fatalf("FULL 元数据必须原样使用，实际改成了 %v", got.Columns)
 	}
 }
+
+// MINIMAL 元数据下「列数没变、只改了类型」：修复前会被 catalog **整体盖回旧类型**，
+// 改类型在流上彻底看不见（目标端按旧口径继续写，直到下次 prepare 才发现）。
+//
+// 判据：类型串一变，就不许再拿 catalog 的类型覆盖；列名照旧按序号补齐。
+// 这是 Owl II 在 #94 评审里指出的必改项（列数不变的 MODIFY COLUMN 会被盖掉）。
+func TestEnrichRelationKeepsBinlogTypeWhenTypeChanged(t *testing.T) {
+	s := &Source{}
+	s.SetKnownTables([]source.Table{{
+		TableRef:   source.TableRef{Schema: "app", Table: "orders"},
+		Columns:    []source.Column{{Name: "id", Type: "bigint"}, {Name: "v", Type: "bigint"}},
+		PrimaryKey: []string{"id"}, HasStablePK: true,
+	}})
+
+	// 第一版：与 catalog 一致（MINIMAL 的占位名）。
+	rel1 := &source.Table{
+		TableRef: source.TableRef{Schema: "app", Table: "orders"},
+		Columns:  []source.Column{{Name: "col_1", Type: "bigint"}, {Name: "col_2", Type: "bigint"}},
+	}
+	got1 := s.enrichRelation(rel1)
+	if got1.Columns[1].Type != "bigint" || got1.Columns[1].Name != "v" {
+		t.Fatalf("第一版应沿用 catalog：%#v", got1.Columns[1])
+	}
+
+	// 第二版：源端 MODIFY COLUMN v VARCHAR(64)（列数不变，只有类型变了）。
+	rel2 := &source.Table{
+		TableRef: source.TableRef{Schema: "app", Table: "orders"},
+		Columns:  []source.Column{{Name: "col_1", Type: "bigint"}, {Name: "col_2", Type: "varchar(64)"}},
+	}
+	got2 := s.enrichRelation(rel2)
+	if got2.Columns[1].Type != "varchar(64)" {
+		t.Fatalf("类型变了却仍被 catalog 盖成 %q：改类型在流上看不见（MINIMAL 的默认路径）",
+			got2.Columns[1].Type)
+	}
+	if got2.Columns[1].Name != "v" {
+		t.Fatalf("名字仍要按序号补齐，实际 %q", got2.Columns[1].Name)
+	}
+	// 第三版回到 bigint（再改一次）也要看得见。
+	rel3 := &source.Table{
+		TableRef: source.TableRef{Schema: "app", Table: "orders"},
+		Columns:  []source.Column{{Name: "col_1", Type: "bigint"}, {Name: "col_2", Type: "bigint"}},
+	}
+	if got3 := s.enrichRelation(rel3); got3.Columns[1].Type != "bigint" {
+		t.Fatalf("改回去也要看得见，实际 %q", got3.Columns[1].Type)
+	}
+}
+
+// looseSameType：MINIMAL 元数据下「同一列」的两种写法必须判成同一列，
+// 而**真的改了类型**必须判成不同——两边都会出事：
+// 判太严 → 每一张带 varchar/char/text 的表都在第一条 Relation 上误暂停；
+// 判太松 → 改类型被 catalog 盖回去，目标端按旧口径继续写（静默写错）。
+func TestLooseSameType(t *testing.T) {
+	cases := []struct {
+		binlog, catalog string
+		same            bool
+		why             string
+	}{
+		{"bigint", "bigint", true, "一模一样"},
+		{"varchar(256)", "varchar(64)", true, "utf8mb4 的字符数×4 = binlog 的字节数"},
+		{"varchar(192)", "varchar(64)", true, "utf8mb3 ×3"},
+		{"varchar(64)", "varchar(64)", true, "latin1，字节=字符"},
+		{"char(40)", "char(10)", true, "CHAR 的长度同样是字节（Owl II 实测 char(10) 报 char(40)）"},
+		{"text", "text", true, "一致"},
+		{"blob", "text", true, "TEXT 与 BLOB 共用类型字节，MINIMAL 下分不开——不能因此判成改类型"},
+		{"mediumblob", "mediumtext", true, "同尺寸档"},
+		{"varchar(32)", "varbinary(32)", true, "binary 字符集在 MINIMAL 里拿不到，名字会变"},
+		{"varchar(64)", "bigint", false, "**真的改类型**：必须判不同，否则改类型看不见"},
+		{"int", "bigint", false, "整型宽度变了"},
+		{"mediumtext", "text", false, "尺寸档变了"},
+		{"varchar(512)", "varchar(64)", false, "×8 不在任何字符集的可能里（utf8mb4 最多 ×4）"},
+		{"varchar(20)", "varchar(64)", false, "收窄"},
+	}
+	for _, c := range cases {
+		if got := looseSameType(c.binlog, c.catalog); got != c.same {
+			t.Errorf("looseSameType(%q, %q) = %v，应为 %v —— %s", c.binlog, c.catalog, got, c.same, c.why)
+		}
+	}
+}

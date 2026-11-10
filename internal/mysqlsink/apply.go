@@ -30,6 +30,17 @@ func (s *Sink) Apply(ctx context.Context, evs []source.Event, pos source.Positio
 
 	advance := pos != nil && (len(evs) == 0 || endsWithCommit(evs))
 
+	// **最后一道防线**（契约 §1.5 第 1 条）：判定权在引擎，写路径不做暂停判定。
+	// 但万一引擎那边漏了（表名口径变了、新写路径没包 pauseSink），这里要立刻炸——
+	// 而不是带着新关系往一张结构没对齐的表里写。只查内存集合，不产生 IO。
+	// pausedCache 为空（没调过 LoadPausedTables）时这段是空转，不影响别的路径。
+	for _, ev := range evs {
+		if _, paused := s.pausedCache[ev.Table.Table]; paused {
+			return fmt.Errorf("引擎没有过滤掉暂停表 %s 的事件（内部错误：按表暂停的判定权在引擎，"+
+				"不该把这张表的行交到这里）", ev.Table.Table)
+		}
+	}
+
 	if !batchHasImplicitCommit(evs) {
 		tx, err := s.db.BeginTx(ctx, nil)
 		if err != nil {

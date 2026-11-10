@@ -70,6 +70,18 @@ type stateCapable interface {
 	TruncateTable(ctx context.Context, ref source.TableRef) error
 }
 
+// chunkChronicker 是「块级记账」的可选能力：PG 走 BulkApply（数据 + 块标记 + 位点同事务），
+// 非 PG 目标端没有那条快路径，只能在每块写完之后单独记一笔。
+//
+// 为什么做成可选接口而不是塞进 sink.Sink：契约（sink.Sink）只描述数据写入，
+// 块记账是目标端**运行时状态**的一部分；塞进去等于让每个目标端都必须实现一份空壳。
+// 没有这个能力的目标端照旧能搬（只是搬完不记账、崩了整轮重来），不是静默降级——
+// 引擎在泛化路径里已经用「有没有位点」把增量卡死，这里只影响续跑粒度。
+type chunkChronicker interface {
+	MarkChunkDone(ctx context.Context, ref source.TableRef, no int, from, to string, rows int64) error
+	MarkTableDone(ctx context.Context, ref source.TableRef) error
+}
+
 // 编译期保证：两个目标端都满足状态能力接口（签名不一致会直接编译失败）。
 var (
 	_ stateCapable = (*pgsink.Sink)(nil)
@@ -197,6 +209,14 @@ func (r *runner) executeGeneric(ctx context.Context, res *Result) error {
 
 	if err := st.EnsureMeta(ctx, hashOf(r.doc), string(state.Prepare), "", ""); err != nil {
 		return fmt.Errorf("写入任务状态行失败: %w", err)
+	}
+	// 暂停登记能力（契约 §1.7 最后一条 / §4.5 Data 清单最后一项）：**在跑之前**就把
+	// 「这个目标端能不能记暂停」问清楚。不致命——这条任务可能整轮都用不到暂停；
+	// 但必须说出来，别等半夜遇到结构不一致时才报一句「补列失败」。
+	if pr, ok := r.gsink.(interface{ PauseRegistryReady(context.Context) error }); ok {
+		if perr := pr.PauseRegistryReady(ctx); perr != nil {
+			r.note(ctx, "这台 MySQL 目标端暂时不能登记按表暂停（遇到结构不一致会整 run 失败）："+perr.Error())
+		}
 	}
 	rawPos, err := st.Position(ctx)
 	if err != nil {
@@ -420,7 +440,7 @@ func (r *runner) cleanBeforeGenericCopy(ctx context.Context, st stateCapable, fr
 func (r *runner) copyGeneric(ctx context.Context) error {
 	chunkRows := r.chunkRows()
 	_, err := r.src.SnapshotChunksFrom(ctx, source.SnapshotOpt{ChunkRows: chunkRows, Conns: 1}, nil,
-		func(c context.Context, chRef source.TableRef, chNo int, rows [][]any, _, _ string) error {
+		func(c context.Context, chRef source.TableRef, chNo int, rows [][]any, from, to string) error {
 			// 一页可能十万行：按小批喂给 Apply，避免一条超大 INSERT 撞 max_allowed_packet。
 			const perBatch = 500
 			ref := r.targetRef(chRef)
@@ -448,12 +468,38 @@ func (r *runner) copyGeneric(ctx context.Context) error {
 					return err
 				}
 			}
+			// 块记账：**数据先落、标记后落**（MySQL 目标端这一版的两步）。
+			// 崩在两者之间只会「数据在、标记没写」——下一轮重搬一遍靠 upsert 收敛，
+			// 不丢数据、只多搬一次。反过来（先记标记）崩了就是「标记说搬完、数据缺着」。
+			// 记不下来要**响亮失败**：没有标记的续跑会让「这张表欠一次重搬」无从表达
+			// （契约 §1.6 步 2 的 MarkTableRecopyPending 清的就是这些标记）。
+			if cc, ok := r.gsink.(chunkChronicker); ok {
+				if err := cc.MarkChunkDone(c, ref, chNo, from, to, int64(len(rows))); err != nil {
+					return err
+				}
+			}
 			r.rowsCopied += int64(len(rows))
 			r.progress(c, fmt.Sprintf("全量：%s 第 %d 块，%d 行", chRef.Table, chNo, len(rows)))
 			return nil
 		})
 	if err != nil {
 		return err
+	}
+	// 给每张搬过的表盖完成标记（块号 0）。放在所有块之后：崩在盖章之前不会丢数据，
+	// 下一轮从游标往后读只会拿到 0 行，然后重新盖章。
+	if cc, ok := r.gsink.(chunkChronicker); ok {
+		for _, t := range r.selectedTables() {
+			// 这一轮没搬的表**不许盖章**：等 Core 把暂停集合接进通用路径之后，
+			// 被暂停、存量没搬的表也会走到这里——盖上 done=1 就是「pause 解除了、数据还缺着」
+			// 的永久缺行（契约 §4.6 红线 3/5）。现在这条路径没有 skipped，先把这个前提钉住。
+			if r.skippedTables[t.Table] || r.plan.Skip[t.Table] {
+				continue
+			}
+			ref := r.targetRef(source.TableRef{Schema: t.Schema, Table: t.Table})
+			if err := cc.MarkTableDone(ctx, ref); err != nil {
+				return err
+			}
+		}
 	}
 	r.emit(ctx, control.Event{Type: "note",
 		Message: fmt.Sprintf("全量完成：%d 行（目标端 %s）", r.rowsCopied, r.tgtEP.Kind)})
@@ -492,6 +538,8 @@ func (r *runner) streamGeneric(ctx context.Context, st stateCapable, from source
 
 	streamCtx, cancelStream := context.WithCancel(ctx)
 	defer cancelStream()
+	// 后台提交失败要立刻打断流（否则错误被吞，任务停在「实时同步中」）。
+	b.onError = func(error) { cancelStream() }
 	go b.flushLoop(streamCtx)
 
 	var stopHit, idleHit atomic.Bool
@@ -541,8 +589,17 @@ func (r *runner) streamGeneric(ctx context.Context, st stateCapable, from source
 		return b.Add(c, ev)
 	})
 	cancelStream()
+	// 先取根因再 Flush（见 engine.go 同一处的理由）：Flush 失败时别让重试错误盖住根因。
+	cause := b.Err()
 	if err := b.Flush(context.Background()); err != nil {
+		if cause != nil {
+			return cause
+		}
 		return err
+	}
+	// 后台提交失败过就是失败：报真原因，不报「流被打断」。
+	if ferr := b.Err(); ferr != nil {
+		return ferr
 	}
 	code := ExitOK
 	if idleHit.Load() {
@@ -557,6 +614,15 @@ func (r *runner) streamGeneric(ctx context.Context, st stateCapable, from source
 				code = ExitOK
 			}
 		case errors.Is(streamErr, context.Canceled) || isUserStop(ctx, streamErr):
+			code = ExitStopped
+			if idleHit.Load() {
+				code = ExitOK
+			}
+		case stopHit.Load() || idleHit.Load():
+			// 我们自己要求收尾（按停 / 到达 --stop-after / 已追平）后 cancel ctx 打断阻塞读，
+			// 有的连接器会把这个中断冒成一个网络错误（MySQL 源的
+			// `use of closed network connection`）。判据是「**我们先要停的**」，
+			// 不是错误长什么样：真实写入错误不会同时把 stopHit/idleHit 置起来。
 			code = ExitStopped
 			if idleHit.Load() {
 				code = ExitOK

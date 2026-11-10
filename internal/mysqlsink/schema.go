@@ -25,6 +25,9 @@ var metaDDL = []string{
 		"position text NULL," +
 		"watermark text NULL," +
 		"snapshot_id varchar(128) NULL," +
+		// 按表暂停（契约 §1.4）：一列 JSON 文本，key = 目标端裸表名。
+		// 老库用 ensurePausedColumn 补列——MySQL 没有 ADD COLUMN IF NOT EXISTS，只能先查再 ALTER。
+		"paused_tables text NULL," +
 		"started_at datetime(6) NOT NULL," +
 		"updated_at datetime(6) NOT NULL" +
 		") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",

@@ -222,8 +222,11 @@ func (s *Source) Preflight(ctx context.Context, req source.Requirements) (source
 
 // Prepare implements source.Source. MySQL needs no server-side objects for a
 // stream, so there is nothing to apply — and nothing to undo.
-func (s *Source) Prepare(ctx context.Context, actions []source.Action) ([]source.Action, error) {
-	out := make([]source.Action, 0, len(actions))
+func (s *Source) Prepare(ctx context.Context, actions []source.Action) (out []source.Action, err error) {
+	// 出口统一打语义标记（契约 §4.4）：引擎只问 source.ClassOf，不 import 本包。
+	// 没有这一层时，MySQL 源的错误在引擎里**全部**落到「未识别的数据库错误」。
+	defer func() { err = markClass(err) }()
+	out = make([]source.Action, 0, len(actions))
 	for _, a := range actions {
 		a.Applied = false
 		a.Reason = "MySQL 的增量不依赖服务端对象（没有槽位/发布），无需准备"
@@ -329,7 +332,8 @@ func (s *Source) readServerID(ctx context.Context) (uint32, bool) {
 
 // Stream implements source.Source: it reads the binlog from `from` and hands
 // whole transactions to handler.
-func (s *Source) Stream(ctx context.Context, from source.Position, handler source.EventHandler) error {
+func (s *Source) Stream(ctx context.Context, from source.Position, handler source.EventHandler) (err error) {
+	defer func() { err = markClass(err) }()
 	// TLS 闸门放在最前面：连库、读排序规则都不该发生在「这条链路注定不能开流」之前。
 	if err := s.checkReplicationTLS(); err != nil {
 		return err
@@ -547,6 +551,14 @@ func (s *Source) RunStream(ctx context.Context, start Position, asm *Assembler) 
 		}
 		frame, err := conn.ReadEventPacket(ctx)
 		if err != nil {
+			// 用户按了停止 / --stop-when-idle 到点：引擎会 cancel ctx 并关连接来打断
+			// 阻塞读，于是这里拿到的是一个网络错误（`use of closed network connection`），
+			// 那**不是**数据库出问题。把它原样往上抛，用户会看到「未识别的数据库错误，
+			// 请把日志发给维护者」+ 退出码 1 —— 一次正常收尾被记成失败。
+			// 判据用 ctx（而不是错误文本）：谁关的连接不重要，ctx 结束了就是我们的取消。
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			return fmt.Errorf("读取变更流中断: %w", err)
 		}
 		if len(frame) == 0 {

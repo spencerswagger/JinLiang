@@ -77,6 +77,12 @@ type tableInfo struct {
 	ref   source.TableRef
 	cols  []string
 	types []string
+	// srcTypes[i] 是**源端原文**的类型（`bigint` / `varchar(64)` / `datetime(6)`），
+	// types[i] 是映射到目标端的类型。两者都要留：
+	//   - 写 SQL 用 types（目标端方言）；
+	//   - 报「源端改了什么类型」只能用 srcTypes —— 拿 types 报会把 MySQL 的
+	//     `varchar(32)→varchar(64)` 说成「源端原来是 text，现在是 text」，用户没法行动。
+	srcTypes []string
 	// collations[i] 是第 i 列的排序规则（空 = 用类型/库的默认）。跨库必须带上：
 	// 排序规则不同会让唯一索引判重与 ORDER BY 结果悄悄变样。
 	collations []string
@@ -105,6 +111,10 @@ type Sink struct {
 	// prepareNotes 收集「降级成提示」的判定（例如用户表多出的列不算漂移），
 	// 由引擎在 prepare 后统一 emit 出去——不许无声。
 	prepareNotes []string
+	// pendingPauses 收集 prepare 期发现的「这张表结构对不上」。
+	// **不在第一张就返回**（契约 §6 硬口径 2）：一次收全，本轮把这些表全部登记暂停，
+	// 其它表照常跑。撞到第一张就停会让「其它表继续」退化成「每次重跑多暂停一张」。
+	pendingPauses []PausableError
 
 	// ownerToken 让「同一个进程里的两个 Sink」也彼此可分（否则它们同 pid、
 	// 同 instance_id，第二个会把第一个的租约抢走）。
@@ -193,6 +203,7 @@ func buildTables(cat source.Catalog, srcKind catalog.Engine) (map[string]*tableI
 			ti.colIndex[c.Name] = len(ti.cols)
 			ti.cols = append(ti.cols, c.Name)
 			ti.types = append(ti.types, targetType(srcKind, c.Type))
+			ti.srcTypes = append(ti.srcTypes, c.Type)
 			ti.collations = append(ti.collations, c.Collation)
 		}
 		for _, name := range ti.pk {
@@ -570,7 +581,19 @@ func (s *Sink) EnsureSchema(ctx context.Context, _ source.Catalog) ([]source.Act
 				})
 			} else {
 				if err := s.reconcileColumns(ctx, ti); err != nil {
-					return actions, err
+					var pe PausableError
+					if !errors.As(err, &pe) {
+						return actions, err
+					}
+					// 结构对不上：**记下来继续看下一张表**，由引擎统一登记暂停。
+					s.pendingPauses = append(s.pendingPauses, pe)
+					actions = append(actions, source.Action{
+						ID: "pause:" + key, What: "表 " + ti.ref.Table + " 的结构和源端对不上（" +
+							pe.Reason() + "）：本轮暂停这张表，其它表继续",
+						Applied: false,
+						Reason:  "按表暂停（docs/CONTRACT-PAUSE-AND-POSITION.md §1.2）",
+					})
+					continue
 				}
 				continue
 			}
@@ -838,14 +861,17 @@ func parseTypeArgs(args string) ([]int, bool) {
 }
 
 var typeAliases = map[string]string{
-	"int4":        "integer",
-	"int8":        "bigint",
-	"int2":        "smallint",
-	"float8":      "double precision",
-	"float4":      "real",
-	"bool":        "boolean",
-	"varchar":     "character varying",
-	"bpchar":      "character",
+	"int4":    "integer",
+	"int8":    "bigint",
+	"int2":    "smallint",
+	"float8":  "double precision",
+	"float4":  "real",
+	"bool":    "boolean",
+	"varchar": "character varying",
+	"bpchar":  "character",
+	// MySQL 侧写的是 `char(10)`，PG 的 information_schema 回的是 `character(10)`：
+	// 不归一化就会判成「列类型不一致」，源端一个 CHAR 列就能把整轮同步停掉（真库实测）。
+	"char":        "character",
 	"timestamptz": "timestamp with time zone",
 	"timestamp":   "timestamp without time zone",
 	"decimal":     "numeric",
@@ -1040,18 +1066,22 @@ func (s *Sink) Apply(ctx context.Context, evs []source.Event, pos source.Positio
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// 已被暂停的表：**整批拒绝**，位点一点都不动。
-	//
-	// 为什么不能「跳过它、让位点前进」：整条任务只有一个位点，跳过等于把这批变更永久丢掉，
-	// 而界面上一切正常。按表暂停的含义是**这条同步停下来**（位点共用，别的表也走不动），
-	// 重跑时幂等补上——失败会有人看，静默缺数据不会。
+	// **最后一道防线**（不是判定）：判定权在引擎（契约 §1.5 第 1 条），但万一引擎那边漏了
+	// ——表名口径变了、新写路径没包 pauseSink、snapshot 漏了某张跳过表——这里要立刻炸，
+	// 而不是带着新 Relation 往一张结构没对齐的表里写（`alignRelationTx` 还会顺手补列，
+	// 写进去就没人知道了）。只查内存集合，不产生 IO。
 	for _, ev := range evs {
-		if !s.isPausedLocked(ev.Table.Table) {
+		if _, paused := s.pausedCache[ev.Table.Table]; !paused {
 			continue
 		}
-		rec := s.pausedCache[ev.Table.Table]
-		return &TablePausedError{TableName: ev.Table.Table, Detail: rec.Detail, ReasonCode: rec.Reason}
+		return fmt.Errorf("引擎没有过滤掉暂停表 %s 的事件（内部错误：按表暂停的判定权在引擎，"+
+			"不该把这张表的行交到这里）", ev.Table.Table)
 	}
+
+	// 写路径**不再做暂停判定**（docs/CONTRACT-PAUSE-AND-POSITION.md §1.5 第 1 条）：
+	// 判定权在引擎——引擎按表丢掉暂停表的事件、保留 Begin/Commit、让位点照常前进，
+	// 欠账由「解除暂停时整表重搬」还。这里再来一次整批拒绝就会把别的表的行也挡住，
+	// 正是「一张表坏了、几十张无关表一起停」那个被否决的行为。
 
 	tx, err := s.conn.Begin(ctx)
 	if err != nil {
@@ -1274,12 +1304,14 @@ func (s *Sink) alignRelationTx(ctx context.Context, tx pgx.Tx, ev source.Event) 
 	// **colIndex 必须一起重建**——只改 cols/types 会让按列名找下标的路径错位。
 	ti.cols = ti.cols[:0]
 	ti.types = ti.types[:0]
+	ti.srcTypes = ti.srcTypes[:0]
 	ti.collations = ti.collations[:0]
 	ti.colIndex = map[string]int{}
 	for _, c := range ev.Relation.Columns {
 		ti.colIndex[c.Name] = len(ti.cols)
 		ti.cols = append(ti.cols, c.Name)
 		ti.types = append(ti.types, targetType(s.opt.SourceKind, c.Type))
+		ti.srcTypes = append(ti.srcTypes, c.Type)
 		ti.collations = append(ti.collations, c.Collation)
 	}
 	ti.pkIdx = ti.pkIdx[:0]
@@ -1303,9 +1335,14 @@ func (s *Sink) alignRelationTx(ctx context.Context, tx pgx.Tx, ev source.Event) 
 //
 // 只比列数会把后两种悄悄放过——缓存留着旧类型/旧名字继续写，静默写错。
 func relationMatches(ti *tableInfo, rel *source.Table, src catalog.Engine) (sameNames, sameTypes, keptAll bool, typeDiff, nameDiff string) {
+	// 两份：目标端映射后的类型（判等用）与源端原文（**给人看**用）。
+	// 只留映射后的那份时，跨引擎的「改类型」提示会写成两句目标端类型，
+	// 用户拿着 `text → text` 完全不知道源端到底改了什么。
 	byName := map[string]string{}
+	srcByName := map[string]string{}
 	for _, c := range rel.Columns {
 		byName[c.Name] = targetType(src, c.Type)
+		srcByName[c.Name] = c.Type
 	}
 	sameNames = len(rel.Columns) == len(ti.cols)
 	if sameNames {
@@ -1332,9 +1369,23 @@ func relationMatches(ti *tableInfo, rel *source.Table, src catalog.Engine) (same
 		}
 		if i < len(ti.types) && typ != ti.types[i] {
 			sameTypes = false
-			// 这条路两端都是**源端**类型：ti.types = 建表时从源端 catalog 拿到的旧类型，
-			// typ = 事件里 Relation 带来的新类型。写成「目标端」会把用户引去改错的一端。
-			tparts = append(tparts, fmt.Sprintf("列 %s：源端原来是 %s，现在是 %s", name, ti.types[i], typ))
+			// 判等按**目标端映射后**的类型（那才是写进去的），提示按**源端原文**（那是用户改的）。
+			// 两边都说清楚：跨引擎时目标端类型可能一直没变（MySQL varchar→text 都是 text），
+			// 只说目标端等于没说；只说源端又解释不了为什么要停。
+			var srcFrom, srcTo string
+			if i < len(ti.srcTypes) {
+				srcFrom = ti.srcTypes[i]
+			}
+			srcTo = srcByName[name]
+			switch {
+			case srcFrom != "" && srcTo != "" && srcFrom != srcTo && srcFrom != typ && srcTo != typ:
+				tparts = append(tparts, fmt.Sprintf("列 %s：源端 %s → %s（目标端映射 %s → %s）",
+					name, srcFrom, srcTo, ti.types[i], typ))
+			case srcFrom != "" && srcTo != "" && srcFrom != srcTo:
+				tparts = append(tparts, fmt.Sprintf("列 %s：源端 %s → %s", name, srcFrom, srcTo))
+			default:
+				tparts = append(tparts, fmt.Sprintf("列 %s：源端原来是 %s，现在是 %s", name, ti.types[i], typ))
+			}
 		}
 		if i < len(rel.Columns) && rel.Columns[i].Name != name {
 			renames = append(renames, fmt.Sprintf("第 %d 列：原 %s → 现 %s", i+1, name, rel.Columns[i].Name))
@@ -1363,7 +1414,9 @@ const (
 	PauseReasonSchemaDrift = "schema_drift" // 改名 / 删列
 )
 
-// TablePausedError 表示「这张表已被标记暂停」：整批拒绝、位点不推进。
+// TablePausedError 表示「这张表已被标记暂停」。**写路径不再产生它**（判定权在引擎，
+// 见 docs/CONTRACT-PAUSE-AND-POSITION.md §1.5 第 1 条）；类型留着是为了兼容旧调用方
+// 与「按表识别错误」的形状（`PausableError` 的一个实现）。
 // 与 TypeChangedError 同族（PausableError）——要能按表识别、要能挂码。
 type TablePausedError struct {
 	TableName string

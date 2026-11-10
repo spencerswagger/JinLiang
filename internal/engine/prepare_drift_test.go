@@ -11,11 +11,11 @@ package engine_test
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/spencerswagger/jinliang/internal/core"
 	"github.com/spencerswagger/jinliang/internal/engine"
 	"github.com/spencerswagger/jinliang/internal/pgsink"
 )
@@ -45,23 +45,35 @@ func TestPrepareDriftOwnTableGetsE1015(t *testing.T) {
 	// 这里给 30s 上限：真死锁时立刻红，而不是把整包测试拖到超时。
 	runCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	res, err := engine.Run(runCtx, engine.Options{Store: store, JobID: jobID, SnapshotOnly: true})
-	if err == nil {
-		t.Fatal("我们建的表多出源端没有的列：prepare 必须报结构漂移，不能静默加列")
+	// 按表暂停落地后（契约 §1.2/§1.5）：prepare 期的漂移**不再打死整轮**，
+	// 而是把这张表登记暂停、其它表照跑；这张表本轮连存量也不搬。
+	if _, err := engine.Run(runCtx, engine.Options{Store: store, JobID: jobID, SnapshotOnly: true}); err != nil {
+		t.Fatalf("一张表结构漂移不该打死整轮: %v", err)
 	}
-	run, gerr := store.GetRun(ctx, res.RunID)
-	if gerr != nil {
-		t.Fatal(gerr)
+	job, err := store.GetJob(ctx, jobID)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if run.Code != string(core.CodeSchemaMismatch) {
-		t.Fatalf("应挂 %s，得到 %q；last_error=%s", core.CodeSchemaMismatch, run.Code, run.LastError)
+	var raw string
+	if err := dstDB.QueryRow(ctx, "SELECT COALESCE(paused_tables,'') FROM _jl_meta WHERE job_key=$1",
+		job.JobKey).Scan(&raw); err != nil {
+		t.Fatal(err)
 	}
-	for _, want := range []string{table, "legacy", pgsink.PauseReasonSchemaDrift} {
-		if !strings.Contains(run.LastError, want) {
-			t.Fatalf("last_error 要点名表、列与原因码 %q，得到：%s", want, run.LastError)
-		}
+	var rec map[string]pgsink.PausedTable
+	if err := json.Unmarshal([]byte(raw), &rec); err != nil {
+		t.Fatalf("paused_tables 不是合法 JSON（%q）：%v", raw, err)
 	}
-	t.Logf("自有表漂移：runs.code=%s，last_error 点名 %s/legacy", run.Code, table)
+	one, ok := rec[table]
+	if !ok {
+		t.Fatalf("漂移的表必须登记暂停，得到 %q", raw)
+	}
+	if one.Reason != pgsink.PauseReasonSchemaDrift {
+		t.Fatalf("原因码应为 %q，得到 %q", pgsink.PauseReasonSchemaDrift, one.Reason)
+	}
+	if !strings.Contains(one.Detail, "legacy") {
+		t.Fatalf("detail 要点名那一列（legacy），得到 %q", one.Detail)
+	}
+	t.Logf("自有表漂移：登记暂停（reason=%s，detail 点名 legacy），整轮不失败", one.Reason)
 }
 
 func TestPrepareDriftUserTableOnlyNotes(t *testing.T) {

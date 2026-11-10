@@ -10,6 +10,7 @@ package engine_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -1007,7 +1008,9 @@ func TestDDLTypeChangeIsRefusedNotSilent(t *testing.T) {
 		t.Fatalf("应返回 TypeChangedError（第③步要按类型降级成「只暂停该表」），得到 %T: %v", err, err)
 	}
 	// ① 方向必须无歧义。这条路（streaming）两端都是**源端**类型：旧 → 新。
-	if !strings.Contains(err.Error(), "源端原来是 bigint") || !strings.Contains(err.Error(), "现在是 text") {
+	//    句式统一成「列 X：源端 旧 → 新（目标端映射 …）」，跨引擎时括号里那段才会出现
+	//    （见 pgsink.relationMatches：判等按目标端映射、提示按源端原文）。
+	if !strings.Contains(err.Error(), "源端 bigint → text") {
 		t.Fatalf("streaming 路要标清「源端原来/现在」各是什么：%v", err)
 	}
 	// ② typed error 只带事实：动作与风险交给码表（否则同一条错误两段动作）
@@ -1110,13 +1113,20 @@ func TestEnsureSchemaTypeMismatchIsPausable(t *testing.T) {
 	}
 	defer s.Close()
 
-	_, err = s.EnsureSchema(ctx, source.Catalog{Tables: []source.Table{rel}})
-	if err == nil {
-		t.Fatal("目标列类型与源端不一致时必须报错")
+	// 按表暂停落地后：`EnsureSchema` **不再在第一张不一致的表上返回错误**——它把不一致收进
+	// `TakePendingPauses()`，由引擎统一登记暂停、其它表照常（契约 §6 硬口径 2）。
+	// 所以这里断言的是「收得到那张表 + 原因码对」，而不是「返回一个 error」。
+	if _, err := s.EnsureSchema(ctx, source.Catalog{Tables: []source.Table{rel}}); err != nil {
+		t.Fatalf("结构对不上不该让 EnsureSchema 整轮失败（其它表还要跑）: %v", err)
 	}
-	var pe pgsink.PausableError
-	if !errors.As(err, &pe) {
-		t.Fatalf("必须是 PausableError（第③步按表暂停），得到 %T: %v", err, err)
+	pending := s.TakePendingPauses()
+	if len(pending) != 1 {
+		t.Fatalf("应收到 1 张待暂停的表，得到 %d：%v", len(pending), pending)
+	}
+	pe := pending[0]
+	// 再取一次必须为空（交出去就清空，防止同一张表被登记两遍）
+	if again := s.TakePendingPauses(); len(again) != 0 {
+		t.Fatalf("TakePendingPauses 必须交出并清空，第二次还拿到 %v", again)
 	}
 	if pe.Table() != table {
 		t.Fatalf("要能直接拿到表名，得到 %q", pe.Table())
@@ -1127,9 +1137,14 @@ func TestEnsureSchemaTypeMismatchIsPausable(t *testing.T) {
 	}
 }
 
-// E1015 落地后的端到端：目标列类型与源端不一致 → `runs.code` 必须是 E1015（不再留空）。
-// 这是 #64 那条必改的最终验收：机器能判等（Reason/Table）→ **人也看得到码**。
-func TestSchemaMismatchRunGetsE1015(t *testing.T) {
+// prepare 期目标列类型与源端不一致 → **只暂停这张表**，run 正常收尾（契约 §1.2/§1.5）。
+//
+// 这条用例翻过面：原先是「整轮失败 + runs.code=E1015」。按表暂停落地后，prepare 期的不一致
+// 由 `EnsureSchema` 收进 `TakePendingPauses` 交给引擎登记，其它表照跑、位点照前进。
+// 现在钉的是：run 不失败、记录里点名这张表与原因码、**这张表一行都不写**（存量也不搬）。
+//
+// 这张目标表是测试自己建的（不在 `_jl_object` 里）→ `resume=manual`：引擎不许自动清空它。
+func TestSchemaMismatchPausesOnlyThatTable(t *testing.T) {
 	srcDSN, dstDSN := dsns(t)
 	srcDB := mustConn(t, srcDSN)
 	dstDB := mustConn(t, dstDSN)
@@ -1144,23 +1159,39 @@ func TestSchemaMismatchRunGetsE1015(t *testing.T) {
 	exec(t, dstDB, "DROP TABLE IF EXISTS _jl_meta, _jl_chunk, _jl_lease, _jl_object, _jl_instance")
 
 	store, jobID := onceJobSingleTable(t, srcDSN, dstDSN, "typechange", table)
-	res, err := engine.Run(ctx, engine.Options{Store: store, JobID: jobID, SnapshotOnly: true})
-	if err == nil {
-		t.Fatal("目标列类型不一致必须失败")
+	if _, err := engine.Run(ctx, engine.Options{Store: store, JobID: jobID, SnapshotOnly: true}); err != nil {
+		t.Fatalf("一张表结构对不上不该打死整轮（其它表要继续跑）: %v", err)
 	}
-	run, gerr := store.GetRun(ctx, res.RunID)
-	if gerr != nil {
-		t.Fatal(gerr)
+	job, err := store.GetJob(ctx, jobID)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if run.Code != string(core.CodeSchemaMismatch) {
-		t.Fatalf("runs.code 应为 %s，得到 %q；last_error=%s",
-			core.CodeSchemaMismatch, run.Code, run.LastError)
+	var raw string
+	if err := dstDB.QueryRow(ctx, "SELECT COALESCE(paused_tables,'') FROM _jl_meta WHERE job_key=$1",
+		job.JobKey).Scan(&raw); err != nil {
+		t.Fatal(err)
 	}
-	// 具体是哪张表、哪种情况，由运行时写进 last_error（码表只给类别）
-	for _, want := range []string{table, pgsink.PauseReasonTypeChanged} {
-		if !strings.Contains(run.LastError, want) {
-			t.Fatalf("last_error 应含 %q（表名与原因码），得到：%s", want, run.LastError)
-		}
+	var rec map[string]pgsink.PausedTable
+	if err := json.Unmarshal([]byte(raw), &rec); err != nil {
+		t.Fatalf("paused_tables 不是合法 JSON（%q）：%v", raw, err)
+	}
+	one, ok := rec[table]
+	if !ok {
+		t.Fatalf("这张表必须被登记为暂停，得到 %q", raw)
+	}
+	if one.Reason != pgsink.PauseReasonTypeChanged {
+		t.Fatalf("原因码应为 %q，得到 %q", pgsink.PauseReasonTypeChanged, one.Reason)
+	}
+	if pgsink.NormalizedResume(one.Resume) != pgsink.ResumeManual {
+		t.Fatalf("测试自己建的目标表不在 _jl_object 里 → 必须按 manual 处置（不许自动清空），得到 %q", one.Resume)
+	}
+	// 存量也不搬：这张表一行都不该出现
+	var n int
+	if err := dstDB.QueryRow(ctx, "SELECT count(*) FROM "+table).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("暂停表连存量都不搬（契约 §6 硬口径 2），实际写了 %d 行", n)
 	}
 }
 
@@ -1293,6 +1324,16 @@ func tableFingerprint(t *testing.T, conn *pgx.Conn, table string) string {
 	return fp
 }
 
+// countRowsIn 数一张表的行数（按名拼 SQL，仅测试用表名）。
+func countRowsIn(t *testing.T, conn *pgx.Conn, table string) int {
+	t.Helper()
+	var n int
+	if err := conn.QueryRow(context.Background(), "SELECT count(*) FROM "+table).Scan(&n); err != nil {
+		t.Fatalf("数 %s 的行数失败: %v", table, err)
+	}
+	return n
+}
+
 // columnType 读目标端列的 data_type（改类型前后各查一次，用来证明两端一致）。
 func columnType(t *testing.T, conn *pgx.Conn, table, col string) string {
 	t.Helper()
@@ -1342,22 +1383,37 @@ func TestTypeChangeAlignThenIncrementalWorks(t *testing.T) {
 	// ② 源端改类型（bigint → numeric(12,2)）
 	exec(t, srcDB, "ALTER TABLE "+table+" ALTER COLUMN v TYPE numeric(12,2)")
 
-	// ③ 本版不跟随改类型：必须明确拒绝，且**同一个失败同一个原因码**（E1015 + 表名 + 原因码）
-	res, err := engine.Run(ctx, engine.Options{Store: store, JobID: jobID, SnapshotOnly: true})
-	if err == nil {
-		t.Fatal("源端改了列类型，本版不跟随：必须拒绝，不能静默按旧类型写")
+	// ③ 本版不跟随改类型：**只暂停这张表**（不是整轮失败），run 正常收尾
+	if _, err := engine.Run(ctx, engine.Options{Store: store, JobID: jobID, SnapshotOnly: true}); err != nil {
+		t.Fatalf("一张表改了列类型不该打死整轮: %v", err)
 	}
-	run, gerr := store.GetRun(ctx, res.RunID)
-	if gerr != nil {
-		t.Fatal(gerr)
+	job, jerr := store.GetJob(ctx, jobID)
+	if jerr != nil {
+		t.Fatal(jerr)
 	}
-	if run.Code != string(core.CodeSchemaMismatch) {
-		t.Fatalf("改类型应挂 %s，得到 %q；last_error=%s", core.CodeSchemaMismatch, run.Code, run.LastError)
+	var rawPaused string
+	if err := dstDB.QueryRow(ctx, "SELECT COALESCE(paused_tables,'') FROM _jl_meta WHERE job_key=$1",
+		job.JobKey).Scan(&rawPaused); err != nil {
+		t.Fatal(err)
 	}
-	for _, want := range []string{table, pgsink.PauseReasonTypeChanged} {
-		if !strings.Contains(run.LastError, want) {
-			t.Fatalf("last_error 应含 %q，得到：%s", want, run.LastError)
-		}
+	var recPaused map[string]pgsink.PausedTable
+	if err := json.Unmarshal([]byte(rawPaused), &recPaused); err != nil {
+		t.Fatalf("paused_tables 不是合法 JSON（%q）：%v", rawPaused, err)
+	}
+	one, ok := recPaused[table]
+	if !ok {
+		t.Fatalf("改类型的表必须被登记暂停，得到 %q", rawPaused)
+	}
+	if one.Reason != pgsink.PauseReasonTypeChanged {
+		t.Fatalf("原因码应为 %q，得到 %q", pgsink.PauseReasonTypeChanged, one.Reason)
+	}
+	// 这张目标表是首搬时引擎自己建的（在 _jl_object 里）→ recopy：对齐后必须整表重搬
+	if pgsink.NormalizedResume(one.Resume) != pgsink.ResumeRecopy {
+		t.Fatalf("本任务建的表应走 recopy（对齐后整表重搬），得到 %q", one.Resume)
+	}
+	// 暂停期间表还是旧结构、旧数据：一行新数据都不该写进去
+	if n := countRowsIn(t, dstDB, table); n != 1000 {
+		t.Fatalf("暂停期间不许写这张表：期望 1000 行（首搬的），实际 %d 行", n)
 	}
 
 	// ④ 按文案给的下一步：把目标端列类型改成与源端一致，再跑一次
@@ -1410,9 +1466,9 @@ func TestTypeChangeAlignThenIncrementalWorks(t *testing.T) {
 	if fp := tableFingerprint(t, dstDB, table); fp != tableFingerprint(t, srcDB, table) {
 		t.Fatalf("追平后指纹不一致：目标 %s", fp)
 	}
-	t.Logf("改类型前 %s/%s → 改类型后 %s/%s；指纹 %s → %s；拒绝时码=%s；"+
-		"改类型后增/改/删追平时延 %.0fms",
-		srcType0, dstType0, srcType1, dstType1, srcFP0, srcFP1, run.Code,
+	t.Logf("改类型前 %s/%s → 改类型后 %s/%s；指纹 %s → %s；暂停原因码=%s（resume=%s）；"+
+		"对齐后整表重搬并解除；改类型后增/改/删追平时延 %.0fms",
+		srcType0, dstType0, srcType1, dstType1, srcFP0, srcFP1, one.Reason, one.Resume,
 		float64(latency.Microseconds())/1000)
 }
 

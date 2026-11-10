@@ -1,0 +1,343 @@
+package mysqlsink
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/spencerswagger/jinliang/internal/pgsink"
+	"github.com/spencerswagger/jinliang/internal/source"
+)
+
+// 按表暂停的存储（MySQL 目标端，与 PG 侧**同构**：一列 JSON 文本，不是新表）。
+//
+// 契约：docs/CONTRACT-PAUSE-AND-POSITION.md §1.4（记录形状）与 §4.2（六个方法）。
+// 形状：
+//
+//	{"orders":{"reason":"type_changed","at":"…","detail":"…","resume":"recopy","skipped_rows":1284}}
+//
+// 五条硬约束（改这段代码前先读）：
+//  1. **key = 目标端裸表名**，与 `_jl_chunk.table_name` 逐字节同源（不带 schema）。
+//  2. **只碰这一列**：登记是独立一条 UPDATE，绝不与 `position` 同一条——位点只能由数据事务推进。
+//  3. **at / reason 不覆盖**：第一次的时刻与原因最有价值（重搬失败重登记也不改）。
+//  4. **单 key 读改写**：先 `SELECT … FOR UPDATE` 再写回，绝不拿内存里的整表集合重建整列
+//     （那会把别的表、以及不归本轮管的记录一起抹掉）。
+//  5. **失败必须响**：状态行不存在、列不存在、UPDATE 没落地 —— 一律报错。
+//     「UPDATE 影响 0 行当成功」在这里是严禁的（契约 §1.7 最后一条）。
+//
+// 为什么复用 `pgsink.PausedTable` 而不是在 MySQL 侧另定义一个：两边必须是**同一份 JSON 形状**，
+// 一个结构体两个包各写一份，迟早会在字段名/omitempty 上分叉，而消费者的判等是按字段的。
+
+// pausedTableColumn 是 `_jl_meta` 上那一列的名字（与 PG 侧逐字相同）。
+const pausedTableColumn = "paused_tables"
+
+// ErrPauseUnsupported 表示 MySQL 目标端这条连接**没法**登记暂停（列补不上：缺权限/只读/老库）。
+//
+// 它是「明确失败」的载体：引擎看到它就把这张表按「整 run 失败」处理，
+// 并在 plan/preflight 里事先说明——绝不静默降级成「跳过但没记下」。
+var ErrPauseUnsupported = fmt.Errorf("MySQL 目标端不支持按表暂停")
+
+// LoadPausedTables 把库里的暂停记录读进内存缓存（引擎 prepare 时读一次）。
+//
+// 脏 JSON 按「没有暂停」处理并发一条 note（`PausedDirty`），与 pgsink 同口径：
+// 少写比多写安全——绝不能因为一列坏了就把整条同步停死。
+func (s *Sink) LoadPausedTables(ctx context.Context) error {
+	cur, dirty, err := s.readPaused(ctx)
+	if err != nil {
+		return err
+	}
+	s.pausedCache, s.pausedDirty = cur, dirty
+	return nil
+}
+
+// PausedTables 读回当前记录的暂停表（status / doctor 用；不看内存缓存）。
+func (s *Sink) PausedTables(ctx context.Context) (map[string]pgsink.PausedTable, error) {
+	cur, _, err := s.readPaused(ctx)
+	return cur, err
+}
+
+// PausedDirty 报告库里那一列不是合法 JSON（已按「无暂停」处理，引擎据此发 note）。
+func (s *Sink) PausedDirty() bool { return s.pausedDirty }
+
+// PauseTable 登记一张表的暂停——**本次运行唯一的写点**（幂等 upsert 单 key）。
+//
+// 顺序契约（§1.5 第 2 条）：登记必须先于跳过落库。这里返回错误时，调用方必须整批失败。
+func (s *Sink) PauseTable(ctx context.Context, ref source.TableRef, rec pgsink.PausedTable) error {
+	if strings.TrimSpace(ref.Table) == "" {
+		return fmt.Errorf("内部错误：登记暂停时表名为空（key 必须是目标端裸表名）")
+	}
+	if strings.TrimSpace(rec.Reason) == "" {
+		// 原因码是机器判等的凭据，空值等于没登记。
+		return fmt.Errorf("内部错误：登记暂停表 %s 时没有原因码", ref.Table)
+	}
+	if rec.At == "" {
+		rec.At = time.Now().UTC().Format(time.RFC3339)
+	}
+	cur, err := s.mutatePaused(ctx, ref.Table, func(m map[string]pgsink.PausedTable) error {
+		if old, ok := m[ref.Table]; ok {
+			// at / reason **都不覆盖**：第一次的时刻与原因最有价值，而且 reason 是机器判等用的
+			// （第二次因为别的原因又停一次，把 type_changed 改成 schema_drift 会让对账口径漂）。
+			// resume 跟着本次判定走（所有权可能变了）；detail 用新的（用户要看的是当前差异）。
+			rec.At = old.At
+			if old.Reason != "" {
+				// 旧记录没有原因码（手写进库/更早的版本）时不要把空码钉死：
+				// 空 reason 在本文件的不变量里等于「没登记过」。
+				rec.Reason = old.Reason
+			}
+			if rec.Resume == "" {
+				rec.Resume = old.Resume
+			}
+			// 跳过窗口的记账也是累计值，重登记不清零。
+			if rec.SkippedRows == 0 {
+				rec.SkippedRows, rec.SkippedFrom = old.SkippedRows, old.SkippedFrom
+			}
+			if rec.LastSkippedPos == "" {
+				rec.LastSkippedPos = old.LastSkippedPos
+			}
+		}
+		// 未知值一律按 recopy（宁可多搬一次，不可留下一张永远不一致的表）——与 pgsink 同一判据。
+		rec.Resume = pgsink.NormalizedResume(rec.Resume)
+		m[ref.Table] = rec
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	s.pausedCache = cur
+	return nil
+}
+
+// NoteSkipped 记一笔「跳过窗口」的账：行数累加、`skipped_from` 首次不覆盖、`last_skipped_pos` 跟本批。
+//
+// 不登记的表不写（宁可不记，也不凭空造一条暂停）。
+// 记账失败不该让整批失败（数据已落库、位点已前进，判失败反而制造「写成功却报错」），
+// 由调用方决定只发 note——所以这里把错误如实返回，不吞。
+func (s *Sink) NoteSkipped(ctx context.Context, ref source.TableRef, rows int64, pos string) error {
+	if rows <= 0 && pos == "" {
+		return nil
+	}
+	cur, err := s.mutatePaused(ctx, ref.Table, func(m map[string]pgsink.PausedTable) error {
+		rec, ok := m[ref.Table]
+		if !ok {
+			return nil // 没登记过：不写，也不报错（调用方按 note 处理）
+		}
+		rec.SkippedRows += rows
+		if rec.SkippedFrom == "" {
+			rec.SkippedFrom = pos // 第一次的缺口起点最有价值
+		}
+		if pos != "" {
+			rec.LastSkippedPos = pos
+		}
+		m[ref.Table] = rec
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	s.pausedCache = cur
+	return nil
+}
+
+// ClearPausedTable 只删这一个 key（别的表记录留着）。
+//
+// 幂等：key 本来就不在 → 成功返回（「搬成清该表，搬败留记录」，重复清不算错）。
+// 但**状态行不存在**是另一回事：那说明目标端的任务状态没了，必须报错而不是假装清过。
+func (s *Sink) ClearPausedTable(ctx context.Context, ref source.TableRef) error {
+	cur, err := s.mutatePaused(ctx, ref.Table, func(m map[string]pgsink.PausedTable) error {
+		delete(m, ref.Table)
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	s.pausedCache = cur
+	return nil
+}
+
+// MarkTableRecopyPending 把一张表标成「欠一次整表重搬」：**只清块标记，不动数据**（契约 §1.6 步 2）。
+//
+// 含 `chunk_no=0`（完成标记）：不清它的话，`planCopy` 会认为这张表的存量搬完了，
+// 重搬永远排不进去——「暂停解除了、数据其实还缺着」。只清这一张表，别的表照旧续跑。
+func (s *Sink) MarkTableRecopyPending(ctx context.Context, ref source.TableRef) error {
+	// 这里**不碰** `paused_tables`（只删块标记）：补列失败是另一件事，
+	// 让它把「重搬」卡在一个跟它无关的原因上，用户会照着错的提示去修。
+	res, err := s.db.ExecContext(ctx,
+		"DELETE FROM `_jl_chunk` WHERE job_key = ? AND table_name = ?", s.opt.JobKey, ref.Table)
+	if err != nil {
+		return fmt.Errorf("把 %s 标成待重搬失败（清块标记）: %w", ref.Table, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("把 %s 标成待重搬失败（读影响行数）: %w", ref.Table, err)
+	}
+	// 0 行是**合法**的：这张表本来就没块标记（比如暂停发生在首搬之前）。
+	// 但块表本身不可读要报错——那是「以为清了、其实没清」。
+	_ = n
+	return nil
+}
+
+// ── 内部：读改写 ─────────────────────────────────────────────
+
+// mutatePaused 在**一个事务**里做「读当前 JSON → 改这一个 key → 写回」。
+//
+// 三条不许绕过的点：
+//   - `SELECT … FOR UPDATE` 锁住状态行：两个进程同时登记不会互相覆盖；
+//   - 写回时 `updated_at=NOW(6)`：MySQL 在「所有列都没变」时返回 0 影响行，
+//     带上时间戳才能把「真的没写进去」与「写了但值一样」分开；
+//   - 影响 0 行 → 回读核对：值与我们写的一致才算幂等成功，否则报错（绝不静默）。
+func (s *Sink) mutatePaused(ctx context.Context, table string,
+	mut func(map[string]pgsink.PausedTable) error) (map[string]pgsink.PausedTable, error) {
+
+	if err := s.ensurePausedColumn(ctx); err != nil {
+		return nil, err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("开暂停登记事务失败: %w", err)
+	}
+	defer tx.Rollback() //nolint:errcheck
+
+	var raw sql.NullString
+	err = tx.QueryRowContext(ctx,
+		"SELECT `"+pausedTableColumn+"` FROM `_jl_meta` WHERE job_key = ? FOR UPDATE", s.opt.JobKey).
+		Scan(&raw)
+	if err == sql.ErrNoRows {
+		return nil, fmt.Errorf("登记暂停失败：目标端的任务状态行不存在（job_key=%s）。"+
+			"你能做什么：先跑一次 `jinliang run` 让它把状态行建出来（或检查目标库是不是被清过）；"+
+			"风险：没有（本次没有写入任何数据）", s.opt.JobKey)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("读暂停记录失败: %w", err)
+	}
+
+	cur := map[string]pgsink.PausedTable{}
+	if raw.Valid && strings.TrimSpace(raw.String) != "" {
+		if jerr := json.Unmarshal([]byte(raw.String), &cur); jerr != nil {
+			// 脏 JSON：按「没有暂停」继续（少写而不是多写），但要留痕。
+			cur = map[string]pgsink.PausedTable{}
+			s.pausedDirty = true
+		}
+	}
+	if err := mut(cur); err != nil {
+		return nil, err
+	}
+	body, err := json.Marshal(cur)
+	if err != nil {
+		return nil, fmt.Errorf("暂停记录序列化失败: %w", err)
+	}
+
+	res, err := tx.ExecContext(ctx,
+		"UPDATE `_jl_meta` SET `"+pausedTableColumn+"` = ?, updated_at = NOW(6) WHERE job_key = ?",
+		string(body), s.opt.JobKey)
+	if err != nil {
+		return nil, fmt.Errorf("写暂停记录失败: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return nil, fmt.Errorf("写暂停记录失败（读影响行数）: %w", err)
+	}
+	if affected == 0 {
+		// 两种可能：① 值与我们写的一模一样（幂等空写，合法）；② 行在锁内被别人删了。
+		// 回读核对，不靠猜。
+		var got sql.NullString
+		if qerr := tx.QueryRowContext(ctx,
+			"SELECT `"+pausedTableColumn+"` FROM `_jl_meta` WHERE job_key = ?", s.opt.JobKey).
+			Scan(&got); qerr != nil || !got.Valid || got.String != string(body) {
+			return nil, fmt.Errorf("写暂停记录没生效（UPDATE 影响 0 行，且回读的内容对不上）。" +
+				"常见原因：目标库是只读/只读副本、或另一个进程刚把状态行改掉。" +
+				"你能做什么：确认目标库可写（`SELECT @@read_only`），或等另一个进程结束后重跑；" +
+				"风险：没有（本次没有跳过任何表，也没有推进位点）")
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("提交暂停记录失败: %w", err)
+	}
+	_ = table
+	return cur, nil
+}
+
+// readPaused 读回暂停记录（不锁）。
+func (s *Sink) readPaused(ctx context.Context) (map[string]pgsink.PausedTable, bool, error) {
+	if err := s.ensurePausedColumn(ctx); err != nil {
+		return nil, false, err
+	}
+	var raw sql.NullString
+	err := s.db.QueryRowContext(ctx,
+		"SELECT `"+pausedTableColumn+"` FROM `_jl_meta` WHERE job_key = ?", s.opt.JobKey).Scan(&raw)
+	if err == sql.ErrNoRows {
+		return map[string]pgsink.PausedTable{}, false, nil // 还没有任务状态行：等于没有暂停
+	}
+	if err != nil {
+		return nil, false, fmt.Errorf("读暂停记录失败: %w", err)
+	}
+	out := map[string]pgsink.PausedTable{}
+	if !raw.Valid || strings.TrimSpace(raw.String) == "" {
+		return out, false, nil
+	}
+	if jerr := json.Unmarshal([]byte(raw.String), &out); jerr != nil {
+		return map[string]pgsink.PausedTable{}, true, nil // 脏 JSON → 按无暂停
+	}
+	return out, false, nil
+}
+
+// ensurePausedColumn 保证 `_jl_meta.paused_tables` 这一列存在（老库补列）。
+//
+// **MySQL 没有 `ADD COLUMN IF NOT EXISTS`**（那是 MariaDB 的方言）：8.0/8.4 执行会直接语法错。
+// 所以先查 information_schema 再决定要不要 ALTER。
+// 补不上（缺 ALTER 权限、只读副本、库被锁）→ `ErrPauseUnsupported` 包装的明确失败：
+// 契约 §1.7 最后一条要求「`PauseTable` 明确失败 + plan 标注」，严禁静默。
+func (s *Sink) ensurePausedColumn(ctx context.Context) error {
+	s.pausedColMu.Lock()
+	defer s.pausedColMu.Unlock()
+	if s.pausedColOK {
+		return nil
+	}
+	var n int
+	err := s.db.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM information_schema.columns "+
+			"WHERE table_schema = DATABASE() AND table_name = '_jl_meta' AND column_name = ?",
+		pausedTableColumn).Scan(&n)
+	if err != nil {
+		return fmt.Errorf("%w：查 `_jl_meta` 有没有 `%s` 列失败: %v。"+
+			"你能做什么：确认目标端账号能读 information_schema（一般都有）；"+
+			"风险：没有（本次没有写入任何数据）", ErrPauseUnsupported, pausedTableColumn, err)
+	}
+	if n == 0 {
+		if _, err := s.db.ExecContext(ctx,
+			"ALTER TABLE `_jl_meta` ADD COLUMN `"+pausedTableColumn+"` text NULL"); err != nil {
+			return fmt.Errorf("%w：给 `_jl_meta` 补 `%s` 列失败（目标端是 MySQL %s）。"+
+				"你能做什么：① 用有 ALTER 权限的账号手工执行 "+
+				"`ALTER TABLE _jl_meta ADD COLUMN paused_tables text NULL`；"+
+				"② 或者换 PostgreSQL 目标端。风险：没有（本次没有跳过任何表，也没有推进位点）",
+				ErrPauseUnsupported, pausedTableColumn, s.serverVersion)
+		}
+	}
+	s.pausedColOK = true
+	return nil
+}
+
+// PauseRegistryReady 供 preflight/plan 用：目标端能不能登记暂停（列在、或能补上）。
+// 返回 nil = 支持；返回错误 = 那条错误本身就是四段式说明，直接展示给用户。
+func (s *Sink) PauseRegistryReady(ctx context.Context) error { return s.ensurePausedColumn(ctx) }
+
+// PauseRegistry 是契约 §4.2 的六个方法（在**本包**里再声明一遍是为了拿到编译期保证：
+// 签名漂了就直接编译失败，而不是等引擎运行时 `ok == false` 静默退回「不支持」）。
+//
+// 为什么没放进 internal/sink：那需要把 `PausedTable` 也搬过去（pgsink 已经在用自己那份，
+// 搬它等于同时改 PG 侧写路径与所有调用方）。归属留给 Ark/Core 收口，本包先钉住签名。
+type PauseRegistry interface {
+	LoadPausedTables(ctx context.Context) error
+	PausedTables(ctx context.Context) (map[string]pgsink.PausedTable, error)
+	PauseTable(ctx context.Context, ref source.TableRef, rec pgsink.PausedTable) error
+	NoteSkipped(ctx context.Context, ref source.TableRef, rows int64, pos string) error
+	ClearPausedTable(ctx context.Context, ref source.TableRef) error
+	MarkTableRecopyPending(ctx context.Context, ref source.TableRef) error
+}
+
+var _ PauseRegistry = (*Sink)(nil)
+
+// PausedKeys 返回记录里的表名（排序后；展示与对账用）。
+func PausedKeys(m map[string]pgsink.PausedTable) []string { return pgsink.PausedKeys(m) }

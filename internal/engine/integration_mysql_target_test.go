@@ -171,6 +171,32 @@ func TestMySQLTargetFullCopyAndIncremental(t *testing.T) {
 		t.Fatalf("目标端应有 20 行，实际 %d", n)
 	}
 
+	// **块进度必须真的落库**（MySQL 目标端原来一块账都不记，`MarkTableRecopyPending`
+	// 清的就是这些标记）。这里钉住接线：完成标记（chunk_no=0）+ 至少一块数据块，
+	// 且完成标记的行数等于各块之和。谁把记账挪到数据之前、或干脆删掉调用，这里就红。
+	var doneRows, sumRows int64
+	var chunks int
+	if err := dst.QueryRowContext(context.Background(),
+		"SELECT COUNT(*) FROM `_jl_chunk` WHERE table_name = ? AND chunk_no > 0",
+		table).Scan(&chunks); err != nil {
+		t.Fatalf("读块标记失败: %v", err)
+	}
+	if chunks == 0 {
+		t.Fatalf("全量搬完却一块块标记都没有：块级续跑与「欠一次重搬」都无从表达")
+	}
+	if err := dst.QueryRowContext(context.Background(),
+		"SELECT `rows` FROM `_jl_chunk` WHERE table_name = ? AND chunk_no = 0", table).Scan(&doneRows); err != nil {
+		t.Fatalf("读完成标记失败: %v", err)
+	}
+	if err := dst.QueryRowContext(context.Background(),
+		"SELECT COALESCE(SUM(`rows`),0) FROM `_jl_chunk` WHERE table_name = ? AND chunk_no > 0",
+		table).Scan(&sumRows); err != nil {
+		t.Fatalf("统计块行数失败: %v", err)
+	}
+	if doneRows != sumRows || doneRows != 20 {
+		t.Fatalf("完成标记行数应等于各块之和且为 20：完成标记 %d / 各块合计 %d", doneRows, sumRows)
+	}
+
 	// 增量：改一笔、删一笔、加一笔
 	exec(t, src, "UPDATE "+table+" SET payload='updated' WHERE id=2")
 	exec(t, src, "DELETE FROM "+table+" WHERE id=3")
