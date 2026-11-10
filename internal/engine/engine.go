@@ -1037,6 +1037,14 @@ func (r *runner) snapshot(ctx context.Context) error {
 		}
 	} else {
 		if err := r.cleanBeforeRecopy(ctx); err != nil {
+			if r.opt.Resync {
+				// 清到一半失败：把**已经清掉的**表落进审计（job.resync.partial），
+				// 让「清了哪几张」在审计里自洽，而不是只活在易失的事件流里。
+				r.resyncReport.Tables = r.clearedTables
+				if aerr := r.auditResyncPartial(ctx, err); aerr != nil {
+					return fmt.Errorf("%w（另：写 job.resync.partial 审计失败：%v）", err, aerr)
+				}
+			}
 			return err
 		}
 		if r.opt.Resync {
@@ -1128,13 +1136,16 @@ func (r *runner) cleanBeforeRecopy(ctx context.Context) error {
 	if r.plan.Clean == cleanNone || len(r.plan.CleanNames) == 0 {
 		return nil
 	}
-	cleared := make([]string, 0, len(r.plan.CleanNames))
 	for _, name := range r.plan.CleanNames {
 		ref, ok := r.tableByName(name)
 		if !ok {
 			continue
 		}
 		if err := r.recopyAction(ctx, ref, r.plan.CleanWhy); err != nil {
+			// 非 --resync 路径，这里是**唯一**的判定点（原样报给用户）。
+			// --resync 已经在前置里过了同一道判定；能走到这里还失败，只可能是
+			// 「预检与真清之间所有权变了」（`_jl_object` 被外部改过）——属内部错误面，
+			// 原样上报即可，不另写一套文案（换文案会让人以为是新的用户可修问题）。
 			return err
 		}
 		// 清数据和清标记**必须同一个事务**：中间崩在「数据清了、标记还在」那种
@@ -1142,13 +1153,13 @@ func (r *runner) cleanBeforeRecopy(ctx context.Context) error {
 		if err := r.sink.ResetTableChunks(ctx, r.targetRef(ref)); err != nil {
 			return fmt.Errorf("清空 %s 准备重搬失败: %w", name, err)
 		}
-		cleared = append(cleared, name)
+		// **清成一张记一张**：清到一半崩/失败时，审计里也要能说出「已经清掉哪几张」，
+		// 而不是只在事件流里翻（进程一重启就没了）。
+		r.clearedTables = append(r.clearedTables, name)
 		// 说清维护窗口的形状：清完到搬完之间，目标端是**部分数据**，不是「旧但完整」。
 		r.note(ctx, "清空了 "+name+" 里上次搬进去的行（重搬全量，避免留下源端已删除的行）；"+
 			"从这一刻到这张表搬完之前，目标端是部分数据，不是旧但完整的快照")
 	}
-	// 「实际清了哪些表」只在这里定稿：计划可以失败一半，报告不能替它圆场。
-	r.clearedTables = cleared
 	return nil
 }
 

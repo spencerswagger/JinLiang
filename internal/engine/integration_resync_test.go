@@ -283,6 +283,12 @@ func resyncJob(t *testing.T, srcDSN, dstDSN, name, table string, chunkRows int) 
 
 func resyncJobMode(t *testing.T, srcDSN, dstDSN, name, table, frequency string, chunkRows ...int) (*control.Store, string) {
 	t.Helper()
+	return resyncJobTables(t, srcDSN, dstDSN, name, []string{table}, frequency, chunkRows...)
+}
+
+func resyncJobTables(t *testing.T, srcDSN, dstDSN, name string, tables []string,
+	frequency string, chunkRows ...int) (*control.Store, string) {
+	t.Helper()
 	ctx := context.Background()
 	store, err := control.Open(control.Options{DataDir: t.TempDir(), Autogen: true})
 	if err != nil {
@@ -317,13 +323,22 @@ func resyncJobMode(t *testing.T, srcDSN, dstDSN, name, table, frequency string, 
 			},
 			Target:  control.TargetDoc{Kind: "postgres", Schema: "public", OnExists: "append"},
 			Mode:    control.ModeDoc{Frequency: frequency},
-			Content: &control.ContentDoc{Tables: map[string]control.TableDoc{table: {}}},
+			Content: &control.ContentDoc{Tables: tableDocs(tables)},
 		},
 	})
 	if err != nil {
 		t.Fatalf("建任务失败: %v", err)
 	}
 	return store, job.ID
+}
+
+// tableDocs 把表名列表变成 content.tables。
+func tableDocs(tables []string) map[string]control.TableDoc {
+	out := make(map[string]control.TableDoc, len(tables))
+	for _, t := range tables {
+		out[t] = control.TableDoc{}
+	}
+	return out
 }
 
 // tableShape 是「行数 + 内容指纹」：光比行数看不出改行丢没丢。
@@ -641,4 +656,88 @@ func slotConfirmed(t *testing.T, conn *pgx.Conn, slot string) string {
 		return ""
 	}
 	return *v
+}
+
+// 清到一半失败时，审计必须能说出「已经清掉哪几张」——`job.resync.partial`。
+//
+// 构造是确定的：目标端多一张带外键的表引用第二张表 → `TRUNCATE resync_p2` 必失败
+// （PG 不让 truncate 被外键引用的表，0A000）。第一张（按下标/字典序在前）已经清掉，
+// 所以 partial 里应当正好有它、且**没有** job.resync.cleared（没清完就不许写「已清完」）。
+func TestResyncPartialFailureRecordsActuallyClearedTables(t *testing.T) {
+	srcDSN, dstDSN := dsns(t)
+	srcDB := mustConn(t, srcDSN)
+	dstDB := mustConn(t, dstDSN)
+	ctx := context.Background()
+	tables := []string{"resync_p1", "resync_p2"}
+
+	for _, tb := range tables {
+		exec(t, srcDB, "DROP TABLE IF EXISTS "+tb)
+		exec(t, srcDB, "CREATE TABLE "+tb+" (id bigint PRIMARY KEY, payload text NOT NULL)")
+		exec(t, srcDB, fmt.Sprintf("INSERT INTO %s SELECT g, 'r'||g FROM generate_series(1,1500) g", tb))
+		exec(t, dstDB, "DROP TABLE IF EXISTS "+tb)
+	}
+	exec(t, dstDB, "DROP TABLE IF EXISTS resync_fk")
+	exec(t, dstDB, "DROP TABLE IF EXISTS _jl_meta, _jl_chunk, _jl_lease, _jl_object, _jl_instance")
+
+	store, jobID := resyncJobTables(t, srcDSN, dstDSN, "resync-partial", tables, "continuous+initial", 1000)
+	job, err := store.GetJob(ctx, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	slot, err := state.ObjectName("slot", job.JobKey, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = dstDB.Exec(context.Background(), "DROP TABLE IF EXISTS resync_fk")
+		_, _ = srcDB.Exec(context.Background(), `SELECT pg_drop_replication_slot($1) WHERE EXISTS
+			(SELECT 1 FROM pg_replication_slots WHERE slot_name=$1)`, slot)
+	})
+
+	// 第一轮：两张表都搬成、都由本任务建（`_jl_object` 有登记）。
+	if _, err := engine.Run(ctx, engine.Options{
+		Store: store, JobID: jobID, Actor: control.ActorCLI, IdleAfter: 1 * time.Second,
+	}); err != nil {
+		t.Fatalf("第一轮应该成功：%v", err)
+	}
+	for _, tb := range tables {
+		if ours, err := tableOwnedByJob(ctx, store, jobID, dstDB, tb); err != nil || !ours {
+			t.Fatalf("前提：%s 应是本任务建的表，得到 ours=%v err=%v", tb, ours, err)
+		}
+	}
+	// 让第二张表清不动：一张外部表用外键引用它。
+	exec(t, dstDB, "CREATE TABLE resync_fk (id bigint PRIMARY KEY, p2_id bigint REFERENCES resync_p2(id))")
+
+	_, errResync := engine.Run(ctx, engine.Options{
+		Store: store, JobID: jobID, Actor: control.ActorCLI, Resync: true, IdleAfter: 1 * time.Second,
+	})
+	if errResync == nil {
+		t.Fatal("第二张表被外键引用、TRUNCATE 必失败，--resync 不该成功")
+	}
+
+	partial, err := store.ListAuditByAction(ctx, "job.resync.partial", 10)
+	if err != nil {
+		t.Fatalf("读审计失败：%v", err)
+	}
+	if len(partial) != 1 {
+		t.Fatalf("清到一半失败应有一条 job.resync.partial，得到 %d 条", len(partial))
+	}
+	detail := partial[0].Detail
+	// 已经清掉的只有第一张；第二张（失败的那张）不许出现在 cleared_tables 里。
+	if !strings.Contains(detail, `"resync_p1"`) {
+		t.Fatalf("partial 审计要记下已经清掉的 resync_p1：%s", detail)
+	}
+	if strings.Contains(detail, `"resync_p2"`) {
+		t.Fatalf("resync_p2 没清成，不许算进 cleared_tables：%s", detail)
+	}
+	if !strings.Contains(detail, "error") {
+		t.Fatalf("partial 审计要带上失败原因：%s", detail)
+	}
+	// 没清完就不许写「已清完」。
+	if done, err := store.ListAuditByAction(ctx, "job.resync.cleared", 10); err != nil {
+		t.Fatalf("读审计失败：%v", err)
+	} else if len(done) != 0 {
+		t.Fatalf("清表失败时不许写 job.resync.cleared，得到 %d 条", len(done))
+	}
+	t.Logf("清到 resync_p2 失败：partial 审计记下已清的 [resync_p1]，未写 cleared")
 }

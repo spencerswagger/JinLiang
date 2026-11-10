@@ -43,8 +43,11 @@
   2. 清空 `position/watermark/snapshot_id`（必须在清表之前：反过来崩在中间就是「位点说有进度、表是空的」）；
   3. 重建书签（`Prepare` 会 drop 旧 slot、按当前位点建新的）；
   4. 清本任务写过的表 + 该表的块标记（同一个事务），然后从零重搬。
-  不清用户表、不换 `job_key`、不删运行历史；审计分两段：`job.resync`（谁触发、哪个书签、旧位点、
-  `planned_tables`）与 `job.resync.cleared`（**实际**清掉哪些表，清完才写）。
+  不清用户表、不换 `job_key`、不删运行历史。审计分三段，每段只说自己那一刻的事实：
+  - `job.resync`：谁触发（actor）、哪个书签、旧 `phase`/`position`、`planned_tables`（**计划**）；
+  - `job.resync.cleared`：**全部**清完之后写，`cleared_tables` 是实清清单；
+  - `job.resync.partial`：清到一半失败时写，`cleared_tables` 是**已经清掉**的那几张 + 失败原因
+    （没有这条，「清了哪几张」只能翻事件流，而事件流进程一重启就没了）。
 
 ## 5. 与增量的接缝
 

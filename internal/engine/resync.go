@@ -183,6 +183,26 @@ func (r *runner) auditResync(ctx context.Context, planned []string) error {
 	return nil
 }
 
+// auditResyncPartial 记录「清到一半失败时**已经**清掉哪些表」。
+//
+// 为什么必须有这一条：`job.resync.cleared` 只在全部清完时写；清到第三张时权限没了
+// 或连接断了，审计里就只剩「计划清 5 张」——用户回头查「到底清了几张」只能去翻
+// 事件流，而事件流进程一重启就没了。这条把「已经发生的破坏」钉在库里。
+func (r *runner) auditResyncPartial(ctx context.Context, cause error) error {
+	rep := r.resyncReport
+	if rep == nil || r.opt.Store == nil {
+		return nil
+	}
+	actor := strings.TrimSpace(r.opt.Actor)
+	if actor == "" {
+		actor = control.ActorSystem
+	}
+	return r.opt.Store.Audit(ctx, actor, "job.resync.partial", map[string]any{
+		"job_id": r.job.ID, "job_key": r.job.JobKey, "job_name": r.job.Name,
+		"slot": rep.Slot, "cleared_tables": rep.Tables, "error": cause.Error(),
+	})
+}
+
 // auditResyncCleared 记录「**真的**清了哪些表」——在 cleanBeforeRecopy 跑完之后写。
 //
 // 为什么要两条：计划可以中途失败（清到第三张时权限没了），一条审计既说「谁按的」
