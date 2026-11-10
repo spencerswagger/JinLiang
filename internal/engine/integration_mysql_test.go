@@ -233,3 +233,46 @@ func TestMySQLSourceFullCopyAndIncremental(t *testing.T) {
 		t.Fatal("源端新增的 id=4 必须出现在目标端")
 	}
 }
+
+// `--stop-after` 必须**按承诺的时间**停下来。
+//
+// 这条钉的是取消路径：MySQL 侧的复制读会阻塞到下一帧或心跳（默认 10 秒），只在循环
+// 开头查 ctx.Done() 等于「按停后还要等 10 秒」，drain/flush 全被拖住——用户看到的
+// 就是 `--stop-after 3s` 实际跑了 10 秒。修复（关连接打断阻塞读）之后，收尾应在
+// 一两秒内完成；没有 elapsed 断言的话，回归会静默回到 10 秒。
+func TestMySQLSourceStopAfterCancelsPromptly(t *testing.T) {
+	srcDSN, dstDSN := mysqlDSNs(t)
+	my := mustMySQL(t, srcDSN)
+	dst := mustConn(t, dstDSN)
+	table := "engine_mysql_stop"
+
+	myExec(t, my, "DROP TABLE IF EXISTS "+table)
+	myExec(t, my, "CREATE TABLE "+table+" (id BIGINT NOT NULL PRIMARY KEY, payload VARCHAR(32))")
+	myExec(t, my, "INSERT INTO "+table+" VALUES (1,'a'),(2,'b')")
+	t.Cleanup(func() { myExec(t, my, "DROP TABLE IF EXISTS "+table) })
+
+	exec(t, dst, "DROP TABLE IF EXISTS "+table)
+	exec(t, dst, "DROP TABLE IF EXISTS _jl_meta, _jl_chunk, _jl_lease, _jl_object, _jl_instance")
+
+	store, jobID := newMySQLJob(t, srcDSN, dstDSN, "mysql-stop", table, "continuous+initial")
+	ensureStateTables(t, store, dstDSN, jobID)
+
+	const stopAfter = 2 * time.Second
+	started := time.Now()
+	res, err := engine.Run(context.Background(), engine.Options{
+		Store: store, JobID: jobID, StopAfter: stopAfter,
+	})
+	elapsed := time.Since(started)
+	if err != nil {
+		t.Fatalf("--stop-after 收尾不该报错（用户停止不是失败）：%v", err)
+	}
+	if res.ExitCode != engine.ExitStopped {
+		t.Fatalf("--stop-after 之后退出码应是 %d，实际 %d", engine.ExitStopped, res.ExitCode)
+	}
+	// 上限留足余量（含全量 + 连接建立），但必须明显小于「等心跳」的 10 秒。
+	if elapsed > stopAfter+4*time.Second {
+		t.Fatalf("--stop-after %s 实际跑了 %s：取消没有打断阻塞读（回归到「等心跳」）",
+			stopAfter, elapsed.Round(time.Millisecond))
+	}
+	t.Logf("--stop-after %s → 实际 %s", stopAfter, elapsed.Round(time.Millisecond))
+}

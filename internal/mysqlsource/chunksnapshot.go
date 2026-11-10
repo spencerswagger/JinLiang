@@ -3,8 +3,10 @@ package mysqlsource
 import (
 	"context"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -49,6 +51,20 @@ var errNoSnapshotSession = fmt.Errorf("没有正在进行的快照会话（内�
 // tables 是本次要搬的表（**只搬这些**）：引擎按 job 选表，连接器不替它做决定——
 // 早期实现里这里读的是整个库的 catalog，结果「只同步一张表」的任务会悄悄搬全库。
 func (s *Source) BeginSnapshot(ctx context.Context, tables []source.Table) (Position, error) {
+	return s.beginSnapshot(ctx, tables, true)
+}
+
+// BeginSnapshotRead 只开一致性读视图，**不读位点、不拿全局读锁**。
+//
+// 续跑（引擎已经有位点、只是接着读剩下的块）用它：`FLUSH TABLES WITH READ LOCK`
+// 会瞬间挡住源库的所有写入，而续跑根本不需要新位点——为了一个用不上的值去锁库，
+// 等于把「续跑」变成一次小型停写事故。缺 RELOAD 权限的账号也会在这里白报一次错。
+func (s *Source) BeginSnapshotRead(ctx context.Context, tables []source.Table) error {
+	_, err := s.beginSnapshot(ctx, tables, false)
+	return err
+}
+
+func (s *Source) beginSnapshot(ctx context.Context, tables []source.Table, needPosition bool) (Position, error) {
 	if len(tables) == 0 {
 		return Position{}, fmt.Errorf("没有要搬的表（source.scope / content.tables 都是空的）")
 	}
@@ -56,33 +72,39 @@ func (s *Source) BeginSnapshot(ctx context.Context, tables []source.Table) (Posi
 	if err != nil {
 		return Position{}, err
 	}
-	probe, err := NewProber(s.db).Probe(ctx)
-	if err != nil {
-		conn.Close()
-		return Position{}, err
-	}
-	stmt := probe.StatusStatement
-	if stmt == "" {
-		conn.Close()
-		return Position{}, capabilityError("缺「读位点」权限",
-			"读不到当前位点，全量搬完没法接上增量",
-			"按预检 MY-03 给账号补 REPLICATION CLIENT，然后重跑",
-			"没有位点就只能整表重搬，且增量接不上")
+	var stmt string
+	if needPosition {
+		probe, err := NewProber(s.db).Probe(ctx)
+		if err != nil {
+			conn.Close()
+			return Position{}, err
+		}
+		stmt = probe.StatusStatement
+		if stmt == "" {
+			conn.Close()
+			return Position{}, capabilityError("缺「读位点」权限",
+				"读不到当前位点，全量搬完没法接上增量",
+				"按预检 MY-03 给账号补 REPLICATION CLIENT，然后重跑",
+				"没有位点就只能整表重搬，且增量接不上")
+		}
 	}
 
 	// 位点与快照必须同一瞬间：能拿全局读锁就先拿锁读位点（最严格），
 	// 拿不到（缺 RELOAD / 云上禁用）就按旧行为「先开快照，再读位点」——
 	// 后者的窗口极短（同一连接上的两条语句），而且位点只会比快照更晚，
 	// 方向是「多重放一段」，由 upsert 幂等吸收，不会丢。
+	// needPosition=false（续跑）时这两步都跳过：不锁库、不读位点。
 	var pos Position
 	locked := false
-	if _, err := conn.ExecContext(ctx, "FLUSH TABLES WITH READ LOCK"); err == nil {
-		locked = true
-		pos, err = s.readStatusConn(ctx, conn, stmt)
-		if err != nil {
-			_, _ = conn.ExecContext(ctx, "UNLOCK TABLES")
-			conn.Close()
-			return Position{}, err
+	if needPosition {
+		if _, err := conn.ExecContext(ctx, "FLUSH TABLES WITH READ LOCK"); err == nil {
+			locked = true
+			pos, err = s.readStatusConn(ctx, conn, stmt)
+			if err != nil {
+				_, _ = conn.ExecContext(ctx, "UNLOCK TABLES")
+				conn.Close()
+				return Position{}, err
+			}
 		}
 	}
 	if _, err := conn.ExecContext(ctx, "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ"); err != nil {
@@ -99,7 +121,7 @@ func (s *Source) BeginSnapshot(ctx context.Context, tables []source.Table) (Posi
 		conn.Close()
 		return Position{}, fmt.Errorf("开一致性快照失败: %w", err)
 	}
-	if !locked {
+	if needPosition && !locked {
 		pos, err = s.readStatusConn(ctx, conn, stmt)
 		if err != nil {
 			_, _ = conn.ExecContext(ctx, "ROLLBACK")
@@ -195,7 +217,9 @@ func (s *Source) currentSnapshot(ctx context.Context) (sess *snapshotSession, ow
 	if err != nil {
 		return nil, false, err
 	}
-	if _, err := s.BeginSnapshot(ctx, tables); err != nil {
+	// 续跑（没有会话）只开读视图：不拿全局读锁、不读位点——位点已经在目标库里，
+	// 这里再去锁一次源库是纯粹的风险。
+	if err := s.BeginSnapshotRead(ctx, tables); err != nil {
 		return nil, false, err
 	}
 	s.snapMu.Lock()
@@ -240,18 +264,30 @@ func (s *Source) allTables(ctx context.Context) ([]source.Table, error) {
 
 // —— 游标编解码 ——
 //
-// 块边界（`_jl_chunk.range_to`）要能**原样**变成下一次查询的 WHERE 参数：
-// 拼字符串（`fmt.Sprintf("%v")`）在含逗号/引号的键上会读重或读漏，所以这里用
-// JSON 数组编码。值一律按文本传，交给 MySQL 按列类型比较（与 `(pk) > (?,?)` 一致）。
+// 块边界（`_jl_chunk.range_to`）要能**原样**变成下一次查询的 WHERE 参数。这里必须
+// **带类型**：二进制主键（BINARY(16) 存 UUID）与时间主键（DATETIME(6)）一旦被打印成
+// 文本，还原出来的就是字符串，`WHERE (pk) > ('[0 0 …]')` 会按字节比——`'['`=0x5B
+// 让绝大多数 UUID 落在它之前，续跑**直接跳到表尾**：已提交块之后的行不再读，却照常
+// MarkTableDone、退出码 0、指纹只跟「自己读到的部分」一致。这是「看起来成功」里
+// 最难查的一类，所以编码按类型分开，解码还原成驱动认的类型（二进制给 []byte，
+// 时间给 MySQL 认的字面量），**不**复用 PG bytea 的 `\x…` 形态。
+
+// cursorPart 是块边界里的一个主键值，带类型标记。
+//
+//	t: n=null i=int u=uint f=float s=string b=bytes(hex) d=datetime(MySQL 字面量)
+type cursorPart struct {
+	T string `json:"t"`
+	V string `json:"v,omitempty"`
+}
 
 // EncodeCursor 把主键值编码成块边界文本（空键 → 空串 = 表头）。
 func EncodeCursor(vals []source.Value) string {
 	if len(vals) == 0 {
 		return ""
 	}
-	parts := make([]string, len(vals))
+	parts := make([]cursorPart, len(vals))
 	for i, v := range vals {
-		parts[i] = fmt.Sprintf("%v", driverValue(v))
+		parts[i] = encodeCursorPart(v)
 	}
 	b, err := json.Marshal(parts)
 	if err != nil {
@@ -260,21 +296,90 @@ func EncodeCursor(vals []source.Value) string {
 	return string(b)
 }
 
+func encodeCursorPart(v source.Value) cursorPart {
+	switch v.Kind {
+	case source.KindNull:
+		return cursorPart{T: "n"}
+	case source.KindInt:
+		return cursorPart{T: "i", V: strconv.FormatInt(v.I, 10)}
+	case source.KindUint:
+		return cursorPart{T: "u", V: strconv.FormatUint(v.U, 10)}
+	case source.KindFloat:
+		return cursorPart{T: "f", V: strconv.FormatFloat(v.F, 'g', -1, 64)}
+	case source.KindString, source.KindJSON:
+		return cursorPart{T: "s", V: v.S}
+	case source.KindBytes:
+		// 十六进制：二进制列按字节比大小，还原成 []byte 才保序。
+		return cursorPart{T: "b", V: hex.EncodeToString(v.B)}
+	case source.KindTime:
+		// MySQL 认的字面量（UTC + 微秒）。**不要**用 time.Time 的 %v 形态
+		// （`… +0000 UTC`）：MySQL 解析不了，或被截到秒 → 边界行重读或漏读。
+		return cursorPart{T: "d", V: v.T.UTC().Format("2006-01-02 15:04:05.999999")}
+	case source.KindBool:
+		if v.I != 0 {
+			return cursorPart{T: "i", V: "1"}
+		}
+		return cursorPart{T: "i", V: "0"}
+	}
+	return cursorPart{T: "s", V: v.S}
+}
+
 // decodeCursor 把块边界文本还原成比较参数；读不懂就报错（**不静默从表头重读**：
 // 那会把已搬完的块再搬一遍，虽然幂等，但会让「续跑」变成「整表重扫」而用户不知道）。
+//
+// 老边界（上一版写的纯字符串数组）仍然认：升级过程中目标库里可能还留着它。
 func decodeCursor(s string) ([]any, error) {
 	if strings.TrimSpace(s) == "" {
 		return nil, nil
 	}
-	var parts []string
+	var parts []cursorPart
 	if err := json.Unmarshal([]byte(s), &parts); err != nil {
+		var legacy []string
+		if err2 := json.Unmarshal([]byte(s), &legacy); err2 == nil {
+			out := make([]any, len(legacy))
+			for i, p := range legacy {
+				out[i] = p
+			}
+			return out, nil
+		}
 		return nil, fmt.Errorf("块边界 %q 读不懂（不是本工具写的？）：%w", s, err)
 	}
 	out := make([]any, len(parts))
 	for i, p := range parts {
-		out[i] = p
+		v, err := decodeCursorPart(p)
+		if err != nil {
+			return nil, fmt.Errorf("块边界第 %d 个键解不开（%s=%q）: %w", i+1, p.T, p.V, err)
+		}
+		out[i] = v
 	}
 	return out, nil
+}
+
+func decodeCursorPart(p cursorPart) (any, error) {
+	switch p.T {
+	case "n":
+		return nil, nil
+	case "i":
+		n, err := strconv.ParseInt(p.V, 10, 64)
+		return n, err
+	case "u":
+		n, err := strconv.ParseUint(p.V, 10, 64)
+		return n, err
+	case "f":
+		f, err := strconv.ParseFloat(p.V, 64)
+		return f, err
+	case "s":
+		return p.V, nil
+	case "b":
+		b, err := hex.DecodeString(p.V)
+		if err != nil {
+			return nil, err
+		}
+		return b, nil
+	case "d":
+		return p.V, nil // MySQL 按列类型解析这个字面量
+	}
+	return nil, fmt.Errorf("不认识的类型标记 %q", p.T)
 }
 
 // eachChunkFrom 按 keyset 页切块，可以从 from.Cursor 之后接着读，块号从 from.LastNo+1 起。
@@ -330,11 +435,13 @@ func (s *Source) eachChunkFrom(ctx context.Context, conn *sql.Conn, t source.Tab
 			return fmt.Errorf("%s 的块边界有 %d 个键，而主键有 %d 列：位点与本任务对不上（换过主键？）",
 				t.Table, len(args), len(pk))
 		}
-		// 续跑：游标是「上一块的右边界」，直接当上一页的 lastKey 用（值按文本传，
-		// 由 MySQL 按列类型比较）。不重建 source.Value 是为了不丢精度。
+		// 续跑：游标是「上一块的右边界」，直接当上一页的 lastKey 用。
+		// **必须按原类型还原**（toValue 认得 []byte / int64 / string …）：一律包成
+		// KindString 会把二进制主键退化成文本，`WHERE (pk) > ('[0 0 …]')` 按字节比
+		// 就跳到表尾——已提交块之后的行不再读，却照常 MarkTableDone、退出码 0。
 		lastKey = make([]source.Value, len(args))
 		for i, a := range args {
-			lastKey[i] = source.Value{Kind: source.KindString, S: fmt.Sprintf("%v", a)}
+			lastKey[i] = toValue(a)
 		}
 	}
 
