@@ -367,6 +367,16 @@ func (r *runner) storedPosition(ctx context.Context) (source.Position, error) {
 //
 // 这正是 #74 在 PG 路径上踩过的那一课：判据必须是可重算的事实（phase / 对象登记 / 行数），
 // 不能是「这一轮是不是第一次」这种需要人回忆的东西。
+//
+// **不变量（顺序敏感，改顺序前先读这段）**：`Count == 0 → continue`（下面那句
+// `if n == 0 { continue }`，紧跟在 Count 之后）必须排在所有权与 phase 判定**之前**。
+// 有它在，「清表成功之后、phaseTo(prepare) 之前崩」就是安全的：
+// 表已经空了，下一轮第一件事就是 Count==0 跳过，不会因为 phase 还停在 'snapshot' 而
+// 永久硬停（那会把「防止静默跳过」换成「卡死不可恢复」）。会一直硬停的只有
+// 「用户表 + 有行 + phase=='snapshot'」——那正是要停下来问人的那一格，且有三条出路
+// （改 on_exists / 换空的 target.schema / 手动删掉本任务写进去的行）。
+// 用例：TestCleanBeforeGenericCopySkipsEmptyTable（不连库，`go test ./...` 里就能发现
+// 有人把顺序改回去了）与 TestMySQLTargetEmptyTableWithSnapshotPhaseStillCopies（真库）。
 func (r *runner) cleanBeforeGenericCopy(ctx context.Context, st stateCapable, fresh bool, phase string) error {
 	for _, ref := range r.tables {
 		tref := r.targetRef(ref)
