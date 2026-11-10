@@ -245,10 +245,15 @@ func decodeStringCell(col int, data []byte, maxLen int, kind binaryKind) (source
 		return source.Value{}, 0, errShort(col, prefix+length, len(data))
 	}
 	raw := data[prefix : prefix+length]
-	// 判定顺序：**先看排序规则**，拿不到才退回内容启发式。
+	// 判定顺序：**这一版 binlog 的排序规则** > catalog 补的 kind > 内容启发式。
 	//   - binBinary：按定义就是字节，内容长什么样都不影响（`BINARY(4)='abcd'` 也是字节）；
-	//   - binText：按字符存，交字符串（非法 UTF-8 仍退回字节，宁可显式也不改写内容）；
-	//   - binUnknown：5.7 这类拿不到排序规则的场景，只能按内容判——这是兜底，不是常态。
+	//   - binText：按字符存，交字符串；
+	//   - binUnknown：排序规则与 catalog 都给不出（5.7 且 catalog 列数对不上）时按内容判。
+	//
+	// **别把「退回字节」当成安全兜底**：下游 MySQL 端原样写回是对的，但 PG 端把
+	// KindBytes 写成 `\x..` 字面量（`::text::text`），存进去不是原始字节也不报错。
+	// 真正的闸应该在 sink（目标列是文本 + 值来自非 UTF-8 文本列 → 明确失败），
+	// 这里只负责「按已知元数据解码」，不替下游保证语义。
 	switch kind {
 	case binBinary:
 		return source.Value{Kind: source.KindBytes, B: append([]byte(nil), raw...)}, prefix + length, nil

@@ -112,3 +112,42 @@ func TestCatalogBinaryKind(t *testing.T) {
 		}
 	}
 }
+
+// 优先级回归（两方向）：**这一版 binlog 的排序规则**比「流开始时的 catalog」权威。
+//
+// 场景：流中 `ALTER … MODIFY c VARBINARY(64)` / 反向改成 utf8mb4，列数不变，
+// catalog（FillColumnKinds 的来源）还是旧的。若让 catalog 压过 binlog，
+// 类型串会被纠回旧基名 → 与旧 catalog 一比「没变」→ **该暂停不暂停**，
+// 值还按错的族解码（可打印的当文本写、不可打印的走 `\x..` 字面量）。
+func TestColumnBinaryKindPrefersWireCollation(t *testing.T) {
+	// 方向一：catalog 说字符（旧），binlog 说 binary（新）→ 必须按字节。
+	tm := &TableMap{Schema: "app", Table: "t", Columns: 1,
+		Types: []byte{typeVarchar}, Meta: []uint16{64},
+		ColumnCollations: []uint64{binaryCollationID}}
+	FillColumnKinds(tm, &source.Table{
+		TableRef: source.TableRef{Schema: "app", Table: "t"},
+		Columns:  []source.Column{{Name: "c", Type: "varchar(64)", Charset: "utf8mb4"}},
+	})
+	if got := tm.columnBinaryKind(0); got != binBinary {
+		t.Fatalf("binlog 说 binary、catalog 说字符时应取 binlog（按字节），实际 %v", got)
+	}
+	if got := tableFromMap(tm).Columns[0].Type; got != "varbinary(64)" {
+		t.Fatalf("类型串应是 varbinary(64)（否则改类型判定看不见），实际 %q", got)
+	}
+
+	// 方向二：catalog 说 binary（旧），binlog 说 utf8mb4（新）→ 必须按字符。
+	tm2 := &TableMap{Schema: "app", Table: "t", Columns: 1,
+		Types: []byte{typeVarchar}, Meta: []uint16{64},
+		ColumnCollations: []uint64{255}} // utf8mb4_0900_ai_ci
+	FillColumnKinds(tm2, &source.Table{
+		TableRef: source.TableRef{Schema: "app", Table: "t"},
+		Columns:  []source.Column{{Name: "c", Type: "varbinary(64)"}},
+	})
+	if got := tm2.columnBinaryKind(0); got != binText {
+		t.Fatalf("binlog 说字符、catalog 说二进制时应取 binlog（按字符），实际 %v", got)
+	}
+	// 64 字节在 utf8mb4 里是 16 个字符：字符族要按字符集换算（P3 那条）。
+	if got := tableFromMap(tm2).Columns[0].Type; got != "varchar(16)" {
+		t.Fatalf("类型串应是 varchar(16)（64 字节 ÷ 4），实际 %q", got)
+	}
+}

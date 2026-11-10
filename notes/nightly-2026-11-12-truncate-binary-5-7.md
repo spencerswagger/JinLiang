@@ -107,6 +107,13 @@
    用例 `TestEnrichRelationFixesBinaryBaseOn57` + `TestFillColumnKindsCovers57` 里的类型串断言。
 3. 顺带把真库用例从 `RunStream` 改到 **`Stream`**（引擎走的就是它，会补列名/换算字符数）——
    原来那条用例绕过了 enrich，所以「Relation 长什么样」这件事其实没被验到。
+4. **优先级搞反过一次（Owl II 抓到）**：`columnBinaryKind` 原来「先信 catalog 的 ColumnKinds」——
+   而 catalog 是**流开始时**的快照，排序规则才是**这一版表定义**的权威。流中
+   `ALTER … MODIFY c VARBINARY(64)`（列数不变）时 catalog 还是 `binText`，压过 binlog 的 63，
+   类型串被纠回 `varchar` → 与旧 catalog 一比「没变」→ **该暂停不暂停**。
+   改成：排序规则非 0 就以它为准，`collationFor==0`（5.7）才用 ColumnKinds；
+   `FillColumnKinds` 也跳过「这一版已有排序规则」的列。用例
+   `TestColumnBinaryKindPrefersWireCollation`（两个方向）+ 类型串断言。
 
 结果：CI **13 个 job 全绿**，含 `mysql 5.7` 腿。
 

@@ -307,20 +307,25 @@ const binaryCollationID = 63
 
 // columnBinaryKind 判断第 i 列按字节存还是按字符存。
 //
-// 顺序很关键：**先信 catalog 补进来的 ColumnKinds**（5.7 只有它有），再退回
-// TABLE_MAP 的排序规则（8.0+），最后才是「不知道」。
+// **优先级：这一版 binlog 的排序规则 > catalog 补全的 ColumnKinds > 不知道。**
+//
+// 为什么排序规则优先：ColumnKinds 来自「流开始时」的 catalog 快照，而排序规则是
+// **这一版表定义**的权威。源端在流中 `ALTER … MODIFY c VARBINARY(64)`（列数不变）时，
+// catalog 还是旧的 `binText`——若让它压过 binlog 明确的 63，类型串会被纠回 varchar，
+// 与旧 catalog 一比「没变」→ **该暂停不暂停**，值还按字符解码（正是要挡的形态）。
+//
+// 5.7 恒为 0（没有可选元数据），那时才轮到 ColumnKinds。
 func (tm *TableMap) columnBinaryKind(i int) binaryKind {
+	if id := tm.collationFor(i); id != 0 {
+		if id == binaryCollationID {
+			return binBinary
+		}
+		return binText
+	}
 	if i < len(tm.ColumnKinds) && tm.ColumnKinds[i] != binUnknown {
 		return tm.ColumnKinds[i]
 	}
-	switch tm.collationFor(i) {
-	case 0:
-		return binUnknown
-	case binaryCollationID:
-		return binBinary
-	default:
-		return binText
-	}
+	return binUnknown
 }
 
 // FillColumnKinds 用 catalog 的字符集补「哪一列按字节存」。
@@ -335,6 +340,12 @@ func FillColumnKinds(tm *TableMap, known *source.Table) {
 	kinds := make([]binaryKind, tm.Columns)
 	any := false
 	for i := range kinds {
+		// 这一版 binlog 已经给了排序规则（8.0+）就不用 catalog：那是流开始时的快照，
+		// 拿它盖住现行定义会把「流中改了 binary↔text」这类改动看漏。
+		if tm.collationFor(i) != 0 {
+			kinds[i] = binUnknown
+			continue
+		}
 		kinds[i] = catalogBinaryKind(known.Columns[i])
 		if kinds[i] != binUnknown {
 			any = true
