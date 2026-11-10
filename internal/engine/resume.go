@@ -72,6 +72,14 @@ type chunkPlan struct {
 	CleanNames []string
 	// CleanWhy 决定「为什么必须清」的说法（用户照这句话决定下一步）。
 	CleanWhy recopyReason
+	// Written 是「目标端可能留有本任务写进去的行」的表（有块标记或表完成标记）。
+	// 清表只允许碰它们：没标记的表里没有我们的行，清了就是删用户数据。
+	//
+	// 单独留一份（而不是只在 markClean 里临时算）是因为 `--resync` 要复用同一个
+	// 名单去清「上一轮正常判定本来不打算清」的表——清表范围的判据只能有一处。
+	Written []string
+	// CopiedBefore 表示「目标端留下过『这个任务搬过』的证据」（老状态没有块账时靠它兜底）。
+	CopiedBefore bool
 	// Why 是给人看的一句话：为什么续跑 / 为什么重搬。
 	Why string
 }
@@ -121,6 +129,8 @@ type copyInputs struct {
 // 删掉的行就永远留在目标端（退出码 0）。所以 cleanAll 的判据必须是可重算的。
 func planCopy(in copyInputs) chunkPlan {
 	p := chunkPlan{From: map[string]chunkFrom{}, Skip: map[string]bool{}}
+	p.Written = writtenTables(in)
+	p.CopiedBefore = copiedBefore(in)
 	if len(in.Tables) == 0 {
 		p.Kind = copySkip
 		return p
@@ -254,27 +264,44 @@ func planCopy(in copyInputs) chunkPlan {
 // markClean 给「从头搬」这一轮挂上清表信息：清哪些表（我们写过的）与为什么清。
 // 没有标记的表格子不进去——那些表里没有我们的行，清了就是删用户数据。
 func (p *chunkPlan) markClean(in copyInputs, why recopyReason) {
-	p.Clean = cleanAll
-	p.CleanWhy = why
-	p.CleanNames = nil
-	for _, t := range in.Tables {
-		pr := in.Progress[t.Table]
-		if pr.Done || pr.LastNo > 0 {
-			p.CleanNames = append(p.CleanNames, t.Table)
-		}
-	}
-	if len(p.CleanNames) == 0 && copiedBefore(in) {
+	if len(p.Written) == 0 && copiedBefore(in) {
 		// 老状态（升级前跑过）：整本块账都没有，但目标端留下了「搬过」的证据。
 		// 这时无从分辨哪张表有我们的行，只能整批清——不清就补不掉这段时间的删除。
-		for _, t := range in.Tables {
-			p.CleanNames = append(p.CleanNames, t.Table)
-		}
+		p.Written = allNames(in.Tables)
 	}
+	p.setClean(why)
+}
+
+// setClean 按 p.Written 挂上清表名单（决定「清什么」的判据只有这一处）。
+func (p *chunkPlan) setClean(why recopyReason) {
+	p.CleanWhy = why
+	p.CleanNames = append([]string(nil), p.Written...)
+	p.Clean = cleanAll
 	if len(p.CleanNames) == 0 {
 		// 这个任务从没往目标端写过东西（首次搬）：没有可清的行。
 		// 也不能清——append 模式复用的用户表里全是用户自己的行。
 		p.Clean = cleanNone
 	}
+}
+
+// writtenTables 是「目标端可能留有本任务写进去的行」的表（有块标记或表完成标记）。
+func writtenTables(in copyInputs) []string {
+	var out []string
+	for _, t := range in.Tables {
+		pr := in.Progress[t.Table]
+		if pr.Done || pr.LastNo > 0 {
+			out = append(out, t.Table)
+		}
+	}
+	return out
+}
+
+func allNames(tables []source.Table) []string {
+	out := make([]string, 0, len(tables))
+	for _, t := range tables {
+		out = append(out, t.Table)
+	}
+	return out
 }
 
 // copiedBefore 判断「目标端有没有『这个任务搬过』的证据」——只用于兜底那格
@@ -359,7 +386,10 @@ func (r *runner) decideCopyPlan(ctx context.Context, src runSource,
 	plan := planCopy(in)
 	// 只剩一种组合会落到「不搬 + 重放不了」：continuous 模式（它本来就不搬存量）。
 	// 这时硬着头皮从新书签开始流，等于把中间那段变更静默扔掉——不如说清楚停下。
-	if plan.Kind == copySkip && (!in.SlotReplayable || in.SlotAhead) && in.Mode == "continuous" {
+	// 例外：用户显式带了 --resync，那就是他对「要么整轮重搬、要么接受这段空洞」
+	// 的回答（continuous 没有存量可搬，只剩第二个选项），由 applyResync 记录在案。
+	if plan.Kind == copySkip && (!in.SlotReplayable || in.SlotAhead) &&
+		in.Mode == "continuous" && !r.opt.Resync {
 		return plan, &unreplayableSlotError{stored: pos}
 	}
 	return plan, nil
@@ -374,8 +404,9 @@ type unreplayableSlotError struct{ stored string }
 func (e *unreplayableSlotError) Error() string {
 	return "源端书签追不回目标端的位点了（书签不在了，或 WAL 已被 max_slot_wal_keep_size 丢掉）：" +
 		"位点 " + e.stored + " 之后那段变更重放不出来，而这个任务只接增量、不搬存量。\n" +
-		"你现在能做什么：1) 让它整轮重搬一次（把 mode.frequency 改成 once 跑一轮，再改回 continuous）；" +
-		"2) 确认这段空洞可以接受后重建任务。\n" +
+		"你现在能做什么：1) 整轮重搬一次：jinliang run --job <任务名> --resync（重建书签，从零搬全量）；" +
+		"2) 只重建书签、接受中间那段空洞：把 mode.frequency 保持 continuous，再跑同一个 --resync（不搬存量）；" +
+		"3) 确认这段空洞无所谓后重建任务。\n" +
 		"风险：整轮重搬期间目标端会短暂与源端不一致；放着不管则会永久缺这一段变更。"
 }
 

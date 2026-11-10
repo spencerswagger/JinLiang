@@ -127,6 +127,10 @@ func (p pgRunSource) IsZero(pos source.Position) bool {
 
 func (p pgRunSource) RequiresExportedSnapshot() bool { return true }
 
+// RebuildSlot 实现 slotRebuilder：只有 continuous 模式下的 --resync 会用到。
+// 语义与「下次 Prepare 会建一条新的」绑定在一起，见 pgsource.Source.RebuildSlot。
+func (p pgRunSource) RebuildSlot(ctx context.Context) error { return p.s.RebuildSlot(ctx) }
+
 func (p pgRunSource) Prepare(ctx context.Context, needSnapshot bool) (prepOutcome, error) {
 	res, err := p.s.Prepare(ctx, pgsource.PrepareOptions{Snapshot: needSnapshot})
 	if err != nil {

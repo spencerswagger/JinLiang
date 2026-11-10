@@ -50,6 +50,8 @@ type stateCapable interface {
 	EnsureMeta(ctx context.Context, jobHash, phase, position, snapshotID string) error
 	SetPhase(ctx context.Context, phase string) error
 	State(ctx context.Context) (phase, position string, err error)
+	// ClearProgress 清掉权威位点/水位/快照 ID（`--resync` 的唯一清点写法）。
+	ClearProgress(ctx context.Context) error
 	DoneChunks(ctx context.Context) (map[string]map[int]bool, error)
 	// 这里故意**没有**「清全部块标记」这种能力：清标记与推位点必须同一个事务
 	// （pgsink.StartFreshCopy），单独暴露一个「只清标记」的方法等于把必改 1 的窗口

@@ -358,7 +358,7 @@ func TestUnreplayableSlotErrorSaysWhatToDo(t *testing.T) {
 	for _, want := range []string{
 		"书签追不回",                  // 发生了什么
 		"max_slot_wal_keep_size", // 为什么
-		"改成 once",                // 你能做什么
+		"--resync",               // 你能做什么（必须是真能跑的命令，见 E3001 文案用例）
 		"风险",                     // 风险
 	} {
 		if !strings.Contains(msg, want) {
@@ -377,6 +377,7 @@ func TestRecopyReasonSentences(t *testing.T) {
 		{recopyHalfCopy, "上次全量搬到一半就断了"},
 		{recopyGap, "追不回目标端的位点"},
 		{recopyNoPK, "没有稳定的主键"},
+		{recopyResync, "显式要求了 --resync"},
 	}
 	seen := map[string]bool{}
 	for _, c := range cases {
