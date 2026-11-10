@@ -23,7 +23,7 @@ import (
 // 第二个返回值是给人看的差异说明（不一致时非空）。
 //
 // 表不存在 → 返回 (false, "目标端还没有这张表", nil)：由调用方决定要不要建
-//（调用方用 `TableExists` 区分「不存在」与「存在但类型不对」）。
+// （调用方用 `TableExists` 区分「不存在」与「存在但类型不对」）。
 func (s *Sink) ColumnsMatch(ctx context.Context, ref source.TableRef, cols []source.Column) (bool, string, error) {
 	have, err := s.columnTypes(ctx, ref)
 	if err != nil {
