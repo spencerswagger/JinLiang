@@ -243,7 +243,7 @@ var specs = []Spec{
 			"最常见是书签名额（max_replication_slots）被占光，也可能是连接数（max_connections）" +
 			"或发送进程（max_wal_senders）到顶。原始消息与 SQLSTATE 原样留在 last_error 里",
 		Next: []string{
-			"先看是谁占着（在源库 psql 里执行）：SELECT slot_name, active, database FROM pg_replication_slots;——我们建的书签都以 jl_ 开头",
+			"先看是谁占着（复制即可执行）：psql \"$SRC\" -c \"SHOW max_replication_slots\" -c \"SELECT slot_name, active, database FROM pg_replication_slots\"；我们建的书签都以 jl_ 开头",
 			"清理确认没在用的：SELECT pg_drop_replication_slot('jl_xxx'); 若是已删任务的遗留，先 jinliang gc --dry-run 看一眼，确认没有别的实例在用再 jinliang gc --force",
 			"确实要更多名额：ALTER SYSTEM SET max_replication_slots = <n>; 然后重启实例（这个参数是 postmaster 级，reload 不生效），再重跑（位点没动，不会重搬历史）",
 		},
