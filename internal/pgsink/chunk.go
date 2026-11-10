@@ -104,7 +104,7 @@ func (s *Sink) MarkTableDone(ctx context.Context, ref source.TableRef) error {
 	q := fmt.Sprintf(`INSERT INTO %s (job_key, table_name, chunk_no, range_from, range_to, done, rows)
 		SELECT $1, $2, %d, NULL, NULL, true,
 		       COALESCE((SELECT sum(rows) FROM %s WHERE job_key=$1 AND table_name=$2 AND chunk_no > 0), 0)
-		ON CONFLICT (job_key, table_name, chunk_no) DO UPDATE SET done=true`,
+		ON CONFLICT (job_key, table_name, chunk_no) DO UPDATE SET done=true, rows=EXCLUDED.rows`,
 		ck, TableDoneChunkNo, ck)
 	_, err := s.conn.Exec(ctx, q, s.opt.JobKey, ref.Table)
 	return err
