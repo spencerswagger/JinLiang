@@ -875,6 +875,10 @@ func (r *runner) prepare(ctx context.Context) error {
 	if err := sink.LoadPausedTables(ctx); err != nil {
 		return err
 	}
+	// prepare 阶段降级成提示的判定（用户表多出的列不算漂移）——必须发出来，不许无声。
+	for _, n := range sink.PrepareNotes() {
+		r.note(ctx, n)
+	}
 	if sink.PausedDirty() {
 		r.note(ctx, "目标端的暂停表记录不是合法 JSON：本轮按「没有暂停」继续（不影响同步）")
 	}

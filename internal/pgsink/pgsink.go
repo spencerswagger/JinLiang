@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -101,6 +102,9 @@ type Sink struct {
 	// 由 LoadPausedTables 装好；pausedDirty 表示库里那列不是合法 JSON（按无暂停继续）。
 	pausedCache map[string]PausedTable
 	pausedDirty bool
+	// prepareNotes 收集「降级成提示」的判定（例如用户表多出的列不算漂移），
+	// 由引擎在 prepare 后统一 emit 出去——不许无声。
+	prepareNotes []string
 
 	// ownerToken 让「同一个进程里的两个 Sink」也彼此可分（否则它们同 pid、
 	// 同 instance_id，第二个会把第一个的租约抢走）。
@@ -641,6 +645,22 @@ func (ti *tableInfo) collation(i int) string {
 
 // reconcileColumns adds missing columns (the whitelisted "add column" DDL) and
 // refuses to guess when an existing column has a different type.
+// extraTargetColumns 返回「目标端有、源端没有」的列（保持目标端列顺序，结果稳定）。
+func extraTargetColumns(have map[string]string, srcCols []string) []string {
+	want := make(map[string]bool, len(srcCols))
+	for _, c := range srcCols {
+		want[c] = true
+	}
+	out := make([]string, 0, len(have))
+	for name := range have {
+		if !want[name] {
+			out = append(out, name)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
 func (s *Sink) reconcileColumns(ctx context.Context, ti *tableInfo) error {
 	rows, err := s.conn.Query(ctx,
 		`SELECT a.attname, format_type(a.atttypid, a.atttypmod),
@@ -671,6 +691,30 @@ func (s *Sink) reconcileColumns(ctx context.Context, ti *tableInfo) error {
 	if s.opt.OnExists == "error" {
 		return fmt.Errorf("%w: 目标端已经有表 %s（%d 列）。当前设置是「撞表就停」",
 			ErrTargetTableExists, ti.ref.Table, len(have))
+	}
+	// **prepare 期的结构漂移**：目标端有、源端没有的列。
+	//
+	// 为什么要有这一步：`reconcileColumns` 只遍历**源端列**，所以源端表改名/删列时，
+	// 旧列会静默留在目标端、新列被 ADD 上去——用户看不到任何提示。
+	//
+	// 两条红线（违反即误报）：
+	//  1. **只判本任务建的表**（`_jl_object` 有 `table:<schema>.<table>`）：append/keep 复用的
+	//     用户表里本来就可能有额外列，判它就是天天误报；
+	//  2. 文案写「改名或删列」——prepare 阶段这两者**无法区分**，不许断言「列被改名」。
+	//
+	// 所有权无法确定时**降级为 note**（写进 PrepareNotes，由引擎发出去），不许无声。
+	if extra := extraTargetColumns(have, ti.cols); len(extra) > 0 {
+		ours, err := s.didCreateTableLocked(ctx, ti.ref)
+		if err != nil {
+			return fmt.Errorf("查不到目标表 %s 是谁建的（读 _jl_object 失败）: %w", ti.ref.Table, err)
+		}
+		detail := "目标端有、源端没有的列：" + strings.Join(extra, "、") +
+			"（prepare 阶段无法区分「改名」与「删列」）"
+		if ours {
+			return &SchemaDriftError{TableName: ti.ref.Table, Detail: detail}
+		}
+		s.prepareNotes = append(s.prepareNotes, "表 "+ti.ref.Table+"："+detail+
+			"；这张表不是本任务建的（用户自己的表），多出的列可能是你自己的，**不判为漂移**，按加列继续")
 	}
 	for i, col := range ti.cols {
 		typ, ok := have[col]
@@ -1798,6 +1842,12 @@ func tableObjectName(ref source.TableRef) string {
 func (s *Sink) DidCreateTable(ctx context.Context, ref source.TableRef) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.didCreateTableLocked(ctx, ref)
+}
+
+// didCreateTableLocked 是 DidCreateTable 的不加锁版本：`reconcileColumns` 由
+// `EnsureSchema` 调用，而后者**已经持有 s.mu**——这里再调加锁版会自死锁（实测挂住）。
+func (s *Sink) didCreateTableLocked(ctx context.Context, ref source.TableRef) (bool, error) {
 	q := fmt.Sprintf(`SELECT count(*) FROM %s WHERE object_name=$1 AND job_key=$2 AND dropped_at IS NULL`,
 		s.stateTable("_jl_object"))
 	var n int
