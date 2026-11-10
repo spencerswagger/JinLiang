@@ -284,13 +284,18 @@ YAML
   before_n=$(myq "SELECT COUNT(*) FROM \`$T\`")
   sed 's/frequency: once/frequency: continuous+initial/' "$job" > "$W/job2.yaml"
   timeout 120 "$BIN" import --file "$W/job2.yaml" --data-dir "$data" >/dev/null 2>&1 || true
+  mark "增量（应被拒）开始"
   if runbin run --job acc-pg-mysql --data-dir "$data" >"$W/incr.log" 2>&1; then
     echo "FAIL: PG→MySQL 增量居然跑成功了（本版应明确拒绝）"; tail -3 "$W/incr.log"; return 1
   fi
   after_n=$(myq "SELECT COUNT(*) FROM \`$T\`")
   python3 "$GC" rows --src "$before_n" --dst "$after_n" --expect "$before_n" --label "增量被拒后行数不变" || return 1
   reason=$(grep -oE "只搬全量|还没接上|只支持全量|没开逻辑变更流|定时增量" "$W/incr.log" | head -1)
-  [ -n "$reason" ] || { echo "FAIL: 增量被拒但日志里没有一句原因"; tail -5 "$W/incr.log"; return 1; }
+  if [ -z "$reason" ]; then
+    echo "FAIL: 增量被拒但日志里没有一句原因（下面是把整个日志打出来）"
+    echo "--- $W/incr.log ---"; cat "$W/incr.log" 2>/dev/null | tail -20; echo "--- end ---"
+    return 1
+  fi
 
   n=$after_n
   emit "postgres-mysql" "$n" "${s_fp#*:}" "$secs" pass "mysql=$ver incremental=refused"
@@ -345,13 +350,18 @@ YAML
   before_n=$(myq "SELECT COUNT(*) FROM \`$T\`")
   sed 's/frequency: once/frequency: continuous+initial/' "$job" > "$W/job2.yaml"
   timeout 120 "$BIN" import --file "$W/job2.yaml" --data-dir "$data" >/dev/null 2>&1 || true
+  mark "增量（应被拒）开始"
   if runbin run --job acc-mysql-mysql --data-dir "$data" >"$W/incr.log" 2>&1; then
     echo "FAIL: MySQL→MySQL 增量居然跑成功了（本版应明确拒绝）"; tail -3 "$W/incr.log"; return 1
   fi
   after_n=$(myq "SELECT COUNT(*) FROM \`$T\`")
   python3 "$GC" rows --src "$before_n" --dst "$after_n" --expect "$before_n" --label "增量被拒后行数不变" || return 1
   reason=$(grep -oE "只搬全量|还没接上|只支持全量|没开逻辑变更流|定时增量" "$W/incr.log" | head -1)
-  [ -n "$reason" ] || { echo "FAIL: 增量被拒但日志里没有一句原因"; tail -5 "$W/incr.log"; return 1; }
+  if [ -z "$reason" ]; then
+    echo "FAIL: 增量被拒但日志里没有一句原因（下面是把整个日志打出来）"
+    echo "--- $W/incr.log ---"; cat "$W/incr.log" 2>/dev/null | tail -20; echo "--- end ---"
+    return 1
+  fi
 
   n=$after_n
   emit "mysql-mysql" "$n" "${s_fp#*:}" "$secs" pass "mysql=$ver incremental=refused"
