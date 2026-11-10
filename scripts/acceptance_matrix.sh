@@ -160,12 +160,13 @@ reliability: {batch_rows: 5000}
 YAML
   timeout 120 "$BIN" import --file "$job" --data-dir "$data" >/dev/null 2>&1 || { echo "FAIL: import 失败"; return 1; }
 
-  local t0 t1 secs s_fp d_fp
+  local t0 t1 secs copy_seconds restart_seconds s_fp d_fp
   mark "mysql→pg 全量开始（$ROWS 行）"
   t0=$(now_s)
   runbin run --job acc-mysql-pg --data-dir "$data" --stop-when-idle 5s >"$W/run1.log" 2>&1
   local rc=$?
   t1=$(now_s); secs=$(elapsed "$t0" "$t1")
+  copy_seconds=$secs   # 全量+追平；后面的 restart 单独记，别覆盖它（否则三组合的「耗时」不可比）
   [ $rc -eq 0 ] || { echo "FAIL: 全量+追平退出码 $rc"; tail -5 "$W/run1.log"; return 1; }
 
   s_fp=$(fp_mysql "$T"); d_fp=$(fp_pg "$dst" "$T")
