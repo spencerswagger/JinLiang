@@ -682,7 +682,9 @@ func (w recopyReason) sentence() string {
 // 为什么必须停：不清表跑完算「成功」是最坏的结果 —— 源端删掉的行留在目标端，
 // 界面上一切正常，用户以为已经一致。所以这里把选择权交回去，并给三条都做得到的路。
 type reusedTableRecopyError struct {
-	table  string
+	table string
+	// jobKey / schema 现在 **不再出现在文案里**（第 3 条「手动删掉我们写的行」删掉后没人用它们），
+	// 但保留字段：调用点与将来若要写进 note/审计时还要用，且删字段会让 diff 噪音掩盖行为变化。
 	jobKey string
 	schema string
 	why    recopyReason
@@ -691,13 +693,15 @@ type reusedTableRecopyError struct {
 func (e *reusedTableRecopyError) Error() string {
 	return fmt.Sprintf("%s，而目标表 %s 是你自己的表（不是本任务建的）：要重搬就得先清空它，"+
 		"那会连你原有的行一起删掉，所以我停在这里，不替你决定。\n"+
-		"你现在能做什么（三选一）：1) 想让我们重建：把 target.on_exists 改成 recreate（会清空这张表）；"+
-		"2) 想保留原表：换一个空的 target.schema 重新初始化；"+
-		"3) 手动删掉本任务写进去的行后重跑（进度表 %s._jl_chunk 里有 job_key=%s 与块范围）。\n"+
+		// 只留两条**真能走通**的路。曾经有第 3 条「手动删掉本任务写进去的行后重跑」——
+		// 在「凡从头搬就清表」（#74）之后它已经失效：标记删了也会因 `copiedBefore` 整批点名，
+		// 用户照做必然再撞同一句拒绝。把做不到的动作写进错误，比不给建议更糟。
+		"你现在能做什么（二选一）：1) 想让我们重建：把 target.on_exists 改成 recreate（会清空这张表）；"+
+		"2) 想保留原表：换一个空的 target.schema 重新初始化（旧表会留在原 schema，不再被同步）。\n"+
 		"想先看清差多少：jinliang verify 会逐条报「目标端多出一行（源端没有这个主键 …）」——"+
-		"这一版还没有按块补 delete 的自动修正，所以补齐要靠上面三条之一。\n"+
+		"这一版还没有按块补 delete 的自动修正，所以补齐要靠上面两条之一。\n"+
 		"风险：选 1 会清空这张表；放着不管，源端已删除的行会一直留在目标端。",
-		e.why.sentence(), e.table, e.schema, e.jobKey)
+		e.why.sentence(), e.table)
 }
 
 // initialCopyDone reports whether a previous run finished the initial copy.
