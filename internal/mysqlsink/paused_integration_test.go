@@ -70,6 +70,26 @@ func TestIntegrationPauseRegisterThenClear(t *testing.T) {
 	if got2["jl_b3_pause_a"].At != first {
 		t.Fatalf("at 被覆盖了：%q → %q（第一次的时刻最有价值）", first, got2["jl_b3_pause_a"].At)
 	}
+	// reason 是机器判等用的稳定码，同样不覆盖（第二次换原因会让对账口径漂）。
+	if got2["jl_b3_pause_a"].Reason != pgsink.PauseReasonTypeChanged {
+		t.Fatalf("reason 被覆盖了：%q（必须是第一次那个稳定码）", got2["jl_b3_pause_a"].Reason)
+	}
+	// detail 相反：用最新的（用户要看的是当前差异）。
+	if got2["jl_b3_pause_a"].Detail != "第二次" {
+		t.Fatalf("detail 应更新成最新一次，实际 %q", got2["jl_b3_pause_a"].Detail)
+	}
+
+	// resume 未知值一律按 recopy（宁可多搬一次，不可留下一张永远不一致的表）。
+	if err := s.PauseTable(ctx, refOf("jl_b3_resume_weird"), pgsink.PausedTable{
+		Reason: "schema_drift", Detail: "x", Resume: "weird-value",
+	}); err != nil {
+		t.Fatalf("登记失败: %v", err)
+	}
+	gotW, _ := s.PausedTables(ctx)
+	if gotW["jl_b3_resume_weird"].Resume != pgsink.ResumeRecopy {
+		t.Fatalf("未知 resume 应归一化成 recopy，实际 %q", gotW["jl_b3_resume_weird"].Resume)
+	}
+	_ = s.ClearPausedTable(ctx, refOf("jl_b3_resume_weird"))
 
 	// 解除：只删这一个 key。
 	if err := s.ClearPausedTable(ctx, refOf("jl_b3_pause_a")); err != nil {

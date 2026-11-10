@@ -147,10 +147,14 @@ func Run(in Input) source.Report {
 		// MySQL 目标端已同构落地（docs/CONTRACT-PAUSE-AND-POSITION.md §4.2/§4.5）：
 		// `_jl_meta.paused_tables` 缺列时开跑会先补列（MySQL 没有 ADD COLUMN IF NOT EXISTS，
 		// 先查 information_schema 再 ALTER）；补不上就**明确失败**，不会静默跳过。
+		// **只说存储层做到了什么**：引擎侧的「只停这张表」还没接到 MySQL 目标端
+		// （pause_skip / reconcilePaused 在 PG 专属的 prepare 里），所以这里不许替引擎许诺，
+		// 否则用户会以为「一张表结构不对，别的表还在跑」——实际是整 run 失败。
 		add(source.Check{
-			ID: "PAUSE-01", Title: "目标端支持按表暂停", Status: source.StatusOK,
-			Detail: "结构对不上的表会被记录并只停这张表，其它表继续；恢复时整表重搬。" +
-				"（老库缺 `paused_tables` 列时开跑会先补；补不上会明确失败并说明原因）",
+			ID: "PAUSE-01", Title: "目标端支持记录按表暂停", Status: source.StatusWarn,
+			Detail: "存储层已就绪：`_jl_meta.paused_tables` 这一列在（老库缺列时开跑会先补，" +
+				"补不上会明确失败并说明原因）。**引擎侧的「只停这张表」还没接**——" +
+				"在那之前遇到表结构不一致仍是整 run 失败、位点不推进",
 		})
 	case "postgres":
 		add(source.Check{ID: "PAUSE-01", Title: "目标端支持按表暂停", Status: source.StatusOK,

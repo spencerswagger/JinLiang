@@ -78,8 +78,11 @@ func (s *Sink) PauseTable(ctx context.Context, ref source.TableRef, rec pgsink.P
 	}
 	cur, err := s.mutatePaused(ctx, ref.Table, func(m map[string]pgsink.PausedTable) error {
 		if old, ok := m[ref.Table]; ok {
-			// at / reason 不覆盖：第一次的最有价值。resume 跟着本次判定走（所有权可能变了）。
+			// at / reason **都不覆盖**：第一次的时刻与原因最有价值，而且 reason 是机器判等用的
+			// （第二次因为别的原因又停一次，把 type_changed 改成 schema_drift 会让对账口径漂）。
+			// resume 跟着本次判定走（所有权可能变了）；detail 用新的（用户要看的是当前差异）。
 			rec.At = old.At
+			rec.Reason = old.Reason
 			if rec.Resume == "" {
 				rec.Resume = old.Resume
 			}
@@ -91,9 +94,8 @@ func (s *Sink) PauseTable(ctx context.Context, ref source.TableRef, rec pgsink.P
 				rec.LastSkippedPos = old.LastSkippedPos
 			}
 		}
-		if rec.Resume == "" {
-			rec.Resume = pgsink.ResumeRecopy
-		}
+		// 未知值一律按 recopy（宁可多搬一次，不可留下一张永远不一致的表）——与 pgsink 同一判据。
+		rec.Resume = pgsink.NormalizedResume(rec.Resume)
 		m[ref.Table] = rec
 		return nil
 	})
@@ -156,9 +158,8 @@ func (s *Sink) ClearPausedTable(ctx context.Context, ref source.TableRef) error 
 // 含 `chunk_no=0`（完成标记）：不清它的话，`planCopy` 会认为这张表的存量搬完了，
 // 重搬永远排不进去——「暂停解除了、数据其实还缺着」。只清这一张表，别的表照旧续跑。
 func (s *Sink) MarkTableRecopyPending(ctx context.Context, ref source.TableRef) error {
-	if err := s.ensurePausedColumn(ctx); err != nil {
-		return err
-	}
+	// 这里**不碰** `paused_tables`（只删块标记）：补列失败是另一件事，
+	// 让它把「重搬」卡在一个跟它无关的原因上，用户会照着错的提示去修。
 	res, err := s.db.ExecContext(ctx,
 		"DELETE FROM `_jl_chunk` WHERE job_key = ? AND table_name = ?", s.opt.JobKey, ref.Table)
 	if err != nil {

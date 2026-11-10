@@ -489,6 +489,12 @@ func (r *runner) copyGeneric(ctx context.Context) error {
 	// 下一轮从游标往后读只会拿到 0 行，然后重新盖章。
 	if cc, ok := r.gsink.(chunkChronicker); ok {
 		for _, t := range r.selectedTables() {
+			// 这一轮没搬的表**不许盖章**：等 Core 把暂停集合接进通用路径之后，
+			// 被暂停、存量没搬的表也会走到这里——盖上 done=1 就是「pause 解除了、数据还缺着」
+			// 的永久缺行（契约 §4.6 红线 3/5）。现在这条路径没有 skipped，先把这个前提钉住。
+			if r.skippedTables[t.Table] || r.plan.Skip[t.Table] {
+				continue
+			}
 			ref := r.targetRef(source.TableRef{Schema: t.Schema, Table: t.Table})
 			if err := cc.MarkTableDone(ctx, ref); err != nil {
 				return err
