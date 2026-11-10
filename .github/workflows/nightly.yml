@@ -48,6 +48,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: "1.27.x"
+          cache: true
       - name: 起 PostgreSQL ${{ matrix.pg }}（wal_level=logical）
         run: |
           set -euo pipefail
@@ -135,6 +136,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: "1.27.x"
+          cache: true
       - name: 起 MySQL ${{ matrix.mysql }}（binlog ROW + FULL 行镜像）
         run: |
           set -euo pipefail
@@ -247,6 +249,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: "1.27.x"
+          cache: true
       - name: 起 PostgreSQL 16（wal_level=logical）
         run: |
           set -euo pipefail
@@ -334,6 +337,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: "1.27.x"
+          cache: true
       - name: 起 PostgreSQL 16（wal_level=logical）
         run: |
           set -euo pipefail
@@ -360,6 +364,28 @@ jobs:
           docker exec pg-src psql -U jinliang -d jinliang_src -c 'CREATE DATABASE jinliang_test'
       - name: 性能基线（不达标即红）
         run: scripts/bench.sh --enforce --out bench/latest.json
+      - name: 目标端批量 upsert 吞吐（增量峰值门禁 ≥20k rows/s）
+        # 这道门禁原在 PR 的 b1-engine 里，每次 PR 都跑一遍太贵，挪到 nightly；
+        # 覆盖不丢。三条硬约束（都是「不许静默通过」的具体化）：
+        #   1) pipefail：go test 自己失败必须跟着失败，不能被 `| tee` 吞掉；
+        #   2) 没测到数值＝失败：rate 为空时 `r+0` 会被当成 0，这里先显式判空；
+        #   3) 低于阈值直接红，并把实测数字打进日志。
+        run: |
+          set -euo pipefail
+          # 阈值只写这一个地方，判定和文案都引用它，避免两处漂移。
+          # 20000 是「崩塌才红」的峰值门禁（不是性能基线：p99/内存/冷启在 scripts/bench.sh）。
+          THRESHOLD=20000
+          # -count=3 + 取中位数：单次 40 iterations 在 shared runner 上实测 1.7~2.0 倍方差，
+          # 取中位数把「偶尔一次慢」和「真的垮了」分开。三次都慢 → 中位数也慢 → 照样红。
+          go test -tags=integration -run '^$' -bench BenchmarkApplyUpsert500 -benchtime=40x -count=3 ./internal/pgsink/ | tee /tmp/bench.txt
+          # `|| true`：没匹配到时也要走到下面的显式判空（否则 set -e/pipefail 会静默退出，
+          # 红是红了，但日志里没有「为什么」）。
+          rates=$(grep 'batch=500' /tmp/bench.txt | grep -oE '[0-9]+ rows/s' | grep -oE '^[0-9]+' | sort -n || true)
+          echo "batch=500 三次实测: $(echo "$rates" | tr '\n' ' ')"
+          rate=$(echo "$rates" | sed -n '2p')   # 3 个值的中位数（第 2 小）
+          [ -n "$rate" ] || { echo "❌ 没测到 batch=500 的吞吐数值（benchmark 没跑或输出格式变了）——这不算通过"; tail -30 /tmp/bench.txt; exit 1; }
+          echo "批量路径吞吐（中位数）: $rate rows/s（阈值 $THRESHOLD）"
+          [ "$rate" -ge "$THRESHOLD" ] || { echo "❌ 批量 upsert 吞吐中位数 $rate 低于阈值 $THRESHOLD rows/s"; exit 1; }
       - uses: actions/upload-artifact@v4
         if: always()
         with:
