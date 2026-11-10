@@ -7,8 +7,10 @@
 两档：
   logic  —— 注入到门禁自己的判据（scripts/gate_checks.py、scripts/review_gate_logic.py），
             检测器是它们的 selftest。不需要数据库，秒级。
-  engine —— 注入到实现（pgsink 的位点写入 / 引擎的暂停登记 / 块进度读取），
+  engine —— 注入到实现（pgsink 的位点写入 / 引擎的按表过滤与恢复 / 块进度读取），
             检测器是对应用例。需要真库（PG）。
+            注：#93 之后暂停判定在 `internal/engine/pause_skip.go`，`pgsink.Apply`
+            只剩「引擎漏过滤就报错」的最后防线，所以注入点跟着搬出 pgsink。
 
 每条的字段：名称、注入点（文件 + 一行代码）、期望失败信号、实际结果、是否 fail。
 任何一条「注入后检测器仍然绿」= 门禁放行了错误实现 → 本脚本退出 1。
@@ -107,7 +109,7 @@ MUTATIONS = [
         signal="selftest 退出 1（production-changed / test-hand-added 必须红）",
         note="把「旧结论盖新代码」的拦截关掉（#59 要防的正是这个）",
     ),
-    # ── engine 档：实现（需要真 PD） ───────────────────────────
+    # ── engine 档：实现（需要真 PG） ───────────────────────────
     dict(
         name="position-not-persisted",
         tier="engine",
@@ -129,6 +131,41 @@ MUTATIONS = [
         requires="TestPlanCopy",
         signal="TestPlanCopy FAIL（续跑退化=kill -9 后整轮重搬，重搬行数不为 0）",
         note="块进度读不出来 / 续跑退化成整轮重搬",
+    ),
+    # #93 之后「暂停判定」在引擎侧（internal/engine/pause_skip.go），pgsink.Apply 只剩
+    # 「引擎漏过滤就报错」的最后防线。所以注入点跟着搬，别再对着 pgsink 打。
+    dict(
+        name="forced-recopy-neutered",
+        tier="engine",
+        file="internal/engine/engine.go",
+        find="func (r *runner) applyForcedRecopy(plan *chunkPlan) {\n",
+        replace="func (r *runner) applyForcedRecopy(plan *chunkPlan) {\n\treturn // SABOTAGE: 只清块标记，不接进本轮重搬\n",
+        cmd=["go", "test", "-count=1", "-run", "^TestApplyForcedRecopy", "./internal/engine/"],
+        requires="TestApplyForcedRecopyRescuesSingleTableCopySkip",
+        signal="TestApplyForcedRecopy* FAIL（只清块标记不重搬=恢复永远差一段，还会说「本轮已补齐」）",
+        note="把「欠一次整表重搬」变成只清块标记（单表会落到 copySkip，搬运阶段整个不跑）",
+    ),
+    dict(
+        name="commit-plan-alias",
+        tier="engine",
+        file="internal/engine/engine.go",
+        find="\tr.applyForcedRecopy(plan)\n\tr.plan = *plan\n",
+        replace="\tr.plan = *plan\n\tr.applyForcedRecopy(plan) // SABOTAGE: 先赋值再补计划，r.plan 拿到旧值\n",
+        cmd=["go", "test", "-count=1", "-run", "^TestApplyForcedRecopy", "./internal/engine/"],
+        requires="TestApplyForcedRecopyOnlyTouchesThePausedTable",
+        signal="TestApplyForcedRecopy* FAIL（值类型别名：r.plan 是改之前的计划，调用方那份才是新的）",
+        note="commitPlan 先落值再补计划（指针也救不了：复制发生在补计划之前）",
+    ),
+    dict(
+        name="reconcile-clears-early",
+        tier="engine",
+        file="internal/engine/engine.go",
+        find="\t\tif r.forceRecopy == nil {\n",
+        replace="\t\t_ = r.sink.ClearPausedTable(ctx, ref) // SABOTAGE: 对齐就解除（旧判据）\n\t\tr.forgetPaused(key)\n\t\tif r.forceRecopy == nil {\n",
+        cmd=["go", "test", "-tags=integration", "-count=1", "-run", "^TestReconcilePausedMarksRecopyAndKeepsRecord$", "./internal/engine/"],
+        requires="TestReconcilePausedMarksRecopyAndKeepsRecord",
+        signal="TestReconcilePausedMarksRecopyAndKeepsRecord FAIL（结构对齐就解除=跳过窗口永远没人补，表显示已恢复而数据是旧的）",
+        note="reconcilePaused 改回「结构对齐就解除」（契约 §1.6 第 4 步：解除要等重搬搬成）",
     ),
 ]
 
