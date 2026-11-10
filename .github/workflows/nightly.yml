@@ -372,11 +372,12 @@ jobs:
         #   3) 低于阈值直接红，并把实测数字打进日志。
         run: |
           set -euo pipefail
+          THRESHOLD=20000   # 门禁阈值只写这一个地方，判定和文案都引用它，避免两处漂移
           go test -tags=integration -run '^$' -bench BenchmarkApplyUpsert500 -benchtime=40x ./internal/pgsink/ | tee /tmp/bench.txt
           rate=$(awk '/batch=500/ { for (i=1;i<=NF;i++) if ($i=="rows/s") print $(i-1) }' /tmp/bench.txt | tail -1)
           [ -n "$rate" ] || { echo "❌ 没测到 batch=500 的吞吐数值（benchmark 没跑或输出格式变了）——这不算通过"; tail -30 /tmp/bench.txt; exit 1; }
-          echo "批量路径吞吐: $rate rows/s（阈值 20000）"
-          awk -v r="$rate" 'BEGIN { exit !(r+0 >= 20000) }' || { echo "❌ 批量 upsert 吞吐 $rate 低于 20000 rows/s"; exit 1; }
+          echo "批量路径吞吐: $rate rows/s（阈值 $THRESHOLD）"
+          awk -v r="$rate" -v t="$THRESHOLD" 'BEGIN { exit !(r+0 >= t+0) }' || { echo "❌ 批量 upsert 吞吐 $rate 低于阈值 $THRESHOLD rows/s"; exit 1; }
       - uses: actions/upload-artifact@v4
         if: always()
         with:
