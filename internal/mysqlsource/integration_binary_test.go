@@ -33,6 +33,15 @@ func TestIntegrationBinaryVsTextDecoding(t *testing.T) {
 		tx  TEXT          NULL
 	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`)
 
+	// 与引擎同一条前置：把选表的 catalog 交给连接器。
+	// 5.7 的 TABLE_MAP 没有排序规则，「哪一列按字节存」只能从这份 catalog 的
+	// CHARACTER_SET_NAME 补（引擎在 newMyRunSource 里就是这么做的）。
+	cat, err := s.Catalog(ctx, source.Scope{Schema: s.ep.Database, Include: []string{table}})
+	if err != nil {
+		t.Fatalf("读 catalog 失败: %v", err)
+	}
+	s.SetKnownTables(cat.Tables)
+
 	start, err := s.Status(ctx)
 	if err != nil {
 		t.Fatalf("取起点失败: %v", err)

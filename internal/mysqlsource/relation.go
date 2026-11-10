@@ -292,7 +292,13 @@ const (
 const binaryCollationID = 63
 
 // columnBinaryKind 判断第 i 列按字节存还是按字符存。
+//
+// 顺序很关键：**先信 catalog 补进来的 ColumnKinds**（5.7 只有它有），再退回
+// TABLE_MAP 的排序规则（8.0+），最后才是「不知道」。
 func (tm *TableMap) columnBinaryKind(i int) binaryKind {
+	if i < len(tm.ColumnKinds) && tm.ColumnKinds[i] != binUnknown {
+		return tm.ColumnKinds[i]
+	}
 	switch tm.collationFor(i) {
 	case 0:
 		return binUnknown
@@ -300,6 +306,35 @@ func (tm *TableMap) columnBinaryKind(i int) binaryKind {
 		return binBinary
 	default:
 		return binText
+	}
+}
+
+// FillColumnKinds 用 catalog 的字符集补「哪一列按字节存」。
+//
+// 只在 TABLE_MAP 给不出排序规则时（5.7）才需要，但因为写入的是 ColumnKinds、
+// 而 columnBinaryKind 优先看它，8.0 上补了也无害（两边结论一致）。
+// 对不上的情形一律留 binUnknown：宁可退回内容启发式，也不要凭序号猜错列。
+func FillColumnKinds(tm *TableMap, known *source.Table) {
+	if tm == nil || known == nil || len(known.Columns) != tm.Columns {
+		return
+	}
+	kinds := make([]binaryKind, tm.Columns)
+	any := false
+	for i := range kinds {
+		cs := known.Columns[i].Charset
+		switch {
+		case cs == "":
+			kinds[i] = binUnknown
+		case strings.EqualFold(cs, "binary"):
+			kinds[i] = binBinary
+			any = true
+		default:
+			kinds[i] = binText
+			any = true
+		}
+	}
+	if any {
+		tm.ColumnKinds = kinds
 	}
 }
 

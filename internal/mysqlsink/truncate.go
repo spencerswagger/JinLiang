@@ -46,7 +46,9 @@ func (s *Sink) truncateOwned(ctx context.Context, ref source.TableRef, reason st
 			"你能做什么：① 想让这张表归本任务管 → 在任务里把它改成可重建（on_exists=recreate），"+
 			"或先手工清空它再重跑（`TRUNCATE TABLE %s`，只在你确认里面没有自己的数据时做）；"+
 			"② 不想让本任务碰它 → 把它从 content.tables 里去掉后重新 import；"+
-			"③ 只是想让源端这次 TRUNCATE 跟过去 → 手工在目标端执行同一条 TRUNCATE。"+
+			"③ 如果你就是想让这次 TRUNCATE 生效：手工执行同一条 TRUNCATE 之后，**还要**把这张表"+
+			"改成 recreate 或移出范围再重跑——只手工清空不会放行（失败批的位点没有越过这条事件，"+
+			"重跑会撞同一道闸，永远卡在这里）。"+
 			"风险：手工清空是**不可回滚**的，表里的行找不回来；本实现不会替你猜",
 			ErrTruncateNotOwned, qualified(ref), s.opt.JobKey, reason, qualified(ref))
 	}
