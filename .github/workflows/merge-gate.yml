@@ -118,8 +118,10 @@ jobs:
             -e MYSQL_USER=jinliang -e MYSQL_PASSWORD=jinliang \
             mysql:${{ matrix.mysql }} \
             --server-id=1 --log-bin=mysql-bin --binlog-format=ROW --binlog-row-image=FULL
-          for i in $(seq 1 90); do
-            docker exec my-src mysqladmin ping -uroot -proot --silent >/dev/null 2>&1 && exit 0
+          # 不能用 mysqladmin ping：它在「拒绝访问」时也返回 0（8.x 初始化期间就是这样），
+          # 会让我们以为库已就绪，下一步 GRANT 直接 Access denied。
+          for i in $(seq 1 120); do
+            docker exec my-src mysql -uroot -proot -N -e 'select 1' >/dev/null 2>&1 && exit 0
             sleep 2
           done
           docker logs my-src; exit 1
@@ -131,16 +133,18 @@ jobs:
             -e MYSQL_USER=jinliang -e MYSQL_PASSWORD=jinliang \
             mysql:${{ matrix.mysql }} \
             --server-id=2 --log-bin=mysql-bin --binlog-format=ROW --binlog-row-image=FULL
-          for i in $(seq 1 90); do
-            docker exec my-dst mysqladmin ping -uroot -proot --silent >/dev/null 2>&1 && exit 0
+          for i in $(seq 1 120); do
+            docker exec my-dst mysql -uroot -proot -N -e 'select 1' >/dev/null 2>&1 && exit 0
             sleep 2
           done
           docker logs my-dst; exit 1
       - name: 补权限 + 报版本
         run: |
           set -e
+          # 用 ALL PRIVILEGES 而不是点名 REPLICATION SLAVE：8.4 已经把那个名字换掉了
+          # （REPLICATION REPLICA），5.7/8.0/8.4 只有这一句都认。
           docker exec my-src mysql -uroot -proot -e "
-            GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'jinliang'@'%';
+            GRANT ALL PRIVILEGES ON *.* TO 'jinliang'@'%' WITH GRANT OPTION;
             CREATE DATABASE IF NOT EXISTS jinliang_test; FLUSH PRIVILEGES; SELECT VERSION();"
           docker exec my-dst mysql -uroot -proot -e "
             CREATE DATABASE IF NOT EXISTS jinliang_target; FLUSH PRIVILEGES; SELECT VERSION();"
