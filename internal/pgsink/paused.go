@@ -147,11 +147,11 @@ func (s *Sink) ClearPausedTable(ctx context.Context, ref source.TableRef) error 
 }
 
 // isPausedLocked 是写路径上的快速判定（调用方已持锁；缓存由 LoadPausedTables 装好）。
-func (s *Sink) isPausedLocked(ref source.TableRef) bool {
+func (s *Sink) isPausedLocked(table string) bool {
 	if s.pausedCache == nil {
 		return false
 	}
-	_, ok := s.pausedCache[ref.Table]
+	_, ok := s.pausedCache[table]
 	return ok
 }
 

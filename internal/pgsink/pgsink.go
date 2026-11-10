@@ -992,6 +992,22 @@ func (s *Sink) Apply(ctx context.Context, evs []source.Event, pos source.Positio
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// 已被暂停的表：**整批拒绝**，位点一点都不动。
+	//
+	// 为什么不能「跳过它、让位点前进」：整条任务只有一个位点，跳过等于把这批变更永久丢掉，
+	// 而界面上一切正常。按表暂停的含义是**这条同步停下来**（位点共用，别的表也走不动），
+	// 重跑时幂等补上——失败会有人看，静默缺数据不会。
+	for _, ev := range evs {
+		if !s.isPausedLocked(ev.Table.Table) {
+			continue
+		}
+		detail := ""
+		if rec, ok := s.pausedCache[ev.Table.Table]; ok {
+			detail = rec.Detail
+		}
+		return &TablePausedError{TableName: ev.Table.Table, Detail: detail}
+	}
+
 	tx, err := s.conn.Begin(ctx)
 	if err != nil {
 		return err
