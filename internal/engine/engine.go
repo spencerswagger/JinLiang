@@ -1312,6 +1312,11 @@ func (r *runner) stream(ctx context.Context, res *Result) error {
 	if err := b.Flush(context.Background()); err != nil {
 		return err
 	}
+	// 后台 flush 的失败要在这里上抛：它在 goroutine 里，没有其它路径把错误带回 run。
+	// 真实失败 → failed；context.Canceled 是「被停下」的副作用（交给下面既有的停止路径判）。
+	if ferr := b.FlushErr(); ferr != nil && !errors.Is(ferr, context.Canceled) {
+		return ferr
+	}
 	if streamErr != nil {
 		var stopped *stoppedError
 		if errors.As(streamErr, &stopped) {

@@ -88,6 +88,8 @@ type batcher struct {
 	applied   int64
 	lastPos   source.Position
 	lastFlush time.Time
+	// flushErr 是后台 flush 的第一次失败（见 FlushErr）。
+	flushErr error
 
 	// 单事务缓冲上限（docs/STREAMING.md §1：128 MB / 100 万事件）。
 	maxTxBytes  int64
@@ -248,7 +250,31 @@ func (e *txTooLargeError) Error() string {
 func (b *batcher) Flush(ctx context.Context) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.flushLocked(ctx)
+	if err := b.flushLocked(ctx); err != nil {
+		b.noteFlushErrLocked(err)
+		return err
+	}
+	return nil
+}
+
+// noteFlushErrLocked 记下第一次落库失败（调用方已持锁）。
+// **第一次**最接近根因：后面的失败多半是它的连锁反应。
+func (b *batcher) noteFlushErrLocked(err error) {
+	if err == nil || b.flushErr != nil {
+		return
+	}
+	b.flushErr = err
+}
+
+// FlushErr 把后台 flush 的失败交给调用方。
+//
+// 为什么必须有：`flushLoop` 在 goroutine 里跑，它的错误没有任何返回值可走；
+// 只在里面 return 等于把它扔了——**写失败而 run 报成功**是最坏的一种「看起来成功」。
+// `stream()` 在收尾时取走它：真实失败按 failed、`context.Canceled` 按 stopped（两者不许混）。
+func (b *batcher) FlushErr() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.flushErr
 }
 
 func (b *batcher) flushLocked(ctx context.Context) error {
@@ -304,6 +330,12 @@ func (b *batcher) flushLoop(ctx context.Context) {
 				continue
 			}
 			err := b.flushLocked(ctx)
+			if err != nil {
+				// **后台循环没法把错误返回给调用方**：不记下来，写入失败就会「看起来成功」
+				//（run 结束、退出码 0、目标端少了一批数据）。记第一手错误，由 stream()
+				// 在收尾时取走并上抛。
+				b.noteFlushErrLocked(err)
+			}
 			b.mu.Unlock()
 			if err != nil {
 				return
