@@ -94,6 +94,22 @@
 - `TestFillColumnKindsRefusesWhenColumnCountDiffers`：列数对不上就不补（不按序号错位猜）；
 - 真库用例改走 `s.Catalog(...)` + `SetKnownTables`（与引擎 `newMyRunSource` 同一条前置）。
 
+**第二轮（5.7 腿又红两次，两次都是真发现）**
+
+1. `CHARACTER_SET_NAME` 对 `BINARY/VARBINARY/BLOB` 是 **NULL**（真库实测），
+   把「字符集空」当成「不知道」→ 又退回内容启发式。改成 `catalogBinaryKind`：
+   有字符集看字符集，没有就看**类型名**（binary/varbinary/blob 家族 → 字节；
+   char/varchar/text 家族 → 字符）。用例 `TestCatalogBinaryKind` 10 格 + 真库 information_schema 断言。
+2. 解码对了、**类型串**还是 `char(4)`（5.7 的 binlog 只说字符家族）。基名纠正原来放在
+   `enrichRelation` 里，而 Relation 是 assembler 在 TABLE_MAP 处就造好的——不经过 enrich 的
+   调用方看到的还是 `char(4)`。改成在 `tableFromMapWith` 里按 `columnBinaryKind` 就地纠
+   （`rerenderForKind`：char↔binary / varchar↔varbinary / text↔blob，长度仍取 binlog）。
+   用例 `TestEnrichRelationFixesBinaryBaseOn57` + `TestFillColumnKindsCovers57` 里的类型串断言。
+3. 顺带把真库用例从 `RunStream` 改到 **`Stream`**（引擎走的就是它，会补列名/换算字符数）——
+   原来那条用例绕过了 enrich，所以「Relation 长什么样」这件事其实没被验到。
+
+结果：CI **13 个 job 全绿**，含 `mysql 5.7` 腿。
+
 **结论：修复。**
 
 ---
