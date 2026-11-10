@@ -104,6 +104,10 @@ type batcher struct {
 	onFlush func(applied int64, pos source.Position)
 	// onApplied reports rows/position to the runner.
 	onApplied func(rows int64, pos source.Position)
+	// onError 在后台提交失败时被调用（调用方用它 cancel 流，把失败立刻冒出来）。
+	onError func(error)
+	// err 是后台提交路径上的第一个错误，由 Err() 交给调用方。
+	err error
 }
 
 func newBatcher(sink applier, src acker, doc control.JobDoc, batchRows int, delay time.Duration,
@@ -307,6 +311,12 @@ func (b *batcher) guardAck(ctx context.Context, pos source.Position) error {
 
 // flushLoop commits on the batch delay even when the stream is quiet, so lag
 // never sits in memory waiting for the next event.
+//
+// 背景循环里的错误**必须往外抛**：以前这里 `return` 就算了，结果是一次 Apply 失败
+// （例如目标表没有唯一键、目标端断连）之后，提交再也不会发生，任务停在「实时同步中」，
+// 既不报错也不前进，直到有人手动按停——用户看到的是「同步卡住了」，日志里什么都没有。
+// 现在的做法：记住第一个错误 + 通知调用方（onError 里 cancel 掉 stream ctx），
+// 调用方在流结束后第一件事就是查这个错误，把它原样当失败报出来。
 func (b *batcher) flushLoop(ctx context.Context) {
 	interval := b.delay
 	if interval < 20*time.Millisecond {
@@ -326,12 +336,35 @@ func (b *batcher) flushLoop(ctx context.Context) {
 				continue
 			}
 			err := b.flushLocked(ctx)
+			if err != nil {
+				b.setErrLocked(err)
+			}
+			onErr := b.onError
 			b.mu.Unlock()
 			if err != nil {
+				if onErr != nil {
+					onErr(err)
+				}
 				return
 			}
 		}
 	}
+}
+
+// setErrLocked 只记第一个错误：后面的错误多半是它的连锁反应（连接已断之类），
+// 报第一个才指得准。
+func (b *batcher) setErrLocked(err error) {
+	if b.err == nil {
+		b.err = err
+	}
+}
+
+// Err 是后台提交路径上出现的第一个错误（没有就 nil）。
+// 它不会自己冒出来——调用方要在流结束后主动查（见 engine.stream / streamGeneric）。
+func (b *batcher) Err() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.err
 }
 
 // Pending reports whether anything is waiting to be committed (rows in the

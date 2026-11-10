@@ -547,6 +547,14 @@ func (s *Source) RunStream(ctx context.Context, start Position, asm *Assembler) 
 		}
 		frame, err := conn.ReadEventPacket(ctx)
 		if err != nil {
+			// 用户按了停止 / --stop-when-idle 到点：引擎会 cancel ctx 并关连接来打断
+			// 阻塞读，于是这里拿到的是一个网络错误（`use of closed network connection`），
+			// 那**不是**数据库出问题。把它原样往上抛，用户会看到「未识别的数据库错误，
+			// 请把日志发给维护者」+ 退出码 1 —— 一次正常收尾被记成失败。
+			// 判据用 ctx（而不是错误文本）：谁关的连接不重要，ctx 结束了就是我们的取消。
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			return fmt.Errorf("读取变更流中断: %w", err)
 		}
 		if len(frame) == 0 {
