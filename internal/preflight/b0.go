@@ -139,6 +139,20 @@ func Run(in Input) source.Report {
 		}
 	}
 
+	// ── 按表暂停能力 ─────────────────────────────────────────
+	// 只有 PG 目标端有 paused_tables 那条状态列。别的目标端遇到「结构对不上」时
+	// 没法登记暂停——这条要**在 plan 里就说清**，别等用户在半夜撞上 E1015 才知道。
+	if in.TargetKind != "" && in.TargetKind != "postgres" {
+		add(source.Check{
+			ID: "PAUSE-01", Title: "目标端不支持按表暂停", Status: source.StatusWarn,
+			Detail: fmt.Sprintf("目标端是 %s：还没有暂停记录那一列——遇到表结构不一致时，"+
+				"整条同步会停下来等你手工对齐（不会静默跳过，也不会假装登记成功）", in.TargetKind),
+		})
+	} else if in.TargetKind == "postgres" {
+		add(source.Check{ID: "PAUSE-01", Title: "目标端支持按表暂停", Status: source.StatusOK,
+			Detail: "结构对不上的表会被记录并停下来，位点不推进"})
+	}
+
 	// ── 批次与并发 ───────────────────────────────────────────
 	if in.BatchRows < 1 || in.BatchRows > 50000 {
 		add(source.Check{ID: "BATCH-01", Title: "每批行数超出范围", Status: source.StatusBlocked,

@@ -93,6 +93,9 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 		return Result{}, errors.New("内部错误：没有控制库")
 	}
 	res := Result{ExitCode: ExitOK}
+	// migrateErr 记「状态表迁移没成功」：后面若撞上缺列，把它一起包进主错误，
+	// 别让用户先读到一条与真实原因无关的列错误。
+	var migrateErr error
 	started := time.Now()
 
 	job, err := opt.Store.GetJob(ctx, opt.JobID)
@@ -133,6 +136,26 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 	srcEP := endpointOf(srcConn, srcSecret)
 	tgtEP := endpointOf(tgtConn, tgtSecret)
 
+	// **状态表迁移要早于任何读 `_jl_meta` 的动作**（StartRun 的冲突回收会读租约/状态）。
+	// 否则旧 schema 的库会在 prepare 之前就因为「没有 paused_tables 列」报一条与真实原因
+	// 无关的错（租约/预检/表不存在才是真因），用户还会以为要手工改表。幂等，一条 DDL。
+	// **尽力而为，绝不在这里中止**：目标库连不上/schema 还没建的时候，真原因会由后面
+	// 的预检或 prepare 报出来（并且要落一条 run 行）——这里中止会让「必失败任务」连
+	// run 行都没有，用户反而看不到真原因。
+	// 只对 **PG 目标端**跑（MySQL 目标端没有暂停记录这类状态列）。
+	// **必须有超时**：目标端黑洞时无超时的 connect 会卡到 OS TCP 超时（~2min），而这时
+	// 还没有 run 行；随后的 preflight 再连一次 → 总等待翻倍且第一次失败不留痕。
+	// 同理，那条 `ADD COLUMN IF NOT EXISTS` 会拿一次 ACCESS EXCLUSIVE，撞上 `_jl_meta`
+	// 长事务会一直等——10s 上限同时解掉这两件事。真原因交给 preflight 报。
+	if tgtEP.Kind == dsn.KindPostgres {
+		mctx, cancelMigrate := context.WithTimeout(ctx, 10*time.Second)
+		err := pgsink.EnsureStateTables(mctx, tgtEP, schemaOf(doc, tgtConn))
+		cancelMigrate()
+		if err != nil {
+			migrateErr = err
+			emitEarlyNote(&res, "先把目标端状态表升到当前版本时出错（真原因稍后由预检报出）："+err.Error())
+		}
+	}
 	run, err := opt.Store.StartRun(ctx, job.ID, state.Preflight, control.RunKindSync)
 	if err != nil && errors.Is(err, control.ErrConflict) {
 		// 控制面有「一个任务只允许一条活跃 run」的约束（#5）。进程被 kill -9 之后
@@ -173,6 +196,10 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 		}(),
 	}
 	err = r.execute(ctx, &res)
+	if err != nil && migrateErr != nil && strings.Contains(err.Error(), "paused_tables") {
+		// 迁移没成功、后面又撞上缺列：把迁移那条一起包进来，别让用户先读到无关的列错误。
+		err = fmt.Errorf("%w（另外：状态表迁移也没成功：%v）", err, migrateErr)
+	}
 	res.Elapsed = time.Since(started)
 	if err != nil {
 		res.ExitCode = ExitFailed
@@ -316,6 +343,10 @@ type runner struct {
 	// clearedTables 是**真的清空过**的表（cleanBeforeRecopy 每清成一张追加一条）。
 	clearedTables []string
 
+	// progressByTable 是本轮读到的块进度（暂停记录收口要用「存量完成没」这个事实，
+	// 而它只能从 _jl_chunk 来，不能从 paused_tables 来）。
+	progressByTable map[string]pgsink.ChunkProgress
+
 	rowsCopied int64
 	rowsStream int64
 	exitCode   int
@@ -420,7 +451,7 @@ func (r *runner) execute(parent context.Context, res *Result) error {
 		if err := r.drain(ctx, ExitOK, "全量完成"); err != nil {
 			return err
 		}
-		res.Note = "只搬了存量数据（mode.frequency=" + r.mode() + "）"
+		emitEarlyNote(res, "只搬了存量数据（mode.frequency="+r.mode()+"）")
 		return nil
 	}
 	if r.mode() == "interval" {
@@ -441,16 +472,16 @@ func (r *runner) execute(parent context.Context, res *Result) error {
 		}
 		// 说清这条路的取舍（Ark 口径 2026-11-10）：水位增量只补新增/更新，
 		// **不同步删除**。文案里不许暗示我们追 delete，否则用户会以为已经一致。
-		res.Note = "interval 模式：只跑了水位增量（整表重搬仅发生在第一次或没有水位列的表）；" +
-			"水位增量只补新增与更新，**不同步删除**——源端删掉的行会留在目标端，" +
-			"需要连删除一起同步请用 continuous+initial，或定期用 once 整轮重搬"
+		emitEarlyNote(res, "interval 模式：只跑了水位增量（整表重搬仅发生在第一次或没有水位列的表）；"+
+			"水位增量只补新增与更新，**不同步删除**——源端删掉的行会留在目标端，"+
+			"需要连删除一起同步请用 continuous+initial，或定期用 once 整轮重搬")
 		return nil
 	}
 	if r.mode() == "full_interval" {
 		if err := r.drain(ctx, ExitOK, "全量周期重跑本轮完成"); err != nil {
 			return err
 		}
-		res.Note = "full_interval 模式：本轮整表重跑；下一轮由调度器（--watch）触发"
+		emitEarlyNote(res, "full_interval 模式：本轮整表重跑；下一轮由调度器（--watch）触发")
 		return nil
 	}
 
@@ -805,6 +836,19 @@ func (r *runner) prepare(ctx context.Context) error {
 	if err := sink.EnsureMeta(ctx, hashOf(r.doc), "", "", ""); err != nil {
 		return fmt.Errorf("写入任务状态行失败: %w", err)
 	}
+	// 暂停记录读在 **EnsureMeta 之后、EnsureSchema 之前**（契约 §1.2）：
+	//   - 之后：状态行得先存在，否则读不到那一列；
+	//   - 之前：写路径的暂停快检必须在**第一次写入前**就绪——EnsureSchema 本身可能写行，
+	//     而 cleanBeforeRecopy 之后才读就已经晚了（那时表可能已经被清过一轮）。
+	// 只读一次：写路径每批都要判定，不能每批查库；这一列只在本轮 prepare 与
+	// 「某表搬成」两处变化。**顺序还有一条硬的：EnsureSchema 必须早于 cleanBeforeRecopy**
+	//（否则会「先清空、后报结构不对」）。三条一起看，这段位置就是唯一正确的。
+	if err := sink.LoadPausedTables(ctx); err != nil {
+		return err
+	}
+	if sink.PausedDirty() {
+		r.note(ctx, "目标端的暂停表记录不是合法 JSON：本轮按「没有暂停」继续（不影响同步）")
+	}
 	// 建表要用**目标端**的表定义（schema 换成目标端的）：源端 catalog 里的
 	// schema 是源库名（MySQL 源就是库名），直接拿去建表会变成「目标端没有这个 schema」。
 	// **顺序有要求：EnsureSchema 必须早于 snapshot() 里的 cleanBeforeRecopy。**
@@ -819,12 +863,23 @@ func (r *runner) prepare(ctx context.Context) error {
 	for _, a := range actions {
 		r.emit(ctx, control.Event{Type: "note", Message: a.What})
 	}
-
 	src, err := r.openSource(ctx)
 	if err != nil {
 		return err
 	}
 	r.src = src
+	// **只有 interval 在这里收口**：它既不清表、也不走 Apply，且 `prepare` 早退后
+	// 再也走不到下面那一次调用；interval 没有「存量」概念，`copyDoneFor` 恒真是设计如此
+	//（契约 §1.2 例外段）。
+	//
+	// 别的模式**必须**等 `decideCopyPlan` 之后再收口：`progressByTable` 是那一步才赋值，
+	// 提前调会让 `chunkProgress()` 是空 map → `copyDoneFor` 走 `!ok → true` → 每张表都被判
+	// 「已搬完」→ 暂停记录被无条件清掉（半截拷贝的表显示「已恢复」而数据是半空的）。
+	if r.mode() == "interval" {
+		if err := r.reconcilePaused(ctx); err != nil {
+			return err
+		}
+	}
 	// interval 模式不做逻辑复制（没有书签、没有发布），只要一条普通读连接；
 	// 少建一个 slot 就等于少一份磁盘占用与一项权限要求。
 	if r.mode() == "interval" {
@@ -930,7 +985,90 @@ func (r *runner) prepare(ctx context.Context) error {
 		writePos, prep.SnapshotName); err != nil {
 		return err
 	}
+	// 收口必须在 `decideCopyPlan` **之后**：`progressByTable` 是那一步才赋值，
+	// 提前调会让 `chunkProgress()` 是空 map、`copyDoneFor` 走 `!ok → true` → 每张表都被
+	// 判成「已搬完」→ 暂停记录被无条件清掉（半截拷贝的表会显示「已恢复」而数据是半空的）。
+	return r.reconcilePaused(ctx)
+}
+
+// reconcilePaused 收紧本轮的暂停记录。
+//
+// 跨轮存活当且仅当：job_key 未变（它就是这个任务）、job_hash 未变、该表仍在本轮表集合里。
+// 任一条不成立 → 清掉并说明；清不掉的（目标端不支持）→ 明确失败，不假装写成功。
+//
+// 解除挂在「EnsureSchema 通过 + 存量搬完」，不是只 EnsureSchema 通过：
+// 结构对齐了但存量还没搬完，这张表仍然是半截数据，不能当作恢复。
+func (r *runner) reconcilePaused(ctx context.Context) error {
+	rec, err := r.sink.PausedTables(ctx)
+	if err != nil {
+		return fmt.Errorf("读暂停表失败: %w", err)
+	}
+	if len(rec) == 0 {
+		return nil
+	}
+	stored, err := r.sink.StoredJobHash(ctx)
+	if err != nil {
+		return fmt.Errorf("读任务指纹失败: %w", err)
+	}
+	sameJob := stored == "" || stored == hashOf(r.doc)
+	inScope := map[string]bool{}
+	for _, t := range r.tables {
+		inScope[t.Table] = true
+	}
+	var dropped []string
+	for _, key := range pgsink.PausedKeys(rec) {
+		if sameJob && inScope[key] {
+			continue
+		}
+		if err := r.sink.ClearPausedTable(ctx, source.TableRef{Schema: r.targetSchema(), Table: key}); err != nil {
+			return fmt.Errorf("清掉不再适用的暂停记录 %s 失败: %w", key, err)
+		}
+		dropped = append(dropped, key)
+	}
+	if len(dropped) > 0 {
+		why := "已不在本轮的表集合里"
+		if !sameJob {
+			why = "任务定义变了（job_hash 不同）"
+		}
+		r.note(ctx, fmt.Sprintf("清掉了 %d 条暂停记录（%s）：%s",
+			len(dropped), why, strings.Join(dropped, "、")))
+	}
+
+	// 结构已对齐 + 存量已完成 → 解除。存量没搬完的保留，等它搬成那一刻再解除
+	//（snapshot() 里 MarkTableDone 之后 ClearPausedTable）。
+	for _, key := range pgsink.PausedKeys(rec) {
+		if !sameJob || !inScope[key] {
+			continue
+		}
+		if !r.copyDoneFor(key) {
+			continue
+		}
+		if err := r.sink.ClearPausedTable(ctx, source.TableRef{Schema: r.targetSchema(), Table: key}); err != nil {
+			return fmt.Errorf("解除 %s 的暂停失败: %w", key, err)
+		}
+		r.note(ctx, "表 "+key+" 的结构已对齐且存量已完成：解除暂停，接下来会从原位点继续重放")
+	}
 	return nil
+}
+
+// copyDoneFor 表示这张表的存量已经搬完（有完成标记）。查的是目标端的块进度，
+// 不看 paused_tables 本身 —— 判定输入必须能只靠「块进度 + 位点」重建。
+func (r *runner) copyDoneFor(table string) bool {
+	pr, ok := r.chunkProgress()[table]
+	if !ok {
+		// 一条块标记都没有：这张表本来就没有「存量要搬」（比如 continuous 只接增量，
+		// 或者上次停在第一块之前）。把它当成「存量已完成」，否则暂停永远解不开。
+		return true
+	}
+	return pr.Done
+}
+
+// chunkProgress 是本轮 prepare 时读到的那份块进度（decideCopyPlan 里装好的）。
+func (r *runner) chunkProgress() map[string]pgsink.ChunkProgress {
+	if r.progressByTable == nil {
+		return map[string]pgsink.ChunkProgress{}
+	}
+	return r.progressByTable
 }
 
 func (r *runner) renewLease(ctx context.Context) {
@@ -1095,6 +1233,12 @@ func (r *runner) snapshot(ctx context.Context) error {
 	for _, t := range r.selectedTables() {
 		if r.plan.Skip[t.Table] {
 			continue
+		}
+		ref := r.targetRef(source.TableRef{Schema: t.Schema, Table: t.Table})
+		// 搬成 → 解除这张表的暂停（**只删这一个 key**，别的表记录留着）。
+		// 契约：「搬成清该表，搬败留记录」。
+		if err := r.sink.ClearPausedTable(ctx, ref); err != nil {
+			return fmt.Errorf("解除 %s 的暂停失败: %w", t.Table, err)
 		}
 		if err := r.sink.MarkTableDone(ctx, r.targetRef(source.TableRef{Schema: t.Schema, Table: t.Table})); err != nil {
 			return fmt.Errorf("记录 %s 的搬完标记失败: %w", t.Table, err)
@@ -1323,7 +1467,8 @@ func (r *runner) stream(ctx context.Context, res *Result) error {
 		}
 		return streamErr
 	}
-	res.Note = "增量到运行结束（continuous）"
+	// 追加而不是赋值：迁移失败（列已存在那类良性失败）留的 early note 不能被盖掉。
+	emitEarlyNote(res, "增量到运行结束（continuous）")
 	return nil
 }
 
@@ -1371,6 +1516,67 @@ func (r *runner) drain(ctx context.Context, exit int, msg string) error {
 	return nil
 }
 
+// emitEarlyNote 在 runner 还不存在时也能把一句话带到结果里（CLI 会打印 Note）。
+func emitEarlyNote(res *Result, msg string) {
+	if res.Note != "" {
+		res.Note += "；"
+	}
+	res.Note += msg
+}
+
+// pauseHead 拼 last_error 的前缀。**表名可能为空**（错误被别处包装过、或 typed error
+// 没填字段）：宁可只写原因码，也不要在界面上留下「（表 ，原因码 x）」这种残句。
+func pauseHead(base string, pe pgsink.PausableError) string {
+	if tbl := pe.Table(); tbl != "" {
+		return fmt.Sprintf("%s（表 %s，原因码 %s）", base, tbl, pe.Reason())
+	}
+	return fmt.Sprintf("%s（原因码 %s）", base, pe.Reason())
+}
+
+// registerPause 把「这张表要暂停」记进目标端的 paused_tables。
+//
+// 目标端不支持（MySQL 没有那条状态列）时**明确失败**：绝不能「UPDATE 影响 0 行当成功」，
+// 那会让用户以为暂停登记生效了，而下一轮又从头踩一遍。
+func (r *runner) registerPause(ctx context.Context, err error) error {
+	var pe pgsink.PausableError
+	if !errors.As(err, &pe) || pe.Table() == "" {
+		return nil
+	}
+	if r.tgtEP.Kind != dsn.KindPostgres {
+		return &pauseUnsupportedError{kind: r.tgtEP.Kind, table: pe.Table(), inner: err}
+	}
+	if r.sink == nil {
+		return nil // 还没开目标端：原始错误照常上抛
+	}
+	ref := r.targetRef(source.TableRef{Schema: r.targetSchema(), Table: pe.Table()})
+	detail := err.Error()
+	if len(detail) > 500 {
+		detail = detail[:500] + "…"
+	}
+	if perr := r.sink.PauseTable(ctx, ref, pe.Reason(), detail); perr != nil {
+		return fmt.Errorf("%w（另外：登记这张表的暂停状态也失败了：%v）", err, perr)
+	}
+	r.note(ctx, "已登记暂停：表 "+pe.Table()+"（原因码 "+pe.Reason()+"），位点没有推进")
+	return nil
+}
+
+// pauseUnsupportedError：目标端不支持按表暂停（本版只有 PG 目标端有那条状态列）。
+type pauseUnsupportedError struct {
+	kind  string
+	table string
+	inner error
+}
+
+func (e *pauseUnsupportedError) Error() string {
+	return "表 " + e.table + " 的结构和源端对不上，需要按表暂停；而当前目标端（" + e.kind + "）" +
+		"还没有暂停记录这一列，本版无法登记。\n" +
+		"你现在能做什么：1) 把目标端的表结构手工对齐后重跑（位点没推进，不会重搬历史）；" +
+		"2) 或者把这张表移出同步范围。\n" +
+		"风险：不对齐就继续写会让数据与列错位；而我们不会「假装登记成功」。原始原因：" + e.inner.Error()
+}
+
+func (e *pauseUnsupportedError) Unwrap() error { return e.inner }
+
 // classifyError 决定这条错误该挂哪个码。**纯函数**，好测、也好评审。
 //
 // 纪律（2026-11-06 裁决）：兜底**不再落 E4002**。E4002 在用户眼里是「津梁自己的 bug，
@@ -1397,6 +1603,14 @@ func classifyError(err error) (code core.Code, classified bool) {
 		return core.CodePositionKindMismatch, true
 	case errors.As(err, &tooBig):
 		return core.CodeTxTooLarge, true
+	case errors.As(err, new(*pauseUnsupportedError)):
+		// 目标端没有「按表暂停」这条状态列：方向/能力不支持，不是这条同步本身错了。
+		return core.CodeUnsupportedDirection, true
+	case errors.Is(err, pgsink.ErrCollationMismatch):
+		// 排序规则不一致 = 同一个文本列在两端比较/判重行为不同，属于「结构对不上」。
+		// 挂 E1015（不另开码）：用户要做的动作和类型不一致那条完全一样——对齐结构后重跑；
+		// 另开一个码只会让用户多查一次「这个码和那个码有什么不同」。
+		return core.CodeSchemaMismatch, true
 	case errors.As(err, new(pgsink.PausableError)):
 		// 「这张表的结构对不上」：prepare 补列时类型不一致，或跑起来后源端改类型/改名/删列。
 		// 目标写成**接口指针**（不是 *TypeChangedError）：将来第三个实现也能匹配上。
@@ -1539,6 +1753,12 @@ func (r *runner) fail(ctx context.Context, err error) error {
 	if r.leaseLost.Load() || errors.As(err, new(*leaseLostError)) {
 		return r.failLostLease(ctx, err)
 	}
+	// 「这张表结构对不上」这一类失败要**登记暂停**（给用户看、给下一轮 prepare 用）。
+	// 登记是独立一条 UPDATE（pgsink.PauseTable），绝不与 position 同条：位点在数据
+	// 事务里本就没推进（这一批整个回滚了），暂停登记不能再顺手把它带走。
+	if perr := r.registerPause(ctx, err); perr != nil {
+		return perr
+	}
 	if isUserStop(ctx, err) {
 		return r.stopEarly(err)
 	}
@@ -1565,7 +1785,7 @@ func (r *runner) fail(ctx context.Context, err error) error {
 			head := spec.Message
 			var pe pgsink.PausableError
 			if errors.As(err, &pe) {
-				head = fmt.Sprintf("%s（表 %s，原因码 %s）", head, pe.Table(), pe.Reason())
+				head = pauseHead(head, pe)
 			}
 			lastError = fmt.Sprintf("[%s] %s：%s 下一步：%s",
 				code, head, err.Error(), strings.Join(spec.Next, "；"))
