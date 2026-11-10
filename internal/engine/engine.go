@@ -1650,14 +1650,14 @@ func classifyError(err error) (code core.Code, classified bool) {
 		// 文案以码表 E1013 为准；**不造伪 SQLSTATE**——那是协议语义，塞假值会带偏所有
 		// 按 SQLSTATE 分类的地方。
 		return core.CodeObjectMissing, true
+	case pgsource.IsNoPrivilege(err):
+		// 42501：源端 SELECT 或目标端 DDL/DML 被拒——用户要做的事都是「去要授权」。
+		return core.CodeNoPrivilege, true
 	case pgwire.SQLState(err) == "53400":
 		// all replication slots are in use：权限够、资源满。按 Ark 的边界，它必须排在
 		// 42501（权限）/ 3F000·42P01（对象不存在）之后、兜底之前 —— 那三类动作不同。
 		// 用户要做的事只有三件（见码表 E1016 的 Next）；last_error 原样保留 SQLSTATE 与消息。
 		return core.CodeSourceResourceLimit, true
-	case pgsource.IsNoPrivilege(err):
-		// 42501：源端 SELECT 或目标端 DDL/DML 被拒——用户要做的事都是「去要授权」。
-		return core.CodeNoPrivilege, true
 	case pgsource.IsObjectMissing(err):
 		// 3F000/42P01：schema 或表不存在。next 里按 SQLSTATE 分流（缺 schema 建 schema、
 		// 缺表别去建 schema），文案以码表为准，不走 hint()。

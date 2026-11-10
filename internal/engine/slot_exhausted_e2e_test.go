@@ -59,7 +59,9 @@ func TestSlotExhaustedEndToEndGetsE1016(t *testing.T) {
 	}
 	free := maxSlots - used
 	if free <= 0 {
-		t.Skipf("源端书签名额已满（%d/%d），别人的占位不该由我清：换一台库再跑", used, maxSlots)
+		// 名额被占满本身就该报（nightly 的 integration 步骤 grep `--- SKIP` 即失败，
+		// 跳过会让整步红、消息却写「有用例被跳过」，排查的人会去找跳过原因而不是谁泄漏了名额）。
+		t.Fatalf("源端书签名额已满（%d/%d）——不是跳过，是环境里有人泄漏了书签：先查 pg_replication_slots", used, maxSlots)
 	}
 	// 填满：只建**物理**占位书签（最便宜，且不影响逻辑复制）
 	for i := 0; i < free; i++ {
