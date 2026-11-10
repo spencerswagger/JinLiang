@@ -41,7 +41,10 @@ func TestReplicationStreamAllowsExplicitlyNoTLS(t *testing.T) {
 	// 不去真连（用一个立刻关闭的本地端口，拿到的是连接错误而不是 TLS 拒绝）。
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		t.Skipf("本机不能监听: %v", err)
+		// 能监听本机回环是这条用例的**前提**（runner 一定具备）。
+		// 前提缺失要响亮失败：跳过会让「显式关 TLS 不会被闸门拦住」这段永远没人验，
+		// 而 workflow 里的 `--- SKIP` 打红只能告诉你「有用例跳了」，指不到这一行。
+		t.Fatalf("本机不能监听 127.0.0.1: %v（前提缺失，不跳过）", err)
 	}
 	addr := ln.Addr().(*net.TCPAddr)
 	go func() {
