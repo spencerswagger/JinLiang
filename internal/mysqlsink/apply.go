@@ -126,8 +126,14 @@ func (s *Sink) applyImplicitCommitStatements(ctx context.Context, evs []source.E
 	for _, ev := range evs {
 		switch ev.Kind {
 		case source.EvTruncate:
-			if _, err := s.db.ExecContext(ctx, "TRUNCATE TABLE "+qualified(ev.Table)); err != nil {
-				return fmt.Errorf("清空 %s 失败: %w", qualified(ev.Table), err)
+			// 源端 TRUNCATE **跟随**到目标端，但只跟随「本任务建的表」。
+			//
+			// append/keep 语义下目标表可能是用户自己的：源端清空不代表用户想让我们
+			// 清掉目标端那张表里的存量（它里面可能有源端从来没有的行）。
+			// 判断不了所有权时不猜、也不静默跳过——明确失败并给出三条出路，
+			// 与 pgsink 处理「破坏性 DDL」同一个口径（不替你执行，但告诉你怎么做）。
+			if err := s.truncateOwned(ctx, ev.Table, "源端执行了 TRUNCATE，要把这次清空跟到目标端"); err != nil {
+				return err
 			}
 		case source.EvDDL:
 			if err := s.applyDDL(ctx, ev.DDL); err != nil {
