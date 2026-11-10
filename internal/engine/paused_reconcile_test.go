@@ -7,8 +7,9 @@ package engine
 // `copyDoneFor` 走 `!ok → true`，每张表都被判「已搬完」，暂停记录被无条件清掉：
 // 半截拷贝的表下一轮显示「已恢复」，实际是半空的（契约点名的坏状态）。
 //
-// 这两格直接打 `copyDoneFor` + `reconcilePaused` 的语义；调用点位置由 prepare 里的顺序
-// 保证（注释写死），变异「把调用点挪到 decideCopyPlan 之前」会让第一格红。
+// 前两格直接打 `copyDoneFor` + `reconcilePaused` 的语义（**绕开了 prepare**，所以它们
+// 抓不到「调用点提前」这个洞——别把它们当调用点的证据）。调用点由下面那格
+// `TestPrepareKeepsPauseRecordForHalfCopied` 走真 `prepare` 来钉。
 
 import (
 	"context"

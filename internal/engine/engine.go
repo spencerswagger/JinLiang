@@ -93,6 +93,9 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 		return Result{}, errors.New("内部错误：没有控制库")
 	}
 	res := Result{ExitCode: ExitOK}
+	// migrateErr 记「状态表迁移没成功」：后面若撞上缺列，把它一起包进主错误，
+	// 别让用户先读到一条与真实原因无关的列错误。
+	var migrateErr error
 	started := time.Now()
 
 	job, err := opt.Store.GetJob(ctx, opt.JobID)
@@ -139,9 +142,18 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 	// **尽力而为，绝不在这里中止**：目标库连不上/schema 还没建的时候，真原因会由后面
 	// 的预检或 prepare 报出来（并且要落一条 run 行）——这里中止会让「必失败任务」连
 	// run 行都没有，用户反而看不到真原因。
+	// 只对 **PG 目标端**跑（MySQL 目标端没有暂停记录这类状态列）。
+	// **必须有超时**：目标端黑洞时无超时的 connect 会卡到 OS TCP 超时（~2min），而这时
+	// 还没有 run 行；随后的 preflight 再连一次 → 总等待翻倍且第一次失败不留痕。
+	// 同理，那条 `ADD COLUMN IF NOT EXISTS` 会拿一次 ACCESS EXCLUSIVE，撞上 `_jl_meta`
+	// 长事务会一直等——10s 上限同时解掉这两件事。真原因交给 preflight 报。
 	if tgtEP.Kind == dsn.KindPostgres {
-		if err := pgsink.EnsureStateTables(ctx, tgtEP, schemaOf(doc, tgtConn)); err != nil {
-			emitEarlyNote(&res, "先把目标端状态表升到当前版本时出错（不影响本轮判定，真原因稍后由预检报出）："+err.Error())
+		mctx, cancelMigrate := context.WithTimeout(ctx, 10*time.Second)
+		err := pgsink.EnsureStateTables(mctx, tgtEP, schemaOf(doc, tgtConn))
+		cancelMigrate()
+		if err != nil {
+			migrateErr = err
+			emitEarlyNote(&res, "先把目标端状态表升到当前版本时出错（真原因稍后由预检报出）："+err.Error())
 		}
 	}
 	run, err := opt.Store.StartRun(ctx, job.ID, state.Preflight, control.RunKindSync)
@@ -184,6 +196,10 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 		}(),
 	}
 	err = r.execute(ctx, &res)
+	if err != nil && migrateErr != nil && strings.Contains(err.Error(), "paused_tables") {
+		// 迁移没成功、后面又撞上缺列：把迁移那条一起包进来，别让用户先读到无关的列错误。
+		err = fmt.Errorf("%w（另外：状态表迁移也没成功：%v）", err, migrateErr)
+	}
 	res.Elapsed = time.Since(started)
 	if err != nil {
 		res.ExitCode = ExitFailed
@@ -435,7 +451,7 @@ func (r *runner) execute(parent context.Context, res *Result) error {
 		if err := r.drain(ctx, ExitOK, "全量完成"); err != nil {
 			return err
 		}
-		res.Note = "只搬了存量数据（mode.frequency=" + r.mode() + "）"
+		emitEarlyNote(res, "只搬了存量数据（mode.frequency="+r.mode()+"）")
 		return nil
 	}
 	if r.mode() == "interval" {
@@ -456,16 +472,16 @@ func (r *runner) execute(parent context.Context, res *Result) error {
 		}
 		// 说清这条路的取舍（Ark 口径 2026-11-10）：水位增量只补新增/更新，
 		// **不同步删除**。文案里不许暗示我们追 delete，否则用户会以为已经一致。
-		res.Note = "interval 模式：只跑了水位增量（整表重搬仅发生在第一次或没有水位列的表）；" +
-			"水位增量只补新增与更新，**不同步删除**——源端删掉的行会留在目标端，" +
-			"需要连删除一起同步请用 continuous+initial，或定期用 once 整轮重搬"
+		emitEarlyNote(res, "interval 模式：只跑了水位增量（整表重搬仅发生在第一次或没有水位列的表）；"+
+			"水位增量只补新增与更新，**不同步删除**——源端删掉的行会留在目标端，"+
+			"需要连删除一起同步请用 continuous+initial，或定期用 once 整轮重搬")
 		return nil
 	}
 	if r.mode() == "full_interval" {
 		if err := r.drain(ctx, ExitOK, "全量周期重跑本轮完成"); err != nil {
 			return err
 		}
-		res.Note = "full_interval 模式：本轮整表重跑；下一轮由调度器（--watch）触发"
+		emitEarlyNote(res, "full_interval 模式：本轮整表重跑；下一轮由调度器（--watch）触发")
 		return nil
 	}
 
@@ -852,11 +868,17 @@ func (r *runner) prepare(ctx context.Context) error {
 		return err
 	}
 	r.src = src
-	// interval 单独在这里收口：它既不清表、也不走 Apply，但用户对齐结构后改 interval 跑时，
-	// 记录不清掉会让 status 一直显示「已暂停」而数据其实在写。
-	// **只在这里调**：interval 没有「存量」概念，`copyDoneFor` 恒真是设计如此（契约 §1.2 例外段）。
-	if err := r.reconcilePaused(ctx); err != nil {
-		return err
+	// **只有 interval 在这里收口**：它既不清表、也不走 Apply，且 `prepare` 早退后
+	// 再也走不到下面那一次调用；interval 没有「存量」概念，`copyDoneFor` 恒真是设计如此
+	//（契约 §1.2 例外段）。
+	//
+	// 别的模式**必须**等 `decideCopyPlan` 之后再收口：`progressByTable` 是那一步才赋值，
+	// 提前调会让 `chunkProgress()` 是空 map → `copyDoneFor` 走 `!ok → true` → 每张表都被判
+	// 「已搬完」→ 暂停记录被无条件清掉（半截拷贝的表显示「已恢复」而数据是半空的）。
+	if r.mode() == "interval" {
+		if err := r.reconcilePaused(ctx); err != nil {
+			return err
+		}
 	}
 	// interval 模式不做逻辑复制（没有书签、没有发布），只要一条普通读连接；
 	// 少建一个 slot 就等于少一份磁盘占用与一项权限要求。
