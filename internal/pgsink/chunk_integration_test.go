@@ -128,3 +128,66 @@ func TestChunkProgressRoundTrip(t *testing.T) {
 		t.Fatalf("ResetTableChunks 之后不该再有进度，得到 %+v", p)
 	}
 }
+
+// 完成标记（chunk_no=0）的 rows 必须跟着**块重放**刷新（P1）。
+//
+// 与 MySQL 目标端同一个缺口（两边 SQL 不同、坑一样）：块重放会改各块之和，
+// 完成标记若停在旧值，它和 `ChunkProgress.Rows` 就永久脱节——任何「按已搬行数
+// 判断搬没搬完」的逻辑都会被这个陈旧值带偏（该重搬判成已搬完 = 静默缺行）。
+func TestChunkStampRefreshesOnReplay(t *testing.T) {
+	ctx := context.Background()
+	table := "chunk_stamp_replay"
+	s := openSinkFor(t, batchCatalog(table), nil)
+	if _, err := s.EnsureSchema(ctx, batchCatalog(table)); err != nil {
+		t.Fatalf("建目标表失败: %v", err)
+	}
+	ref := source.TableRef{Schema: "public", Table: table}
+	ti := s.Table(ref)
+	if ti == nil {
+		t.Fatal("目标端没有表定义")
+	}
+	rows := func(from, to int) [][]any {
+		out := make([][]any, 0, to-from+1)
+		for i := from; i <= to; i++ {
+			out = append(out, []any{strconv.Itoa(i), "p" + strconv.Itoa(i)})
+		}
+		return out
+	}
+	stampRows := func() int64 {
+		var n int64
+		if err := s.conn.QueryRow(ctx,
+			"SELECT rows FROM _jl_chunk WHERE job_key=$1 AND table_name=$2 AND chunk_no=0",
+			s.opt.JobKey, table).Scan(&n); err != nil {
+			t.Fatalf("读完成标记失败: %v", err)
+		}
+		return n
+	}
+
+	if err := s.BulkApply(ctx, ti, 1, rows(1, 3), "pos1", "", "3"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkTableDone(ctx, ref); err != nil {
+		t.Fatal(err)
+	}
+	if got := stampRows(); got != 3 {
+		t.Fatalf("首次盖章应是 3 行，实际 %d", got)
+	}
+
+	// 重放同一块（续跑重读 / 重搬后重读）：行数变大，完成标记必须跟着变。
+	if err := s.BulkApply(ctx, ti, 1, rows(1, 5), "pos1", "", "5"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkTableDone(ctx, ref); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.ChunkProgress(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[table].Rows != 5 {
+		t.Fatalf("ChunkProgress.Rows 应是 5，实际 %d", got[table].Rows)
+	}
+	if n := stampRows(); n != 5 {
+		t.Fatalf("完成标记的 rows 没跟着重放刷新：%d，应为 5（与 ChunkProgress.Rows 永久脱节）", n)
+	}
+}
