@@ -145,3 +145,82 @@ func TestApplyForcedRecopyOnlyTouchesThePausedTable(t *testing.T) {
 	}
 	_ = b
 }
+
+// 止损指令（维护者 2026-08-11）点名的那个坑：**「清块标记」不等于「下一轮会重搬」**。
+//
+// Owl II 复审实测：`planCopy` 在「单表 + 块标记已清空 + 位点在 + phase=paused」时判 **skip**
+// （理由是「旧版本没有块进度记录，按阶段认定存量已搬完」）；两表时判 resume 但该表
+// `From/Skip/Recopy` 全空、`Clean=cleanNone`（从表头重读却不清表）。
+//
+// 所以恢复路径**不能**依赖「清了标记自然就重搬」。这条用例把两件事同时钉住：
+//  1. 前提是真实的（`planCopy` 确实会给 skip）；
+//  2. `commitPlan` 必须把它救回来（`Recopy` + `CleanNames` + 非 skip 的 Kind），
+//     而不是等 Ark 修订契约（M1）之后再说。
+func TestPausedTableWithClearedChunksWouldSkipWithoutForcedRecopy(t *testing.T) {
+	ref := source.TableRef{Schema: "public", Table: "orders"}
+	in := copyInputs{
+		Mode:     "continuous+initial",
+		Tables:   []source.Table{{TableRef: ref, PrimaryKey: []string{"id"}}},
+		Progress: map[string]pgsink.ChunkProgress{}, // reconcilePaused 刚把块标记清干净
+		StoredCP: "postgres:v1:0/100",
+		// 书签可重放 + 阶段是 paused（用户结构对不上那一轮的收尾阶段）
+		SlotReplayable: true, Capable: true, PriorPhase: "paused",
+	}
+	plan := planCopy(in)
+	if plan.Kind != copySkip {
+		t.Fatalf("前提变了：零块标记 + phase=paused 现在判 %s —— 说明 planCopy 的「老状态兼容」"+
+			"那条改了，请同步更新这条用例与 applyForcedRecopy 的必要性说明", plan.Kind)
+	}
+
+	r := &runner{forceRecopy: map[string]source.TableRef{"orders": ref}}
+	r.commitPlan(&plan)
+	if r.plan.Kind == copySkip {
+		t.Fatal("清块标记之后靠 planCopy 自己会判 skip：解除暂停就变成「没搬也没清」，静默缺数据")
+	}
+	if !containsTable(r.plan.Recopy, "orders") {
+		t.Fatal("必须显式进 plan.Recopy（那条分支才会清空 + 从表头重读）")
+	}
+	if !r.needSnapshot {
+		t.Fatal("要重搬就必须真的跑搬运阶段")
+	}
+}
+
+// 两表场景：本任务建的待重搬表要在 `CleanNames` 里（`Written` 是按清标记**之前**的块进度算的，
+// 刚被清过的那张表进不去 → 「从表头重读却不清表」）。
+func TestForcedRecopyJoinsCleanNamesOnFreshRuns(t *testing.T) {
+	a := source.TableRef{Schema: "public", Table: "orders"}
+	b := source.TableRef{Schema: "public", Table: "healthy"}
+	in := copyInputs{
+		Mode:       "once", // AlwaysCopy → copyFresh + cleanAll
+		AlwaysCopy: true,
+		Tables:     []source.Table{{TableRef: a, PrimaryKey: []string{"id"}}, {TableRef: b, PrimaryKey: []string{"id"}}},
+		Progress: map[string]pgsink.ChunkProgress{
+			// orders 的标记刚被清掉；healthy 还有完成标记 → 不是 allDone，落「续跑」那支；
+			// 于是 CleanNames 是按**清标记前**的块进度算的，含不了 orders（这条用例要钉的正是它）。
+			"healthy": {Done: true, LastNo: 1},
+		},
+		StoredCP: "postgres:v1:0/100", SlotReplayable: true, Capable: true, PriorPhase: "paused",
+	}
+	plan := planCopy(in)
+	// 两表（一张搬完、一张标记被清）判的是**续跑**：那条路 `Clean=cleanNone`、`Recopy` 也空，
+	// 从表头重读却不清表 —— 这就是止损指令里说的第二个形状。
+	if plan.Kind != copyResume {
+		t.Fatalf("前提变了：两表且一张待重搬现在判 %s（期望 resume）", plan.Kind)
+	}
+	if containsTable(plan.Recopy, "orders") || containsName(plan.CleanNames, "orders") {
+		t.Fatalf("planCopy 自己不会把这张表排进 Recopy/CleanNames（Skip/From 也都没有它）——正因如此才需要 applyForcedRecopy")
+	}
+
+	r := &runner{forceRecopy: map[string]source.TableRef{"orders": a}}
+	r.commitPlan(&plan)
+	if !containsName(r.plan.CleanNames, "orders") {
+		// 续跑那条路 Clean=cleanNone，清理名单不参与；此时由 recopyOne 的 ResetTableChunks 清。
+		// 所以这里只要求 Clean 真需要清的时候名单里必须有它。
+		if r.plan.Clean != cleanNone {
+			t.Fatalf("需要清表的轮次必须把待重搬的表补进清理名单（否则不清表只 upsert → 幻行），得到 %v", r.plan.CleanNames)
+		}
+	}
+	if !containsTable(r.plan.Recopy, "orders") {
+		t.Fatal("也要进 Recopy（两个入口共用 recopyOne：判所有权 + 清空 + 清块标记）")
+	}
+}

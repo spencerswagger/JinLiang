@@ -136,6 +136,17 @@ func (r *runner) prepareGeneric(ctx context.Context) error {
 		return err
 	}
 	r.gsink = gs
+	// 目标端实现了暂停存储（六个方法）就绑上：MySQL 目标端从此也能「只停一张表」。
+	// 没实现则为 nil，写路径原样透传、遇结构不一致按失败处理（不许静默跳过）。
+	if reg, ok := gs.(pauseRegistry); ok {
+		r.pauseReg = reg
+		if err := reg.LoadPausedTables(ctx); err != nil {
+			return err
+		}
+		if err := r.loadPausedSet(ctx); err != nil {
+			return err
+		}
+	}
 	src, err := r.openSource(ctx)
 	if err != nil {
 		return err
@@ -520,8 +531,10 @@ func (r *runner) targetRelation(ref source.TableRef) *source.Table {
 
 // streamGeneric 是「非 PG 目标端」的持续流：与 PG 路径同一套 batcher 规则。
 func (r *runner) streamGeneric(ctx context.Context, st stateCapable, from source.Position) error {
+	// 按表暂停的过滤包在**映射之后**（paused_tables 的 key 是目标端裸表名）。
+	// 暂停存储没绑上时 pauseSink 原样透传——MySQL 目标端从 PR #95 起就有这套存储了。
 	mapped := newRefMappedSink(r.gsink, r.targetRef)
-	b := newBatcher(mapped, r.src, r.doc, r.batchRows(), r.batchDelay(), from,
+	b := newBatcher(newPauseSink(mapped, r), r.src, r.doc, r.batchRows(), r.batchDelay(), from,
 		func(rows int64, pos source.Position) {
 			r.rowsStream += rows
 			r.mu.Lock()
@@ -618,11 +631,14 @@ func (r *runner) streamGeneric(ctx context.Context, st stateCapable, from source
 			if idleHit.Load() {
 				code = ExitOK
 			}
-		case stopHit.Load() || idleHit.Load():
+		case (stopHit.Load() || idleHit.Load()) && isLocalClose(streamErr):
 			// 我们自己要求收尾（按停 / 到达 --stop-after / 已追平）后 cancel ctx 打断阻塞读，
 			// 有的连接器会把这个中断冒成一个网络错误（MySQL 源的
-			// `use of closed network connection`）。判据是「**我们先要停的**」，
-			// 不是错误长什么样：真实写入错误不会同时把 stopHit/idleHit 置起来。
+			// `use of closed network connection`）。这里的判据是**两个条件同时成立**：
+			//   ① 我们先要停的；② 错误本身长得像「本地主动关闭」（`isLocalClose`）。
+			// 只判 ① 会把「停止请求之后才到的真实错误」（目标库断连 / 权限被回收 / 解码失败）
+			// 记成「已停止」、退出码 0 —— 用户以为一切正常，实际数据停在半路。
+			// 后台提交失败（`b.Err()`）在调用点更早就已返回，不会走到这里。
 			code = ExitStopped
 			if idleHit.Load() {
 				code = ExitOK

@@ -373,6 +373,9 @@ type runner struct {
 	// paused 是本轮的内存暂停集合（key = 目标端裸表名）：写路径每批都要判，不能每批查库。
 	// 由 loadPausedSet 装好，registerPause / snapshot 搬成 两处更新（见 pause_skip.go）。
 	paused map[string]pgsink.PausedTable
+	// pauseReg 是「按表暂停的存储层」：PG 目标端是 pgsink，MySQL 目标端是 mysqlsink。
+	// 为 nil 表示这个目标端还没有暂停存储（写路径原样透传，遇不一致就报错）。
+	pauseReg pauseRegistry
 	// forceRecopy 是「欠一次整表重搬」的表（结构刚从不对齐变成对齐）。
 	// 它们由 reconcilePaused 收集，decideCopyPlan 之后接进 plan.Recopy——
 	// 那条分支会「查所有权 → 清空表 + 清块标记 → 从表头重读」，正是契约 §1.6 步 2–3 要的。
@@ -917,6 +920,8 @@ func (r *runner) prepare(ctx context.Context) error {
 	// 只读一次：写路径每批都要判定，不能每批查库；这一列只在本轮 prepare 与
 	// 「某表搬成」两处变化。**顺序还有一条硬的：EnsureSchema 必须早于 cleanBeforeRecopy**
 	//（否则会「先清空、后报结构不对」）。三条一起看，这段位置就是唯一正确的。
+	// 先绑存储层：PG 目标端就是 pgsink 自己（它实现了那六个方法）。
+	r.pauseReg = sink
 	if err := sink.LoadPausedTables(ctx); err != nil {
 		return err
 	}
@@ -1292,14 +1297,24 @@ func containsTable(refs []source.TableRef, table string) bool {
 	return false
 }
 
-// copyDoneFor 表示这张表的存量已经搬完（有完成标记）。查的是目标端的块进度，
-// 不看 paused_tables 本身 —— 判定输入必须能只靠「块进度 + 位点」重建。
+// copyDoneFor 表示这张表的存量已经搬完（有 `chunk_no=0` 完成标记）。
+//
+// ⚠️ **语义已改，待 Ark 修订契约（M1）确认**（维护者 2026-11-11 止损指令 + Owl II 复审实测）：
+// 老版本这里是「一条块标记都没有 → true（当作已搬完）」，理由是「否则暂停永远解不开」。
+// 但那条假设在暂停恢复这条路上会做出**静默缺数据**：`reconcilePaused` 清掉块标记之后，
+// 下一轮 prepare 读到的就是「零块标记」，于是当场判「已搬完」→ 解除暂停 + skip，
+// 一张结构刚对齐的表**一行都没重搬**却显示已恢复。
+//
+// 现在的口径：**零块标记 = 没有「搬完」的证据**，一律 false。
+// 「continuous / interval 本来就没有存量」这种例外由调用方按模式判（它们不靠这个函数）；
+// 暂停恢复的判据也不再用它——`reconcilePaused` 只做「标成欠一次重搬」，
+// 真正的解除在 `snapshot()` 搬成那一刻。
+//
+// 注意：这个函数现在**没有生产调用点**，留着是为了让上面这条语义有地方写、有用例可钉。
 func (r *runner) copyDoneFor(table string) bool {
 	pr, ok := r.chunkProgress()[table]
 	if !ok {
-		// 一条块标记都没有：这张表本来就没有「存量要搬」（比如 continuous 只接增量，
-		// 或者上次停在第一块之前）。把它当成「存量已完成」，否则暂停永远解不开。
-		return true
+		return false
 	}
 	return pr.Done
 }
@@ -1753,10 +1768,12 @@ func (r *runner) stream(ctx context.Context, res *Result) error {
 		if idleDone.Load() {
 			return &stoppedError{ok: true, msg: fmt.Sprintf("已经追平且安静了 %s：按 --stop-when-idle 正常收尾", r.opt.IdleAfter)}
 		}
-		if stopHit.Load() {
+		// 同 target.go：只有「我们先要停」+「错误像本地关闭」同时成立才算正常收尾。
+		// 只判 stopHit 会把停止之后才到的真实错误吞成退出码 0。
+		if stopHit.Load() && isLocalClose(streamErr) {
 			return &stoppedError{msg: fmt.Sprintf("到达本次运行的时间上限（%s），已收尾", r.opt.StopAfter)}
 		}
-		if ctx.Err() != nil {
+		if ctx.Err() != nil && isLocalClose(streamErr) {
 			return &stoppedError{msg: "收到停止信号：已把手上这个事务提交完"}
 		}
 		return streamErr
@@ -1836,18 +1853,16 @@ func (r *runner) registerPause(ctx context.Context, err error) error {
 	if !errors.As(err, &pe) || pe.Table() == "" {
 		return nil
 	}
-	if r.tgtEP.Kind != dsn.KindPostgres {
+	if r.pauseReg == nil {
+		// 目标端没有暂停存储（还没实现那六个方法）：**明确失败**，不许「假装登记成功」。
 		return &pauseUnsupportedError{kind: r.tgtEP.Kind, table: pe.Table(), inner: err}
-	}
-	if r.sink == nil {
-		return nil // 还没开目标端：原始错误照常上抛
 	}
 	ref := r.targetRef(source.TableRef{Schema: r.targetSchema(), Table: pe.Table()})
 	detail := err.Error()
 	if len(detail) > 500 {
 		detail = detail[:500] + "…"
 	}
-	if perr := r.sink.PauseTable(ctx, ref, pgsink.PausedTable{
+	if perr := r.pauseReg.PauseTable(ctx, ref, pgsink.PausedTable{
 		Reason: pe.Reason(),
 		Detail: detail,
 		Resume: r.resumeModeFor(ctx, ref),
@@ -1869,10 +1884,28 @@ func (r *runner) registerPause(ctx context.Context, err error) error {
 // 判据用 `_jl_object`（谁建的表），不是配置：同一份 yaml 里可能两种表都有。
 // 查不出结论时按 manual——**宁可停下来问，不可替用户删数据**。
 func (r *runner) resumeModeFor(ctx context.Context, ref source.TableRef) string {
-	if r.sink == nil {
+	if r.pauseReg == nil {
 		return pgsink.ResumeManual
 	}
-	ours, err := r.sink.DidCreateTable(ctx, ref)
+	// 「这张表是不是本任务建的」两边的目标端都有这个能力（`targetSink` 接口里的 DidCreateTable）。
+	var ours bool
+	var err error
+	switch {
+	case r.sink != nil:
+		ours, err = r.sink.DidCreateTable(ctx, ref)
+	case r.gsink != nil:
+		// `targetSink` 契约里没有「谁建的表」这一项（那是清表所有权判据，走 stateCapable 之外的
+		// 可选能力）：拿不到就按 manual 处理——宁可停下来问，不可替用户删数据。
+		if dc, ok := r.gsink.(interface {
+			DidCreateTable(context.Context, source.TableRef) (bool, error)
+		}); ok {
+			ours, err = dc.DidCreateTable(ctx, ref)
+		} else {
+			return pgsink.ResumeManual
+		}
+	default:
+		return pgsink.ResumeManual
+	}
 	if err != nil || !ours {
 		return pgsink.ResumeManual
 	}
