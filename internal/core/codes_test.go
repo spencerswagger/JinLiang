@@ -146,7 +146,9 @@ func TestSchemaMismatchSaysWholeRunStops(t *testing.T) {
 		}
 	}
 	// Why 要覆盖两个时机，并说清「具体看 last_error」。
-	for _, want := range []string{"prepare", "改类型", "last_error"} {
+	// #72 把 Why 改准了：type_changed 两个时机都会出现（prepare 的类型不一致 /
+	// 运行时把列类型改了），schema_drift 只在 streaming。断言按这个事实写。
+	for _, want := range []string{"prepare", "type_changed", "schema_drift", "last_error"} {
 		if !strings.Contains(spec.Why, want) {
 			t.Errorf("Why 应含 %q（两个时机都要覆盖，具体到表列看 last_error）", want)
 		}
