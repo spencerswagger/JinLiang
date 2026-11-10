@@ -370,6 +370,12 @@ jobs:
           mkdir -p dist
           CGO_ENABLED=0 go build -trimpath -o dist/jinliang ./cmd/jinliang
       - name: 块级续跑（known-red：单表口径，重启搬 ≈ 未搬完 ±1 块）
+        # 责任人：Core（引擎读侧，不是 Data：写侧 #95 已落，`_jl_chunk` 真有 2 行）
+        # 转绿用例：scripts/b1_mysql_to_mysql.sh killcopy（单表口径：重启搬 ≈ 未搬完 ±1 块）
+        # 移除 continue-on-error 的触发条件：Core 接通读路径（`copyGeneric` 把 nil 传给
+        #   `SnapshotChunksFrom`，internal/engine/target.go:456；`executeGeneric` 只看
+        #   `fresh || full_interval || len(forceRecopy)>0`，从不读 `ChunkProgress`），
+        #   且该格重启重搬行数 ≤1 块。
         id: killcopy
         continue-on-error: true
         env:

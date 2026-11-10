@@ -173,6 +173,16 @@ MUTATIONS = [
         note="把裸 io.EOF 加进 isLocalClose 的识别集合",
     ),
     dict(
+        name="known-red-template-lax",
+        tier="logic",
+        file="scripts/known_red.py",
+        find='TEMPLATE_MARKERS = ("责任人", "转绿用例", "移除 continue-on-error")',
+        replace='TEMPLATE_MARKERS = ("转绿用例", "移除 continue-on-error")  # SABOTAGE: 不要求写责任人',
+        cmd=[sys.executable, "scripts/known_red.py", "selftest"],
+        signal="selftest 退出 1（缺「责任人」的 fixture 必须被点出来）",
+        note="三件套模板缺一项（责任人）时不再拦截",
+    ),
+    dict(
         name="chunk-resume-degraded",
         tier="engine",
         file="internal/engine/resume.go",

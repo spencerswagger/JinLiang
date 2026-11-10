@@ -350,3 +350,26 @@ Core #99（`c72f36c`）把 `target.go` 的收尾判定收窄到 `isLocalClose`�
 第 10 条注入（`registerPause` 那条）**不需要 Core 打洞**：用例直测写路径 + 目标端触发器把
 「登记落库失败」造出来，注入 `pause-registration-succeeds`（`pgsink.PauseTable` 无条件成功）
 → `TestPauseRegistrationFailureFailsWholeBatch` 必红 → **KILLED**（engine 档 9/9）。所以它不进倒计时清单。
+
+## 7.13 Owl 必改 2 条 + 三件套模板（2026-11-12）
+
+**M1 killcopy 注释口径错（已改）**：原文写「mysqlsink 还没写块记账（Data 在补）…实现落地这天
+这一步会自己变绿」——被实跑证伪：写侧 #95 已落（`_jl_chunk` 真有 2 行），红在读侧
+（`copyGeneric` 给 `SnapshotChunksFrom` 传 `nil`，`target.go:456`）。现在步骤注释是三行事实：
+
+```
+# 责任人：Core（引擎读侧，不是 Data：写侧 #95 已落，`_jl_chunk` 真有 2 行）
+# 转绿用例：scripts/b1_mysql_to_mysql.sh killcopy（单表口径：重启搬 ≈ 未搬完 ±1 块）
+# 移除 continue-on-error 的触发条件：Core 接通读路径（…target.go:456…从不读 ChunkProgress），
+#   且该格重启重搬行数 ≤1 块。
+```
+
+**M2 停止后真实错误（已在 `6210f5c` 改完）**：用例改成「`streamGeneric` 之后显式调
+`r.fail(ctx, err)`」再断言 `last_error`——这正是 `Run` 落库那一段（`engine.go:2111`），
+不是放宽到只看「没 panic」；四条断言（没被吞 / 不是 `reachedDone` / 根因在 / `last_error` 在）一条没删。
+同时去掉 `knownred` 标签与 `continue-on-error`，该步骤已阻塞并在 CI 转绿。
+
+**三件套模板自检（新增）**：`known_red.py template_missing()` 只认「紧贴步骤名上面的连续 `#` 注释」，
+缺 `责任人` / `转绿用例` / `移除 continue-on-error` 任一项 → `check` 判失败；selftest 加了
+`scripts/testdata/known-red-missing-owner.yml`（故意缺「责任人」）与真 workflow 两条断言；
+注入 `known-red-template-lax`（不要求写责任人）→ selftest 必红 → KILLED。

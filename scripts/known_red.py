@@ -128,6 +128,41 @@ def step_suspended(doc, step_name, text=None):
     return False, False
 
 
+TEMPLATE_MARKERS = ("责任人", "转绿用例", "移除 continue-on-error")
+
+
+def template_missing(text, step_name):
+    """三件套模板自检：已知红步骤的注释必须写清「责任人 / 转绿用例 / 移除条件」。
+
+    只认**这一步自己的注释块**（步骤名那一行往上 12 行 + 到 `run:`/`uses:` 之前），
+    不认 job 级别的说明——否则「挂在 job 头上」也能糊过去，下一格已知红还是同一个形状。
+    """
+    lines = text.splitlines()
+    want = step_name.strip()
+    idx = None
+    for i, line in enumerate(lines):
+        if "name:" in line and line.split("name:", 1)[1].strip().strip('"\'') == want:
+            idx = i
+            break
+    if idx is None:
+        return list(TEMPLATE_MARKERS)
+    # 只收「紧贴在步骤名上面的连续 # 注释」——往上遇到非注释行就停，
+    # 免得把文件头的说明文字当成这一步的三件套（自证 fixture 就踩过这个坑）。
+    above = []
+    j = idx - 1
+    while j >= 0 and lines[j].strip().startswith("#"):
+        above.append(lines[j])
+        j -= 1
+    block = list(reversed(above)) + [lines[idx]]
+    for j in range(idx + 1, len(lines)):
+        l = lines[j]
+        if l.strip().startswith("run:") or l.strip().startswith("uses:"):
+            break
+        block.append(l)
+    blob = "\n".join(block)
+    return [m for m in TEMPLATE_MARKERS if m not in blob]
+
+
 def classify(landed, suspended):
     if landed is None:
         return None, "无法探测（缺 go / 缺 pyyaml 之类），台账暂时对不上"
@@ -154,6 +189,14 @@ def check(only=None, workflow=None, probes=None):
         if only and e["id"] != only:
             continue
         found, suspended = step_suspended(doc, e["step"], text)
+        if suspended:
+            missing = template_missing(text, e["step"])
+            if missing:
+                rows.append((e, None, suspended,
+                             "注释缺三件套：%s（责任人 / 转绿用例 / 移除 continue-on-error）" % "、".join(missing),
+                             False))
+                bad += 1
+                continue
         if e["probe"].startswith("job:"):
             rows.append((e, None, suspended,
                          "由 %s job 的 verify 步骤对账（%s）" % (e["probe"][4:], "步骤仍挂起" if suspended else "步骤已激活"),
@@ -199,6 +242,7 @@ SELFTEST = [
 
 
 FIXTURE = os.path.join(ROOT, "scripts/testdata/known-red-suspended.yml")
+FIXTURE_MISSING = os.path.join(ROOT, "scripts/testdata/known-red-missing-owner.yml")
 
 
 def selftest():
@@ -225,6 +269,21 @@ def selftest():
         print("selftest: FAIL 仍红 + 仍挂起 —— 应放行，实际 %d" % rc_ok)
     else:
         print("selftest: ok   仍红 + 仍挂起 = 放行（fixture）")
+
+    # 三件套模板：真 workflow 必须齐全；故意缺「责任人」的 fixture 必须被点出来。
+    step = REGISTRY[0]["step"]
+    real_missing = template_missing(open(WORKFLOW, encoding="utf-8").read(), step)
+    fx_missing = template_missing(open(FIXTURE_MISSING, encoding="utf-8").read(), step)
+    if real_missing:
+        bad += 1
+        print("selftest: FAIL 真 workflow 的三件套缺：%s" % "、".join(real_missing))
+    else:
+        print("selftest: ok   真 workflow 三件套齐全")
+    if fx_missing != ["责任人"]:
+        bad += 1
+        print("selftest: FAIL 缺责任人的 fixture 应被点出 ['责任人']，实际 %r" % (fx_missing,))
+    else:
+        print("selftest: ok   三件套缺一项 = 判失败（fixture）")
     if bad:
         print("selftest: %d 条不符合预期" % bad)
         return 1
