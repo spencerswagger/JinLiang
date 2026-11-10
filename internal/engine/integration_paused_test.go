@@ -13,19 +13,19 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/spencerswagger/jinliang/internal/control"
-	"github.com/spencerswagger/jinliang/internal/core"
 	"github.com/spencerswagger/jinliang/internal/engine"
 	"github.com/spencerswagger/jinliang/internal/pgsink"
 )
 
-// 按表暂停（第③步/契约 2）：暂停登记、位点不动、key 与块标记同源、解除后恢复。
+// 按表暂停（docs/CONTRACT-PAUSE-AND-POSITION.md §1.5/§1.6）：**只停该表**。
 //
 // 契约要点（改这段前先读）：
-//   - 暂停登记是**独立一条 UPDATE**，位点在暂停前后逐字节相等；
+//   - 命中暂停表的行**整条跳过**（不写、不计指纹），其它表照写，位点**照常前进**；
+//     ——旧行为「整批拒绝、位点不动、其它表也停」已被否决（DESIGN.md §4 本来就是表级）；
 //   - key = 目标端裸表名，与 `_jl_chunk.table_name` 逐字节相同；
-//   - 位点只有一个 → 整条同步停下来，其它表也不会继续推进（不是「只停该表」）；
-//   - 解除挂在「EnsureSchema 通过 + 存量搬完」，解除后从原位点继续重放，
-//     一条变更都不丢。
+//   - 跳过窗口记在 `skipped_rows`/`skipped_from` 里（可枚举、可补偿）；
+//   - 恢复**不是**「结构对齐就解除」：对齐只把该表标成「欠一次整表重搬」（清块标记），
+//     真正解除发生在重搬搬成那一刻；重搬要清表（暂停窗口里的 DELETE 看不见，只 upsert 会留幻行）。
 func TestPauseTableRegistersKeyKeepsPositionAndRecovers(t *testing.T) {
 	srcDSN, dstDSN := dsns(t)
 	srcDB := mustConn(t, srcDSN)
@@ -65,32 +65,28 @@ func TestPauseTableRegistersKeyKeepsPositionAndRecovers(t *testing.T) {
 	exec(t, srcDB, "INSERT INTO "+ta+" (id,payload,v) VALUES (301,'after-ddl',1.25)")
 	exec(t, srcDB, "INSERT INTO "+tb+" (id,payload,v) VALUES (301,'b-after',7)")
 
-	// ③ 这一轮必须失败并登记暂停
+	// ③ 这一轮**不再整轮失败**：A 被暂停、A 的行不写、B 的行照写、位点照常前进。
 	res, err := engine.Run(ctx, engine.Options{Store: store, JobID: jobID, IdleAfter: 500 * time.Millisecond})
-	if err == nil {
-		t.Fatal("源端改了列类型：这一轮必须失败（位点不推进），不能静默跳过")
+	if err != nil {
+		t.Fatalf("只有一张表结构对不上，不该打死整轮（其它表要继续跑）: %v", err)
 	}
 	run, gerr := store.GetRun(ctx, res.RunID)
 	if gerr != nil {
 		t.Fatal(gerr)
 	}
-	if run.Code != string(core.CodeSchemaMismatch) {
-		t.Fatalf("应挂 E1015，得到 %q；last_error=%s", run.Code, run.LastError)
-	}
-	for _, want := range []string{ta, "v"} {
-		if !strings.Contains(run.LastError, want) {
-			t.Fatalf("last_error 要到字段级（应含 %q），得到：%s", want, run.LastError)
-		}
+	if run.FinishReason != "completed" {
+		t.Fatalf("这一轮应正常收尾（表级暂停不是 run 失败），得到 finish_reason=%q code=%q last_error=%s",
+			run.FinishReason, run.Code, run.LastError)
 	}
 
-	// ④ 位点逐字节不动 + 暂停 key 与块标记同源
+	// ④ 位点**必须前进**（跳过这张表不等于停下整条同步）+ 暂停 key 与块标记同源
 	var posAfter string
 	if err := dstDB.QueryRow(ctx, "SELECT COALESCE(position,'') FROM _jl_meta WHERE job_key=$1",
 		job.JobKey).Scan(&posAfter); err != nil {
 		t.Fatal(err)
 	}
-	if posAfter != posBefore {
-		t.Fatalf("暂停前后位点必须逐字节相等：%q → %q", posBefore, posAfter)
+	if posAfter == posBefore {
+		t.Fatalf("跳过了 A 之后位点必须前进（否则下一轮会重读同一段、永远卡住）：%q", posAfter)
 	}
 	paused, err := readPaused(t, dstDB, job.JobKey)
 	if err != nil {
@@ -128,8 +124,7 @@ func TestPauseTableRegistersKeyKeepsPositionAndRecovers(t *testing.T) {
 		}
 	}
 
-	// ⑤ 位点没推进 → 那一批两条 INSERT 都没写进去（包括**另一张表**的那条：
-	//    位点只有一个，其它表也不会继续推进）
+	// ⑤ 只停该表：A 的那一行没进目标端，**B 的那一行必须进**（A1 断言）
 	var aRows, bRows int
 	if err := dstDB.QueryRow(ctx, "SELECT count(*) FROM "+ta+" WHERE id=301").Scan(&aRows); err != nil {
 		t.Fatal(err)
@@ -137,31 +132,67 @@ func TestPauseTableRegistersKeyKeepsPositionAndRecovers(t *testing.T) {
 	if err := dstDB.QueryRow(ctx, "SELECT count(*) FROM "+tb+" WHERE id=301").Scan(&bRows); err != nil {
 		t.Fatal(err)
 	}
-	if aRows != 0 || bRows != 0 {
-		t.Fatalf("位点没推进，这一批一条都不该落库：A=%d B=%d", aRows, bRows)
+	if aRows != 0 {
+		t.Fatalf("暂停表的行不许写进目标端，实际 A=%d", aRows)
+	}
+	if bRows != 1 {
+		t.Fatalf("其它表必须照常推进（这就是「只停该表」）：B=%d，期望 1", bRows)
+	}
+	// 跳过窗口要记账（可枚举、可补偿），否则就是静默缺失。
+	if paused[ta].SkippedRows < 1 {
+		t.Fatalf("跳过窗口必须记账（skipped_rows ≥ 1），得到 %+v", paused[ta])
+	}
+	if paused[ta].SkippedFrom == "" {
+		t.Fatalf("跳过窗口要记下起点位点（skipped_from），得到 %+v", paused[ta])
 	}
 
-	// ⑥ 按文案对齐结构后重跑：解除暂停、从原位点继续重放，两张表都追平
+	// ⑥ 对齐结构后重跑：**整表重搬** A（清表 + 从新视图搬），搬成才解除；B 不受影响
 	exec(t, dstDB, "ALTER TABLE "+ta+" ALTER COLUMN v TYPE numeric(12,2)")
+	// 暂停窗口里源端还删过 A 的行：只 upsert 不清表的话这些行会永久留在目标端（幻行），
+	// 所以重搬必须走「清表」这条路。这条数据就是为了让「只 upsert」的写法必红。
+	exec(t, srcDB, "DELETE FROM "+ta+" WHERE id BETWEEN 1 AND 50")
 	t0 := time.Now()
-	if _, err := engine.Run(ctx, engine.Options{Store: store, JobID: jobID, IdleAfter: 700 * time.Millisecond}); err != nil {
+	res2, err := engine.Run(ctx, engine.Options{Store: store, JobID: jobID, IdleAfter: 700 * time.Millisecond})
+	if err != nil {
 		t.Fatalf("对齐结构后重跑应成功: %v", err)
 	}
 	caughtUp := time.Since(t0)
+	if res2.RowsCopied < 1 {
+		t.Fatalf("对齐后必须真的重搬了暂停表（RowsCopied=%d）：只从旧位点重放补不回跳过的行", res2.RowsCopied)
+	}
 	paused2, err := readPaused(t, dstDB, job.JobKey)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(paused2) != 0 {
-		t.Fatalf("结构对齐 + 存量已完成 → 必须解除暂停，仍有：%v", paused2)
+		t.Fatalf("重搬搬成 → 必须解除暂停，仍有：%v", paused2)
 	}
 	for _, tbl := range []string{ta, tb} {
 		if fp := tableFingerprint(t, dstDB, tbl); fp != tableFingerprint(t, srcDB, tbl) {
-			t.Fatalf("%s 解除暂停后应与源端一致：目标 %s", tbl, fp)
+			t.Fatalf("%s 恢复后应与源端一致：目标 %s / 源 %s", tbl, fp, tableFingerprint(t, srcDB, tbl))
 		}
 	}
-	t.Logf("暂停：位点 %q 前后逐字节相等；key=%q 与块标记同源；解除后两端指纹一致，"+
-		"整轮（含 700ms 静止判定）用时 %.0fms", posAfter, ta, float64(caughtUp.Milliseconds()))
+	var n int
+	if err := dstDB.QueryRow(ctx, "SELECT count(*) FROM "+ta).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 251 {
+		t.Fatalf("重搬后应剩 251 行（300+1 新行−50 删除），实际 %d：清表没做干净就是幻行", n)
+	}
+	t.Logf("按表暂停：位点 %q → %q（前进）；A 的那 1 行没写、B 的照写；"+
+		"跳过记账 %d 行（起点 %s）；对齐后整表重搬 %d 行并解除，两端指纹一致，重搬追平用时 %.0fms",
+		posBefore, posAfter, paused[ta].SkippedRows, paused[ta].SkippedFrom,
+		res2.RowsCopied, float64(caughtUp.Milliseconds()))
+}
+
+// readPausedOrFail 是 readPaused 的「读不出来就算失败」版本（用例里到处用）。
+func readPausedOrFail(t *testing.T, conn *pgx.Conn, jobKey string) map[string]pgsink.PausedTable {
+	t.Helper()
+	m, err := readPaused(t, conn, jobKey)
+	if err != nil {
+		t.Fatalf("读暂停记录失败: %v", err)
+	}
+	return m
 }
 
 // readPaused 直接读 _jl_meta.paused_tables 并按 JSON 解析（不经过代码里的缓存），
@@ -259,27 +290,42 @@ func TestTypeChangeTextAndVarcharWideningThenIncremental(t *testing.T) {
 	exec(t, srcDB, "ALTER TABLE "+table+" ALTER COLUMN s TYPE varchar(60)")
 	srcAfter := [2]string{columnType(t, srcDB, table, "v"), columnType(t, srcDB, table, "s")}
 
-	// 目标端故意只对齐第一列：第二列仍窄 → 本轮必须拒绝（不许静默按旧类型写）
+	// 目标端故意只对齐第一列：第二列仍窄 → **这张表被暂停**（不许静默按旧类型写、也不许收窄截断），
+	// 但整轮不再失败（契约 §1.2/§1.5：只停这一张表）。
 	exec(t, dstDB, "ALTER TABLE "+table+" ALTER COLUMN v TYPE text")
-	res, err := engine.Run(ctx, engine.Options{Store: store, JobID: jobID, SnapshotOnly: true})
-	if err == nil {
-		t.Fatal("目标端 varchar 仍比源端窄：必须拒绝（收窄会截断），不能静默通过")
+	if _, err := engine.Run(ctx, engine.Options{Store: store, JobID: jobID, SnapshotOnly: true}); err != nil {
+		t.Fatalf("一张表类型对不上不该打死整轮: %v", err)
 	}
-	run, gerr := store.GetRun(ctx, res.RunID)
-	if gerr != nil {
+	job0, jerr := store.GetJob(ctx, jobID)
+	if jerr != nil {
+		t.Fatal(jerr)
+	}
+	rec0, err := readPaused(t, dstDB, job0.JobKey)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if run.Code != string(core.CodeSchemaMismatch) {
-		t.Fatalf("收窄应挂 E1015，得到 %q；last_error=%s", run.Code, run.LastError)
+	one, ok := rec0[table]
+	if !ok {
+		t.Fatalf("varchar 仍比源端窄 → 必须暂停这张表，得到 %v", rec0)
 	}
-	if !strings.Contains(run.LastError, table) || !strings.Contains(run.LastError, "s") {
-		t.Fatalf("last_error 要点名表与列，得到：%s", run.LastError)
+	if one.Reason != pgsink.PauseReasonTypeChanged {
+		t.Fatalf("原因码应为 %q，得到 %q", pgsink.PauseReasonTypeChanged, one.Reason)
+	}
+	if !strings.Contains(one.Detail, "s") {
+		t.Fatalf("detail 要点名那一列（s），得到 %q", one.Detail)
+	}
+	// 目标端那列**没有被偷偷改宽**：改宽的只能是用户（我们只暂停，不动结构）
+	if typ := columnType(t, dstDB, table, "s"); typ != "character varying" {
+		t.Fatalf("目标端列类型不该被我们改，得到 %s", typ)
 	}
 
-	// 对齐第二列之后：两侧类型一致 + 增量继续可用（判据 3）
+	// 对齐第二列之后：暂停解除（走整表重搬）+ 两侧类型一致 + 增量继续可用（判据 3）
 	exec(t, dstDB, "ALTER TABLE "+table+" ALTER COLUMN s TYPE varchar(60)")
 	if _, err := engine.Run(ctx, engine.Options{Store: store, JobID: jobID, SnapshotOnly: true}); err != nil {
 		t.Fatalf("对齐后重跑应成功: %v", err)
+	}
+	if after := readPausedOrFail(t, dstDB, job0.JobKey); len(after) != 0 {
+		t.Fatalf("结构对齐并重搬之后必须解除暂停，仍有 %v", after)
 	}
 	dstAfter := [2]string{columnType(t, dstDB, table, "v"), columnType(t, dstDB, table, "s")}
 	if srcAfter != dstAfter {
