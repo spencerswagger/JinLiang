@@ -6,6 +6,6 @@ jobs:
   demo:
     runs-on: ubuntu-latest
     steps:
-      - name: 块级续跑（块进度 > 0 且重启重搬 ≤ 1 块）
+      - name: 块级续跑（known-red：单表口径，重启搬 ≈ 未搬完 ±1 块）
         continue-on-error: true
         run: echo fixture

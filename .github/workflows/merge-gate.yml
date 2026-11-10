@@ -296,11 +296,16 @@ jobs:
       - name: 增量中途 kill -9 → 重搬 0 行
         env: *m2m-env
         run: timeout -k 10 900 bash scripts/b1_mysql_to_mysql.sh ./dist/jinliang kill
-      - name: 块级续跑（块进度 > 0 且重启重搬 ≤ 1 块）
+      - name: 块进度记账（阻塞：搬运期逐块 + 完成后表标记 rows = 各块之和）
+        # Data #95 已落地，这条现在是**阻塞**判据（不再挂 continue-on-error）。
+        # 判据不依赖引擎的续跑读路径：只验目标端有没有认真记账。
+        env: *m2m-env
+        run: timeout -k 10 900 bash scripts/b1_mysql_to_mysql.sh ./dist/jinliang accounting
+      - name: 块级续跑（known-red：单表口径，重启搬 ≈ 未搬完 ±1 块）
         id: killcopy
-        # ⚠ 已知红，**有台账**：scripts/known_red.py 的 mysqlsink-chunk-accounting
-        # （责任人 Data / 转绿用例 b1_mysql_to_mysql.sh killcopy / 移除条件：mysqlsink 写 _jl_chunk）。
-        # 台账每天对账：实现落地了这一步还挂着 continue-on-error，门禁会直接判 1（断言未激活）。
+        # ⚠ 已知红，**有台账**：scripts/known_red.py 的 chunk-resume-wiring
+        # （责任人 Core / 转绿用例 killcopy / 移除条件：executeGeneric 接 planCopy+DoneChunks）。
+        # 记账已落（上一步阻塞），但引擎侧读块进度还没接 → 重启仍整表重搬。
         continue-on-error: true
         env: *m2m-env
         run: timeout -k 10 900 bash scripts/b1_mysql_to_mysql.sh ./dist/jinliang killcopy
@@ -316,5 +321,6 @@ jobs:
             echo "### MySQL→MySQL（ROWS=20000，双实例）"
             echo "- 全量+增量：见上一步日志"
             echo "- kill -9：判据「重启重搬 0 行」"
-            echo "- killcopy：判据「_jl_chunk > 0 且重启重搬 ≤ 1 块」——块记账已落（#95，_jl_chunk 有行），续跑接线未落（重启仍整轮重搬）→ 仍为已知红，台账由 verify 步骤对账"
+            echo "- 块记账（阻塞）：搬运期逐块 + 完成后表标记 rows = 各块之和"
+            echo "- 块级续跑（known-red，单表口径）：重启搬 ≈ 未搬完 ±1 块——引擎读块进度未接（Core），台账由 verify 对账"
           } >> "$GITHUB_STEP_SUMMARY"

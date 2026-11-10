@@ -275,3 +275,33 @@ scripts/local_stack.sh down
 | killcopy | ① 块记账已落（#95）；② 续跑接线**未落**（重启仍整轮重搬） | 仍挂起 | ✅ 合法已知红 |
 | late-error | 未修（knownred 用例仍红） | 仍挂起 | ✅ 合法已知红 |
 - 三元组失联也会红：步骤名改了/删了，`step_suspended` 找不到 → 判失败（台账与 YAML 失联）。
+
+## 7.8 「0 重搬」三口径（各自落在哪、数字属于哪个口径）
+
+契约把「0 重搬」拆成三个**互不替代**的度量。之前的矩阵只有一种口径，容易把「整轮没搬」和
+「该表没搬」混成一件事。现在每条断言都带口径名，输出里也打出来：
+
+| 口径 | 定义 | 落在哪个用例/脚本 | 输出里的标记 |
+|---|---|---|---|
+| ① 整轮（验收主口径） | `rowsCopied==0 ∧ plan.Kind==copySkip` | `acceptance_matrix.sh` 的 MySQL→PG kill 那格 → `gate_checks.py recopy --scope whole`；`plan.Kind==copySkip` 由 `TestPlanCopySingleTableResumeMetric` 的反面断言（表已搬完 → copySkip）钉住 | `[整轮口径] 重启后整轮重搬 0 行` |
+| ② 单表 | `chunk_no=0` 仍在 ∧ `plan.From[table]` 非空 | `b1_mysql_to_mysql.sh killcopy` → `gate_checks.py recopy --scope table`（结果面）；`plan.From` 非空由 `TestPlanCopySingleTableResumeMetric` 直接断言（判据面） | `[单表口径] 重启搬 N 行 ≈ 未搬完 M 行（±1 块）` |
+| ③ 暂停恢复 | 该表重搬行数 == 该表行数，**允许 ≠ 0** | `TestPauseTableRegistersKeyKeepsPositionAndRecovers` 新增断言 `res2.RowsCopied == 251` | `[暂停恢复口径] 该表重搬 251 行 = 表行数（本口径允许非 0）` |
+
+`gate_checks.py recopy` 现在必须显式给 `--scope whole|table|pause`，selftest 24 条覆盖三种口径
+（含「单表口径整表重搬必须红」「暂停恢复多搬/少搬必须红」）。
+
+## 7.9 killcopy：记账转阻塞（绿），续跑仍 known-red（Core）
+
+Data 的块记账（#95）落地后，按「实现已落地 + 步骤仍挂起 = 判 1」的规则，把这一格**拆成两步**：
+
+| 步骤 | 判据 | 依赖 | 实跑结果 |
+|---|---|---|---|
+| `块进度记账（阻塞）` | 搬运期逐块（`chunk_no>0 ∧ done=1`）+ 完成后表标记 `chunk_no=0` 的 `rows` **等于各块之和**、等于表行数；记账不许虚报 | 只依赖目标端记账（#95 已落） | **PASS**：`搬运期 2 块 / 4000 行；完成后表标记 rows=20000 = 各块之和 = 表行数` |
+| `块级续跑（known-red）` | 单表口径：重启搬 ≈ 未搬完 ±1 块 | 引擎通用全量路径读块进度（**未落**，`executeGeneric` 至今不调 `DoneChunks`） | **仍红**：`中断 4500 行 → 重启搬 20000 行（应补 15500 + 多出 4500）` → `[单表口径] 超界` |
+
+为什么没有把整格直接转阻塞：转阻塞的前提是「实现已落地」，而这里是**一半落地**——记账有了，
+读路径没有；`executeGeneric` 里 `DoneChunks` 零调用点（`grep -n "DoneChunks(" internal/engine/*.go`
+只有接口声明）。现在硬转阻塞就会让 `mysql-mysql` job 常红，等于把 known-red 变成 noise，
+所以按台账规则保留 known-red，责任人改为 **Core**，触发条件写成：
+「`planCopy`/`DoneChunks` 接进 `executeGeneric`，重启搬 ≈ 未搬完（±1 块）后删 `continue-on-error`」。
+台账 probe 仍用这一步的真实 `outcome`——接线一旦落地，`verify` 会立刻判「断言未激活」逼着删。

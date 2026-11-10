@@ -54,12 +54,47 @@ def fp_ok(src, dst):
 
 
 def recopy_ok(copied, allow=0):
-    """崩溃重启后**重搬行数**必须是 0（或显式允许的块内回滚行数）。"""
+    """【整轮口径】崩溃重启后**整轮重搬行数**必须是 0（`rowsCopied==0 ∧ plan.Kind==copySkip`）。
+
+    口径定义见契约 §「0 重搬的三口径」：整轮 / 单表 / 暂停恢复互不替代。
+    这个函数只服务**整轮**：它回答的是「这次重启有没有重新搬存量」。
+    """
     if copied < 0:
         return False, "重搬行数读不出来（%d）：读不到就拦截" % copied
     if copied > allow:
-        return False, "重启后重搬了 %d 行（允许 %d）：这是整轮重搬，不是位点续跑" % (copied, allow)
-    return True, "重启后重搬 %d 行（允许 %d）" % (copied, allow)
+        return False, "[整轮口径] 重启后重搬了 %d 行（允许 %d）：这是整轮重搬，不是位点续跑" % (copied, allow)
+    return True, "[整轮口径] 重启后整轮重搬 %d 行（允许 %d）" % (copied, allow)
+
+
+def recopy_table_ok(resumed, remaining, chunk, allow_chunks=1):
+    """【单表口径】块级续跑：只允许「中断时正在写的那一块」回滚重来。
+
+    判据来自契约：`chunk_no=0` 仍在（表还没完成）∧ `plan.From[table]` 非空。
+    在脚本里能观测到的是它的**结果**：重启搬的行数 ≈ 未搬完的部分（±1 块）。
+    `plan.From` 的非空由单测 `TestPlanCopySingleTableResumeMetric` 直接钉住。
+    """
+    if min(resumed, remaining, chunk) < 0:
+        return False, "[单表口径] 行数读不出来（重启=%d 未搬完=%d 块=%d）：读不到就拦截" % (resumed, remaining, chunk)
+    lo = max(0, remaining - chunk * allow_chunks)
+    hi = remaining + chunk * allow_chunks
+    if not (lo <= resumed <= hi):
+        return False, ("[单表口径] 重启搬了 %d 行，未搬完的是 %d 行（±%d 块×%d 行）："
+                       "超出就是整表重搬，不是块级续跑" % (resumed, remaining, allow_chunks, chunk))
+    return True, "[单表口径] 重启搬 %d 行 ≈ 未搬完 %d 行（±%d 块）" % (resumed, remaining, allow_chunks)
+
+
+def recopy_pause_ok(recopied, table_rows):
+    """【暂停恢复口径】该表重搬行数 == 该表行数，**允许 ≠ 0**。
+
+    这是与「重启后重搬 0 行」完全不同的度量：暂停恢复就是要整表重搬补齐跳过窗口，
+    所以这里判的是「搬够了」，不是「没搬」。
+    """
+    if recopied < 0 or table_rows < 0:
+        return False, "[暂停恢复口径] 行数读不出来（重搬=%d 表行数=%d）" % (recopied, table_rows)
+    if recopied != table_rows:
+        return False, ("[暂停恢复口径] 该表重搬 %d 行，表里应有 %d 行：恢复必须整表搬齐"
+                       "（本口径允许非 0，但必须相等）" % (recopied, table_rows))
+    return True, "[暂停恢复口径] 该表重搬 %d 行 = 表行数（本口径允许非 0）" % recopied
 
 
 def pause_ok(keys=None, want=None):
@@ -102,6 +137,13 @@ SELFTEST = [
     ("recopy 1", recopy_ok(1), False),
     ("recopy 整轮", recopy_ok(20000), False),
     ("recopy 读不到", recopy_ok(-1), False),
+    ("单表口径 只补未完成", recopy_table_ok(16000, 16000, 2000), True),
+    ("单表口径 允许 1 块回滚", recopy_table_ok(18000, 16000, 2000), True),
+    ("单表口径 整表重搬", recopy_table_ok(20000, 16000, 2000), False),
+    ("单表口径 少搬", recopy_table_ok(10000, 16000, 2000), False),
+    ("暂停恢复 相等（非 0）", recopy_pause_ok(251, 251), True),
+    ("暂停恢复 少搬", recopy_pause_ok(200, 251), False),
+    ("暂停恢复 多搬", recopy_pause_ok(300, 251), False),
     ("pause 只登记该表", pause_ok("a", "a"), True),
     ("pause 多登记了表", pause_ok("a,b", "a"), False),
     ("pause 少登记了表", pause_ok("", "a"), False),
@@ -144,8 +186,15 @@ def main(argv):
         p.add_argument("--src", required=True)
         p.add_argument("--dst", required=True)
     elif cmd == "recopy":
-        p.add_argument("--copied", type=int, required=True)
+        p.add_argument("--scope", choices=["whole", "table", "pause"], default="whole",
+                       help="整轮 / 单表 / 暂停恢复——三个互不替代的度量")
+        p.add_argument("--copied", type=int, default=None)
         p.add_argument("--allow", type=int, default=0)
+        p.add_argument("--resumed", type=int, default=None)
+        p.add_argument("--remaining", type=int, default=None)
+        p.add_argument("--chunk", type=int, default=None)
+        p.add_argument("--recopied", type=int, default=None)
+        p.add_argument("--table-rows", dest="table_rows", type=int, default=None)
     elif cmd == "pause":
         p.add_argument("--keys", default=None)
         p.add_argument("--want", default=None)
@@ -161,7 +210,21 @@ def main(argv):
     if cmd == "fp":
         ok, why = fp_ok(a.src, a.dst)
     elif cmd == "recopy":
-        ok, why = recopy_ok(a.copied, a.allow)
+        if a.scope == "whole":
+            if a.copied is None:
+                print("gate: FAIL [整轮口径] 缺 --copied", file=sys.stderr)
+                return 2
+            ok, why = recopy_ok(a.copied, a.allow)
+        elif a.scope == "table":
+            if None in (a.resumed, a.remaining, a.chunk):
+                print("gate: FAIL [单表口径] 缺 --resumed/--remaining/--chunk", file=sys.stderr)
+                return 2
+            ok, why = recopy_table_ok(a.resumed, a.remaining, a.chunk)
+        else:
+            if None in (a.recopied, a.table_rows):
+                print("gate: FAIL [暂停恢复口径] 缺 --recopied/--table-rows", file=sys.stderr)
+                return 2
+            ok, why = recopy_pause_ok(a.recopied, a.table_rows)
     elif cmd == "pause":
         ok, why = pause_ok(a.keys, a.want)
     else:

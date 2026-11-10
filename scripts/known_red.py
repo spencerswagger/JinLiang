@@ -33,13 +33,13 @@ WORKFLOW = os.path.join(ROOT, ".github/workflows/merge-gate.yml")
 # 台账。每条都必须是「可对账」的：probe 判「实现落地没有」，step 判「步骤还挂着没有」。
 REGISTRY = [
     dict(
-        id="mysqlsink-chunk-accounting",
-        step="块级续跑（块进度 > 0 且重启重搬 ≤ 1 块）",
-        owner="Data",
-        detector="scripts/b1_mysql_to_mysql.sh killcopy（_jl_chunk > 0 且重启重搬 ≤ 1 块）",
-        unblock="① mysqlsink 写 `_jl_chunk`（#95 已落，`internal/mysqlsink/chunk.go`）；"
-                "② 引擎通用全量路径读块进度，让「重启重搬」≤1 块（续跑接线）。"
-                "两条都在主干后，删掉该步骤的 continue-on-error",
+        id="chunk-resume-wiring",
+        step="块级续跑（known-red：单表口径，重启搬 ≈ 未搬完 ±1 块）",
+        owner="Core",
+        detector="scripts/b1_mysql_to_mysql.sh killcopy（单表口径：重启搬 ≈ 未搬完 ±1 块）",
+        unblock="引擎通用全量路径接 planCopy/DoneChunks（MySQL 目标端读块进度）；"
+                "合入后重启搬 ≈ 未搬完，删掉该步骤的 continue-on-error。"
+                "注：块记账本身已落（#95），已单独成**阻塞**步骤",
         probe="job:mysql-mysql",
     ),
     dict(
@@ -221,8 +221,8 @@ def selftest():
             print("selftest: ok   %s" % name)
     # 端到端那条：fixture 里步骤仍挂起 + 检测器 outcome=success（= 实现已落地）→ 必须判 1。
     # 这是任务要求的「构造一次『实现已落地 + 步骤仍挂起』的场景，门禁必须红」的自证。
-    rc_hit = verify("mysqlsink-chunk-accounting", "success", workflow=FIXTURE, quiet=True)
-    rc_ok = verify("mysqlsink-chunk-accounting", "failure", workflow=FIXTURE, quiet=True)
+    rc_hit = verify("chunk-resume-wiring", "success", workflow=FIXTURE, quiet=True)
+    rc_ok = verify("chunk-resume-wiring", "failure", workflow=FIXTURE, quiet=True)
     if rc_hit != 1:
         bad += 1
         print("selftest: FAIL 已落地 + 仍挂起 —— 应判 1，实际 %d" % rc_hit)
