@@ -16,7 +16,6 @@ package engine_test
 
 import (
 	"context"
-	"database/sql"
 	"os"
 	execpkg "os/exec"
 	"path/filepath"
@@ -114,7 +113,12 @@ func TestMySQLSourceTypeChangePausesOnlyThatTableAndRecovers(t *testing.T) {
 	mustMySQLPos(t, "全量后", posFull)
 
 	// ── 第 2 轮：流着的时候源端改列类型 ──────────────────────────────
-	cmd := execpkg.Command(bin, "run", "--job", jobName, "--data-dir", dataDir)
+	//
+	// 裁决 A（docs/CONTRACT-PAUSE-AND-POSITION.md，#90/#93）之后的行为：
+	//   - 只停**这张表**：它的事件被引擎丢掉，其它表照写；
+	//   - 位点**照常前进**（跳过的那段记在 paused_tables 里，靠恢复时整表重搬补齐）；
+	//   - run 不失败，安静下来按 --stop-when-idle 收尾。
+	cmd := execpkg.Command(bin, "run", "--job", jobName, "--data-dir", dataDir, "--stop-when-idle", "6s")
 	cmd.Env = os.Environ()
 	logFile, err := os.Create(filepath.Join(t.TempDir(), "run-ddl.log"))
 	if err != nil {
@@ -126,10 +130,9 @@ func TestMySQLSourceTypeChangePausesOnlyThatTableAndRecovers(t *testing.T) {
 	}
 	defer func() { _ = cmd.Process.Kill(); _ = cmd.Wait() }()
 
+	jobKey := myJobKey(t, dst)
+
 	// 先让流真的跑起来（写一行、等它到目标端），再动 DDL。
-	//
-	// **位点基线要在这里取**：上面那行流过去之后「数据 + 位点」一起提交，位点本来就该前进；
-	// 拿全量后的位点当基线，会把这次正常前进误判成「暂停期间位点被推进」。
 	myExec(t, my, "INSERT INTO "+other+" (id,payload) VALUES (10,'r10')")
 	if !waitRowsQuiet(t, dst, other, 4, 45*time.Second) {
 		body, _ := os.ReadFile(logFile.Name())
@@ -143,91 +146,76 @@ func TestMySQLSourceTypeChangePausesOnlyThatTableAndRecovers(t *testing.T) {
 	myExec(t, my, "INSERT INTO "+changed+" (id,v) VALUES (11,'abc')")
 	myExec(t, my, "INSERT INTO "+other+" (id,payload) VALUES (11,'r11')")
 
+	// 等「这张表被记成暂停」（裁决 A 下 run 不退出，判定靠库里的记录）。
+	rec, ok := waitPaused(t, dst, jobKey, changed, 60*time.Second)
+	if !ok {
+		body, _ := os.ReadFile(logFile.Name())
+		t.Fatalf("源端改列类型后 60s 内没有把 %s 记成暂停。这一轮的输出：\n%s", changed, body)
+	}
+
 	done := make(chan struct{})
-	go func() { _ = cmd.Wait(); close(done) }()
+	code := 0
+	go func() {
+		err := cmd.Wait()
+		if ee, ok := err.(*execpkg.ExitError); ok {
+			code = ee.ExitCode()
+		}
+		close(done)
+	}()
 	select {
 	case <-done:
-	case <-time.After(60 * time.Second):
+	case <-time.After(90 * time.Second):
 		_ = cmd.Process.Kill()
 		body, _ := os.ReadFile(logFile.Name())
-		t.Fatalf("源端改列类型之后任务没有停下来（60s 仍在跑）——这一批会静默写错或一直重试：\n%s", body)
+		t.Fatalf("改类型之后任务没有安静下来（90s 仍在跑）：\n%s", body)
 	}
 	_ = logFile.Close()
 	body, _ := os.ReadFile(logFile.Name())
 	out := string(body)
-
-	// 判据②：run 以「结构对不上」结束（E1015 那张四段式卡片），不是「未识别的数据库错误」。
-	// 断言落在卡片文案与「已登记暂停」这两句上：码表里的编号不一定印在 stdout，
-	// 但「表 + 列 + 前后类型 + 位点没推进」这四件事必须都在。
-	for _, want := range []string{"与源端的列类型不一致", "已登记暂停", "type_changed", "位点没有推进"} {
-		if !strings.Contains(out, want) {
-			t.Fatalf("改类型后的输出里应有 %q（E1015 卡片的一部分），实际：\n%s", want, out)
-		}
-	}
-	// 判据④的前半：**暂停这一批没有把位点带走**。
-	//
-	// 这里不能直接断言「位点逐字节不变」：源端改类型的那条 ALTER 在 binlog 里自成一笔事务，
-	// 它被 MySQL 源按「本版不搬 DDL」过滤掉之后，引擎仍然要把事务边界往上走（空批次只推进位点）——
-	// 否则位点会永久卡在这条 DDL 上、每轮都从它开始重放。所以「位点不动」的准确含义是：
-	// **出问题的那一批一条都没落库，位点也没越过它**。可观测的判据是下面两条：
-	//   ① 位点只前进不回退（没有任何回退的余地）；
-	//   ② 那张表里待重放的那一行（id=11）不在目标端 —— 位点若越过它，恢复后就再也补不回来。
-	posAfterFail := myPosition(t, dst)
-	mustMySQLPos(t, "暂停后", posAfterFail)
-	if myPosLess(posAfterFail, posBefore) {
-		t.Fatalf("位点回退了：%s → %s", posBefore, posAfterFail)
-	}
-	if pgHasRow(t, dst, changed, "id = 11") {
-		t.Fatalf("%s 里出现了 id=11：改类型那一批本该整批拒绝（位点没越过它，重放时才补得上）", changed)
+	if code != 0 {
+		t.Fatalf("裁决 A 下「只停该表」不该让 run 失败，实际退出码 %d：\n%s", code, out)
 	}
 
-	// 判据①：paused_tables 里只有改类型的那张表，且记录可读。
-	jobKey := myJobKey(t, dst)
-	paused, err := readPaused(t, dst, jobKey)
-	if err != nil {
-		t.Fatalf("读暂停记录失败: %v", err)
-	}
-	rec, ok := paused[changed]
-	if !ok {
-		t.Fatalf("paused_tables 里没有 %s：%v。改类型必须**留痕**，不能只失败不记录", changed, paused)
-	}
-	if _, bad := paused[other]; bad {
-		t.Fatalf("paused_tables 里出现了没改类型的表 %s：%v。"+
-			"暂停记录的 key 必须是**出问题的那张表**，不能把同批次别的表一起记上", other, paused)
+	// 判据①：paused_tables 里**只有**改类型的那张表，且记录可读。
+	if _, bad := readPausedMap(t, dst, jobKey)[other]; bad {
+		t.Fatalf("paused_tables 里出现了没改类型的表 %s：%v", other, readPausedMap(t, dst, jobKey))
 	}
 	if rec.Reason != pgsink.PauseReasonTypeChanged {
 		t.Fatalf("暂停原因码应为 type_changed，实际 %q（detail=%s）。原因码是机器判等用的稳定值", rec.Reason, rec.Detail)
 	}
-	// 前后对照必须写清楚，长度单位随「元数据级别」可能差一档：
-	//   - binlog_row_metadata=FULL（带列字符集）→ `varchar(64)`，与用户写的一致；
-	//   - MINIMAL（8.0/8.4/9 的开箱默认，CI 的 b4 就是这一套）→ 只有字节上限，
-	//     报 `varchar(256)`。这是已知差别，要精确到字符请开 FULL（notes 里有写）。
-	// 两种都必须给出「哪张表、哪一列、从什么类型到什么类型」。
 	for _, want := range []string{"bigint", "v"} {
 		if !strings.Contains(rec.Detail, want) {
 			t.Fatalf("detail 里应有 %q（用户要知道哪一列），实际 %q", want, rec.Detail)
 		}
 	}
+	// 前后对照必须写清楚。长度单位随元数据级别可能差一档（FULL 带列字符集 → varchar(64)；
+	// 拿不到列字符集的版本只能按字节报 → varchar(256)），两种都要给出「从什么到什么」。
 	if !strings.Contains(rec.Detail, "bigint → varchar(64)") &&
 		!strings.Contains(rec.Detail, "bigint → varchar(256)") {
-		t.Fatalf("detail 应写成「源端 bigint → varchar(N)」这种前后对照（N 随元数据级别），实际 %q", rec.Detail)
+		t.Fatalf("detail 应写成「源端 bigint → varchar(N)」这种前后对照，实际 %q", rec.Detail)
 	}
 
-	// 判据③（当前契约的诚实断言）：另一张表的那一行也没落库。
-	if got := pgCount(t, dst, other); got != 4 {
-		t.Fatalf("%s 现在应有 4 行（id=11 那行不该进），实际 %d。"+
-			"位点只有一个 → 整条同步会停下，这是契约 notes/contract-paused-tables.md §4.1 写明的边界；"+
-			"若将来改成「其它表继续跑」，这条断言要跟着改成 5", other, got)
+	// 判据②（裁决 A）：**其它表照跑** —— 旁证表那一行必须落库（旧契约下它停在 4 行）。
+	if got := pgCount(t, dst, other); got != 5 {
+		t.Fatalf("%s 应有 5 行（裁决 A：一张表坏了别的表继续跑；旧契约下是 4 行），实际 %d：\n%s",
+			other, got, out)
+	}
+	// 判据③（裁决 A）：**位点照常前进**（跳过的那段靠恢复时整表重搬补齐，不是靠位点不动）。
+	posAfterPause := myPosition(t, dst)
+	mustMySQLPos(t, "暂停后", posAfterPause)
+	if !myPosLess(posBefore, posAfterPause) {
+		t.Fatalf("裁决 A 下位点必须前进：%s → %s（位点不动是旧契约的行为）", posBefore, posAfterPause)
+	}
+	// 被暂停那张表的行**没有**进目标端（跳过是事实，不能假装写了）。
+	if pgHasRow(t, dst, changed, "id = 11") {
+		t.Fatalf("%s 里出现了 id=11：暂停期间这张表的行应当被跳过（欠账交给恢复时的整表重搬）", changed)
 	}
 
-	// ── 第 3 轮：对齐目标端列类型 → 重跑，从原位点恢复并追平 ─────────
+	// ── 第 3 轮：对齐目标端列类型 → 重跑：解除暂停 + 整表重搬补齐 ────
 	exec(t, dst, "ALTER TABLE "+changed+" ALTER COLUMN v TYPE text USING v::text")
-	out2, code := run("--stop-when-idle", "5s")
-	if code != 0 {
-		t.Fatalf("对齐类型后重跑失败（退出码 %d）：\n%s", code, out2)
-	}
-	if strings.Contains(out2, "全量完成") {
-		t.Fatalf("对齐后重跑又搬了一遍全量（应该从原位点重放）：\n%s", out2)
+	out2, code2 := run("--stop-when-idle", "8s")
+	if code2 != 0 {
+		t.Fatalf("对齐类型后重跑失败（退出码 %d）：\n%s", code2, out2)
 	}
 	if paused, err := readPaused(t, dst, jobKey); err != nil {
 		t.Fatalf("读暂停记录失败: %v", err)
@@ -236,16 +224,17 @@ func TestMySQLSourceTypeChangePausesOnlyThatTableAndRecovers(t *testing.T) {
 	}
 	posFixed := myPosition(t, dst)
 	mustMySQLPos(t, "恢复后", posFixed)
-	if !myPosLess(posBefore, posFixed) {
-		t.Fatalf("恢复后位点没有前进：%s → %s", posBefore, posFixed)
+	// 恢复这一轮**不该**要求位点再前进：整表重搬是补数据，不是推位点；
+	// 位点只能不动或前进，退后就是重放，重放会让 md5 对不上。
+	if myPosLess(posFixed, posAfterPause) {
+		t.Fatalf("恢复后位点退后了：%s → %s", posAfterPause, posFixed)
 	}
-
-	// 位点没越过那一批的**正面证据**：恢复后 id=11 被重放补上了。
+	// 跳过的那一行靠**整表重搬**补回来（不是靠位点重放）。
 	if !pgHasRow(t, dst, changed, "id = 11 AND v = 'abc'") {
-		t.Fatalf("%s 恢复后仍没有 id=11/'abc'：说明位点已经越过了改类型那一批，这段变更永久丢失", changed)
+		t.Fatalf("%s 恢复后仍没有 id=11/'abc'：整表重搬没把它补回来，这段变更永久丢失：\n%s", changed, out2)
 	}
 
-	// 判据④的后半：两张表都与源端一致（改类型的列按值语义比对）。
+	// 判据④：两张表都与源端一致。
 	for _, tc := range []struct{ tbl, srcQ, dstQ string }{
 		{changed,
 			"SELECT CONCAT(COUNT(*), ':', COALESCE(GROUP_CONCAT(CONCAT(id,'|',COALESCE(v,'∅')) ORDER BY id),'')) FROM " + changed,
@@ -265,8 +254,35 @@ func TestMySQLSourceTypeChangePausesOnlyThatTableAndRecovers(t *testing.T) {
 			t.Fatalf("%s 恢复后两端不一致：源 %s / 目标 %s", tc.tbl, srcFP, dstFP)
 		}
 	}
-	t.Logf("改类型暂停：%s 被记成 %s（%s），位点 %s 未动；对齐后重放追平，位点 %s",
-		changed, rec.Reason, rec.Detail, posBefore, posFixed)
+	t.Logf("改类型暂停（裁决 A）：%s 记成 %s（%s）；期间位点 %s → %s、旁证表照写到 5 行；"+
+		"对齐后整表重搬补齐，位点 %s",
+		changed, rec.Reason, rec.Detail, posBefore, posAfterPause, posFixed)
+}
+
+// readPausedMap 读暂停记录（不存在就返回空 map）。
+func readPausedMap(t *testing.T, conn *pgx.Conn, jobKey string) map[string]pgsink.PausedTable {
+	t.Helper()
+	m, err := readPaused(t, conn, jobKey)
+	if err != nil {
+		t.Fatalf("读暂停记录失败: %v", err)
+	}
+	return m
+}
+
+// waitPaused 等某张表被记成暂停（裁决 A 下 run 不会因此退出，只能看库里的记录）。
+func waitPaused(t *testing.T, conn *pgx.Conn, jobKey, table string,
+	d time.Duration) (pgsink.PausedTable, bool) {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		if m, err := readPaused(t, conn, jobKey); err == nil {
+			if rec, ok := m[table]; ok {
+				return rec, true
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return pgsink.PausedTable{}, false
 }
 
 // myJobKey 读本任务在目标端的 job_key（_jl_meta 只有这一行 MySQL 位点）。
@@ -291,17 +307,6 @@ func waitRows(t *testing.T, conn *pgx.Conn, table string, n int, d time.Duration
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Fatalf("等 %s 到 %d 行超时（实际 %d）：增量流没有跑起来", table, n, pgCount(t, conn, table))
-}
-
-// binlogRowMetadata 读源端的 binlog_row_metadata（FULL / MINIMAL / NOBLOB）。
-// 它决定 binlog 里有没有列名与字符集，也就决定了类型串能精确到哪一步。
-func binlogRowMetadata(t *testing.T, my *sql.DB) string {
-	t.Helper()
-	var v string
-	if err := my.QueryRow("SELECT @@binlog_row_metadata").Scan(&v); err != nil {
-		t.Fatalf("读 @@binlog_row_metadata 失败: %v", err)
-	}
-	return v
 }
 
 // pgHasRow 报告目标表里有没有满足条件的那一行。

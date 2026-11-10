@@ -176,9 +176,17 @@ MySQL 侧写 `char(10)`，PG 的 `information_schema` 回 `character(10)`；`typ
 与 #93 的接触点只有 `pgsink.Apply` 的写路径（它改跳过语义，我改的是消息与类型），
 `_jl_meta.paused_tables` 的形状两边都不动。
 
-### 仍未覆盖：MINIMAL 元数据下的字符数精度
+### 精度边界（更正）
 
-`binlog_row_metadata=MINIMAL`（8.0/8.4/9 的开箱默认）拿不到列字符集，
-`VARCHAR(64)` 只能报成 `varchar(256)`（字节）。`looseSameType` 保证它**不会**被误判成「改类型」，
-但**提示里的数字**只能到这个精度。要精确到字符请开 `binlog_row_metadata=FULL`
-（启动 preflight 可以就这一点给一条提示——归 #93/preflight 那边，不在本 PR）。
+上一版这里写「MINIMAL 拿不到列字符集」，**写错了**：MINIMAL 缺的是**列名**，
+列字符集在 TABLE_MAP 的可选元数据里仍然有（CI 的 b4 是 MINIMAL，报出来的就是 `varchar(64)`）。
+真正只能按字节报的是 **5.7**（那套元数据更少）——所以 `looseSameType` 的 ×2..×4 主要是给 5.7 兜底。
+
+### 契约已冻结：裁决 A（#90 / #93）
+
+本 PR 的用例已按 A 重写：
+- 旁证表**照跑到 5 行**（旧契约下停在 4 行）；
+- **位点照常前进**（旧契约下要求不动）；
+- 跳过的那一行靠**恢复时整表重搬**补回来（不是靠位点重放）；
+- run **不失败**，`--stop-when-idle` 正常收尾（旧契约下是 E1015 失败）。
+本 PR 不碰这条写路径，只给它提供「哪张表 + 源端前后类型」。
