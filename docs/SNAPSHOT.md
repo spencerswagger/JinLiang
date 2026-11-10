@@ -38,9 +38,13 @@
 - 重启：读未完成块继续；快照 id 已失效（源库重启 / 超过 `idle_replication_slot_timeout`）→ 整段重来，并在动作清单里说明原因。
 - MySQL 无主键表：只有表级断点，重来成本要在 `plan` 里标出。
 - **显式整轮重搬**：`jinliang run --job <任务名> --resync`。它不看上面的续跑判据，
-  直接落 `copyFresh`：清空 `position/watermark/snapshot_id` → 清本任务写过的表（`DidCreateTable`
-  把关，用户自己的表一律停下问）→ 清块标记 → 重建书签 → 从零重搬。
-  不清用户表、不换 `job_key`、不删运行历史；审计记 `job.resync`（谁触发、哪个书签、清了哪些表）。
+  直接落 `copyFresh`，顺序是：
+  1. **先问「这几张表能不能清」**（`DidCreateTable`；用户自己的表一律停下问，**此时位点与书签都还没动**）；
+  2. 清空 `position/watermark/snapshot_id`（必须在清表之前：反过来崩在中间就是「位点说有进度、表是空的」）；
+  3. 重建书签（`Prepare` 会 drop 旧 slot、按当前位点建新的）；
+  4. 清本任务写过的表 + 该表的块标记（同一个事务），然后从零重搬。
+  不清用户表、不换 `job_key`、不删运行历史；审计分两段：`job.resync`（谁触发、哪个书签、旧位点、
+  `planned_tables`）与 `job.resync.cleared`（**实际**清掉哪些表，清完才写）。
 
 ## 5. 与增量的接缝
 

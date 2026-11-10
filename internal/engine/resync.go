@@ -43,7 +43,8 @@ type ResyncReport struct {
 	OldPosition string
 	// Slot 是本次重建的源端同步书签（continuous 模式的「重建」也落在它上面）。
 	Slot string
-	// Tables 是这一轮要清空并重搬的表（目标端裸表名，按 catalog 顺序）。
+	// Tables 是**真的清空过**的表（清成一张填一张，按 catalog 顺序）。
+	// 计划清单不在这里——它只进审计的 planned_tables，别把计划当已完成报告。
 	Tables []string
 }
 
@@ -123,16 +124,43 @@ func (r *runner) applyResync(p *chunkPlan, priorPhase, priorPos string) error {
 	}
 	p.setClean(recopyResync)
 	p.Why = "--resync：重建同步书签并从零整轮重搬（目标端结果等于源端当前状态）"
-	rep.Tables = append(rep.Tables, p.CleanNames...)
 	return nil
 }
 
-// auditResync 记录「谁触发、重建哪个书签、清了哪些表」。
+// precheckResyncTables 在**任何破坏性动作之前**把「这几张表能不能清」问一遍。
+//
+// 为什么必须前置：清位点、重建书签、清表是三步不可逆的动作。把「这是你自己的表、
+// 清不清由你定」这种需要人来决定的失败留到第三步，前面的位点和旧书签就已经没了；
+// 用户「再跑一次」会被判 copySkip（块标记还在、Done 齐）直接进流，把
+// (旧位点, 新起点] 永久跳过且不报错——他要的是整轮重搬，代码却替他接受了空洞。
+//
+// 这里复用 recopyAction（同一个 fail-closed 判定），失败时位点与书签都还没动，
+// 用户看到的是原本那三条可选路，而不是一个被弄坏的现场。
+func (r *runner) precheckResyncTables(ctx context.Context, p chunkPlan) error {
+	if p.Clean == cleanNone || len(p.CleanNames) == 0 {
+		return nil
+	}
+	for _, name := range p.CleanNames {
+		ref, ok := r.tableByName(name)
+		if !ok {
+			continue // 与 cleanBeforeRecopy 同口径：不在本轮范围内的名字跳过
+		}
+		if err := r.recopyAction(ctx, ref, p.CleanWhy); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// auditResync 记录「谁触发、重建哪个书签、**计划**清哪些表」。
 //
 // 放在清表之前（prepare 里，清位点之后）：审计失败必须响亮——再往后就是删数据，
 // 而用户有权知道这一步是谁按的。位点已清 + 计划是 copyFresh，所以就算这里失败，
 // 下一次 run 也会整轮重搬，不会停在「位点空了、表还是旧的」。
-func (r *runner) auditResync(ctx context.Context) error {
+//
+// 字段叫 planned_tables 而不是 cleared_tables：此刻一张表都还没清。真正清完哪些表
+// 由 auditResyncCleared 另记一条，两段各说事实，不拿计划冒充结果。
+func (r *runner) auditResync(ctx context.Context, planned []string) error {
 	rep := r.resyncReport
 	if rep == nil {
 		return nil
@@ -145,13 +173,35 @@ func (r *runner) auditResync(ctx context.Context) error {
 		if err := r.opt.Store.Audit(ctx, actor, "job.resync", map[string]any{
 			"job_id": r.job.ID, "job_key": r.job.JobKey, "job_name": r.job.Name,
 			"slot": rep.Slot, "old_phase": rep.OldPhase, "old_position": rep.OldPosition,
-			"cleared_tables": rep.Tables,
+			"planned_tables": planned,
 		}); err != nil {
 			return fmt.Errorf("--resync 已清空位点，但写审计失败：%w（目标表一行都没动）", err)
 		}
 	}
 	r.note(ctx, fmt.Sprintf("--resync：重建同步书签 %s，位点从 %q 清空；接下来会清空 %d 张本任务写过的表再整轮重搬：%s",
-		rep.Slot, rep.OldPosition, len(rep.Tables), strings.Join(rep.Tables, ", ")))
+		rep.Slot, rep.OldPosition, len(planned), strings.Join(planned, ", ")))
+	return nil
+}
+
+// auditResyncCleared 记录「**真的**清了哪些表」——在 cleanBeforeRecopy 跑完之后写。
+//
+// 为什么要两条：计划可以中途失败（清到第三张时权限没了），一条审计既说「谁按的」
+// 又说「清了哪些」就只能二选一，另一个必是假话。
+func (r *runner) auditResyncCleared(ctx context.Context) error {
+	rep := r.resyncReport
+	if rep == nil || r.opt.Store == nil {
+		return nil
+	}
+	actor := strings.TrimSpace(r.opt.Actor)
+	if actor == "" {
+		actor = control.ActorSystem
+	}
+	if err := r.opt.Store.Audit(ctx, actor, "job.resync.cleared", map[string]any{
+		"job_id": r.job.ID, "job_key": r.job.JobKey, "job_name": r.job.Name,
+		"slot": rep.Slot, "cleared_tables": rep.Tables,
+	}); err != nil {
+		return fmt.Errorf("清表已完成（%d 张），但写审计失败：%w", len(rep.Tables), err)
+	}
 	return nil
 }
 

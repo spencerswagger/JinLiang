@@ -405,7 +405,7 @@ func cmdRun(args []string) error {
 		if res.Note != "" {
 			fmt.Println("说明：" + res.Note)
 		}
-		if rep := res.Resync; rep != nil {
+		if rep := res.Resync; rep != nil && res.ExitCode == engine.ExitOK {
 			// 「谁触发了、重建了哪个位点、清了哪些表」——用户回头查的正是这三件事。
 			// 引擎已把同一份写进 audit（action=job.resync）；这里让当场的输出也对得上。
 			fmt.Printf("--resync：书签 %s，旧位点 %q 已清空，清了 %d 张表：%s\n",

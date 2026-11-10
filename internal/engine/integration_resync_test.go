@@ -65,24 +65,22 @@ func TestResyncRebuildsBrokenBookmarkAndCatchesUp(t *testing.T) {
 
 	// ── 第一轮：正常开跑，快照窗口里把书签删掉 → 必须红着停下，且是 E3001。
 	stopKill := make(chan struct{})
-	dropped := make(chan bool, 1)
-	go killSlotWhileCopying(t, srcDB, slot, stopKill, dropped)
+	killerDone := make(chan bool, 1)
+	go killSlotWhileCopying(t, srcDB, slot, stopKill, killerDone)
 
 	res1, err1 := engine.Run(ctx, engine.Options{
 		Store: store, JobID: jobID, Actor: control.ActorCLI,
 		IdleAfter: 3 * time.Second, // 破坏失败时这一轮会正常跑完 → 下面按「没测到」处理
 	})
 	close(stopKill)
-	if err1 == nil {
-		t.Fatalf("书签被删掉之后这一轮必须失败，却成功收尾了（阶段 %s）；"+
-			"这说明破坏动作没落在快照窗口里，用例没测到 E3001", res1.Phase)
+	// **必须等破坏 goroutine 真的退出**再开第二轮：它最后一拍可能删掉第二轮刚建的书签，
+	// 那样第二轮会以「can no longer get changes from replication slot」失败——用例
+	// 变成在测自己制造的竞态（本地已经踩过一次）。
+	if !<-killerDone {
+		t.Fatalf("没能在快照窗口里删掉书签：用例没测到 E3001（引擎错误：%v）", err1)
 	}
-	select {
-	case ok := <-dropped:
-		if !ok {
-			t.Fatalf("没能在快照窗口里删掉书签：用例没测到 E3001（引擎错误：%v）", err1)
-		}
-	default:
+	if err1 == nil {
+		t.Fatalf("书签被删掉之后这一轮必须失败，却成功收尾了（阶段 %s）", res1.Phase)
 	}
 	if ev := events.wait(5*time.Second, func(e control.Event) bool {
 		return e.Type == "error" && e.Code == "E3001"
@@ -112,6 +110,17 @@ func TestResyncRebuildsBrokenBookmarkAndCatchesUp(t *testing.T) {
 		IdleAfter: 2 * time.Second,
 	})
 	if err2 != nil {
+		// 失败时把诊断打出来：位点与书签是这条能力的全部依据。
+		t.Logf("_jl_meta: phase=%q position=%q", metaScalar(t, dstDB, "phase", job.JobKey), metaScalar(t, dstDB, "position", job.JobKey))
+		var restart, confirmed, status string
+		var active bool
+		if qerr := srcDB.QueryRow(ctx, `SELECT COALESCE(restart_lsn::text,''), COALESCE(confirmed_flush_lsn::text,''),
+			COALESCE(wal_status,''), active FROM pg_replication_slots WHERE slot_name=$1`, slot).
+			Scan(&restart, &confirmed, &status, &active); qerr != nil {
+			t.Logf("读书签 %s 状态失败：%v", slot, qerr)
+		} else {
+			t.Logf("书签 %s: restart=%s confirmed=%s status=%s active=%v", slot, restart, confirmed, status, active)
+		}
 		t.Fatalf("--resync 应该能自己修好这一轮，得到错误：%v（阶段 %s）", err2, res2.Phase)
 	}
 	if res2.ExitCode != engine.ExitOK {
@@ -189,22 +198,34 @@ func TestResyncRebuildsBrokenBookmarkAndCatchesUp(t *testing.T) {
 		doneAt.Sub(t0).Truncate(time.Millisecond),
 		res2.Elapsed.Truncate(time.Millisecond))
 
-	// 留痕：谁触发、重建了哪个书签、清了哪些表，必须能在审计里查到。
-	entries, err := store.ListAuditByAction(ctx, "job.resync", 10)
+	// 留痕分两段，各说事实：
+	//   job.resync         —— 谁触发、哪个书签、旧位点、**计划**清哪些表（planned_tables）；
+	//   job.resync.cleared —— **实际**清了哪些表（清完才写）。
+	intent, err := store.ListAuditByAction(ctx, "job.resync", 10)
 	if err != nil {
 		t.Fatalf("读审计失败：%v", err)
 	}
-	if len(entries) != 1 {
-		t.Fatalf("应有一条 job.resync 审计，得到 %d 条", len(entries))
+	if len(intent) != 1 {
+		t.Fatalf("应有一条 job.resync（意图）审计，得到 %d 条", len(intent))
 	}
-	// 「谁触发」是 audit 的 actor 列；「重建哪个书签、清了哪些表、从哪个位点」在 detail 里。
-	if entries[0].Actor != control.ActorCLI {
-		t.Fatalf("审计的 actor 应是 %q（谁触发的），得到 %q", control.ActorCLI, entries[0].Actor)
+	if intent[0].Actor != control.ActorCLI {
+		t.Fatalf("审计的 actor 应是 %q（谁触发的），得到 %q", control.ActorCLI, intent[0].Actor)
 	}
-	detail := entries[0].Detail
-	for _, want := range []string{slot, table, "postgres:", "cleared_tables"} {
-		if !strings.Contains(detail, want) {
-			t.Fatalf("审计 detail 里缺 %q（重建哪个书签、清了哪些表、旧位点都要有）：%s", want, detail)
+	for _, want := range []string{slot, table, "postgres:", "planned_tables"} {
+		if !strings.Contains(intent[0].Detail, want) {
+			t.Fatalf("意图审计 detail 里缺 %q（哪个书签、计划清哪些表、旧位点都要有）：%s", want, intent[0].Detail)
+		}
+	}
+	cleared, err := store.ListAuditByAction(ctx, "job.resync.cleared", 10)
+	if err != nil {
+		t.Fatalf("读审计失败：%v", err)
+	}
+	if len(cleared) != 1 {
+		t.Fatalf("应有一条 job.resync.cleared（实清）审计，得到 %d 条", len(cleared))
+	}
+	for _, want := range []string{slot, table, "cleared_tables"} {
+		if !strings.Contains(cleared[0].Detail, want) {
+			t.Fatalf("实清审计 detail 里缺 %q：%s", want, cleared[0].Detail)
 		}
 	}
 }
@@ -214,17 +235,20 @@ func TestResyncRebuildsBrokenBookmarkAndCatchesUp(t *testing.T) {
 // 为什么用轮询而不是「在某个钩子里删」：我们要复现的是**外部**把一个正在用的书签
 // 删掉（DBA/清理脚本），让它从外面发生才作数。整个快照期间会反复尝试：
 // 删成功一次就够，之后删不到（书签已不存在）也无所谓。
-func killSlotWhileCopying(t *testing.T, conn *pgx.Conn, slot string, stop <-chan struct{}, dropped chan<- bool) {
+func killSlotWhileCopying(t *testing.T, conn *pgx.Conn, slot string, stop <-chan struct{}, done chan<- bool) {
 	tick := time.NewTicker(2 * time.Millisecond)
 	defer tick.Stop()
 	reported := false
+	// 无论从哪条路返回，都必须告诉调用方「我已经不再删了」。
+	defer func() {
+		select {
+		case done <- reported:
+		default:
+		}
+	}()
 	for {
 		select {
 		case <-stop:
-			select {
-			case dropped <- reported:
-			default:
-			}
 			return
 		case <-tick.C:
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -245,10 +269,6 @@ func killSlotWhileCopying(t *testing.T, conn *pgx.Conn, slot string, stop <-chan
 			cancel()
 			if reported {
 				// 已经删掉了：不再重试（后面 Prepare 不会再建，直到下一轮 --resync）。
-				select {
-				case dropped <- true:
-				default:
-				}
 				return
 			}
 		}
@@ -463,4 +483,162 @@ func TestResyncContinuousReanchorsBookmarkOnly(t *testing.T) {
 	if n != 0 {
 		t.Fatalf("continuous 不该搬存量，目标端却有 %d 行", n)
 	}
+}
+
+// Owl II 必改 1 的判据：`--resync` 必须**先问「这张表能不能清」，再动位点与书签**。
+//
+// 复现路径（`on_exists: append` + 目标表是用户自己的 + 上次全量已搬完）：
+// 旧实现里 `ClearProgress` + `Prepare(Snapshot)` 先把位点和旧书签毁掉，直到
+// `snapshot() → cleanBeforeRecopy → recopyAction` 才因为「不是本任务建的表」停下。
+// 留下的是「位点没了 + 旧书签没了 + 表一行没清」——用户再跑一次会被判 `copySkip`
+// 直接进流，(旧位点, 新起点] 永久跳过且不报错。
+//
+// 判据：失败发生在清位点之前 —— position 与书签 confirmed_flush_lsn **逐字节相等**，
+// 且这条失败是响亮的（runs 里 last_error 点名表），现场可直接重试。
+func TestResyncRefusesUserTableBeforeTouchingPosition(t *testing.T) {
+	srcDSN, dstDSN := dsns(t)
+	srcDB := mustConn(t, srcDSN)
+	dstDB := mustConn(t, dstDSN)
+	ctx := context.Background()
+	const table = "resync_user_table"
+
+	exec(t, srcDB, "DROP TABLE IF EXISTS "+table)
+	exec(t, srcDB, "CREATE TABLE "+table+" (id bigint PRIMARY KEY, payload text NOT NULL)")
+	exec(t, srcDB, fmt.Sprintf("INSERT INTO %s SELECT g, 'r'||g FROM generate_series(1,2000) g", table))
+	exec(t, dstDB, "DROP TABLE IF EXISTS "+table)
+	exec(t, dstDB, "DROP TABLE IF EXISTS _jl_meta, _jl_chunk, _jl_lease, _jl_object, _jl_instance")
+	// **用户自己建的表**（不是本任务建的）：append 模式会复用它，`_jl_object` 里没有登记。
+	exec(t, dstDB, "CREATE TABLE "+table+" (id bigint PRIMARY KEY, payload text NOT NULL)")
+
+	store, jobID := resyncJob(t, srcDSN, dstDSN, "resync-user-table", table, 1000)
+	job, err := store.GetJob(ctx, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	slot, err := state.ObjectName("slot", job.JobKey, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = srcDB.Exec(context.Background(), `SELECT pg_drop_replication_slot($1) WHERE EXISTS
+			(SELECT 1 FROM pg_replication_slots WHERE slot_name=$1)`, slot)
+	})
+
+	// 先正常搬一轮：块标记 Done 齐（所以 --resync 的 CleanNames 里有这张表）。
+	if _, err := engine.Run(ctx, engine.Options{
+		Store: store, JobID: jobID, Actor: control.ActorCLI, IdleAfter: 1 * time.Second,
+	}); err != nil {
+		t.Fatalf("先正常搬一轮应该成功：%v", err)
+	}
+	if ours, err := tableOwnedByJob(ctx, store, jobID, dstDB, table); err != nil || ours {
+		t.Fatalf("前提：目标表必须是用户自己的（_jl_object 无登记），得到 ours=%v err=%v", ours, err)
+	}
+
+	posBefore := metaScalar(t, dstDB, "position", job.JobKey)
+	phaseBefore := metaScalar(t, dstDB, "phase", job.JobKey)
+	slotBefore := slotConfirmed(t, srcDB, slot)
+	if posBefore == "" || slotBefore == "" {
+		t.Fatalf("前提：应已有位点与书签 confirmed（pos=%q slot=%q）", posBefore, slotBefore)
+	}
+
+	// --resync 必须在这里停下，且**位点与书签都没动**。
+	_, errResync := engine.Run(ctx, engine.Options{
+		Store: store, JobID: jobID, Actor: control.ActorCLI, Resync: true, IdleAfter: 1 * time.Second,
+	})
+	if errResync == nil {
+		t.Fatal("目标表是用户自己的，--resync 必须停下（不能先毁位点再问）")
+	}
+	if !strings.Contains(errResync.Error(), table) {
+		t.Fatalf("失败文案要点名这张表，得到：%v", errResync)
+	}
+
+	if got := metaScalar(t, dstDB, "position", job.JobKey); got != posBefore {
+		t.Fatalf("失败发生在清位点之前，position 必须逐字节不变：%q → %q", posBefore, got)
+	}
+	if got := metaScalar(t, dstDB, "phase", job.JobKey); got != phaseBefore {
+		t.Fatalf("失败发生在改阶段之前，phase 必须不变：%q → %q", phaseBefore, got)
+	}
+	if got := slotConfirmed(t, srcDB, slot); got != slotBefore {
+		t.Fatalf("旧书签必须原样（没被 drop/重建）：confirmed %q → %q", slotBefore, got)
+	}
+	// 目标表一行都不能少（没被清过）。
+	var n int64
+	if err := dstDB.QueryRow(ctx, "SELECT count(*) FROM "+table).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 2000 {
+		t.Fatalf("表不该被动过：应仍是 2000 行，得到 %d", n)
+	}
+
+	// 失败必须落在 runs 里（历史页要看得到），并点名表。
+	runs, err := store.ListRuns(ctx, jobID, 5)
+	if err != nil {
+		t.Fatalf("读运行历史失败：%v", err)
+	}
+	if len(runs) == 0 {
+		t.Fatal("应有一条失败的 run")
+	}
+	last := runs[0]
+	if last.EndedAt == "" {
+		t.Fatalf("这条 run 应该已经收尾：%+v", last)
+	}
+	if !strings.Contains(last.LastError, table) {
+		t.Fatalf("runs.last_error 要点名这张表，得到 %q", last.LastError)
+	}
+
+	// 现场可以直接重试：位点还在，普通 run 必须能接着跑（不会把一段变更静默跳过）。
+	if _, err := engine.Run(ctx, engine.Options{
+		Store: store, JobID: jobID, Actor: control.ActorCLI, IdleAfter: 1 * time.Second,
+	}); err != nil {
+		t.Fatalf("失败之后现场应可重试（位点与书签都还在），得到：%v", err)
+	}
+	t.Logf("append + 用户表：--resync 在清位点前停下，position %q 与书签 %q 原样", posBefore, slotBefore)
+}
+
+// tableOwnedByJob 查目标表是不是本任务建的（读 _jl_object，与 DidCreateTable 同源）。
+func tableOwnedByJob(ctx context.Context, store *control.Store, jobID string,
+	dstDB *pgx.Conn, table string) (bool, error) {
+	job, err := store.GetJob(ctx, jobID)
+	if err != nil {
+		return false, err
+	}
+	var n int
+	err = dstDB.QueryRow(ctx,
+		`SELECT count(*) FROM _jl_object WHERE object_name=$1 AND job_key=$2 AND dropped_at IS NULL`,
+		"table:public."+table, job.JobKey).Scan(&n)
+	return n > 0, err
+}
+
+// metaScalar 读 _jl_meta 某一列（position/phase），空值返回 ""。
+func metaScalar(t *testing.T, conn *pgx.Conn, column, jobKey string) string {
+	t.Helper()
+	var v *string
+	q := fmt.Sprintf(`SELECT %s::text FROM _jl_meta WHERE job_key=$1`, column)
+	if err := conn.QueryRow(context.Background(), q, jobKey).Scan(&v); err != nil {
+		if strings.Contains(err.Error(), "no rows") {
+			return ""
+		}
+		t.Fatalf("读 _jl_meta.%s 失败: %v", column, err)
+	}
+	if v == nil {
+		return ""
+	}
+	return *v
+}
+
+// slotConfirmed 读源端书签的 confirmed_flush_lsn（缺失/空返回 ""）。
+func slotConfirmed(t *testing.T, conn *pgx.Conn, slot string) string {
+	t.Helper()
+	var v *string
+	if err := conn.QueryRow(context.Background(),
+		`SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name=$1`, slot).Scan(&v); err != nil {
+		if strings.Contains(err.Error(), "no rows") {
+			return ""
+		}
+		t.Fatalf("读书签 %s 失败: %v", slot, err)
+	}
+	if v == nil {
+		return ""
+	}
+	return *v
 }

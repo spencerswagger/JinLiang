@@ -79,8 +79,10 @@ func TestApplyResyncForcesFreshCopyAndKeepsCleanListNarrow(t *testing.T) {
 	if rep == nil || rep.OldPosition != "postgres:v1:0/1A2B3C" || rep.OldPhase != "streaming" {
 		t.Fatalf("报告要留住「从哪重建」：%+v", rep)
 	}
-	if strings.Join(rep.Tables, ",") != "a,b" {
-		t.Fatalf("报告里的清表名单要跟 plan 一致，得到 %v", rep.Tables)
+	// 报告里的 Tables 是**实清**结果，此刻一张都还没清（清表发生在 snapshot 里）。
+	// 计划清单只在 plan.CleanNames / 审计的 planned_tables 里，不许混。
+	if len(rep.Tables) != 0 {
+		t.Fatalf("还没清表，报告就不许有「已清」的表：%v", rep.Tables)
 	}
 }
 

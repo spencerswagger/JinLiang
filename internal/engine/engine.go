@@ -313,6 +313,8 @@ type runner struct {
 	resyncReport *ResyncReport
 	// snapshotDone 只用于 `--resync` 的收尾断言：说了整轮重搬就必须真的搬过。
 	snapshotDone bool
+	// clearedTables 是**真的清空过**的表（cleanBeforeRecopy 每清成一张追加一条）。
+	clearedTables []string
 
 	rowsCopied int64
 	rowsStream int64
@@ -849,6 +851,14 @@ func (r *runner) prepare(ctx context.Context) error {
 	r.plan = plan
 	r.needSnapshot = plan.Kind != copySkip
 	if r.opt.Resync {
+		// **先问「这几张表能不能清」，再动任何东西**。清位点、重建书签、清表是三步
+		// 破坏性动作；把「不是本任务建的表」这种需要用户决定的失败留到最后一步，
+		// 就等于先把位点和书签毁了再停下：位点没了、旧书签没了、表一行没清，用户
+		// 「再跑一次」会被判成 copySkip 直接进流，把 (旧位点, 新起点] 永久跳过且
+		// 不报错——他明明要的是整轮重搬，代码却替他做了「接受空洞」的决定。
+		if err := r.precheckResyncTables(ctx, plan); err != nil {
+			return err
+		}
 		// 清位点必须在 src.Prepare 之前、更要在清表之前：
 		//   - 在 EnsureMeta 之前：它的 position 是 COALESCE 语义，晚清会被写回的旧位点盖掉；
 		//   - 在清表之前：清表发生在 snapshot()。反过来（先清表、后清位点）一旦崩在中间，
@@ -856,7 +866,9 @@ func (r *runner) prepare(ctx context.Context) error {
 		if err := r.sink.ClearProgress(ctx); err != nil {
 			return fmt.Errorf("清位点失败，已停下（目标表一行都没动）: %w", err)
 		}
-		if err := r.auditResync(ctx); err != nil {
+		// 审计写的是**计划**（planned_tables）：真正清完哪些表另有一条
+		// job.resync.cleared，别把计划当已完成报告。
+		if err := r.auditResync(ctx, plan.CleanNames); err != nil {
 			return err
 		}
 		// continuous 没有存量：--resync 的动作全在「换一条书签」上。
@@ -1027,6 +1039,13 @@ func (r *runner) snapshot(ctx context.Context) error {
 		if err := r.cleanBeforeRecopy(ctx); err != nil {
 			return err
 		}
+		if r.opt.Resync {
+			// 报告与「实清」审计都在这里定稿：清完才填，不拿计划冒充结果。
+			r.resyncReport.Tables = r.clearedTables
+			if err := r.auditResyncCleared(ctx); err != nil {
+				return err
+			}
+		}
 		// 开始一次新的搬：**清块标记 + 推位点，同一个事务**（pgsink.StartFreshCopy）。
 		// 分两次写、还先推位点的话，中间崩一次会留下「新位点 + 上一轮的块标记」，
 		// 下次被判成续跑：旧游标接着搬、增量从新位点重放 → (旧位点,新位点] 的
@@ -1109,6 +1128,7 @@ func (r *runner) cleanBeforeRecopy(ctx context.Context) error {
 	if r.plan.Clean == cleanNone || len(r.plan.CleanNames) == 0 {
 		return nil
 	}
+	cleared := make([]string, 0, len(r.plan.CleanNames))
 	for _, name := range r.plan.CleanNames {
 		ref, ok := r.tableByName(name)
 		if !ok {
@@ -1122,10 +1142,13 @@ func (r *runner) cleanBeforeRecopy(ctx context.Context) error {
 		if err := r.sink.ResetTableChunks(ctx, r.targetRef(ref)); err != nil {
 			return fmt.Errorf("清空 %s 准备重搬失败: %w", name, err)
 		}
+		cleared = append(cleared, name)
 		// 说清维护窗口的形状：清完到搬完之间，目标端是**部分数据**，不是「旧但完整」。
 		r.note(ctx, "清空了 "+name+" 里上次搬进去的行（重搬全量，避免留下源端已删除的行）；"+
 			"从这一刻到这张表搬完之前，目标端是部分数据，不是旧但完整的快照")
 	}
+	// 「实际清了哪些表」只在这里定稿：计划可以失败一半，报告不能替它圆场。
+	r.clearedTables = cleared
 	return nil
 }
 
