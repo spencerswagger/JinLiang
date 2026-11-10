@@ -100,6 +100,7 @@ func newJob(t *testing.T, src, dst, jobName, table string) (*control.Store, stri
 	if err != nil {
 		t.Fatalf("建任务失败: %v", err)
 	}
+	trackJobSlots(t, src, store, job.ID)
 	return store, job.ID
 }
 
@@ -115,6 +116,56 @@ func cfgOf(t *testing.T, dsn string) *pgx.ConnConfig {
 		t.Fatalf("DSN 解析失败: %v", err)
 	}
 	return cfg
+}
+
+// trackJobSlots 在用例收尾时回收这条任务建的逻辑书签。
+//
+// 为什么必须回收：逻辑书签是**实例级**资源（max_replication_slots，PG 默认 10），
+// 而一轮 engine 集成用例会建 6~10 个书签。只要有一条用例不回收，同一轮里靠后的用例
+// 就会撞 "all replication slots are in use (SQLSTATE 53400)"，下一轮更是从第一条就开始红。
+// 这就是「整包跑红、单条单跑绿」的真正来源——不是用例之间顺序依赖，是资源没还。
+func trackJobSlots(t *testing.T, srcDSN string, store *control.Store, jobID string) {
+	t.Helper()
+	conn := mustConn(t, srcDSN)
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		job, err := store.GetJob(ctx, jobID)
+		if err != nil {
+			return // 用例自己把任务删了：没有书签要清
+		}
+		dropSlotsLike(ctx, conn, "jl_"+job.JobKey+"%")
+	})
+}
+
+// dropSlotsLike 删掉名字匹配的书签；占着书签的读者先踢掉（测试收尾时它一定是废弃进程）。
+// 尽力而为：清不掉只记日志，不用清理失败改写用例结论。
+func dropSlotsLike(ctx context.Context, conn *pgx.Conn, pattern string) {
+	rows, err := conn.Query(ctx,
+		`SELECT slot_name, active_pid FROM pg_replication_slots WHERE slot_name LIKE $1`, pattern)
+	if err != nil {
+		return
+	}
+	type slot struct {
+		name string
+		pid  *int
+	}
+	var slots []slot
+	for rows.Next() {
+		var s slot
+		if rows.Scan(&s.name, &s.pid) == nil {
+			slots = append(slots, s)
+		}
+	}
+	rows.Close()
+	for _, s := range slots {
+		if s.pid != nil {
+			if _, err := conn.Exec(ctx, `SELECT pg_terminate_backend($1)`, *s.pid); err == nil {
+				time.Sleep(200 * time.Millisecond) // 等后端真的退干净
+			}
+		}
+		_, _ = conn.Exec(ctx, `SELECT pg_drop_replication_slot($1)`, s.name)
+	}
 }
 
 // 这是 Owl 要的那条可证伪用例：目标端**预置 3 行**（用户自己的表，append 模式复用它）
@@ -507,6 +558,7 @@ func intervalJob(t *testing.T, srcDSN, dstDSN, name, table, lookback string) (*c
 	if err != nil {
 		t.Fatalf("建任务失败: %v", err)
 	}
+	trackJobSlots(t, srcDSN, store, job.ID)
 	return store, job.ID
 }
 
@@ -816,6 +868,7 @@ func continuousJob(t *testing.T, srcDSN, dstDSN, name, table string) (*control.S
 	if err != nil {
 		t.Fatalf("建任务失败: %v", err)
 	}
+	trackJobSlots(t, srcDSN, store, job.ID)
 	return store, job.ID
 }
 
@@ -1146,6 +1199,7 @@ func onceJobSingleTable(t *testing.T, srcDSN, dstDSN, name, table string) (*cont
 	if err != nil {
 		t.Fatalf("建任务失败: %v", err)
 	}
+	trackJobSlots(t, srcDSN, store, job.ID)
 	return store, job.ID
 }
 
