@@ -230,7 +230,7 @@ YAML
     python3 "$GC" recopy --scope whole --copied "$copied" --label "kill -9 重启（整轮口径）" || return 1
     s_fp=$(fp_mysql "$T"); d_fp=$(fp_pg "$dst" "$T")
     python3 "$GC" fp --src "$s_fp" --dst "$d_fp" --label "kill -9 重启后" || { echo "  源 $s_fp / 目标 $d_fp"; return 1; }
-    extra="$extra kill=recopy-${copied}-rows restart_seconds=${restart_seconds}s"
+    extra="$extra kill=recopy-${copied}-rows"
   fi
 
   local n; n=$(pgq "$dst" "SELECT count(*) FROM $T")
