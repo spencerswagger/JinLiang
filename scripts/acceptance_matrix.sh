@@ -271,20 +271,28 @@ YAML
   runbin run --job acc-pg-mysql --data-dir "$data" >"$W/run1.log" 2>&1
   rc=$?
   t1=$(now_s); secs=$(elapsed "$t0" "$t1")
+  mark "pg→mysql 全量结束 rc=$rc 用时=${secs}s"
   [ $rc -eq 0 ] || { echo "FAIL: 全量退出码 $rc"; tail -5 "$W/run1.log"; return 1; }
 
   s_fp=$(fp_pg "$src" "$T"); d_fp=$(fp_mysql "$T")
   python3 "$GC" fp --src "$s_fp" --dst "$d_fp" --label "pg→mysql 全量" || { echo "  源 $s_fp / 目标 $d_fp"; return 1; }
 
-  # 增量必须**明确拒绝**（不静默降级成「只搬一次」）
+  # 增量必须**明确拒绝**（不静默降级成「只搬一次」）。
+  # 判据不看具体文案（拒绝的原因有多种：目标端没接增量路径、源库没开逻辑变更流、模式不支持…），
+  # 只看两件可证伪的事：① 退出码非 0；② 目标端行数一行没多。
+  local before_n after_n reason
+  before_n=$(myq "SELECT COUNT(*) FROM \`$T\`")
   sed 's/frequency: once/frequency: continuous+initial/' "$job" > "$W/job2.yaml"
-  "$BIN" import --file "$W/job2.yaml" --data-dir "$data" >/dev/null 2>&1 || true
+  timeout 120 "$BIN" import --file "$W/job2.yaml" --data-dir "$data" >/dev/null 2>&1 || true
   if runbin run --job acc-pg-mysql --data-dir "$data" >"$W/incr.log" 2>&1; then
-    echo "FAIL: PG→MySQL 增量居然跑了（本版应明确拒绝）"; tail -3 "$W/incr.log"; return 1
+    echo "FAIL: PG→MySQL 增量居然跑成功了（本版应明确拒绝）"; tail -3 "$W/incr.log"; return 1
   fi
-  grep -q "只搬全量\|还没接上" "$W/incr.log" || { echo "FAIL: 增量被拒但没说清原因"; tail -3 "$W/incr.log"; return 1; }
+  after_n=$(myq "SELECT COUNT(*) FROM \`$T\`")
+  python3 "$GC" rows --src "$before_n" --dst "$after_n" --expect "$before_n" --label "增量被拒后行数不变" || return 1
+  reason=$(grep -oE "只搬全量|还没接上|只支持全量|没开逻辑变更流|定时增量" "$W/incr.log" | head -1)
+  [ -n "$reason" ] || { echo "FAIL: 增量被拒但日志里没有一句原因"; tail -5 "$W/incr.log"; return 1; }
 
-  n=$(myq "SELECT COUNT(*) FROM \`$T\`")
+  n=$after_n
   emit "postgres-mysql" "$n" "${s_fp#*:}" "$secs" pass "mysql=$ver incremental=refused"
 }
 
@@ -327,19 +335,25 @@ YAML
   runbin run --job acc-mysql-mysql --data-dir "$data" >"$W/run1.log" 2>&1
   rc=$?
   t1=$(now_s); secs=$(elapsed "$t0" "$t1")
+  mark "mysql→mysql 全量结束 rc=$rc 用时=${secs}s"
   [ $rc -eq 0 ] || { echo "FAIL: 全量退出码 $rc"; tail -5 "$W/run1.log"; return 1; }
 
   d_fp=$(fp_mysql "$T")
   python3 "$GC" fp --src "$s_fp" --dst "$d_fp" --label "mysql→mysql 全量" || { echo "  源 $s_fp / 目标 $d_fp"; return 1; }
 
+  local before_n after_n reason
+  before_n=$(myq "SELECT COUNT(*) FROM \`$T\`")
   sed 's/frequency: once/frequency: continuous+initial/' "$job" > "$W/job2.yaml"
-  "$BIN" import --file "$W/job2.yaml" --data-dir "$data" >/dev/null 2>&1 || true
+  timeout 120 "$BIN" import --file "$W/job2.yaml" --data-dir "$data" >/dev/null 2>&1 || true
   if runbin run --job acc-mysql-mysql --data-dir "$data" >"$W/incr.log" 2>&1; then
-    echo "FAIL: MySQL→MySQL 增量居然跑了（本版应明确拒绝）"; tail -3 "$W/incr.log"; return 1
+    echo "FAIL: MySQL→MySQL 增量居然跑成功了（本版应明确拒绝）"; tail -3 "$W/incr.log"; return 1
   fi
-  grep -q "只搬全量\|还没接上\|只支持全量" "$W/incr.log" || { echo "FAIL: 增量被拒但没说清原因"; tail -3 "$W/incr.log"; return 1; }
+  after_n=$(myq "SELECT COUNT(*) FROM \`$T\`")
+  python3 "$GC" rows --src "$before_n" --dst "$after_n" --expect "$before_n" --label "增量被拒后行数不变" || return 1
+  reason=$(grep -oE "只搬全量|还没接上|只支持全量|没开逻辑变更流|定时增量" "$W/incr.log" | head -1)
+  [ -n "$reason" ] || { echo "FAIL: 增量被拒但日志里没有一句原因"; tail -5 "$W/incr.log"; return 1; }
 
-  n=$(myq "SELECT COUNT(*) FROM \`$T\`")
+  n=$after_n
   emit "mysql-mysql" "$n" "${s_fp#*:}" "$secs" pass "mysql=$ver incremental=refused"
 }
 

@@ -17,9 +17,11 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BASE="$ROOT/.localdb"
 PGBIN=${PGBIN:-/usr/lib/postgresql/17/bin}
 MYBASE=${MYBASE:-/.toolchain/mysql}
-PGPORT=${PGPORT:-55432}
-MYPORT=${MYPORT:-53306}
-MYPORT2=${MYPORT2:-53307}
+# 端口再挪开一档：宿主网络是多个 agent 共用的，55432/53306 这一组也被别人占过
+# （撞上别人的实例比连不上更难查：库名对不上、wal_level 是 replica，报错还指向别处）。
+PGPORT=${PGPORT:-55442}
+MYPORT=${MYPORT:-53316}
+MYPORT2=${MYPORT2:-53317}
 ENVF="$BASE/stack.env"
 
 log() { printf '[stack] %s\n' "$*" >&2; }
@@ -52,7 +54,15 @@ pg_up() {
     "$PGBIN/psql" "postgres://jinliang@127.0.0.1:$PGPORT/postgres" -tAc "select 1 from pg_database where datname='$db'" 2>/dev/null | grep -q 1 \
       || "$PGBIN/createdb" -h 127.0.0.1 -p "$PGPORT" -U jinliang "$db"
   done
-  log "pg :$PGPORT wal_level=$("$PGBIN/psql" "postgres://jinliang@127.0.0.1:$PGPORT/postgres" -tAc 'show wal_level')"
+  local wl
+  wl=$("$PGBIN/psql" "postgres://jinliang@127.0.0.1:$PGPORT/postgres" -tAc 'show wal_level' 2>/dev/null)
+  # 端口上「有人应答」不等于「应答的是我的库」：撞到别人的实例时，最典型的症状就是
+  # wal_level 不是 logical（于是 PG→* 的增量直接报「源库没开逻辑变更流」）。
+  if [ "$wl" != "logical" ]; then
+    log "PG :$PGPORT 上不是本栈的库（wal_level=$wl）——端口被别的实例占了，换 PGPORT 再来"
+    exit 1
+  fi
+  log "pg :$PGPORT wal_level=$wl"
 }
 
 my_ping() { "$MYBASE/bin/mysqladmin" --socket="$1/mysqld.sock" -uroot ping >/dev/null 2>&1; }
