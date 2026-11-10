@@ -381,6 +381,11 @@ type runner struct {
 	// 那条分支会「查所有权 → 清空表 + 清块标记 → 从表头重读」，正是契约 §1.6 步 2–3 要的。
 	// 只清块标记是不够的：`BulkApply` 只有 upsert，不清表的话暂停窗口里被删掉的行会留下来。
 	forceRecopy map[string]source.TableRef
+	// recopyRecords 记住「欠一次重搬」那些表当时的暂停记录：重搬前要先摘记录
+	// （目标端的最后一道防线会拦住暂停表的写入），失败时要还原。
+	recopyRecords map[string]pgsink.PausedTable
+	// recopyFinished 表示这一轮的重搬已经收尾（记录已按契约解除）。哨兵据此决定要不要还原。
+	recopyFinished bool
 	// skippedTables 是「本轮结构对不上、连存量也不搬」的表（prepare 期发现的）。
 	// 它们仍在 r.tables 里（跨轮存活判据要它），但不进 copy plan 的搬运名单。
 	skippedTables map[string]bool
@@ -643,9 +648,10 @@ func posString(p source.Position) string {
 // 返回 nil 表示可以清；返回错误表示必须停下（原因随 recopyReason 走）。
 func (r *runner) recopyAction(ctx context.Context, ref source.TableRef, why recopyReason) error {
 	// 查的是**目标端**的表（对象登记按目标 schema 记），报错里说源端表名。
-	ours, err := r.sink.DidCreateTable(ctx, r.targetRef(ref))
+	// 两种目标端都要能问：PG 是 pgsink、MySQL 是 mysqlsink（都实现了 DidCreateTable）。
+	ours, err := r.didCreateTable(ctx, r.targetRef(ref))
 	if err != nil {
-		return fmt.Errorf("查不到目标表 %s 是谁建的（读 _jl_object 失败）: %w", ref.Table, err)
+		return fmt.Errorf("查不到目标表 %s 是谁建的（读对象登记失败）: %w", ref.Table, err)
 	}
 	if ours {
 		return nil
@@ -675,6 +681,25 @@ func (r *runner) recopyOne(ctx context.Context, ref source.TableRef) error {
 		r.note(ctx, ref.Table+" 没有稳定的主键，只能整表重来（不清其它表）")
 	}
 	return nil
+}
+
+// didCreateTable 问「这张目标表是不是本任务建的」——PG / MySQL 目标端都要能回答。
+//
+// 清表的所有权判据只能走这一条：拿不到答案时**返回错误**（让调用方停下来问），
+// 不许默认 true（那会删用户的数据），也不许默认 false（那会让重搬永远做不成）。
+func (r *runner) didCreateTable(ctx context.Context, ref source.TableRef) (bool, error) {
+	type owner interface {
+		DidCreateTable(context.Context, source.TableRef) (bool, error)
+	}
+	switch {
+	case r.sink != nil:
+		return r.sink.DidCreateTable(ctx, ref)
+	case r.gsink != nil:
+		if o, ok := r.gsink.(owner); ok {
+			return o.DidCreateTable(ctx, ref)
+		}
+	}
+	return false, fmt.Errorf("目标端（%s）没有「谁建的表」这项能力，无法判断能不能清空重搬", r.tgtEP.Kind)
 }
 
 // recopyReason 说清「为什么要清这张表」——文案必须跟着原因走。
@@ -1139,11 +1164,18 @@ func (r *runner) reconcilePaused(ctx context.Context) error {
 	if len(rec) == 0 {
 		return nil
 	}
-	// `StoredJobHash` **不在** `pauseRegistry` 里（mysqlsink 也还没有这个方法）：
-	// 片 C 真正要补的是它，不是「把那三行绑定放回来」。今天只有 PG 路径调这里。
-	stored, err := r.sink.StoredJobHash(ctx)
-	if err != nil {
-		return fmt.Errorf("读任务指纹失败: %w", err)
+	// `StoredJobHash` 是**可选**能力：MySQL 目标端（Data 的 PauseRegistry）还没有这个方法。
+	// 没有它就按「同一个任务」处理——代价只是「改了 job_hash 之后旧记录不会自动出清」，
+	// 比「因为读不到指纹就把所有暂停记录当出范围清掉」安全得多。
+	stored := ""
+	if h, ok := reg.(interface {
+		StoredJobHash(context.Context) (string, error)
+	}); ok {
+		h2, err := h.StoredJobHash(ctx)
+		if err != nil {
+			return fmt.Errorf("读任务指纹失败: %w", err)
+		}
+		stored = h2
 	}
 	sameJob := stored == "" || stored == hashOf(r.doc)
 	inScope := map[string]bool{}

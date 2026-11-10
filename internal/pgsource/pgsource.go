@@ -1005,7 +1005,12 @@ func (s *Source) buildRelation(m *pglogrepl.RelationMessage) (*relation, error) 
 		if idx < len(ti.collations) {
 			coll = ti.collations[idx]
 		}
-		tbl.Columns = append(tbl.Columns, source.Column{Name: col.Name, Type: typ, Collation: coll})
+		// TypeOID 用 pgoutput 给的 DataType（**就是 pg_type.oid**）：这是「类型身份」，
+		// 比文本可靠——`int8`/`bigint`、`numeric`/`numeric(12,2)` 的文本差异全是噪音，
+		// 而「改成了 text」与「放宽 varchar 长度」在文本上都叫变化、语义却相反。
+		tbl.Columns = append(tbl.Columns, source.Column{
+			Name: col.Name, Type: typ, Collation: coll, TypeOID: int64(col.DataType),
+		})
 	}
 	rel.table = tbl
 	return rel, nil
