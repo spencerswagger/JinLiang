@@ -1727,7 +1727,13 @@ func (r *runner) stream(ctx context.Context, res *Result) error {
 		return nil
 	})
 	cancelStream()
+	// 先取后台提交的根因再 Flush：Flush 失败时用户看到的应该是「目标表没有唯一键」，
+	// 而不是重试途中的 `conn closed`（Owl II P2）。顺序反过来就会盖住根因。
+	cause := b.Err()
 	if err := b.Flush(context.Background()); err != nil {
+		if cause != nil {
+			return cause
+		}
 		return err
 	}
 	// 后台提交失败过：它是真正的原因，而 streamErr 只是被它 cancel 掉之后的
