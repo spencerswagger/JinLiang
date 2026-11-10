@@ -841,6 +841,12 @@ func (r *runner) prepare(ctx context.Context) error {
 		return err
 	}
 	r.src = src
+	// 暂停记录要在 interval 早退**之前**收口：interval 既不清表、也不走 Apply，
+	// 但用户对齐结构后改 interval 跑时，记录如果不在这里清掉，status 会一直显示「已暂停」
+	// 而数据其实在写——那种「界面与事实相反」最难查。
+	if err := r.reconcilePaused(ctx); err != nil {
+		return err
+	}
 	// interval 模式不做逻辑复制（没有书签、没有发布），只要一条普通读连接；
 	// 少建一个 slot 就等于少一份磁盘占用与一项权限要求。
 	if r.mode() == "interval" {
@@ -946,9 +952,9 @@ func (r *runner) prepare(ctx context.Context) error {
 		writePos, prep.SnapshotName); err != nil {
 		return err
 	}
-	// 本轮 prepare 结束前收口暂停记录：不成立的清掉、已经恢复的解除。
-	// 这样**一轮结束后 keys ⊆ 本轮表集合**，下一轮不会读到不归它管的记录。
-	return r.reconcilePaused(ctx)
+	// 收口已经在 openSource 之后、interval 早退之前做过一次（见上）；
+	// 这里不再重复，避免同一次 prepare 里跑两遍。
+	return nil
 }
 
 // reconcilePaused 收紧本轮的暂停记录。

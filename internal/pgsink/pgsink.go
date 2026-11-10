@@ -728,9 +728,13 @@ func compatibleType(have, want string) bool {
 		return false
 	}
 	if hargs == "" || wargs == "" {
-		// 任一端没写参数：目标端是「无界」就是宽，源端无界而目标有界则可能是窄。
-		// 无界的那端按最大处理：源端无界 / 目标有界 → 可能收窄 → 不兼容。
-		return wargs == ""
+		// 任一端没写参数（`numeric` / `timestamp` / `varchar` 的无界形态）：
+		// **无界按最大处理** → 只要目标端是无界的就一定装得下（return true）；
+		// 目标端有界、源端无界 → 可能收窄 → 不兼容（return false）。
+		//
+		// 这两句与注释是同一个意思，之前写反过一次：目标 `numeric(12,2)` / 源端无界
+		// `numeric` 被判成兼容 → PG 静默四舍五入、退出 0、数据已变形。
+		return hargs == ""
 	}
 	return !typeNarrowed(hb, hargs, wargs)
 }
@@ -1001,11 +1005,8 @@ func (s *Sink) Apply(ctx context.Context, evs []source.Event, pos source.Positio
 		if !s.isPausedLocked(ev.Table.Table) {
 			continue
 		}
-		detail := ""
-		if rec, ok := s.pausedCache[ev.Table.Table]; ok {
-			detail = rec.Detail
-		}
-		return &TablePausedError{TableName: ev.Table.Table, Detail: detail}
+		rec := s.pausedCache[ev.Table.Table]
+		return &TablePausedError{TableName: ev.Table.Table, Detail: rec.Detail, ReasonCode: rec.Reason}
 	}
 
 	tx, err := s.conn.Begin(ctx)
@@ -1324,6 +1325,9 @@ type TablePausedError struct {
 	TableName string
 	// Detail 说明这张表为什么还停着（对齐结构之后重跑才会解除）。
 	Detail string
+	// ReasonCode 是**登记时那条记录里的真实原因码**（type_changed / schema_drift）。
+	// 不带它的话 Reason() 恒为 type_changed，registerPause 会把 schema_drift 覆盖掉。
+	ReasonCode string
 }
 
 func (e *TablePausedError) Error() string {
@@ -1333,8 +1337,13 @@ func (e *TablePausedError) Error() string {
 	return fmt.Sprintf("表 %s 仍处于暂停状态：本批不写入，位点未推进", e.TableName)
 }
 
-// Reason 实现 PausableError。
-func (e *TablePausedError) Reason() string { return PauseReasonTypeChanged }
+// Reason 实现 PausableError：带登记时的真实原因码（缺省才退回 type_changed）。
+func (e *TablePausedError) Reason() string {
+	if e.ReasonCode != "" {
+		return e.ReasonCode
+	}
+	return PauseReasonTypeChanged
+}
 
 // Table 实现 PausableError。
 func (e *TablePausedError) Table() string { return e.TableName }

@@ -267,3 +267,27 @@ func TestSQLErrorWithoutConstraintName(t *testing.T) {
 		t.Fatalf("应保留码与消息: %s", got)
 	}
 }
+
+// compatibleType 的「无参数」分支：**无界按最大处理**。
+// 之前写反过一次：目标 numeric(12,2) / 源端无界 numeric 被判兼容 → PG 静默四舍五入、
+// 退出 0、数据已变形；反过来目标 timestamp(默认 6) / 源端 timestamp(6) 又判成假不兼容。
+func TestCompatibleTypeUnboundedArgs(t *testing.T) {
+	cases := []struct {
+		have, want string
+		ok         bool
+		why        string
+	}{
+		{"numeric", "numeric(12,3)", true, "目标无界装得下源端带参"},
+		{"numeric(12,2)", "numeric", false, "目标有界、源端无界 → 可能收窄 → 不兼容"},
+		{"timestamp", "timestamp(6)", true, "目标 timestamp(默认 6 位) 装得下 6 位"},
+		{"timestamp(0)", "timestamp(6)", false, "6 位进 0 位 → 截断微秒"},
+		{"varchar", "varchar(60)", true, "目标无长度上限"},
+		{"varchar(20)", "varchar(60)", false, "收窄"},
+		{"varchar(60)", "varchar(20)", true, "放宽放行"},
+	}
+	for _, c := range cases {
+		if got := compatibleType(c.have, c.want); got != c.ok {
+			t.Errorf("compatibleType(%q, %q) = %v，应为 %v（%s）", c.have, c.want, got, c.ok, c.why)
+		}
+	}
+}

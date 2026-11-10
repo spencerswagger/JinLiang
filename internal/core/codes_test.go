@@ -156,8 +156,15 @@ func TestSchemaMismatchSaysWholeRunStops(t *testing.T) {
 	if len(spec.Next) < 2 || len(spec.Next) > 3 {
 		t.Errorf("Next 要 1~3 步，得到 %d 步", len(spec.Next))
 	}
-	if !strings.Contains(spec.Next[2], "--accept-change") {
-		t.Errorf("「不想跟这张表」这一步要给出真实可执行的开关（--accept-change），得到 %q", spec.Next[2])
+	// **Next 里不许出现未实现的开关**：`--accept-change` 全仓没有实现过（cmdRun 的 flag
+	// 里没有它），写进去用户会拿到 `flag provided but not defined`——这正是 #78 清掉的那类假命令。
+	for _, n := range spec.Next {
+		if strings.Contains(n, "--accept-change") {
+			t.Fatalf("Next 里出现了未实现的开关：%q", n)
+		}
+	}
+	if !strings.Contains(spec.Next[2], "content.tables") {
+		t.Errorf("「不想跟这张表」要给一条真能走的动作（从 content.tables 去掉后重新 import），得到 %q", spec.Next[2])
 	}
 	if !strings.Contains(spec.Risk, "其它表也不会继续推进") {
 		t.Error("Risk 必须写明「其它表也不会继续推进」——位点只有一个，这是实际后果")
