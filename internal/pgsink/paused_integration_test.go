@@ -211,3 +211,78 @@ func TestApplyRefusesPausedTable(t *testing.T) {
 	}
 	t.Logf("暂停表写路径：另一个实例读回记录后整批拒绝、目标端 0 行")
 }
+
+// 老库补列：`_jl_meta` 是 #76 之前的列集合（没有 paused_tables），Open 之后必须补上，
+// 并且 PauseTable 真能写进去（不是「跑通没报错」）。
+//
+// 变异：把 `ADD COLUMN IF NOT EXISTS paused_tables` 那行注掉 → 这条必红。
+func TestOldStateTableGetsPausedColumn(t *testing.T) {
+	ctx := context.Background()
+	const schema = "paused_old"
+	table := "old_orders"
+	conn := openRaw(t)
+	for _, stmt := range []string{
+		"CREATE SCHEMA IF NOT EXISTS " + schema,
+		"DROP TABLE IF EXISTS " + schema + "." + table,
+		"DROP TABLE IF EXISTS " + schema + "._jl_meta",
+		// **旧列集合**：与 #76 之前完全一致（没有 paused_tables）
+		`CREATE TABLE ` + schema + `._jl_meta (
+			job_key        text PRIMARY KEY,
+			name           text NOT NULL,
+			instance_id    text NOT NULL,
+			schema_version int  NOT NULL DEFAULT 1,
+			job_hash       text NOT NULL DEFAULT '',
+			schema_hash    text,
+			phase          text NOT NULL,
+			position       text,
+			watermark      text,
+			snapshot_id    text,
+			started_at     timestamptz NOT NULL DEFAULT now(),
+			updated_at     timestamptz NOT NULL DEFAULT now()
+		)`,
+	} {
+		if _, err := conn.Exec(ctx, stmt); err != nil {
+			t.Fatalf("造老库失败（%s）: %v", stmt, err)
+		}
+	}
+	conn.Close(ctx)
+
+	// Open 会跑 ensureStateTables（生产里每条命令都经过它）
+	s := openSinkFor(t, pausedCatalogIn(schema, table), func(o *Options) {
+		o.JobKey = "pausedold"
+		o.Schema = schema
+	})
+	var hasCol bool
+	if err := s.conn.QueryRow(ctx, `SELECT count(*) > 0 FROM information_schema.columns
+		WHERE table_schema=$1 AND table_name='_jl_meta' AND column_name='paused_tables'`, schema).Scan(&hasCol); err != nil {
+		t.Fatal(err)
+	}
+	if !hasCol {
+		t.Fatalf("老库的 %s._jl_meta 上没有补出 paused_tables 列（ADD COLUMN 没生效）", schema)
+	}
+	// 真能写：不是「列在就算好」
+	if err := s.EnsureMeta(ctx, "h", "", "", ""); err != nil {
+		t.Fatalf("老库状态行写不进去: %v", err)
+	}
+	ref := source.TableRef{Schema: schema, Table: table}
+	if err := s.PauseTable(ctx, ref, PauseReasonTypeChanged, "v: 目标 text / 源 bigint"); err != nil {
+		t.Fatalf("老库上 PauseTable 必须能写: %v", err)
+	}
+	got, err := s.PausedTables(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := got[table]; !ok {
+		t.Fatalf("写进去的暂停记录读不回来：%v", got)
+	}
+	t.Logf("老库补列：%s._jl_meta 补出 paused_tables 且 PauseTable 可写（key=%s）", schema, table)
+}
+
+// pausedCatalogIn 是指定 schema 的表定义（与 pausedCatalog 同形状，schema 可换）。
+func pausedCatalogIn(schema, table string) source.Catalog {
+	c := pausedCatalog(table)
+	for i := range c.Tables {
+		c.Tables[i].Schema = schema
+	}
+	return c
+}
