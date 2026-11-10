@@ -122,6 +122,18 @@ MUTATIONS = [
         note="移除位点持久化",
     ),
     dict(
+        name="register-pause-neutered",
+        tier="engine",
+        file="internal/engine/engine.go",
+        find="func (r *runner) registerPause(ctx context.Context, err error) error {\n",
+        replace="func (r *runner) registerPause(ctx context.Context, err error) error {\n\treturn nil // SABOTAGE: 不登记暂停\n",
+        cmd=["go", "test", "-tags=integration", "-count=1", "-run",
+             "^TestPauseRegistrationFailureFailsWholeBatch$", "./internal/engine/"],
+        requires="TestPauseRegistrationFailureFailsWholeBatch",
+        signal="TestPauseRegistrationFailureFailsWholeBatch FAIL（登记被跳过→错误退化成原始类型不一致，没有「登记失败」这条根因）",
+        note="跳过 DDL 暂停的登记（不写 paused_tables）",
+    ),
+    dict(
         name="chunk-resume-degraded",
         tier="engine",
         file="internal/engine/resume.go",

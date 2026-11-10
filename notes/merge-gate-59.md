@@ -186,3 +186,35 @@ scripts/local_stack.sh down
 | 是否先红过 | **是**：`go test -tags=knownred -run TestStopRequestDoesNotSwallowLateRealError ./internal/engine/` → `真实流错误被记成「正常收尾」（reachedDone）：退出码会变成 130（已停止）` |
 | 为什么用标签不用 Skip | Skip 会让人以为跑过了；`knownred` 保证常规 `go test ./...` 不受影响，而 merge-gate 有一条 `continue-on-error` 的步骤天天跑它——修好后那一步自己变绿，去掉标签即可 |
 | 当前状态 | **挂起（已知红）**，交 Core 修 `target.go` 的收尾判据（建议：先判「错误是否由我们 cancel 引起」，再判 stopHit） |
+
+### 7.5 补上「暂停登记落库失败」这条守卫（第 10 条注入）
+
+上一轮自报的洞：把 `engine.registerPause` 置空后，原有的暂停集成用例仍绿——裁决 A 之后
+没人盯「登记失败＝整批失败」。
+
+| 项 | 内容 |
+|---|---|
+| 用例 | `TestPauseRegistrationFailureFailsWholeBatch`（`internal/engine/pause_registration_failure_test.go`，`package engine`，`-tags=integration`） |
+| 为什么直接测 `pauseSink.Apply` | prepare 阶段的结构核对是**另一条**登记路径（`prepare` 里直接调 `sink.PauseTable`），不经过 `registerPause`。整轮跑很容易被它抢走，用例就变成测 prepare 了；这里用一个「Apply 永远返回 `TypeChangedError`」的假目标端，把**写路径**单独拎出来，时间上完全确定 |
+| 故障怎么造 | 目标端 `_jl_meta` 挂触发器：`paused_tables` 一被更新就 `RAISE`（模拟列被锁 / 库只读 / 磁盘满）。不改引擎，只在目标端制造真实故障 |
+| 断言 | ① Apply 必须失败；② 错误带 `registerPause` 的包裹语「另外：登记这张表的暂停状态也失败了」；③ 触发器原话在错误里（证明 `PauseTable` 的 UPDATE 真跑了）；④ **假目标端只被调用 1 次**（登记失败立刻整批失败，不许原地重试）；⑤ `paused_tables` 里没有半条记录 |
+| 注入项 | `register-pause-neutered`：`engine.registerPause` 首行 `return nil` |
+| 是否先红过 | **是**（先写了整轮版用例，跑出 `登记表 X 的暂停失败（本轮一行都没搬）`——那是 prepare 路径；据此改成直测写路径） |
+| 当前状态 | **绿**：本地 `PASS (0.09s)`；注入 `register-pause-neutered` → `KILLED`（`错误里没有 registerPause 的包裹语`）。`--db` 层现在 **logic 6/6 + engine 7/7 = 13/13** |
+
+需要 Core 打洞吗：**不需要**。用例只依赖导出能力（`pgsink.Open/EnsureMeta/PauseTable`）+ 目标端触发器，
+一行引擎代码都没动。
+
+### 7.6 `merge-gate` 从 advisory 转 required 的判据（写死，别靠记忆）
+
+观察期一周，期满按下面三条**客观判据**决定（全部满足才转）：
+
+1. **拦截成功**：观察期内至少出现 1 次真实拦截（红），且被拦的原因是它该拦的（结论过期 / 注入存活 /
+   矩阵不一致），不是环境抖动；
+2. **无误报**：同一窗口内没有「门禁红但查下来是实现没问题」的记录（含 flaky：同一 commit 重跑
+   结论不同也算一次误报）；
+3. **红灯可归因**：每次红都能在 job 日志里直接指到判据名（`gate_checks` / `mutation` / `acceptance`
+   / `review` 四层之一），不允许出现「红了但不知道哪条判据」。
+
+任一条不满足 → 继续 advisory，并在 notes 里记下差在哪；**不按时间自动转**。
+转的时候只删 `continue-on-error` 并把已有 check 名加进 required，不改 job 名（与 #59 的节奏一致）。
