@@ -136,9 +136,12 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 	// **状态表迁移要早于任何读 `_jl_meta` 的动作**（StartRun 的冲突回收会读租约/状态）。
 	// 否则旧 schema 的库会在 prepare 之前就因为「没有 paused_tables 列」报一条与真实原因
 	// 无关的错（租约/预检/表不存在才是真因），用户还会以为要手工改表。幂等，一条 DDL。
+	// **尽力而为，绝不在这里中止**：目标库连不上/schema 还没建的时候，真原因会由后面
+	// 的预检或 prepare 报出来（并且要落一条 run 行）——这里中止会让「必失败任务」连
+	// run 行都没有，用户反而看不到真原因。
 	if tgtEP.Kind == dsn.KindPostgres {
 		if err := pgsink.EnsureStateTables(ctx, tgtEP, schemaOf(doc, tgtConn)); err != nil {
-			return res, fmt.Errorf("把目标端的状态表升到当前版本失败（旧库首次运行也要先完成迁移）: %w", err)
+			emitEarlyNote(&res, "先把目标端状态表升到当前版本时出错（不影响本轮判定，真原因稍后由预检报出）："+err.Error())
 		}
 	}
 	run, err := opt.Store.StartRun(ctx, job.ID, state.Preflight, control.RunKindSync)
@@ -1488,6 +1491,14 @@ func (r *runner) drain(ctx context.Context, exit int, msg string) error {
 	r.phase = state.Done
 	r.emit(dctx, control.Event{Type: "done", Phase: state.Done, Message: msg})
 	return nil
+}
+
+// emitEarlyNote 在 runner 还不存在时也能把一句话带到结果里（CLI 会打印 Note）。
+func emitEarlyNote(res *Result, msg string) {
+	if res.Note != "" {
+		res.Note += "；"
+	}
+	res.Note += msg
 }
 
 // pauseHead 拼 last_error 的前缀。**表名可能为空**（错误被别处包装过、或 typed error
