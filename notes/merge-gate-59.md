@@ -45,15 +45,20 @@ MERGE-GATE: PASS（4 层全绿）
 | 1 | fp-compare-neutered | `gate_checks.py` 的 `if a[1] != b[1]:` → `if False:` | `gate_checks.py selftest` 红（「fp md5 不同」） | rc=1，`1/19 条判据不符合预期` | 是 |
 | 2 | rows-count-neutered | `gate_checks.py` 的 `if src != expect:` → `if False:` | selftest 红（「rows 源少一行」） | rc=1，`FAIL rows 源少一行 —— 期望 拦截，实际 通过` | 是 |
 | 3 | recopy-check-neutered | `gate_checks.py` 的 `if copied > allow:` → `if False:` | selftest 红（recopy 1 / 整轮两条） | rc=1，`2/19 条判据不符合预期` | 是 |
-| 4 | pause-position-neutered | `gate_checks.py` 的 `if before != after:` → `if False:` | selftest 红（「pause 位点动了」） | rc=1，`1/19 条判据不符合预期` | 是 |
-| 5 | pause-keys-neutered | `gate_checks.py` 的 `if got != exp:` → `if False:` | selftest 红（多/少登记两条） | rc=1，`2/19 条判据不符合预期` | 是 |
+| 4 | pause-keys-neutered | `gate_checks.py` 的 `if got != exp:` → `if False:` | selftest 红（多/少登记两条） | rc=1，`2/17 条判据不符合预期` | 是 |
 | 6 | review-deny-word-weakened | `review_gate_logic.py` 的 `DENY` 正则 `[1-9]` → `[8-9]` | `review_gate_logic.py selftest` 红（mustfix-2 / history-zero） | rc=1，`必改 2 条` 被误放行 | 是 |
 | 7 | review-stale-accepts | `review_gate_logic.py` 的 `if anchor.get("production_touched"):` → `if False and …` | selftest 红（production-changed / test-hand-added） | rc=1 | 是 |
-| 8 | position-not-persisted | `pgsink.setPositionTx` 首行 `return nil` | `TestPositionPersistedWithData` FAIL | rc=1，`位点没落盘：期望 postgres:v1:0/AA` | 是 |
-| 9 | ddl-pause-skipped | `engine.registerPause` 首行 `return nil` | `TestPauseTableRegistersKeyKeepsPositionAndRecovers` FAIL | rc=1，`应只登记 1 张暂停表，得到 map[]` | 是 |
+| 8 | pause-filter-keeps-all | `pause_skip.go` 的 `if _, paused := …; !paused {` → `true \|\| !paused` | `TestPauseSinkFilterDropsOnlyPausedTableRows` FAIL | rc=1，`应只剩 Begin / B 的 INSERT / Commit，得到 6 条` | 是 |
+| 9 | position-not-persisted | `pgsink.setPositionTx` 首行 `return nil` | `TestPositionPersistedWithData` FAIL | rc=1，`位点没落盘：期望 postgres:v1:0/AA` | 是 |
 | 10 | chunk-resume-degraded | `resume.planCopy` 的 `p.Kind = copyResume` → `copyFresh` | `TestPlanCopy` FAIL | rc=1，`结论错：想要 resume，得到 fresh` | 是 |
 
-结论：**10/10 被抓住**（logic 7/7、engine 3/3）。
+结论：**9/9 被抓住**（logic 6/6、engine 3/3）。
+
+一条**未被抓住**的注入（记成缺口，不藏）：把 `engine.registerPause` 首行改成 `return nil`
+（不登记暂停）后，`TestPauseTableRegistersKeyKeepsPositionAndRecovers` 仍然是绿的。原因是
+裁决 A 之后这条用例的主要断言变成了「只跳该表 + 位点前进 + 对齐后整表重搬」，
+**「登记失败必须整批失败」这条没有被端到端盯住**（`pauseSink.Apply` 里那条 `return rerr`）。
+本门禁没有把它塞进必过清单（塞进去会常红），而是写在这里交给 Core 补一格用例。
 
 两条设计取舍（踩过）：
 - 「块进度读不出来」第一版注入在 `pgsink.DoneChunks`，用重量级集成用例 `TestChunkResumeAfterSIGKILL`

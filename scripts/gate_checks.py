@@ -10,7 +10,7 @@
     gate_checks.py selftest
     gate_checks.py fp   --src "20000:aa..." --dst "20000:aa..." [--label 组合]
     gate_checks.py recopy --copied 0
-    gate_checks.py pause --before "postgres:v1:0/1" --after "postgres:v1:0/1" [--keys a,b] [--want a]
+    gate_checks.py pause --keys a,b --want a
     gate_checks.py rows --src 20000 --dst 20000 --expect 20000
 
 退出码：0 = 判据成立（放行）/ 1 = 判据不成立（拦截）/ 2 = 参数不成立（也是拦截）。
@@ -62,18 +62,20 @@ def recopy_ok(copied, allow=0):
     return True, "重启后重搬 %d 行（允许 %d）" % (copied, allow)
 
 
-def pause_ok(before, after, keys=None, want=None):
-    """按表暂停的三条硬判据：位点不动、只登记该表、登记键与块标记同源。"""
-    if before is None or after is None:
-        return False, "位点读不出来（前=%r 后=%r）：读不到就拦截" % (before, after)
-    if before != after:
-        return False, "暂停期间位点动了：前 %r / 后 %r（跳过=静默丢数据）" % (before, after)
+def pause_ok(keys=None, want=None):
+    """按表暂停的判据：**只登记该表**（不多不少）。
+
+    位点这一条 2026-11-10 晚被裁决 A 改掉了：暂停表 = 只跳过这张表、其它表照写、
+    位点照常前进，恢复时该表整表重搬（`internal/engine/pause_skip.go`）。
+    所以「暂停期间位点必须不动」是**旧契约**，写进判据会在新实现上变成假红——
+    这正是本文件开头说的：判据必须跟着契约定，而不是跟着记忆定。
+    """
     if want is not None:
         got = sorted(x for x in (keys or "").split(",") if x)
         exp = sorted(x for x in want.split(",") if x)
         if got != exp:
             return False, "暂停登记的表不对：实际 %s / 期望 %s" % (got, exp)
-    return True, "位点不动（%r），暂停登记 %s" % (before, keys or "-")
+    return True, "暂停登记 %s（不多不少）" % (keys or "-")
 
 
 def rows_ok(src, dst, expect):
@@ -100,11 +102,9 @@ SELFTEST = [
     ("recopy 1", recopy_ok(1), False),
     ("recopy 整轮", recopy_ok(20000), False),
     ("recopy 读不到", recopy_ok(-1), False),
-    ("pause 位点不动", pause_ok("pos1", "pos1", "a", "a"), True),
-    ("pause 位点动了", pause_ok("pos1", "pos2", "a", "a"), False),
-    ("pause 多登记了表", pause_ok("pos1", "pos1", "a,b", "a"), False),
-    ("pause 少登记了表", pause_ok("pos1", "pos1", "", "a"), False),
-    ("pause 位点读不到", pause_ok(None, "pos1", "a", "a"), False),
+    ("pause 只登记该表", pause_ok("a", "a"), True),
+    ("pause 多登记了表", pause_ok("a,b", "a"), False),
+    ("pause 少登记了表", pause_ok("", "a"), False),
     ("rows 对上", rows_ok(20000, 20000, 20000), True),
     ("rows 源少一行", rows_ok(19999, 20000, 20000), False),
     ("rows 目标多一行", rows_ok(20000, 20001, 20000), False),
@@ -147,8 +147,6 @@ def main(argv):
         p.add_argument("--copied", type=int, required=True)
         p.add_argument("--allow", type=int, default=0)
     elif cmd == "pause":
-        p.add_argument("--before", required=True)
-        p.add_argument("--after", required=True)
         p.add_argument("--keys", default=None)
         p.add_argument("--want", default=None)
     elif cmd == "rows":
@@ -165,7 +163,7 @@ def main(argv):
     elif cmd == "recopy":
         ok, why = recopy_ok(a.copied, a.allow)
     elif cmd == "pause":
-        ok, why = pause_ok(a.before, a.after, a.keys, a.want)
+        ok, why = pause_ok(a.keys, a.want)
     else:
         ok, why = rows_ok(a.src, a.dst, a.expect)
 
