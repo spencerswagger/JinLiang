@@ -802,7 +802,9 @@ func TestIntegrationFingerprintComparableWithinMySQL(t *testing.T) {
 	// 源端：同一个库（同一个 MySQL 实例）上算同一张表的指纹，必须与目标端相等。
 	src, err := openSourceForTest(t)
 	if err != nil {
-		t.Skipf("没有源端 DSN，跳过跨端比对: %v", err)
+		// 同一份数据两侧指纹相等，是这套规范编码的核心断言；缺 DSN 就跳过等于
+		// 让它在 CI 里永远没人验（本仓库不接受静默通过）。
+		t.Fatalf("跨端指纹比对的前提缺失（需要 JINLIANG_TEST_MYSQL_DSN 指向真库）: %v", err)
 	}
 	srcFP, err := src.Fingerprint(ctx, source.TableRef{Table: table})
 	if err != nil {
