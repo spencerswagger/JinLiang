@@ -372,32 +372,22 @@ jobs:
         #   3) 低于阈值直接红，并把实测数字打进日志。
         run: |
           set -euo pipefail
-          THRESHOLD=20000   # 门禁阈值只写这一个地方，判定和文案都引用它，避免两处漂移
-          go test -tags=integration -run '^$' -bench BenchmarkApplyUpsert500 -benchtime=40x ./internal/pgsink/ | tee /tmp/bench.txt
-          rate=$(awk '/batch=500/ { for (i=1;i<=NF;i++) if ($i=="rows/s") print $(i-1) }' /tmp/bench.txt | tail -1)
+          # 阈值只写这一个地方，判定和文案都引用它，避免两处漂移。
+          # 20000 是「崩塌才红」的峰值门禁（不是性能基线：p99/内存/冷启在 scripts/bench.sh）。
+          THRESHOLD=20000
+          # -count=3 + 取中位数：单次 40 iterations 在 shared runner 上实测 1.7~2.0 倍方差，
+          # 取中位数把「偶尔一次慢」和「真的垮了」分开。三次都慢 → 中位数也慢 → 照样红。
+          go test -tags=integration -run '^$' -bench BenchmarkApplyUpsert500 -benchtime=40x -count=3 ./internal/pgsink/ | tee /tmp/bench.txt
+          # `|| true`：没匹配到时也要走到下面的显式判空（否则 set -e/pipefail 会静默退出，
+          # 红是红了，但日志里没有「为什么」）。
+          rates=$(grep 'batch=500' /tmp/bench.txt | grep -oE '[0-9]+ rows/s' | grep -oE '^[0-9]+' | sort -n || true)
+          echo "batch=500 三次实测: $(echo "$rates" | tr '\n' ' ')"
+          rate=$(echo "$rates" | sed -n '2p')   # 3 个值的中位数（第 2 小）
           [ -n "$rate" ] || { echo "❌ 没测到 batch=500 的吞吐数值（benchmark 没跑或输出格式变了）——这不算通过"; tail -30 /tmp/bench.txt; exit 1; }
-          echo "批量路径吞吐: $rate rows/s（阈值 $THRESHOLD）"
-          awk -v r="$rate" -v t="$THRESHOLD" 'BEGIN { exit !(r+0 >= t+0) }' || { echo "❌ 批量 upsert 吞吐 $rate 低于阈值 $THRESHOLD rows/s"; exit 1; }
+          echo "批量路径吞吐（中位数）: $rate rows/s（阈值 $THRESHOLD）"
+          [ "$rate" -ge "$THRESHOLD" ] || { echo "❌ 批量 upsert 吞吐中位数 $rate 低于阈值 $THRESHOLD rows/s"; exit 1; }
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: bench-report-${{ github.run_id }}
           path: bench/latest.json
-
-  cross-compile:
-    # 三平台交叉编译原来在 PR 的 control-plane 里（71s），移到 nightly：
-    # PR 只保证本机 linux/amd64 能编译，平台覆盖由 nightly/release 守。
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: "1.27.x"
-          cache: true
-      - name: 交叉编译（linux/amd64, linux/arm64, darwin/arm64）
-        run: |
-          set -euo pipefail
-          for target in linux/amd64 linux/arm64 darwin/arm64; do
-            echo "building $target"
-            CGO_ENABLED=0 GOOS=${target%/*} GOARCH=${target#*/} go build -trimpath -o /dev/null ./cmd/jinliang
-          done

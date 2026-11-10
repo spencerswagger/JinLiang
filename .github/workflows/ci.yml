@@ -143,6 +143,27 @@ jobs:
           scripts/e2e_headless.sh ./dist/jinliang
       - name: examples 过 schema
         run: python scripts/validate_schema.py examples/*.yaml
+  cross-compile:
+    # 三平台交叉编译是**独立并行 job**，不是控制面末尾的一步：
+    # 这样 PR 的 wall-clock 不变（和 control-plane 同时跑），但「arm64/darwin 编不过」
+    # 在 PR 阶段就红，而不是等到下一次 nightly（最长滞后一天，且不阻断发版）。
+    # 为什么不放 release.yml：打 tag 时才验，等于承认发版不验证平台构建；
+    # ci 在 push main 上也跑，所以被 tag 的 commit 已经过这道。
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.x"
+          cache: true
+      - name: 交叉编译（linux/amd64, linux/arm64, darwin/arm64）
+        run: |
+          set -euo pipefail
+          for target in linux/amd64 linux/arm64 darwin/arm64; do
+            echo "building $target"
+            CGO_ENABLED=0 GOOS=${target%/*} GOARCH=${target#*/} go build -trimpath -o /dev/null ./cmd/jinliang
+          done
+
   b1-engine:
     # B1 引擎：源 → 目标**真链路**（全量 + 增量 + kill -9 重搬 + 指纹比对）。
     #
