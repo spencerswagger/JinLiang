@@ -43,6 +43,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      # known-red 台账要跑一条 `-tags=knownred` 用例来判断「实现落地没有」，所以这个 job 也要 Go
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.x"
+      - name: 已知红台账（责任人 / 转绿用例 / 移除 continue-on-error 的条件）
+        run: python3 scripts/known_red.py check
       - name: 判据自检（门禁自己的判据必须能红）
         run: python3 scripts/gate_checks.py selftest
       - name: review 门禁自检（#59：锚定 / 否决词 / 解冲突放行）
@@ -86,9 +92,9 @@ jobs:
         env:
           JINLIANG_TEST_PG_DSN: postgres://jinliang:jinliang@127.0.0.1:55432/jinliang_test?sslmode=disable
         run: |
-          # 这一格现在是红的（实现还没修，见 internal/engine/stop_late_error_test.go 的触发条件）。
-          # continue-on-error 是「已知红」而不是「放过」：它天天跑，修好后自然变绿，
-          # 届时去掉这个字段并把 knownred 标签去掉即可。
+          # ⚠ 已知红，**有台账**：scripts/known_red.py 的 stop-swallow-late-error
+          # （责任人 Core / 转绿用例 TestStopRequestDoesNotSwallowLateRealError / 移除条件：
+          #  target.go 收尾判据改成「先判是不是我们 cancel 的」）。台账落地未激活会直接判 1。
           go test -tags=knownred -count=1 -v -timeout 5m -run '^TestStopRequestDoesNotSwallowLateRealError$' ./internal/engine/
       - uses: actions/upload-artifact@v4
         if: always()
@@ -270,8 +276,9 @@ jobs:
         env: *m2m-env
         run: timeout -k 10 900 bash scripts/b1_mysql_to_mysql.sh ./dist/jinliang kill
       - name: 块级续跑（块进度 > 0 且重启重搬 ≤ 1 块）
-        # ⚠ 现在是**已知红**：mysqlsink 还没写块记账（Data 在补），这一格按设计必须红。
-        # 断言已经写死在脚本里，实现落地这天这一步会自己变绿；届时去掉 continue-on-error。
+        # ⚠ 已知红，**有台账**：scripts/known_red.py 的 mysqlsink-chunk-accounting
+        # （责任人 Data / 转绿用例 b1_mysql_to_mysql.sh killcopy / 移除条件：mysqlsink 写 _jl_chunk）。
+        # 台账每天对账：实现落地了这一步还挂着 continue-on-error，门禁会直接判 1（断言未激活）。
         continue-on-error: true
         env: *m2m-env
         run: timeout -k 10 900 bash scripts/b1_mysql_to_mysql.sh ./dist/jinliang killcopy

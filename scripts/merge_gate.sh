@@ -8,6 +8,7 @@
 #
 # 四层判据（任何一层红 = 不放行）：
 #   1. 判据自检      scripts/gate_checks.py selftest        —— 「判据本身」必须能红
+#      known-red 台账 scripts/known_red.py check            —— 已知红必须带责任人/触发条件，且实现落地就转阻塞
 #   2. review 自检   scripts/review_gate_logic.py selftest  —— #59 的锚定/否决词逻辑
 #   3. 反向注入      scripts/mutation_gate.py --tier logic  —— 改坏判据 → 自检必须红
 #   4. review 锚定   scripts/check_review_gate.sh <pr>      —— 真 PR 的结论必须锚在当前 head
@@ -59,6 +60,9 @@ step() { # $1=名称 $2=命令（用 bash -c 跑，输出进日志）
 echo "merge-gate: $(date -u +%FT%TZ) root=$ROOT pr=${PR:-（未指定，只做本地自检）}" | tee -a "$LOG"
 
 step "gate_checks selftest" python3 "$ROOT/scripts/gate_checks.py" selftest
+# 已知红必须收口：台账由 scripts/known_red.py 维护，输出里永远打印倒计时清单，
+# 实现落地了却还挂着 continue-on-error 就直接判 1（「断言未激活」）。
+step "known-red 台账（已知红收口）" python3 "$ROOT/scripts/known_red.py" check
 step "review_gate_logic selftest" python3 "$ROOT/scripts/review_gate_logic.py" selftest
 step "mutation: logic 档" python3 "$ROOT/scripts/mutation_gate.py" --tier logic
 if [ "$DB" = 1 ]; then
@@ -70,6 +74,12 @@ fi
 if [ -n "$PR" ]; then
   step "review 锚定（PR #$PR）" "$ROOT/scripts/check_review_gate.sh" "$PR"
 fi
+
+# 已知红必须**肉眼可见**：不埋在 YAML 里，也不只躺在日志里。
+COUNTDOWN="$(python3 "$ROOT/scripts/known_red.py" list 2>&1 || true)"
+echo
+echo "⚠ known-red 未收的账（责任人 / 转绿用例 / 什么条件才允许删 continue-on-error）："
+printf '%s\n' "$COUNTDOWN" | sed -n '/^|/p'
 
 echo
 echo "| 判据 | 结果 | 摘要 |"

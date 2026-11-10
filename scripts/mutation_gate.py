@@ -89,6 +89,17 @@ MUTATIONS = [
         note="把「只暂停该表」放宽成「登记了就行」",
     ),
     dict(
+        name="known-red-stale-suspended",
+        tier="logic",
+        file="internal/mysqlsink/state.go",
+        find="func (s *Sink) DoneChunks(",
+        replace="// 注入：假装块记账已经实现（INSERT INTO `_jl_chunk`），但 CI 步骤还挂着 continue-on-error\n" +
+                "func (s *Sink) DoneChunks(",
+        cmd=[sys.executable, "scripts/known_red.py", "check", "--only", "mysqlsink-chunk-accounting"],
+        signal="known_red.py check 退出 1（实现已落地 + 步骤仍挂起 = 断言未激活）",
+        note="模拟「实现已在主干但断言没打开」",
+    ),
+    dict(
         name="review-deny-word-weakened",
         tier="logic",
         file="scripts/review_gate_logic.py",

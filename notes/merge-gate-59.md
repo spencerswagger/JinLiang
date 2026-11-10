@@ -218,3 +218,41 @@ scripts/local_stack.sh down
 
 任一条不满足 → 继续 advisory，并在 notes 里记下差在哪；**不按时间自动转**。
 转的时候只删 `continue-on-error` 并把已有 check 名加进 required，不改 job 名（与 #59 的节奏一致）。
+
+**量化口径（可核对，不是「观察一周」）**：
+
+| 判据 | 门槛 | 怎么核对 |
+|---|---|---|
+| 样本量 | 最近 **≥10 次** PR 触发的 `merge-gate` run（或 ≥7 天，取先到者） | `gh run list --workflow merge-gate` |
+| 无误报 | 上述窗口内「红但查下来是实现没问题」= **0**；同一 head 重跑结论不同（flaky）= **0** | run 记录逐条比对 head 与结论 |
+| 拦截有效 | 上述窗口内**至少 2 次**因判据拦截，且原因归属正确（review 过期 / 注入存活 / 矩阵不一致 / 台账未收口之一） | 每次红在 notes 记一行：head + 判据名 + 归属 |
+| 红灯可归因 | 每次红都能指到四层判据之一的**名字**（`gate_checks` / `known_red` / `mutation` / `acceptance` / `review`） | job 日志里的判据行 |
+| 回退条款 | 转 required 后 **7 天内出现 2 次误报或 1 次 flaky** → 立即退回 advisory，并记 notes | 同上 |
+
+四条同时满足才转；**不按时间自动转**。
+
+## 7.7 已知红不许无限期挂着（三元组 + 机器对账 + 自证）
+
+把「先武装断言、先红」做成 `continue-on-error` 很省事，但没有收口机制就会永远红着放行。
+现在每一格都有三元组，并且**由 `scripts/known_red.py` 每天对账**：
+
+| 已知红步骤 | 责任人 | 转绿用例 | 移除 `continue-on-error` 的触发条件 |
+|---|---|---|---|
+| `块级续跑（块进度 > 0 且重启重搬 ≤ 1 块）` | **Data** | `scripts/b1_mysql_to_mysql.sh killcopy`（`_jl_chunk > 0` 且重启重搬 ≤ 1 块） | `mysqlsink` 在全量搬到 MySQL 目标端时写 `_jl_chunk`；**该实现合入后**这一步自动转阻塞（探测：`internal/mysqlsink` 非测试代码里出现写 `_jl_chunk` 的动作） |
+| `回归（knownred）：停止请求之后的真实流错误不许被记成「已停止」` | **Core** | `TestStopRequestDoesNotSwallowLateRealError`（`-tags=knownred`） | `target.go` 收尾判据改成「先判错误是否由我们 cancel 引起，再看 `stopHit`」；**该修复合入后**删 `continue-on-error` 并去掉 `knownred` 标签（探测：这条用例转绿） |
+
+对账规则（`known_red.py` 的 `classify`，纯函数 + 4 条 selftest）：
+
+| 实现落地 | 步骤挂着 `continue-on-error` | 结论 |
+|---|---|---|
+| 否 | 是 | ✅ 合法（打印倒计时清单） |
+| **是** | **是** | ❌ **拦截**：`断言未激活`（断言写好了没人打开，等于没有） |
+| 否 | 否 | ❌ 拦截：`提前激活`（实现没落地就把步骤改成阻塞，CI 会常红） |
+| 是 | 否 | ✅ 已收口 |
+
+- **门禁输出里可见**：`merge_gate.sh` 每次都在结论表之前打印「⚠ known-red 未收的账」表
+  （步骤 / 责任人 / 转绿用例 / 移除条件 / 现状），不埋在 YAML、也不只躺在日志里。
+- **能自证**：注入项 `known-red-stale-suspended` —— 往 `internal/mysqlsink` 里塞一条
+  「写 `_jl_chunk`」的痕迹（模拟实现已落地），台账立刻判 `断言未激活`，`known_red.py check`
+  退出 1，注入框架记为 **KILLED**。这条不用等 Data/Core 真合入就能证明「机制会红」。
+- 三元组失联也会红：步骤名改了/删了，`step_suspended` 找不到 → 判失败（台账与 YAML 失联）。
