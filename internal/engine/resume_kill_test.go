@@ -24,6 +24,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+
+	"github.com/spencerswagger/jinliang/internal/control"
 )
 
 const resumeTotal = 120_000
@@ -930,32 +932,58 @@ func (f *resumeFixture) jobKey(t *testing.T) string {
 	return k
 }
 
-// dropJobSlots 删掉本任务名下的书签（teardown 用）。尽力而为：连不上就算了，
+// dropJobSlots 删掉本任务名下的书签（teardown 用）。尽力而为：清不掉只记日志，
 // 不能让清理把用例的结论搅乱。
+//
+// 这里踩过两个坑，都表现为「整包跑红、单条单跑绿」：
+//  1. 只有调用过 jobKey() 的用例才有 f.key；其余用例 teardown 直接 return，书签全留下。
+//     一轮 engine 集成用例建 6~10 个书签，而 max_replication_slots 默认 10 ——
+//     第二轮（甚至同轮靠后的用例）就从 "all replication slots are in use (53400)" 开始红。
+//     所以这里不再依赖 f.key：没有就从控制库按任务名反查 job_key。
+//  2. 原来只删 `NOT active` 的书签；被 kill 掉的子进程还挂着的 active 书签永远删不掉。
+//     收尾时那些读者一定是废弃进程，先 pg_terminate_backend 再删。
 func (f *resumeFixture) dropJobSlots(t *testing.T) {
 	t.Helper()
-	if f.key == "" || f.srcDB == nil {
+	if f.srcDB == nil {
 		return
 	}
+	key := f.key
+	if key == "" {
+		key = f.jobKeyFromStore(t)
+	}
+	if key == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	dropSlotsLike(ctx, f.srcDB, "jl_"+key+"%")
+}
+
+// jobKeyFromStore 从本用例的控制库里按任务名反查 job_key（书签名 = jl_<job_key>_1）。
+func (f *resumeFixture) jobKeyFromStore(t *testing.T) string {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	rows, err := f.srcDB.Query(ctx,
-		"SELECT slot_name FROM pg_replication_slots WHERE slot_name LIKE $1 AND NOT active",
-		"jl_"+f.key+"%")
+	store, err := control.Open(control.Options{DataDir: f.dataDir})
 	if err != nil {
-		return
+		return ""
 	}
-	var names []string
-	for rows.Next() {
-		var n string
-		if rows.Scan(&n) == nil {
-			names = append(names, n)
+	defer store.Close()
+	sums, err := store.ListJobs(ctx)
+	if err != nil {
+		return ""
+	}
+	for _, s := range sums {
+		if s.Name != f.jobName {
+			continue
 		}
+		job, err := store.GetJob(ctx, s.ID)
+		if err != nil {
+			return ""
+		}
+		return job.JobKey
 	}
-	rows.Close()
-	for _, n := range names {
-		_, _ = f.srcDB.Exec(context.Background(), "SELECT pg_drop_replication_slot($1)", n)
-	}
+	return ""
 }
 
 func slotNameFor(jobKey string) string { return "jl_" + jobKey + "_1" }
