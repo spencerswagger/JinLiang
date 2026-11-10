@@ -51,6 +51,14 @@
 4. 反向注入：把 `MarkTableRecopyPending` 换成「只 upsert 不清表」→ 恢复用例必红（幻行那条已经埋好数据：
    暂停窗口里源端删了 50 行，用例断言重搬后剩 251 行）
 
+### `--resync` × `resume=manual`（Owl II 问的那格，不用改，写下来）
+
+`forceRecopy` 里**永远没有** manual 表（`reconcilePaused` 在 `MarkTableRecopyPending` 之前就
+`continue` 了），所以它不会被自动清空。但它的名字会经 `plan.Written` 进 `CleanNames`，
+于是 `--resync` 会在 `precheckResyncTables` 阶段抛 `reusedTableRecopyError`——**在清位点、
+动任何表之前**整轮失败。fail-closed、零数据损失，符合既有语义；文案会让用户以为是「暂停表
+把整轮挡住了」，下一版措辞要提这件事。
+
 ## §4 没做的（明确边界，不假装）
 
 1. **`ExitPaused=3`**：Ark 的硬口径 3 要求「跑完但有表没写」用退出码 3 区分。这要动 CLI/`Result`/
@@ -67,6 +75,7 @@
 |---|---|---|
 | `applyForcedRecopy` 直接 return（=「只清块标记不重搬」，Owl II 的 P0） | `TestApplyForcedRecopyRescuesSingleTableCopySkip` + `…OnlyTouchesThePausedTable` | **已实测红**（两条都红） |
 | `pauseSink.filter` 不丢暂停表事件 | `TestPauseSinkFilterDropsOnlyPausedTableRows` + integration ⑤ | 待跑（纯函数那格可证伪） |
+| `commitPlan` 里先 `r.plan = plan` 再 `applyForcedRecopy(&plan)`（值类型别名） | `TestApplyForcedRecopy*`（断言的是 `r.plan`） | **已实测红** |
 | `registerPause` 失败仍继续提交（A3） | **还没写这一格** | 欠一条 |
 | `snapshot` 里解除改回「结构对齐就解除」 | `paused_reconcile_test.go` | 待跑（要库） |
 

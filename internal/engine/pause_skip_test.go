@@ -97,15 +97,19 @@ func TestApplyForcedRecopyRescuesSingleTableCopySkip(t *testing.T) {
 		t.Fatalf("前提变了：planCopy 对「零块标记的单表」不再判 copySkip，得到 %s", plan.Kind)
 	}
 	r := &runner{forceRecopy: map[string]source.TableRef{"orders": ref}}
-	r.applyForcedRecopy(&plan)
-	if plan.Kind == copySkip {
+	r.commitPlan(plan)
+	// 断言的是 **r.plan**：`snapshot()` 只读它。改局部变量那份等于没改（踩过一次）。
+	if r.plan.Kind == copySkip {
 		t.Fatal("有表欠重搬时 Kind 不能是 copySkip：snapshot 会整段跳过，说了重搬却一步不动")
 	}
-	if !containsTable(plan.Recopy, "orders") {
-		t.Fatalf("欠重搬的表必须进 plan.Recopy（唯一会清空 + 从表头重读的分支），得到 %+v", plan.Recopy)
+	if !containsTable(r.plan.Recopy, "orders") {
+		t.Fatalf("欠重搬的表必须进 r.plan.Recopy（唯一会清空 + 从表头重读的分支），得到 %+v", r.plan.Recopy)
 	}
-	if plan.Skip["orders"] {
+	if r.plan.Skip["orders"] {
 		t.Fatal("它这次必须搬，不能留在 Skip 名单里")
+	}
+	if !r.needSnapshot {
+		t.Fatal("有表要重搬就必须真的跑搬运阶段（needSnapshot）")
 	}
 }
 
@@ -119,19 +123,19 @@ func TestApplyForcedRecopyOnlyTouchesThePausedTable(t *testing.T) {
 		Skip: map[string]bool{"healthy": true},
 	}
 	r := &runner{forceRecopy: map[string]source.TableRef{"orders": a}}
-	r.applyForcedRecopy(&plan)
+	r.commitPlan(plan)
 
-	if !containsTable(plan.Recopy, "orders") {
-		t.Fatal("欠重搬的表必须进 Recopy")
+	if !containsTable(r.plan.Recopy, "orders") {
+		t.Fatal("欠重搬的表必须进 r.plan.Recopy")
 	}
-	if _, ok := plan.From["orders"]; ok {
+	if _, ok := r.plan.From["orders"]; ok {
 		t.Fatal("重搬要从表头读，不能沿用旧游标")
 	}
-	if !plan.Skip["healthy"] || plan.From["healthy"].Cursor != "100" {
-		t.Fatalf("别的表不受影响（Skip 与游标都要留着），得到 Skip=%v From=%+v", plan.Skip, plan.From)
+	if !r.plan.Skip["healthy"] || r.plan.From["healthy"].Cursor != "100" {
+		t.Fatalf("别的表不受影响（Skip 与游标都要留着），得到 Skip=%v From=%+v", r.plan.Skip, r.plan.From)
 	}
-	if plan.Kind != copyResume {
-		t.Fatalf("Kind 不该被动过，得到 %s", plan.Kind)
+	if r.plan.Kind != copyResume {
+		t.Fatalf("Kind 不该被动过，得到 %s", r.plan.Kind)
 	}
 	_ = b
 }

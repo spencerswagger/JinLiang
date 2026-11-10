@@ -1023,8 +1023,15 @@ func (r *runner) prepare(ctx context.Context) error {
 			return err
 		}
 	}
-	r.plan = plan
-	r.needSnapshot = plan.Kind != copySkip
+	// 接进计划 + 落到 runner 上，**一步做完**：`chunkPlan` 是值类型，`Skip`/`From` 是 map 会
+	// 穿透，但 `Kind`/`Recopy`/`CleanNames`/`Why` 改在局部变量上——「先 r.plan = plan 再改局部
+	// 那份」等于没改（Owl II 探针：单表会「Prepare 按续跑、snapshot 按从头搬」→ 报一句
+	// 「拿不到一致性视图」；多表 `r.plan.Recopy` 为空 → 不清空不重搬，P0 原样回归）。
+	// 所以这两件事只能有一个入口（commitPlan），用例断言的是 **r.plan** 而不是某个局部值。
+	//
+	// 位置也要在 `applyResync` **之后**：它会 `p.Recopy = nil` 并按 `CleanNames` 重排，
+	// 先接的话会被清掉——而 `--resync` 恰恰是结构对不上时最会按的那个键。
+	r.commitPlan(plan)
 	if r.opt.Resync {
 		// **先问「这几张表能不能清」，再动任何东西**。清位点、重建书签、清表是三步
 		// 破坏性动作；把「不是本任务建的表」这种需要用户决定的失败留到最后一步，
@@ -1059,11 +1066,6 @@ func (r *runner) prepare(ctx context.Context) error {
 			}
 		}
 	}
-	// 欠重搬的表必须在 `--resync` 之后接进计划：`applyResync` 会 `p.Recopy = nil`
-	// 并按 `CleanNames` 重排清理名单，先接的话会被它清掉——于是「不清空、不重搬」，
-	// 收尾还会发一句「已恢复：整表重搬完成」。而 `--resync` 恰恰是结构对不上时最会按的键。
-	r.applyForcedRecopy(&plan)
-	r.needSnapshot = plan.Kind != copySkip
 	// 续跑时**不重建书签、不导出视图**：书签得留着才能从原来的位点重放变更。
 	prep, err := src.Prepare(ctx, r.needSnapshot && plan.Kind != copyResume)
 	if err != nil {
@@ -1258,6 +1260,14 @@ func (r *runner) applyForcedRecopy(plan *chunkPlan) {
 		plan.Why = "有 " + strconv.Itoa(len(r.forceRecopy)) + " 张表因为结构不一致暂停过、" +
 			"现在结构已对齐：本轮清空它们并整表重搬（跳过窗口里的删除只能这样补掉）"
 	}
+}
+
+// commitPlan 是「把计划落到 runner 上」的唯一入口：先接欠重搬的表，再赋值。
+// 拆成两步做过一次，就踩了值类型别名的坑（改的是局部 `plan`，`r.plan` 还是旧的）。
+func (r *runner) commitPlan(plan chunkPlan) {
+	r.applyForcedRecopy(&plan)
+	r.plan = plan
+	r.needSnapshot = plan.Kind != copySkip
 }
 
 func containsName(names []string, want string) bool {
