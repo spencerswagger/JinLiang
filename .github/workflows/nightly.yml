@@ -389,10 +389,11 @@ jobs:
           toks=$(grep 'batch=500' /tmp/bench.txt | grep -oE '[0-9][0-9.e+]* rows/s' | sed 's/ rows\/s//' || true)
           rates=''
           for tok in $toks; do
-            case "$tok" in
-              *e+*) rates="$rates$(printf '\n%s' 1000000)" ;;
-              *)    rates="$rates$(printf '\n%s' "$tok")" ;;
-            esac
+            # 数值解析，不硬映射：Go 在 ≥1e6 时打印 `1.2e+06 rows/s`，
+            # 也可能出现 `1.5e+05`——硬当 1e6 会**高估**（偏松）。printf %.0f 直接把两种写法都转成整数。
+            v=$(printf '%.0f' "$tok" 2>/dev/null || true)
+            [ -n "$v" ] || { echo "❌ 吞吐样本 %s 解析不出数值（benchmark 输出格式变了）——这不算通过" "$tok"; exit 1; }
+            rates="$rates$(printf '\n%s' "$v")"
           done
           rates=$(printf '%s\n' "$rates" | sed '/^$/d' | sort -n || true)
           n=$(echo "$rates" | grep -c . || true)

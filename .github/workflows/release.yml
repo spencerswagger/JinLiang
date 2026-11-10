@@ -12,7 +12,8 @@ jobs:
     # 打 tag 前先把三平台编译真跑一遍（约 80s）。为什么放在 release 里：
     # 被 tag 的 commit 理论上已经在 main 上过了 `ci` 的 cross-compile，但「理论上」靠人记性——
     # 从特性分支直接打 tag、或 tag 打了没跑过 CI 的 commit，就会发出一个 arm64/darwin 编不过的版本。
-    # 这段与 ci.yml 的 cross-compile job 逐字相同，改一处要同步另一处。
+    # 实际动作在 scripts/cross-compile.sh（与 ci.yml 的 cross-compile job 同一份脚本，
+    # 平台列表只在这里之外的一个地方定义）。
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -20,13 +21,8 @@ jobs:
         with:
           go-version: "1.27.x"
           cache: true
-      - name: 交叉编译（linux/amd64, linux/arm64, darwin/arm64）
-        run: |
-          set -euo pipefail
-          for target in linux/amd64 linux/arm64 darwin/arm64; do
-            echo "building $target"
-            CGO_ENABLED=0 GOOS=${target%/*} GOARCH=${target#*/} go build -trimpath -o /dev/null ./cmd/jinliang
-          done
+      - name: 交叉编译（三平台，真源在 scripts/cross-compile.sh）
+        run: scripts/cross-compile.sh
 
   coverage:
     runs-on: ubuntu-latest
