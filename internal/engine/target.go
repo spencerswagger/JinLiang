@@ -311,6 +311,8 @@ func (r *runner) executeGeneric(ctx context.Context, res *Result) error {
 			return err
 		}
 		if err := r.copyGeneric(ctx); err != nil {
+			// 重搬失败：把记录还原，否则下一轮既不会重搬也不会暂停（表被清了一半）。
+			r.restorePausedAfterFailedRecopy(ctx)
 			return err
 		}
 		r.src.EndSnapshot()

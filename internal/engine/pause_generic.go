@@ -73,6 +73,10 @@ func (r *runner) planGenericRecopy(ctx context.Context) {
 		if r.forceRecopy == nil {
 			r.forceRecopy = map[string]source.TableRef{}
 		}
+		if r.recopyRecords == nil {
+			r.recopyRecords = map[string]pgsink.PausedTable{}
+		}
+		r.recopyRecords[key] = one
 		ref := srcRef
 		r.forceRecopy[key] = ref
 	}
@@ -122,6 +126,14 @@ func (r *runner) truncateForcedRecopy(ctx context.Context, st stateCapable) erro
 			return fmt.Errorf("清掉 %s 的块标记失败: %w", key, err)
 		}
 		r.clearedTables = append(r.clearedTables, key)
+		// **必须先摘掉暂停记录再写**：目标端 sink 有一道「最后一道防线」——
+		// 收到暂停表的行就报「引擎没有过滤掉」，那是防静默脏写的。而整表重搬的
+		// 写入是**故意**写这张表的，所以要在写之前把记录摘掉（失败时会还原，见
+		// restorePausedAfterFailedRecopy：不能因为一次失败就丢掉恢复路径）。
+		if err := r.pauseReg.ClearPausedTable(ctx, tref); err != nil {
+			return fmt.Errorf("重搬前摘掉 %s 的暂停记录失败: %w", key, err)
+		}
+		r.forgetPaused(key)
 		r.note(ctx, "表 "+key+" 整表重搬：先清空目标端再从头读（暂停窗口里的删除只能这样补掉）")
 	}
 	return nil
@@ -135,13 +147,8 @@ func (r *runner) finishGenericRecopy(ctx context.Context) error {
 	if r.pauseReg == nil || len(r.forceRecopy) == 0 {
 		return nil
 	}
-	for key, ref := range r.forceRecopy {
-		tref := r.targetRef(ref)
-		if err := r.pauseReg.ClearPausedTable(ctx, tref); err != nil {
-			return fmt.Errorf("解除 %s 的暂停失败: %w", key, err)
-		}
-		rec, _ := r.pausedRecord(key)
-		r.forgetPaused(key)
+	for key := range r.forceRecopy {
+		rec := r.recopyRecords[key]
 		msg := "表 " + key + " 已恢复：整表重搬完成"
 		if rec.SkippedRows > 0 {
 			msg += fmt.Sprintf("，跳过窗口的 %d 行已补齐", rec.SkippedRows)
@@ -304,6 +311,26 @@ func relationDiff(want *source.Table, got *source.Table) (string, bool) {
 		return "列名在源端变了（改名或删列）：" + relationShape(got), true
 	}
 	return strings.Join(diffs, "；"), true
+}
+
+// restorePausedAfterFailedRecopy 在整表重搬失败时把暂停记录**放回去**。
+//
+// 为什么必须还原：`truncateForcedRecopy` 已经把记录摘掉（否则目标端的「最后一道防线」
+// 会拦住重搬的写入）。如果重搬失败就停在这里，记录也没了 → 下一轮既不会重搬、也不会暂停，
+// 目标端停在一张**清空了一半**的表上，而退出码、界面一切正常。那是最坏的一种静默缺数据。
+func (r *runner) restorePausedAfterFailedRecopy(ctx context.Context) {
+	if r.pauseReg == nil {
+		return
+	}
+	for key, rec := range r.recopyRecords {
+		ref := source.TableRef{Schema: r.targetSchema(), Table: key}
+		if err := r.pauseReg.PauseTable(ctx, ref, rec); err != nil {
+			r.note(ctx, "重搬失败后还原 "+key+" 的暂停记录也失败了："+err.Error()+
+				"（下一轮不会自动重搬这张表，请手工确认它的数据）")
+			continue
+		}
+		r.rememberPaused(key, rec)
+	}
 }
 
 // pausedSnapshot 返回内存里的暂停集合副本（避免调用方在遍历时与写路径抢锁）。

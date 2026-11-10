@@ -381,6 +381,9 @@ type runner struct {
 	// 那条分支会「查所有权 → 清空表 + 清块标记 → 从表头重读」，正是契约 §1.6 步 2–3 要的。
 	// 只清块标记是不够的：`BulkApply` 只有 upsert，不清表的话暂停窗口里被删掉的行会留下来。
 	forceRecopy map[string]source.TableRef
+	// recopyRecords 记住「欠一次重搬」那些表当时的暂停记录：重搬前要先摘记录
+	// （目标端的最后一道防线会拦住暂停表的写入），失败时要还原。
+	recopyRecords map[string]pgsink.PausedTable
 	// skippedTables 是「本轮结构对不上、连存量也不搬」的表（prepare 期发现的）。
 	// 它们仍在 r.tables 里（跨轮存活判据要它），但不进 copy plan 的搬运名单。
 	skippedTables map[string]bool
