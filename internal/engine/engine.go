@@ -374,6 +374,11 @@ type runner struct {
 	// paused 是本轮的内存暂停集合（key = 目标端裸表名）：写路径每批都要判，不能每批查库。
 	// 由 loadPausedSet 装好，registerPause / snapshot 搬成 两处更新（见 pause_skip.go）。
 	paused map[string]pgsink.PausedTable
+	// forceRecopy 是「欠一次整表重搬」的表（结构刚从不对齐变成对齐）。
+	// 它们由 reconcilePaused 收集，decideCopyPlan 之后接进 plan.Recopy——
+	// 那条分支会「查所有权 → 清空表 + 清块标记 → 从表头重读」，正是契约 §1.6 步 2–3 要的。
+	// 只清块标记是不够的：`BulkApply` 只有 upsert，不清表的话暂停窗口里被删掉的行会留下来。
+	forceRecopy map[string]source.TableRef
 	// skippedTables 是「本轮结构对不上、连存量也不搬」的表（prepare 期发现的）。
 	// 它们仍在 r.tables 里（跨轮存活判据要它），但不进 copy plan 的搬运名单。
 	skippedTables map[string]bool
@@ -646,6 +651,29 @@ func (r *runner) recopyAction(ctx context.Context, ref source.TableRef, why reco
 	return &reusedTableRecopyError{table: ref.Table, jobKey: r.job.JobKey, schema: ref.Schema, why: why}
 }
 
+// recopyOne 执行「整表重来一张表」：先判所有权（不是本任务建的表要停下来问），
+// 再清空数据 + 清块标记（同一事务，`ResetTableChunks`），最后把原因说出来。
+//
+// 两个入口共用：无主键表（块级续跑不了）与「暂停过后欠一次重搬」的表。
+func (r *runner) recopyOne(ctx context.Context, ref source.TableRef) error {
+	why := recopyNoPK
+	if _, forced := r.forceRecopy[ref.Table]; forced {
+		why = recopyPaused
+	}
+	if err := r.recopyAction(ctx, ref, why); err != nil {
+		return err
+	}
+	if err := r.sink.ResetTableChunks(ctx, r.targetRef(ref)); err != nil {
+		return fmt.Errorf("清空 %s 准备整表重来时失败: %w", ref.Table, err)
+	}
+	if why == recopyPaused {
+		r.note(ctx, "表 "+ref.Table+" 整表重搬：先清空目标端再从头读（暂停窗口里的删除只能这样补掉）")
+	} else {
+		r.note(ctx, ref.Table+" 没有稳定的主键，只能整表重来（不清其它表）")
+	}
+	return nil
+}
+
 // recopyReason 说清「为什么要清这张表」——文案必须跟着原因走。
 // 只写「上次搬到一半就断了」是错的：还有一种是「上次搬完了，但位点追不回来」。
 type recopyReason int
@@ -660,6 +688,9 @@ const (
 	// recopyReused：目标端没有可用位点（要重搬），而表里已经有**用户自己的行**。
 	// 与「once / full_interval 每轮重搬」是两种不同的话：前者是状态缺失，后者是模式语义。
 	recopyReused
+	// recopyPaused：这张表因为结构对不上被暂停过，暂停窗口里的事件没写进目标端
+	//（其中可能有 DELETE）——只有「清空 + 整表重搬」能保证结果等于源端当前状态。
+	recopyPaused
 )
 
 func (w recopyReason) sentence() string {
@@ -677,6 +708,9 @@ func (w recopyReason) sentence() string {
 		return "你显式要求了 --resync（整轮重搬）：这一轮先从零重建，目标端结果要等于源端当前状态"
 	case recopyReused:
 		return "目标端没有可用的同步位点，这一轮要从头搬"
+	case recopyPaused:
+		return "这张表在结构不一致期间被暂停过，那段时间的变更没有写入" +
+			"（其中的删除只能靠清空重搬补掉，光 upsert 会留下源端已经删掉的行）"
 	default:
 		return "上次全量搬到一半就断了"
 	}
@@ -971,6 +1005,7 @@ func (r *runner) prepare(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	r.applyForcedRecopy(&plan)
 	// 结构对不上的表：这一轮**连存量都不搬**（契约 §6 硬口径 2）。
 	// 它们仍留在 r.tables 里——跨轮存活判据要用「这张表还在不在范围内」，
 	// 把它从表集合里拿掉会让 reconcilePaused 认为「已出范围」而把暂停记录清掉。
@@ -1153,6 +1188,17 @@ func (r *runner) reconcilePaused(ctx context.Context) error {
 		if err := r.sink.MarkTableRecopyPending(ctx, ref); err != nil {
 			return fmt.Errorf("把 %s 标成待重搬失败: %w", key, err)
 		}
+		if r.forceRecopy == nil {
+			r.forceRecopy = map[string]source.TableRef{}
+		}
+		srcRef := source.TableRef{Schema: r.targetSchema(), Table: key}
+		for _, t := range r.tables {
+			if t.Table == key {
+				srcRef = t
+				break
+			}
+		}
+		r.forceRecopy[key] = srcRef
 		r.rememberPaused(key, one)
 		msg := "表 " + key + " 的结构已对齐：清掉块标记，本轮整表重搬补齐"
 		if one.SkippedRows > 0 {
@@ -1161,6 +1207,47 @@ func (r *runner) reconcilePaused(ctx context.Context) error {
 		r.note(ctx, msg+"（其它表照常续跑）")
 	}
 	return nil
+}
+
+// applyForcedRecopy 把「欠一次整表重搬」的表接进这一轮的搬运计划。
+//
+// 为什么不能只清块标记就完事（Owl II P0，也是我 notes 里那条「换成只 upsert 不清表必红」）：
+//   - 多表：块标记被清 → `planCopy` 判 `copyResume` → `From` 里没有这张表 → 从表头重读，
+//     但走的是 `BulkApply`（**只有 upsert，没有 delete**）→ 暂停窗口里源端删掉的行原样留着；
+//   - 单表（最常见）：整本块账空了 → 落到「老状态兼容」那条 → `copySkip` → **整个搬运阶段都不跑**，
+//     暂停记录永远删不掉，而每轮还发一句「本轮整表重搬补齐」——说了不做。
+//
+// 接进 `plan.Recopy` 才是唯一会「清空表 + 清块标记 + 从表头重读」的分支。
+func (r *runner) applyForcedRecopy(plan *chunkPlan) {
+	if len(r.forceRecopy) == 0 {
+		return
+	}
+	for key, ref := range r.forceRecopy {
+		if plan.Skip != nil {
+			delete(plan.Skip, key) // 它这次必须搬，不能留在「不用碰」名单里
+		}
+		if plan.From != nil {
+			delete(plan.From, key) // 从表头读，不从旧游标续
+		}
+		if !containsTable(plan.Recopy, key) {
+			plan.Recopy = append(plan.Recopy, ref)
+		}
+	}
+	if plan.Kind == copySkip {
+		// 搬运阶段由 Kind 决定跑不跑：copySkip 会让 snapshot 整个跳过。
+		// 有表欠重搬就必须跑一趟，`Recopy` 分支自己会把它们清干净。
+		plan.Kind = copyResume
+		plan.Why = "" // 老状态那句「存量已搬完」已经不成立
+	}
+}
+
+func containsTable(refs []source.TableRef, table string) bool {
+	for _, ref := range refs {
+		if ref.Table == table {
+			return true
+		}
+	}
+	return false
 }
 
 // copyDoneFor 表示这张表的存量已经搬完（有完成标记）。查的是目标端的块进度，
@@ -1277,13 +1364,9 @@ func (r *runner) snapshot(ctx context.Context) error {
 		// 续跑：**不清表、不清块标记**。已提交的块就是已完成的工作，重读它们既慢又
 		// 会把已经收敛的数据再写一遍。唯一要重来的是不能块级续跑的表（无主键）。
 		for _, ref := range r.plan.Recopy {
-			if err := r.recopyAction(ctx, ref, recopyNoPK); err != nil {
+			if err := r.recopyOne(ctx, ref); err != nil {
 				return err
 			}
-			if err := r.sink.ResetTableChunks(ctx, r.targetRef(ref)); err != nil {
-				return fmt.Errorf("清空 %s 准备整表重来时失败: %w", ref.Table, err)
-			}
-			r.note(ctx, ref.Table+" 没有稳定的主键，只能整表重来（不清其它表）")
 		}
 	} else {
 		if err := r.cleanBeforeRecopy(ctx); err != nil {
@@ -1301,6 +1384,13 @@ func (r *runner) snapshot(ctx context.Context) error {
 			// 报告与「实清」审计都在这里定稿：清完才填，不拿计划冒充结果。
 			r.resyncReport.Tables = r.clearedTables
 			if err := r.auditResyncCleared(ctx); err != nil {
+				return err
+			}
+		}
+		// 从头搬的那条路也要执行 `plan.Recopy`：欠重搬的表必须**清空重建**
+		//（`BulkApply` 只有 upsert，不清就会把暂停窗口里被删的行留下来）。
+		for _, ref := range r.plan.Recopy {
+			if err := r.recopyOne(ctx, ref); err != nil {
 				return err
 			}
 		}
@@ -1362,6 +1452,12 @@ func (r *runner) snapshot(ctx context.Context) error {
 		// 搬成 → 解除这张表的暂停（**只删这一个 key**，别的表记录留着）。
 		// 契约：「搬成清该表，搬败留记录」。没有记录时 Clear 是幂等的（本来就没键）。
 		if rec, paused := r.pausedRecord(ref.Table); paused {
+			if pgsink.NormalizedResume(rec.Resume) == pgsink.ResumeManual {
+				// 用户自己的表从来不自动重搬，所以这里也**不能**解除：
+				// 既没搬也没清就报「已恢复」是彻底的假话（Owl II P2）。
+				r.note(ctx, "表 "+ref.Table+" 仍在暂停（目标端既有表，需你决定：重建 / 手工清空 / 移出范围）")
+				continue
+			}
 			if err := r.sink.ClearPausedTable(ctx, ref); err != nil {
 				return fmt.Errorf("解除 %s 的暂停失败: %w", t.Table, err)
 			}
@@ -1698,7 +1794,9 @@ func (r *runner) registerPause(ctx context.Context, err error) error {
 	}); perr != nil {
 		return fmt.Errorf("%w（另外：登记这张表的暂停状态也失败了：%v）", err, perr)
 	}
-	r.rememberPaused(ref.Table, pgsink.PausedTable{Reason: pe.Reason(), Detail: detail})
+	r.rememberPaused(ref.Table, pgsink.PausedTable{
+		Reason: pe.Reason(), Detail: detail, Resume: r.resumeModeFor(ctx, ref),
+	})
 	r.note(ctx, "已暂停表 "+pe.Table()+"（原因码 "+pe.Reason()+"）：这张表的事件不再写入，其它表继续；"+
 		"跳过窗口会在结构对齐后由整表重搬补齐")
 	return nil

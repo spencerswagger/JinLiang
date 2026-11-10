@@ -61,11 +61,24 @@
 4. **streaming 中途「结构又对齐了」的路径**（契约 §1.6 最后一条）：本轮只在 prepare 判定对齐；
    流式期间一直跳过，等下一次 `run` 收口。
 
-## §5 变异验证（写下来的、还没跑的）
+## §5 变异验证
 
-| 变异 | 应该红的地方 |
-|---|---|
-| `pauseSink.filter` 不丢暂停表事件 | `integration_paused_test.go` ⑤（A=0 会变成 1） |
-| `registerPause` 失败仍继续提交 | 还没写这一格（A3）——**欠一条** |
-| `MarkTableRecopyPending` 改成「只 upsert 不清表」 | 恢复用例（251 行 / md5） |
-| `snapshot` 里解除改回「结构对齐就解除」 | `paused_reconcile_test.go`（记录会消失） |
+| 变异 | 应该红的地方 | 实测 |
+|---|---|---|
+| `applyForcedRecopy` 直接 return（=「只清块标记不重搬」，Owl II 的 P0） | `TestApplyForcedRecopyRescuesSingleTableCopySkip` + `…OnlyTouchesThePausedTable` | **已实测红**（两条都红） |
+| `pauseSink.filter` 不丢暂停表事件 | `TestPauseSinkFilterDropsOnlyPausedTableRows` + integration ⑤ | 待跑（纯函数那格可证伪） |
+| `registerPause` 失败仍继续提交（A3） | **还没写这一格** | 欠一条 |
+| `snapshot` 里解除改回「结构对齐就解除」 | `paused_reconcile_test.go` | 待跑（要库） |
+
+### P0 是什么（Owl II 逼出来的，写下来别再犯）
+
+只清块标记不等于「欠一次重搬」：
+
+- **多表**：`planCopy` 判 `copyResume`，`From` 里没有这张表 → 从表头重读，但走的是
+  `BulkApply`（**只有 upsert、没有 delete**）→ 暂停窗口里源端删掉的行原样留着（幻行）。
+- **单表**（最常见）：整本块账空了 → 落到「老状态兼容」那条 → `copySkip` → **搬运阶段整个不跑**，
+  暂停记录永远删不掉，而每轮还发一句「本轮整表重搬补齐」——说了不做。
+
+修法：`reconcilePaused` 把「欠重搬」的表收进 `runner.forceRecopy`，`decideCopyPlan` 之后用
+`applyForcedRecopy` 接进 `plan.Recopy`（唯一会「查所有权 → 清空 → 清块标记 → 从表头重读」的分支），
+`copySkip` 兜底成 `copyResume`。**纯函数用例进 CI**，不依赖库。

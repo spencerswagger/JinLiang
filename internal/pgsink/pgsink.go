@@ -1056,6 +1056,18 @@ func (s *Sink) Apply(ctx context.Context, evs []source.Event, pos source.Positio
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// **最后一道防线**（不是判定）：判定权在引擎（契约 §1.5 第 1 条），但万一引擎那边漏了
+	// ——表名口径变了、新写路径没包 pauseSink、snapshot 漏了某张跳过表——这里要立刻炸，
+	// 而不是带着新 Relation 往一张结构没对齐的表里写（`alignRelationTx` 还会顺手补列，
+	// 写进去就没人知道了）。只查内存集合，不产生 IO。
+	for _, ev := range evs {
+		if _, paused := s.pausedCache[ev.Table.Table]; !paused {
+			continue
+		}
+		return fmt.Errorf("引擎没有过滤掉暂停表 %s 的事件（内部错误：按表暂停的判定权在引擎，"+
+			"不该把这张表的行交到这里）", ev.Table.Table)
+	}
+
 	// 写路径**不再做暂停判定**（docs/CONTRACT-PAUSE-AND-POSITION.md §1.5 第 1 条）：
 	// 判定权在引擎——引擎按表丢掉暂停表的事件、保留 Begin/Commit、让位点照常前进，
 	// 欠账由「解除暂停时整表重搬」还。这里再来一次整批拒绝就会把别的表的行也挡住，
