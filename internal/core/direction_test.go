@@ -106,3 +106,32 @@ func TestPendingDirectionsNotSupported(t *testing.T) {
 		}
 	}
 }
+
+// TestErrorsDocE1014MatchesDirectionMatrix：`docs/ERRORS.md` 的 E1014 行是**手抄**的
+// 码表副本，最容易变成「与代码不一致的说明书」——2026-11-12 就是它把「MySQL → PostgreSQL」
+// 写成还没接通，而 `#75` 早就接上了，用户照文档判断会误以为自己的组合跑不了。
+//
+// 所以：文档里那一行必须逐字包含矩阵生成的两句话（已支持列表 + 未接通列表）。
+// 改方向 → 两处一起改；只改代码不改文档，这条会红。
+// （真源仍是 codes.go；这里的断言只保证「文档没说反话」。）
+func TestErrorsDocE1014MatchesDirectionMatrix(t *testing.T) {
+	raw, err := os.ReadFile("../../docs/ERRORS.md")
+	if err != nil {
+		t.Fatalf("读 docs/ERRORS.md 失败: %v", err)
+	}
+	var row string
+	for _, line := range strings.Split(string(raw), "\n") {
+		if strings.HasPrefix(line, "| E1014 ") {
+			row = line
+			break
+		}
+	}
+	if row == "" {
+		t.Fatal("docs/ERRORS.md 里找不到 E1014 那一行")
+	}
+	for _, want := range []string{DirectionsText(), PendingDirectionsText() + " 还没接通"} {
+		if !strings.Contains(row, want) {
+			t.Errorf("docs/ERRORS.md 的 E1014 行与方向矩阵不一致，缺：%q\n现行：%s", want, row)
+		}
+	}
+}

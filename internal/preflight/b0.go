@@ -142,21 +142,44 @@ func Run(in Input) source.Report {
 	// ── 按表暂停能力 ─────────────────────────────────────────
 	// 这条要**在 plan 里就说清**，别等用户在半夜撞上 E1015 才知道。
 	//
-	// 两个目标端的能力不同，文案必须各说各的（判据见 docs/CONTRACT-PAUSE-AND-POSITION.md §4.5）：
-	//   - PG：引擎侧的按表跳过已经接（#93），只停这张表、位点照常前进；
-	//   - MySQL：**存储层**已就绪（`_jl_meta.paused_tables` 列 + PauseRegistry 六方法），
-	//     但引擎侧的按表跳过还没接过去（pause_skip / reconcilePaused 在 PG 专属的 prepare 里），
-	//     所以在那之前遇到结构不一致仍是整条同步会停下来等手工对齐。
-	//     这里只说存储层做到了什么，不许替引擎许诺。
+	// 口径的真源是 docs/CONTRACT-PAUSE-AND-POSITION.md §1.5/§1.6 与 DECISIONS #17/#19：
+	//   - 两个目标端现在都**已接**引擎侧按表暂停（PG `#93`、MySQL `#102`：`pauseReg` 绑定 +
+	//     恢复四步 `planGenericRecopy` / `truncateForcedRecopy` / `finishGenericRecopy`）；
+	//   - **`interval` 是例外**（§1.6 例外段 / `DECISIONS #19`）：水位轮询按页读写，没有批、
+	//     没有变更流，也就没有「这一批跳过该表、位点照常前进」的位置——它**不做**按表暂停。
+	//     所以 interval 下无条件说「只停它自己」是**假话**，必须换成 warn + 手工对齐的路子。
+	interval := in.Mode == "interval"
 	switch in.TargetKind {
 	case "mysql":
+		if interval {
+			add(source.Check{
+				ID: "PAUSE-01", Title: "定时增量在 MySQL 目标端没接", Status: source.StatusWarn,
+				Detail: "`frequency=interval` 在 MySQL 目标端这一版**整体没接**（水位轮询只有 PG 目标端实现，" +
+					"开跑会被明确拒绝并给出替代模式），所以「只停这张表」也无从谈起。" +
+					"改成 continuous+initial / once / full_interval 之后按表暂停是生效的：" +
+					"只停这张表、其它表照常、位点照常前进，结构对齐后整表重搬补齐",
+			})
+			break
+		}
 		add(source.Check{
-			ID: "PAUSE-01", Title: "目标端支持记录按表暂停", Status: source.StatusWarn,
-			Detail: "存储层已就绪：`_jl_meta.paused_tables` 这一列在（老库缺列时开跑会先补，" +
-				"补不上会明确失败并说明原因）。**引擎侧的「只停这张表」还没接**——" +
-				"在那之前遇到表结构不一致，整条同步会停下来、位点不推进，等你手工对齐后重跑",
+			ID: "PAUSE-01", Title: "目标端支持按表暂停", Status: source.StatusOK,
+			// 契约 §1.5/§1.6：只停**这张表**，其它表照常提交、位点照常前进；
+			// 跳过窗口记在 `_jl_meta.paused_tables`，结构对齐后整表重搬补齐（`#102` 已接）。
+			Detail: "结构对不上的表会被记录并只停它自己（记在目标端 `_jl_meta.paused_tables` 那一列；" +
+				"老库缺列时开跑会先补，补不上会明确失败并说明原因）：其它表照常同步、位点照常前进，" +
+				"跳过的那段在结构对齐后由整表重搬补齐",
 		})
 	case "postgres":
+		if interval {
+			add(source.Check{
+				ID: "PAUSE-01", Title: "定时增量不做按表暂停", Status: source.StatusWarn,
+				Detail: "`frequency=interval` 这一版**没有**「只停这张表」这条通道（水位轮询按页读写，" +
+					"没有「跳过该表、位点照常前进」的位置）：表结构对不上时会照旧写这张表，多半直接报错。" +
+					"先手工把目标端结构对齐再跑；要做到「只停一张表 + 结构对齐后自动整表重搬补齐」，" +
+					"请改用 continuous+initial 或 full_interval",
+			})
+			break
+		}
 		add(source.Check{ID: "PAUSE-01", Title: "目标端支持按表暂停", Status: source.StatusOK,
 			// 口径（docs/CONTRACT-PAUSE-AND-POSITION.md §1.5/§1.6）：只停**这张表**，
 			// 其它表照常提交、位点照常前进；跳过窗口记账，结构对齐后整表重搬补齐。
