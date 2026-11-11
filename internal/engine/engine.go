@@ -970,6 +970,13 @@ func (r *runner) prepare(ctx context.Context) error {
 		return fmt.Errorf("准备目标表失败: %w", err)
 	}
 	for _, a := range actions {
+		// `pause:<table>` 这条 Action 是 sink 对「这张表结构对不上」的通用说法
+		// （「本轮暂停这张表，其它表继续」）。**interval 下它是假话**（契约 §1.6 例外段：
+		// interval 的写路径不过 `pauseSink`，没有跳过通道），由下面 TakePendingPauses
+		// 按 mode 分流的那条 note 统一说明；这里抑制掉，避免同一次输出自相矛盾。
+		if r.mode() == "interval" && strings.HasPrefix(a.ID, "pause:") {
+			continue
+		}
 		r.emit(ctx, control.Event{Type: "note", Message: a.What})
 	}
 	// 结构对不上的表：**登记暂停 + 本轮不搬它的存量**，其它表照常。
