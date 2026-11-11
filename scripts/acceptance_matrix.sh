@@ -5,8 +5,10 @@
 #   scripts/acceptance_matrix.sh --only mysql-postgres --rows 20000
 #   scripts/acceptance_matrix.sh --kill                            # 追加 kill -9 续跑（MySQL→PG）
 #   scripts/acceptance_matrix.sh --json .localdb/acceptance.json
+#   scripts/acceptance_matrix.sh --logdir notes/matrix3            # 原始日志落盘
 #
-# 每格只报三件事：**行数 / 内容 md5 / 耗时**；判据本身走
+# 每格报：目标表名 / 源行数 / 目标行数 / 源 md5 / 目标 md5 / **快照段秒数 / 增量段秒数**。
+# 判据本身走
 # `scripts/gate_checks.py`（行数、指纹、0 行重搬），所以「比对被改松」会被它的
 # selftest + `scripts/mutation_gate.py` 抓住，而不是靠这里再写一遍 if。
 #
@@ -29,6 +31,7 @@ ROWS=${ROWS:-20000}
 KILL=0
 ONLY=""
 JSON=""
+LOG_DIR=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -36,6 +39,7 @@ while [ $# -gt 0 ]; do
     --rows) ROWS="${2:-}"; shift 2 ;;
     --kill) KILL=1; shift ;;
     --json) JSON="${2:-}"; shift 2 ;;
+    --logdir) LOG_DIR="${2:-}"; shift 2 ;;
     --bin) BIN="${2:-}"; shift 2 ;;
     -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
     *) echo "acceptance: 不认识的参数 $1" >&2; exit 2 ;;
@@ -81,14 +85,22 @@ fp_pg() { # $1=dsn $2=表名
 
 mysql_server_version() { myq "SELECT VERSION()" | head -1; }
 
-emit() { # combo rows md5 seconds status extra
-  local line="RESULT combo=$1 rows=$2 md5=$3 seconds=$4 status=$5 ${6:-}"
+# RESULT 行两侧都给：rows/md5/seconds 是旧字段（CI/日报还在读），保留；
+# 新字段 src_rows/dst_rows/src_md5/dst_md5/snapshot_seconds/incremental_seconds 是矩阵要的。
+emit() { # combo 目标表 源行 目标行 源md5 目标md5 快照s 增量s status extra
+  local total; total=$(add_s "$7" "$8")
+  local line="RESULT combo=$1 target=$2 rows=$4 md5=$6 seconds=$total"
+  line="$line src_rows=$3 dst_rows=$4 src_md5=$5 dst_md5=$6"
+  line="$line snapshot_seconds=$7 incremental_seconds=$8 status=$9 ${10:-}"
   echo "$line"
   RESULTS+=("$line")
-  [ "$5" = "pass" ] || FAILED=$((FAILED + 1))
+  [ "$9" = "pass" ] || FAILED=$((FAILED + 1))
 }
 
-workdir() { mktemp -d; }
+# 给了 --logdir 就把每格的原始日志落在那儿（不落 /tmp：execute 每次换沙盒，/tmp 不跨调用）。
+workdir() { # $1=组合名
+  if [ -n "${LOG_DIR:-}" ]; then mkdir -p "$LOG_DIR/$1"; printf '%s' "$LOG_DIR/$1"; else mktemp -d; fi
+}
 
 # 造数：MySQL 侧（id 1..N，payload=row-N）。
 #
@@ -130,13 +142,45 @@ seed_pg() { # $1=dsn $2=表名 $3=行数
 now_s() { date +%s.%N; }
 elapsed() { python3 -c "print(f'{$2-$1:.2f}')"; }
 
+# ── 口径：报表里的两列时间、两侧指纹都按这里算 ──────────────────
+# 指纹（跨端可比）：两端各自按主键升序，逐行算 md5(concat_ws('|', id, payload))，
+#   把每行的 32 位十六进制拼成长串再取一次 md5；行数单列 count(*)。
+#   这是**同一套算式在两端各算一次**，所以数字可以直接对——不是 verify 里那种
+#   「跨端指纹 scope 不同、不可直接比」（docs/VERIFY.md §1）。整表导出取 md5 等价，
+#   20k 行时逐行拼接更省内存，也能顺带报行数。
+#   复算方法（任一端）：SELECT COUNT(*), MD5(GROUP_CONCAT(h ORDER BY id SEPARATOR ''))
+#                       FROM (SELECT id, MD5(CONCAT_WS('|', id, payload)) h FROM t) x;   -- MySQL
+#                       SELECT count(*), md5(string_agg(h,'' ORDER BY id))
+#                       FROM (SELECT id, md5(concat_ws('|', id, payload)) h FROM t) x;   -- PG
+# 耗时（两段分开，都用「追平」口径）：
+#   快照段 = 首轮 run 从启动 → 目标端行数 == 源行数 的秒数；
+#   增量段 = 源端写下三笔（增/改/删）→ 目标端三笔全部可见 的秒数。
+#   两段都**不含**引擎 --stop-when-idle 的收尾等待——否则 300 行和 20000 行都显示 6.3s，
+#   那不是搬运耗时，是「空闲 5 秒后收尾」的常量（第一版就是这么写的，一眼假）。
+#   run 的墙钟单独记在 extra（snapshot_wall），要算总账时用它。
+add_s() { python3 -c "print(f'{$1+$2:.2f}')"; }
+
+# 交叉校验（第二判据）：md5 是「两端同一算式」，verify 是「应用侧逐行全表比对」。
+# 两条独立路径都过才算这一格过。verify 的跨端指纹 scope 不同、不可比，所以这里
+# 只跑 structure+data 级（data 级本身就是全表逐行，不是抽样）。
+verify_cross() { # $1=源 DSN $2=目标 DSN $3=表名 $4=label $5=日志文件
+  # DSN 含口令：命令行不打进日志，只留 verify 自己的输出。
+  timeout 300 "$BIN" verify --source "$1" --target "$2" --tables "$3" --level data >"$5" 2>&1
+  local rc=$?
+  if [ $rc -ne 0 ]; then
+    echo "VERIFY FAIL: $4（rc=$rc）"; sed -n '1,40p' "$5"; return 1
+  fi
+  grep -E "结构级|数据级" "$5" | tail -2
+  return 0
+}
+
 # ── 组合 1：MySQL → PG（全量 + 增量 + kill -9 续跑） ─────────────
 combo_mysql_postgres() {
   local src=${JINLIANG_TEST_MYSQL_SRC_DSN:-} dst=${JINLIANG_TEST_PG_DSN:-}
   [ -n "$src" ] && [ -n "$dst" ] || { echo "EX_CONFIG: 缺 JINLIANG_TEST_MYSQL_SRC_DSN / JINLIANG_TEST_PG_DSN" >&2; return 78; }
-  local T=acc_mp W; W=$(workdir)
+  local T=acc_mp W; W=$(workdir mysql-postgres)
   split_mysql "$src"; local sdb=$MDB; local ver; ver=$(mysql_server_version)
-  local job=$W/job.yaml data=$W/data
+  local job=$W/job.yaml data; data=$(mktemp -d)   # 引擎状态放 /tmp，notes 只留证据（不含 .db/密钥）
 
   seed_mysql "$T" "$ROWS"
   pgq "$dst" "DROP TABLE IF EXISTS $T CASCADE" >/dev/null
@@ -163,31 +207,39 @@ reliability: {batch_rows: 5000}
 YAML
   timeout 120 "$BIN" import --file "$job" --data-dir "$data" >/dev/null 2>&1 || { echo "FAIL: import 失败"; return 1; }
 
-  local t0 t1 secs copy_seconds restart_seconds s_fp d_fp
-  mark "mysql→pg 全量开始（$ROWS 行）"
+  local t0 snap_seconds incr_seconds rc s_fp d_fp lat got pid KIND paused=0 wall
+  mark "mysql→pg 快照开始（$ROWS 行）"
   t0=$(now_s)
-  runbin run --job acc-mysql-pg --data-dir "$data" --stop-when-idle 5s >"$W/run1.log" 2>&1
-  local rc=$? KIND paused=0
-  KIND=$(classify_rc "$rc" "$W/run1.log")
+  runbin run --job acc-mysql-pg --data-dir "$data" --stop-when-idle 5s >"$W/snapshot.log" 2>&1 &
+  pid=$!
+  snap_seconds=""
+  for _ in $(seq 1 3000); do   # 上限 300s：搬不完就是红，不静默
+    got=$(pgq "$dst" "SELECT count(*) FROM $T")
+    [ "${got:-0}" = "$ROWS" ] && { snap_seconds=$(elapsed "$t0" "$(now_s)"); break; }
+    sleep 0.1
+  done
+  wait $pid 2>/dev/null; rc=$?
+  wall=$(elapsed "$t0" "$(now_s)")
+  [ -n "$snap_seconds" ] || { echo "FAIL: 快照 300s 内没搬完（${got:-无}/$ROWS）"; tail -5 "$W/snapshot.log"; return 1; }
+  KIND=$(classify_rc "$rc" "$W/snapshot.log")
   case "$KIND" in needs_action) paused=1 ;; esac
-  t1=$(now_s); secs=$(elapsed "$t0" "$t1")
-  copy_seconds=$secs   # 全量+追平；后面的 restart 单独记，别覆盖它（否则三组合的「耗时」不可比）
   case "$KIND" in
     ok|needs_action|stopped) : ;;  # 3 = 有暂停表（欠账），数据面照样校验
-    *) echo "FAIL: 全量+追平退出码 $rc（$KIND）"; tail -5 "$W/run1.log"; return 1 ;;
+    *) echo "FAIL: 快照段退出码 $rc（$KIND）"; tail -5 "$W/snapshot.log"; return 1 ;;
   esac
 
   s_fp=$(fp_mysql "$T"); d_fp=$(fp_pg "$dst" "$T")
-  python3 "$GC" fp --src "$s_fp" --dst "$d_fp" --label "mysql→pg 全量" || { echo "  源 $s_fp / 目标 $d_fp"; return 1; }
+  python3 "$GC" fp --src "$s_fp" --dst "$d_fp" --label "mysql→pg 快照" || { echo "  源 $s_fp / 目标 $d_fp"; return 1; }
+  mark "mysql→pg 快照完成 ${snap_seconds}s"
 
   # 增量三笔（增/改/删）→ 追平时延
   myq "INSERT INTO \`$T\` VALUES ($((ROWS+1)),'inc-insert')"
   myq "UPDATE \`$T\` SET payload='inc-update' WHERE id=2"
   myq "DELETE FROM \`$T\` WHERE id=3"
   mark "mysql→pg 增量三笔"
-  t0=$(now_s)
-  runbin run --job acc-mysql-pg --data-dir "$data" --stop-when-idle 3s >"$W/run2.log" 2>&1 &
-  local pid=$! got="" lat=""
+  t0=$(now_s); lat=""
+  runbin run --job acc-mysql-pg --data-dir "$data" --stop-when-idle 3s >"$W/incremental.log" 2>&1 &
+  pid=$!
   for _ in $(seq 1 600); do
     got=$(pgq "$dst" "SELECT (SELECT count(*) FROM $T WHERE id=$((ROWS+1)))::text||','||
                      (SELECT count(*) FROM $T WHERE id=2 AND payload='inc-update')::text||','||
@@ -196,11 +248,14 @@ YAML
     sleep 0.1
   done
   wait $pid 2>/dev/null
-  [ -n "$lat" ] || { echo "FAIL: 增量 60s 内没追平（${got:-无}）"; tail -5 "$W/run2.log"; return 1; }
+  [ -n "$lat" ] || { echo "FAIL: 增量 60s 内没追平（${got:-无}）"; tail -5 "$W/incremental.log"; return 1; }
+  incr_seconds=$lat
   s_fp=$(fp_mysql "$T"); d_fp=$(fp_pg "$dst" "$T")
   python3 "$GC" fp --src "$s_fp" --dst "$d_fp" --label "mysql→pg 增量" || { echo "  源 $s_fp / 目标 $d_fp"; return 1; }
+  mark "mysql→pg 增量追平 ${incr_seconds}s"
+  verify_cross "$src" "$dst" "$T" "mysql→pg" "$W/verify.log" || return 1
 
-  local extra="latency=${lat}s"
+  local extra="mysql=$ver paused=$paused snapshot_wall=${wall}s"
   if [ "$KILL" = 1 ]; then
     # kill -9 打在**增量**中间：此时全量已完成，重启只许从落库位点重放，重搬必须为 0。
     nums_mysql
@@ -227,22 +282,20 @@ YAML
     mark "kill -9 后重启（只许从位点重放）"
     t0=$(now_s)
     runbin run --job acc-mysql-pg --data-dir "$data" --stop-when-idle 5s >"$W/kill2.log" 2>&1
-    rc=$?; t1=$(now_s); restart_seconds=$(elapsed "$t0" "$t1")
+    rc=$?; local restart_seconds; restart_seconds=$(elapsed "$t0" "$(now_s)")
     [ $rc -eq 0 ] || { echo "FAIL: 重启退出码 $rc"; tail -5 "$W/kill2.log"; return 1; }
     local copied
     copied=$(grep -oE "全量完成：[0-9]+ 行" "$W/kill2.log" | tail -1 | grep -oE "[0-9]+")
     copied=${copied:-0}
     # 口径①【整轮】：`rowsCopied==0`（重启没有重新搬存量）。这是验收主口径。
-    # `plan.Kind==copySkip` 由引擎在日志里体现为「没有进入全量」——脚本侧用
-    # 「重启日志里不出现『全量完成：N 行』」+ `_jl_chunk` 行数不变 两个可观测事实钉住。
     python3 "$GC" recopy --scope whole --copied "$copied" --label "kill -9 重启（整轮口径）" || return 1
     s_fp=$(fp_mysql "$T"); d_fp=$(fp_pg "$dst" "$T")
     python3 "$GC" fp --src "$s_fp" --dst "$d_fp" --label "kill -9 重启后" || { echo "  源 $s_fp / 目标 $d_fp"; return 1; }
-    extra="$extra kill=recopy-${copied}-rows"
+    extra="$extra kill_recopy=${copied}rows kill_restart=${restart_seconds}s"
   fi
 
-  local n; n=$(pgq "$dst" "SELECT count(*) FROM $T")
-  emit "mysql-postgres" "$n" "${s_fp#*:}" "$copy_seconds" pass "mysql=$ver copy_seconds=${copy_seconds} restart_seconds=${restart_seconds:-0} paused=${paused:-0} $extra"
+  local s_n=${s_fp%%:*} s_md5=${s_fp#*:} d_n=${d_fp%%:*} d_md5=${d_fp#*:}
+  emit mysql-postgres "public.$T" "$s_n" "$d_n" "$s_md5" "$d_md5" "$snap_seconds" "$incr_seconds" pass "$extra"
 }
 
 # 增量验收（三组合共用）：按 #93 之后的实现判，**不再把「被拒」当通过**。
@@ -252,21 +305,34 @@ YAML
 # （退出码 130），脚本却把它当成「被拒」，于是 #92 在 #93 合入后红在两格上：
 # 真正的结论是「增量跑起来了，只是判据还在等一句拒绝文案」。
 #
-# 判据只有两条，都可证伪：
-#   ① rc == 0：任务自己追平后收尾，不是被 timeout / Ctrl-C 打断；
-#   ② 源与目标的内容指纹一致（行数 + 逐行 md5）——不是「看起来动了」。
-# 失败时把日志尾巴打出来：不接受「红了但不知道为什么」。
-incr_check() { # $1=job $2=data-dir $3=log $4=label $5=源指纹 $6=目标表名（连接已 split 到目标）
-  local job=$1 data=$2 log=$3 label=$4 s_fp=$5 T=$6 d_fp rc
-  timeout -k 5 180 "$BIN" run --job "$job" --data-dir "$data" --stop-when-idle 3s >"$log" 2>&1
-  rc=$?
+# 判据三条，都可证伪：
+#   ① 目标端三笔（增/改/删）全部可见——用轮询取追平时刻，顺便得到增量段耗时；
+#   ② rc == 0：任务自己追平后收尾，不是被 timeout / Ctrl-C 打断；
+#   ③ 源与目标的内容指纹一致（行数 + 逐行 md5）——不是「看起来动了」。
+# 目标指纹**跑完再取**：跑前那份还是快照的指纹，拿它比等于拿「跑之前」比「跑之前」，
+# 增量一行没写也会绿（这条最早就是这么写错的，红了两格才发现）。
+INCR_SECONDS=0
+incr_check() { # $1=job $2=data-dir $3=log $4=label $5=源指纹 $6=目标表名 $7=基线行数
+  local job=$1 data=$2 log=$3 label=$4 s_fp=$5 T=$6 base=$7
+  local rc d_fp t0 got pid=""
+  t0=$(now_s); INCR_SECONDS=0
+  timeout -k 5 180 "$BIN" run --job "$job" --data-dir "$data" --stop-when-idle 3s >"$log" 2>&1 &
+  pid=$!
+  for _ in $(seq 1 600); do
+    got=$(myq "SELECT CONCAT(
+                 (SELECT COUNT(*) FROM \`$T\` WHERE id=$((base+1))),',',
+                 (SELECT COUNT(*) FROM \`$T\` WHERE id=2 AND payload='inc-update'),',',
+                 (SELECT COUNT(*) FROM \`$T\` WHERE id=3))")
+    [ "$got" = "1,1,0" ] && { INCR_SECONDS=$(elapsed "$t0" "$(now_s)"); break; }
+    sleep 0.1
+  done
+  wait $pid 2>/dev/null; rc=$?
+  [ "$got" = "1,1,0" ] || { echo "FAIL: $label 60s 内没追平（${got:-无}）"; tail -20 "$log" 2>/dev/null; return 1; }
   if [ $rc -ne 0 ]; then
     echo "FAIL: $label 退出码 $rc（增量没跑成；本版三个方向都已接通，拒绝=回归）"
     echo "--- $log ---"; tail -20 "$log" 2>/dev/null; echo "--- end ---"
     return 1
   fi
-  # 目标指纹必须**跑完再取**：跑前那份还是全量的指纹，拿它比等于拿「跑之前」比「跑之前」，
-  # 增量一行没写也会绿（这条最早就是这么写错的，红了两格才发现）。
   d_fp=$(fp_mysql "$T")
   python3 "$GC" fp --src "$s_fp" --dst "$d_fp" --label "$label" || { echo "  源 $s_fp / 目标 $d_fp"; return 1; }
   return 0
@@ -276,9 +342,9 @@ incr_check() { # $1=job $2=data-dir $3=log $4=label $5=源指纹 $6=目标表名
 combo_postgres_mysql() {
   local src=${JINLIANG_TEST_PG_SRC_DSN:-} dst=${JINLIANG_TEST_MYSQL_DST_DSN:-${JINLIANG_TEST_MYSQL_DSN:-}}
   [ -n "$src" ] && [ -n "$dst" ] || { echo "EX_CONFIG: 缺 JINLIANG_TEST_PG_SRC_DSN / JINLIANG_TEST_MYSQL_DST_DSN" >&2; return 78; }
-  local T=acc_pm W; W=$(workdir)
+  local T=acc_pm W; W=$(workdir postgres-mysql)
   split_mysql "$dst"; local ddb=$MDB; local ver; ver=$(mysql_server_version)
-  local job=$W/job.yaml data=$W/data
+  local job=$W/job.yaml data; data=$(mktemp -d)   # 引擎状态放 /tmp，notes 只留证据（不含 .db/密钥）
 
   seed_pg "$src" "$T" "$ROWS"
   myq "DROP TABLE IF EXISTS \`$T\`"
@@ -307,17 +373,26 @@ YAML
   [ -n "${JINLIANG_TEST_MYSQL_DST_DSN:-}" ] || export JINLIANG_TEST_MYSQL_DST_DSN=$dst
   timeout 120 "$BIN" import --file "$job" --data-dir "$data" >/dev/null 2>&1 || { echo "FAIL: import 失败"; return 1; }
 
-  local t0 t1 secs s_fp d_fp n rc
-  mark "pg→mysql 全量+追平开始"
+  local t0 snap_seconds incr_seconds rc s_fp d_fp KIND paused=0 got pid wall cnt
+  mark "pg→mysql 快照开始（$ROWS 行）"
   t0=$(now_s)
-  runbin run --job acc-pg-mysql --data-dir "$data" --stop-when-idle 5s >"$W/run1.log" 2>&1
-  rc=$?
-  local KIND="${KIND:-}"; KIND=$(classify_rc "$rc" "$W/run1.log"); [ "$KIND" = "needs_action" ] && PAUSED_P2M=1 || PAUSED_P2M=0
-  mark "pg→mysql 全量+追平结束 rc=$rc"
-  case "$KIND" in ok|needs_action|stopped) : ;; *) echo "FAIL: 全量退出码 $rc（$KIND）"; tail -20 "$W/run1.log"; return 1 ;; esac
+  runbin run --job acc-pg-mysql --data-dir "$data" --stop-when-idle 5s >"$W/snapshot.log" 2>&1 &
+  pid=$!
+  snap_seconds=""
+  for _ in $(seq 1 3000); do
+    cnt=$(myq "SELECT COUNT(*) FROM \`$T\`")
+    [ "${cnt:-0}" = "$ROWS" ] && { snap_seconds=$(elapsed "$t0" "$(now_s)"); break; }
+    sleep 0.1
+  done
+  wait $pid 2>/dev/null; rc=$?
+  wall=$(elapsed "$t0" "$(now_s)")
+  [ -n "$snap_seconds" ] || { echo "FAIL: 快照 300s 内没搬完（${cnt:-无}/$ROWS）"; tail -20 "$W/snapshot.log"; return 1; }
+  KIND=$(classify_rc "$rc" "$W/snapshot.log"); [ "$KIND" = "needs_action" ] && paused=1 || paused=0
+  case "$KIND" in ok|needs_action|stopped) : ;; *) echo "FAIL: 快照段退出码 $rc（$KIND）"; tail -20 "$W/snapshot.log"; return 1 ;; esac
+  mark "pg→mysql 快照完成 ${snap_seconds}s"
 
   s_fp=$(fp_pg "$src" "$T"); d_fp=$(fp_mysql "$T")
-  python3 "$GC" fp --src "$s_fp" --dst "$d_fp" --label "pg→mysql 全量" || { echo "  源 $s_fp / 目标 $d_fp"; return 1; }
+  python3 "$GC" fp --src "$s_fp" --dst "$d_fp" --label "pg→mysql 快照" || { echo "  源 $s_fp / 目标 $d_fp"; return 1; }
 
   pgq "$src" "INSERT INTO $T VALUES ($((ROWS+1)),'inc-insert')" >/dev/null
   pgq "$src" "UPDATE $T SET payload='inc-update' WHERE id=2" >/dev/null
@@ -325,20 +400,23 @@ YAML
   mark "pg→mysql 增量三笔"
   s_fp=$(fp_pg "$src" "$T")
   split_mysql "$dst"
-  incr_check acc-pg-mysql "$data" "$W/incr.log" "pg→mysql 增量" "$s_fp" "$T" || return 1
-  t1=$(now_s); secs=$(elapsed "$t0" "$t1")
-
+  incr_check acc-pg-mysql "$data" "$W/incremental.log" "pg→mysql 增量" "$s_fp" "$T" "$ROWS" || return 1
+  incr_seconds=$INCR_SECONDS
+  mark "pg→mysql 增量追平 ${incr_seconds}s"
   split_mysql "$dst"
-  n=$(myq "SELECT COUNT(*) FROM \`$T\`")
-  emit "postgres-mysql" "$n" "${s_fp#*:}" "$secs" pass "mysql=$ver incremental=ok"
+  d_fp=$(fp_mysql "$T")
+  verify_cross "$src" "$dst" "$T" "pg→mysql" "$W/verify.log" || return 1
+
+  local s_n=${s_fp%%:*} s_md5=${s_fp#*:} d_n=${d_fp%%:*} d_md5=${d_fp#*:}
+  emit postgres-mysql "$ddb.$T" "$s_n" "$d_n" "$s_md5" "$d_md5" "$snap_seconds" "$incr_seconds" pass "mysql=$ver paused=$paused snapshot_wall=${wall}s"
 }
 
 # ── 组合 3：MySQL → MySQL（全量 + 增量追平） ────────────────────
 combo_mysql_mysql() {
   local src=${JINLIANG_TEST_MYSQL_SRC_DSN:-} dst=${JINLIANG_TEST_MYSQL_DST_DSN:-}
   [ -n "$src" ] && [ -n "$dst" ] || { echo "EX_CONFIG: 缺 JINLIANG_TEST_MYSQL_SRC_DSN / JINLIANG_TEST_MYSQL_DST_DSN" >&2; return 78; }
-  local T=acc_mm W; W=$(workdir)
-  local job=$W/job.yaml data=$W/data
+  local T=acc_mm W; W=$(workdir mysql-mysql)
+  local job=$W/job.yaml data; data=$(mktemp -d)   # 引擎状态放 /tmp，notes 只留证据（不含 .db/密钥）
 
   split_mysql "$src"; local sdb=$MDB; local ver; ver=$(mysql_server_version)
   seed_mysql "$T" "$ROWS"; local s_fp; s_fp=$(fp_mysql "$T")
@@ -366,17 +444,26 @@ mode: {frequency: continuous+initial}
 YAML
   timeout 120 "$BIN" import --file "$job" --data-dir "$data" >/dev/null 2>&1 || { echo "FAIL: import 失败"; return 1; }
 
-  local t0 t1 secs d_fp n rc
-  mark "mysql→mysql 全量+追平开始"
+  local t0 snap_seconds incr_seconds rc d_fp KIND paused=0 got pid wall cnt
+  mark "mysql→mysql 快照开始（$ROWS 行）"
   t0=$(now_s)
-  runbin run --job acc-mysql-mysql --data-dir "$data" --stop-when-idle 5s >"$W/run1.log" 2>&1
-  rc=$?
-  local KIND="${KIND:-}"; KIND=$(classify_rc "$rc" "$W/run1.log"); [ "$KIND" = "needs_action" ] && PAUSED_M2M=1 || PAUSED_M2M=0
-  mark "mysql→mysql 全量+追平结束 rc=$rc"
-  case "$KIND" in ok|needs_action|stopped) : ;; *) echo "FAIL: 全量退出码 $rc（$KIND）"; tail -20 "$W/run1.log"; return 1 ;; esac
+  runbin run --job acc-mysql-mysql --data-dir "$data" --stop-when-idle 5s >"$W/snapshot.log" 2>&1 &
+  pid=$!
+  snap_seconds=""
+  for _ in $(seq 1 3000); do
+    cnt=$(myq "SELECT COUNT(*) FROM \`$T\`")
+    [ "${cnt:-0}" = "$ROWS" ] && { snap_seconds=$(elapsed "$t0" "$(now_s)"); break; }
+    sleep 0.1
+  done
+  wait $pid 2>/dev/null; rc=$?
+  wall=$(elapsed "$t0" "$(now_s)")
+  [ -n "$snap_seconds" ] || { echo "FAIL: 快照 300s 内没搬完（${cnt:-无}/$ROWS）"; tail -20 "$W/snapshot.log"; return 1; }
+  KIND=$(classify_rc "$rc" "$W/snapshot.log"); [ "$KIND" = "needs_action" ] && paused=1 || paused=0
+  case "$KIND" in ok|needs_action|stopped) : ;; *) echo "FAIL: 快照段退出码 $rc（$KIND）"; tail -20 "$W/snapshot.log"; return 1 ;; esac
+  mark "mysql→mysql 快照完成 ${snap_seconds}s"
 
   d_fp=$(fp_mysql "$T")
-  python3 "$GC" fp --src "$s_fp" --dst "$d_fp" --label "mysql→mysql 全量" || { echo "  源 $s_fp / 目标 $d_fp"; return 1; }
+  python3 "$GC" fp --src "$s_fp" --dst "$d_fp" --label "mysql→mysql 快照" || { echo "  源 $s_fp / 目标 $d_fp"; return 1; }
 
   # 源端三笔（增/改/删），与 MySQL→PG / PG→MySQL 同一套动作。
   split_mysql "$src"
@@ -386,11 +473,15 @@ YAML
   s_fp=$(fp_mysql "$T")
   split_mysql "$dst"
   mark "mysql→mysql 增量三笔"
-  incr_check acc-mysql-mysql "$data" "$W/incr.log" "mysql→mysql 增量" "$s_fp" "$T" || return 1
-  t1=$(now_s); secs=$(elapsed "$t0" "$t1")
+  incr_check acc-mysql-mysql "$data" "$W/incremental.log" "mysql→mysql 增量" "$s_fp" "$T" "$ROWS" || return 1
+  incr_seconds=$INCR_SECONDS
+  mark "mysql→mysql 增量追平 ${incr_seconds}s"
+  split_mysql "$dst"
+  d_fp=$(fp_mysql "$T")
+  verify_cross "$src" "$dst" "$T" "mysql→mysql" "$W/verify.log" || return 1
 
-  n=$(myq "SELECT COUNT(*) FROM \`$T\`")
-  emit "mysql-mysql" "$n" "${s_fp#*:}" "$secs" pass "mysql=$ver incremental=ok"
+  local s_n=${s_fp%%:*} s_md5=${s_fp#*:} d_n=${d_fp%%:*} d_md5=${d_fp#*:}
+  emit mysql-mysql "$ddb.$T" "$s_n" "$d_n" "$s_md5" "$d_md5" "$snap_seconds" "$incr_seconds" pass "mysql=$ver paused=$paused snapshot_wall=${wall}s"
 }
 
 LIST="mysql-postgres postgres-mysql mysql-mysql"
@@ -413,23 +504,25 @@ for combo in $LIST; do
 done
 
 echo
-echo "| 组合 | MySQL | 行数 | md5 | 耗时 | 备注 |"
-echo "|---|---|---|---|---|---|"
-for line in "${RESULTS[@]}"; do
-  combo="" rows="" md5="" seconds="" status="" latency="" kill="" incremental="" rc="" mysql="" restart=""
-  eval "$(printf '%s' "$line" | sed -E 's/^RESULT //; s/([a-z-]+)=([^ ]*)/\1="\2"/g')"
-  if [ "${status:-fail}" = "pass" ]; then
-    echo "| ${combo:-?} | ${mysql:-?} | ${rows:-?} | \`${md5:-?}\` | ${seconds:-?}s | ${latency:-}${restart:+ restart=${restart}} ${kill:-} ${incremental:-} |"
-  else
-    echo "| ${combo:-?} | - | - | - | - | **FAIL** ${rc:-} |"
-  fi
-done
+echo "| 组合 | 目标表名 | 源行数 | 目标行数 | 源 md5 | 目标 md5 | 快照(s) | 增量(s) | 结论 |"
+echo "|---|---|---|---|---|---|---|---|---|"
+printf '%s\n' "${RESULTS[@]}" | python3 -c '
+import sys
+for line in sys.stdin:
+    p = dict(x.split("=", 1) for x in line.split()[1:] if "=" in x)
+    if p.get("combo") and p.get("status") == "pass":
+        print("| {combo} | {target} | {src_rows} | {dst_rows} | `{src_md5}` | `{dst_md5}` | "
+              "{snapshot_seconds} | {incremental_seconds} | pass |".format(**p))
+    elif p.get("combo"):
+        print("| {combo} | - | - | - | - | - | - | - | **FAIL** {rc} |".format(
+            combo=p.get("combo", "?"), rc=p.get("rc", "")))
+'
 
 if [ -n "$JSON" ]; then
   { printf '[\n'; first=1
     for line in "${RESULTS[@]}"; do
       [ $first = 1 ] || printf ',\n'; first=0
-      printf '%s' "$line" | python3 -c 'import json,sys; l=sys.stdin.read().strip(); p=dict(x.split("=",1) for x in l.split()[1:]); print(json.dumps(p, ensure_ascii=False))'
+      printf '%s' "$line" | python3 -c 'import json,sys; l=sys.stdin.read().strip(); print(json.dumps(dict(x.split("=",1) for x in l.split()[1:] if "=" in x), ensure_ascii=False))'
     done; printf '\n]\n'; } > "$JSON"
   echo "JSON：$JSON"
 fi
