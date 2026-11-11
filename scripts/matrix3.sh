@@ -6,6 +6,7 @@
 #   scripts/matrix3.sh                  # 20000 行，输出落 notes/matrix3/<日期>/
 #   ROWS=100000 scripts/matrix3.sh      # 换行数（三格同时换，才比得动）
 #   OUT=notes/matrix3/manual scripts/matrix3.sh
+#   MATRIX3_NO_STACK=1 ... scripts/matrix3.sh   # 不起本地栈/不覆盖 DSN（跑外部实例，如 9.x）
 #
 # 它做四件事：
 #   ①起本地栈（PG 17.11 + 两个 MySQL 8.0.28；已在跑就复用，数据目录在工作区 .localdb）
@@ -13,6 +14,13 @@
 #   ③按组合**串行**跑 scripts/acceptance_matrix.sh：每格的 stdout/stderr 全落
 #     notes/matrix3/<日期>/<组合>/console.log，引擎日志（snapshot/incremental/verify）同目录
 #   ④把三格结果拼成 matrix.md（交付的那张表）
+#
+# 版本档（5.7 / 8.4 / 9.x）：
+#   scripts/version_stack.sh up 9.7.4 /.toolchain/mysql-9.7.4/usr 53346 53347
+#   eval "$(scripts/version_stack.sh env 9.7.4 53346 53347)"
+#   MATRIX3_NO_STACK=1 ROWS=20000 OUT=notes/matrix3/versions/9.7.4 scripts/matrix3.sh
+#   指纹算式由 acceptance_matrix.sh **按能力探测**（MySQL 9.x 没有 MD5() → 两端同换 SHA2-256），
+#   不需要打 patch、也不会因为换算式而放松判据。
 #
 # 为什么串行：三格共用同一个 PG 实例和同一个二进制，并发会互抢 _jl_lease 租约，
 # 而且耗时没法归因。
@@ -28,14 +36,22 @@ mkdir -p "$OUT"
 log() { printf '[matrix3] %s\n' "$*" >&2; }
 
 # ── ① 本地栈 ──────────────────────────────────────────────────
-if ! "$ROOT/scripts/local_stack.sh" status 2>/dev/null | grep -q "在跑"; then
-  log "本地栈没跑，起（PG 17 + MySQL 8.0.28 ×2，第一次初始化约 20s）"
-  "$ROOT/scripts/local_stack.sh" up || { log "本地栈起不来"; exit 78; }
+if [ "${MATRIX3_NO_STACK:-0}" = "1" ]; then
+  # 版本档（5.7 / 8.4 / 9.x）要跑在别的实例上：别起默认栈，也别用它把 DSN 覆盖掉。
+  log "MATRIX3_NO_STACK=1：用外部 DSN，不起本地栈"
+  for v in JINLIANG_TEST_MYSQL_SRC_DSN JINLIANG_TEST_MYSQL_DST_DSN JINLIANG_TEST_PG_DSN JINLIANG_TEST_PG_SRC_DSN; do
+    [ -n "${!v:-}" ] || { log "缺环境变量 $v（MATRIX3_NO_STACK=1 时必须自己给全）"; exit 78; }
+  done
 else
-  log "本地栈已在跑，复用（数据目录 .localdb/）"
+  if ! "$ROOT/scripts/local_stack.sh" status 2>/dev/null | grep -q "在跑"; then
+    log "本地栈没跑，起（PG 17 + MySQL 8.0.28 ×2，第一次初始化约 20s）"
+    "$ROOT/scripts/local_stack.sh" up || { log "本地栈起不来"; exit 78; }
+  else
+    log "本地栈已在跑，复用（数据目录 .localdb/）"
+  fi
+  # shellcheck disable=SC1091
+  . "$ROOT/.localdb/stack.env"
 fi
-# shellcheck disable=SC1091
-. "$ROOT/.localdb/stack.env"
 
 # ── ② 二进制 ──────────────────────────────────────────────────
 mkdir -p "$ROOT/.localdb/bin"

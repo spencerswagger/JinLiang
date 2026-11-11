@@ -73,15 +73,40 @@ runbin() { timeout 300 "$BIN" "$@"; }
 classify_rc() { python3 "$EXITC" classify --code "$1" --log "$2" --kind-only 2>/dev/null; }
 mark() { echo "-- $(date -u +%H:%M:%S) $*"; }
 
+# 指纹算式按**能力**探测，不按版本号分支：MySQL 9.x 起内置 MD5() 已被移除
+# （`ERROR 1305 FUNCTION ... MD5 does not exist`）。探到不可用时两端**同时**换
+# SHA2(...,256) / encode(sha256(...),'hex')——两边仍是同一个算式，跨端照样可比，
+# 判据不放松（行数 + 内容指纹照旧，'-' 依旧判失败）。
+FP_ALG=${FP_ALG:-}
+detect_fp_alg() {
+  local dsn=${JINLIANG_TEST_MYSQL_DST_DSN:-${JINLIANG_TEST_MYSQL_SRC_DSN:-}}
+  if [ -z "$dsn" ]; then FP_ALG=md5; return 0; fi
+  split_mysql "$dsn"
+  if ! myq "SELECT 1" >/dev/null 2>&1; then FP_ALG=md5; return 0; fi   # 连不上就别猜，后面会真报错
+  if myq "SELECT MD5('x')" 2>/dev/null | grep -qE '^[0-9a-f]{32}$'; then FP_ALG=md5; else FP_ALG=sha256; fi
+}
+
 fp_mysql() { # $1=表名（当前连接）
-  myq "SET SESSION group_concat_max_len=1073741824;
-       SELECT CONCAT(COUNT(*),':',COALESCE(MD5(GROUP_CONCAT(h ORDER BY id SEPARATOR '')),'-'))
-       FROM (SELECT id, MD5(CONCAT_WS('|', id, payload)) h FROM \`$1\`) x"
+  if [ "$FP_ALG" = "sha256" ]; then
+    myq "SET SESSION group_concat_max_len=1073741824;
+         SELECT CONCAT(COUNT(*),':',COALESCE(SHA2(GROUP_CONCAT(h ORDER BY id SEPARATOR ''),256),'-'))
+         FROM (SELECT id, SHA2(CONCAT_WS('|', id, payload),256) h FROM \`$1\`) x"
+  else
+    myq "SET SESSION group_concat_max_len=1073741824;
+         SELECT CONCAT(COUNT(*),':',COALESCE(MD5(GROUP_CONCAT(h ORDER BY id SEPARATOR '')),'-'))
+         FROM (SELECT id, MD5(CONCAT_WS('|', id, payload)) h FROM \`$1\`) x"
+  fi
 }
 fp_pg() { # $1=dsn $2=表名
-  pgq "$1" "SELECT count(*)::text||':'||COALESCE(md5(string_agg(h,'' ORDER BY id)),'-')
-            FROM (SELECT id, md5(concat_ws('|', id, payload)) h FROM $2) x"
+  if [ "$FP_ALG" = "sha256" ]; then
+    pgq "$1" "SELECT count(*)::text||':'||COALESCE(encode(sha256(convert_to(string_agg(h,'' ORDER BY id),'UTF8')),'hex'),'-')
+              FROM (SELECT id, encode(sha256(convert_to(concat_ws('|', id, payload),'UTF8')),'hex') h FROM $2) x"
+  else
+    pgq "$1" "SELECT count(*)::text||':'||COALESCE(md5(string_agg(h,'' ORDER BY id)),'-')
+              FROM (SELECT id, md5(concat_ws('|', id, payload)) h FROM $2) x"
+  fi
 }
+detect_fp_alg
 
 mysql_server_version() { myq "SELECT VERSION()" | head -1; }
 

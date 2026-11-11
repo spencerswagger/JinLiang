@@ -1,0 +1,15 @@
+== postgres-mysql ==
+-- 19:15:10 pg→mysql 快照开始（20000 行）
+-- 19:15:16 pg→mysql 快照完成 1.60s
+gate: OK   [pg→mysql 快照] 20000 行，内容指纹一致 f44174a6aa59bef8571ef8817990766f56ca28d793c9b8563f84aa791242997c
+-- 19:15:17 pg→mysql 增量三笔
+gate: OK   [pg→mysql 增量] 20000 行，内容指纹一致 c99f849412d7f83a8f4335fb1b546838a5843d2c1f47d677e4fcab181de9422e
+-- 19:15:21 pg→mysql 增量追平 0.30s
+结论：数据级 ✓（行级全表比对 1 表；跨端指纹不可比，已改用逐行比对）
+RESULT combo=postgres-mysql target=jinliang_target.acc_pm rows=20000 md5=c99f849412d7f83a8f4335fb1b546838a5843d2c1f47d677e4fcab181de9422e seconds=1.90 src_rows=20000 dst_rows=20000 src_md5=c99f849412d7f83a8f4335fb1b546838a5843d2c1f47d677e4fcab181de9422e dst_md5=c99f849412d7f83a8f4335fb1b546838a5843d2c1f47d677e4fcab181de9422e snapshot_seconds=1.60 incremental_seconds=0.30 status=pass mysql=9.7.4 paused=0 snapshot_wall=6.74s
+
+| 组合 | 目标表名 | 源行数 | 目标行数 | 源 md5 | 目标 md5 | 快照(s) | 增量(s) | 结论 |
+|---|---|---|---|---|---|---|---|---|
+| postgres-mysql | jinliang_target.acc_pm | 20000 | 20000 | `c99f849412d7f83a8f4335fb1b546838a5843d2c1f47d677e4fcab181de9422e` | `c99f849412d7f83a8f4335fb1b546838a5843d2c1f47d677e4fcab181de9422e` | 1.60 | 0.30 | pass |
+JSON：notes/matrix3/versions/9.7.4/postgres-mysql/result.json
+acceptance: 全部通过
