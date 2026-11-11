@@ -1,0 +1,4 @@
+[
+{"combo": "postgres-mysql", "target": "jinliang_target.acc_pm", "rows": "20000", "md5": "330ccea0293f33177530c2a6933dad45", "seconds": "2.54", "src_rows": "20000", "dst_rows": "20000", "src_md5": "330ccea0293f33177530c2a6933dad45", "dst_md5": "330ccea0293f33177530c2a6933dad45", "snapshot_seconds": "2.24", "incremental_seconds": "0.30", "status": "pass", "mysql": "5.7.38-log", "paused": "0", "snapshot_wall": "7.42s"}
+
+]
