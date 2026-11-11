@@ -23,7 +23,9 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/spencerswagger/jinliang/internal/sink"
 
 	"github.com/spencerswagger/jinliang/internal/catalog"
 	"github.com/spencerswagger/jinliang/internal/dsn"
@@ -1072,6 +1074,11 @@ func (s *Sink) Apply(ctx context.Context, evs []source.Event, pos source.Positio
 	// 写进去就没人知道了）。只查内存集合，不产生 IO。
 	for _, ev := range evs {
 		if _, paused := s.pausedCache[ev.Table.Table]; !paused {
+			continue
+		}
+		// 整表重搬窗口内**故意**写这张表（契约 §1.6 步 3）：记录留到搬成才解除，
+		// 所以按上下文放行（见 internal/sink/recopy.go）。
+		if sink.InRecopy(ctx, ev.Table.Table) {
 			continue
 		}
 		return fmt.Errorf("引擎没有过滤掉暂停表 %s 的事件（内部错误：按表暂停的判定权在引擎，"+

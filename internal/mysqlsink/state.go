@@ -238,7 +238,11 @@ func ReadLease(ctx context.Context, ep dsn.Endpoint, jobKey string) (LeaseHolder
 
 // EnsureMeta 建立/更新本 job 的元数据行（幂等）。
 func (s *Sink) EnsureMeta(ctx context.Context, jobHash, phase, position, snapshotID string) error {
-	// **phase 只在插入时写，冲突时不改**（与 pgsink 同一口径）。
+	// **phase 与 job_hash 都只在插入时写，冲突时不改**（与 pgsink 同一口径）。
+	//
+	// 为什么 job_hash 不能在冲突时刷新：它是「这张表停着还成不成立」的跨轮存活判据
+	// （`reconcilePaused` 拿 `StoredJobHash` 与本轮 hash 比）。每次都刷新 = 读回来的
+	// 永远等于本轮 hash = 判据恒真 = 换了任务语义旧暂停也清不掉（PG 侧就是这么写的）。
 	//
 	// 为什么：阶段只能由 SetPhase 推进。这里每次都把它重置成 'prepare'，等于把
 	// 「上一轮崩在哪个阶段」这条唯一的可重算事实擦掉——引擎就没法区分
@@ -248,7 +252,7 @@ func (s *Sink) EnsureMeta(ctx context.Context, jobHash, phase, position, snapsho
 		INSERT INTO _jl_meta (job_key, name, instance_id, schema_version, job_hash, phase, position, snapshot_id, started_at, updated_at)
 		VALUES (?, ?, ?, 1, ?, ?, ?, ?, NOW(6), NOW(6))
 		ON DUPLICATE KEY UPDATE
-		  name=VALUES(name), instance_id=VALUES(instance_id), job_hash=VALUES(job_hash),
+		  name=VALUES(name), instance_id=VALUES(instance_id),
 		  snapshot_id=COALESCE(VALUES(snapshot_id), snapshot_id), updated_at=NOW(6)`,
 		s.opt.JobKey, s.opt.Name, s.opt.InstanceID, jobHash, phase, position, snapshotID)
 	if err != nil {
@@ -329,13 +333,8 @@ func (s *Sink) ResetChunks(ctx context.Context) error {
 	return nil
 }
 
-// TruncateTable 清空目标表（recreate/重搬路径用）。
-func (s *Sink) TruncateTable(ctx context.Context, ref source.TableRef) error {
-	if _, err := s.db.ExecContext(ctx, "TRUNCATE TABLE "+s.qualifiedOn(ref)); err != nil {
-		return fmt.Errorf("清空 %s 失败: %w", qualified(ref), err)
-	}
-	return nil
-}
+// TruncateTable 已挪到 truncate.go（带所有权闸门）：留这行注释指路，
+// 免得有人在 state.go 里再写一个裸 TRUNCATE。
 
 // RecordObject 登记「这个对象是本任务建的」（孤儿判定与 recopy fail-closed 的依据）。
 //

@@ -10,6 +10,9 @@ package engine
 //     的分支），而且 `copySkip` 要兜底成会跑搬运的 Kind —— 否则单表任务会「说了重搬、一步不动」。
 
 import (
+	"context"
+	"errors"
+	"strings"
 	"testing"
 
 	"github.com/spencerswagger/jinliang/internal/control"
@@ -222,5 +225,119 @@ func TestForcedRecopyJoinsCleanNamesOnFreshRuns(t *testing.T) {
 	}
 	if r.plan.Skip["orders"] {
 		t.Fatal("它这次必须搬，不能留在 Skip 名单里")
+	}
+}
+
+// ── A3（批级）：「登记失败 → 整批失败」 ────────────────────────────
+//
+// 集成用例（`integration_pause_register_fail_test.go`）钉的是 **prepare 期**登记失败；
+// 这一条钉 **流式每一批**：`pauseSink.Apply` 发现某张表结构对不上 → 先登记 → 登记失败时
+// **这一批整体失败**（不重试、不写别的表、不记跳过账）。
+//
+// 为什么两条都要：prepare 期失败是「这一轮还没开始搬」；批级失败是「已经跑起来了，
+// 这一批里有 A 的变更也有 B 的变更」——后者才是「跳过了但没记下」真正会发生的地方。
+type fakePauseReg struct {
+	failPause bool
+	pauses    int
+	skipped   int
+}
+
+func (f *fakePauseReg) LoadPausedTables(context.Context) error { return nil }
+func (f *fakePauseReg) PausedTables(context.Context) (map[string]pgsink.PausedTable, error) {
+	return map[string]pgsink.PausedTable{}, nil
+}
+func (f *fakePauseReg) PauseTable(context.Context, source.TableRef, pgsink.PausedTable) error {
+	f.pauses++
+	if f.failPause {
+		return errors.New("模拟登记失败：目标端状态行不在了")
+	}
+	return nil
+}
+func (f *fakePauseReg) NoteSkipped(context.Context, source.TableRef, int64, string) error {
+	f.skipped++
+	return nil
+}
+func (f *fakePauseReg) ClearPausedTable(context.Context, source.TableRef) error       { return nil }
+func (f *fakePauseReg) MarkTableRecopyPending(context.Context, source.TableRef) error { return nil }
+
+// countingSink 第一次调用返回 PausableError（模拟「这张表结构对不上」），之后成功。
+type countingSink struct {
+	calls int
+	batch []source.Event
+}
+
+func (c *countingSink) Apply(_ context.Context, evs []source.Event, _ source.Position) error {
+	c.calls++
+	if c.calls == 1 {
+		return &pgsink.TypeChangedError{TableName: "orders", Detail: "列 v：目标端 bigint / 源 numeric"}
+	}
+	c.batch = append(c.batch, evs...)
+	return nil
+}
+
+func TestPauseSinkApplyFailsWholeBatchWhenRegistrationFails(t *testing.T) {
+	reg := &fakePauseReg{failPause: true}
+	inner := &countingSink{}
+	r := pausedRunner("paused_a") // 注意：orders 还**不在**暂停集合里（这一批才发现）
+	r.pauseReg = reg
+	r.doc = control.JobDoc{Target: control.TargetDoc{Schema: "public"}}
+	p := newPauseSink(inner, r)
+
+	evs := []source.Event{
+		{Kind: source.EvBegin},
+		{Kind: source.EvInsert, Table: source.TableRef{Schema: "public", Table: "orders"}},
+		{Kind: source.EvInsert, Table: source.TableRef{Schema: "public", Table: "healthy"}},
+		{Kind: source.EvCommit},
+	}
+	err := p.Apply(context.Background(), evs, nil)
+	if err == nil {
+		t.Fatal("登记失败时这一批必须失败（跳过了但没记下 = 永久静默缺失）")
+	}
+	if !strings.Contains(err.Error(), "登记") {
+		t.Fatalf("错误要指向「登记暂停失败」，得到：%v", err)
+	}
+	if reg.pauses != 1 {
+		t.Fatalf("应尝试登记 1 次，实际 %d 次", reg.pauses)
+	}
+	if inner.calls != 1 {
+		t.Fatalf("登记失败后**不许**再重试这一批：inner 只该被调 1 次，实际 %d 次", inner.calls)
+	}
+	if reg.skipped != 0 {
+		t.Fatalf("没提交成功的批次不许记跳过账，实际记了 %d 次", reg.skipped)
+	}
+}
+
+// 对照：登记**成功**之后才允许跳过——这一批要重试一次，B 的行必须写进去。
+func TestPauseSinkApplyRetriesAfterSuccessfulRegistration(t *testing.T) {
+	reg := &fakePauseReg{}
+	inner := &countingSink{}
+	r := pausedRunner()
+	r.pauseReg = reg
+	r.doc = control.JobDoc{Target: control.TargetDoc{Schema: "public"}}
+	p := newPauseSink(inner, r)
+
+	evs := []source.Event{
+		{Kind: source.EvBegin},
+		{Kind: source.EvInsert, Table: source.TableRef{Schema: "public", Table: "orders"}},
+		{Kind: source.EvInsert, Table: source.TableRef{Schema: "public", Table: "healthy"}},
+		{Kind: source.EvCommit},
+	}
+	if err := p.Apply(context.Background(), evs, nil); err != nil {
+		t.Fatalf("登记成功之后这一批应能提交（其它表继续跑）：%v", err)
+	}
+	if inner.calls != 2 {
+		t.Fatalf("应「先失败 → 登记 → 重试」共 2 次，实际 %d 次", inner.calls)
+	}
+	var kept []string
+	for _, ev := range inner.batch {
+		if ev.Table.Table != "" {
+			kept = append(kept, ev.Table.Table)
+		}
+	}
+	if len(kept) != 1 || kept[0] != "healthy" {
+		t.Fatalf("重试的批里只该剩 healthy 的行，得到 %v", kept)
+	}
+	if reg.skipped != 1 {
+		t.Fatalf("提交成功后要记一次跳过账，实际 %d 次", reg.skipped)
 	}
 }

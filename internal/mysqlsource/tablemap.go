@@ -63,6 +63,15 @@ type TableMap struct {
 	DefaultCollation   uint64
 	ColumnCollations   []uint64
 	CollationOverrides map[int]uint64
+
+	// ColumnKinds 是「这一列按字节存还是按字符存」的**外部补全**（catalog 提供）。
+	//
+	// 为什么需要它：5.7 的 TABLE_MAP 没有可选元数据，排序规则一个都不给，于是
+	// `BINARY(4)` 只能靠内容猜——`'abcd'` 这种「内容恰好合法」的列会被判成字符串，
+	// 下游 `::text::bytea` 会把反斜杠开头的值静默改写。catalog（information_schema）
+	// 的 CHARACTER_SET_NAME 是权威：`binary` 就是按字节存，流开始时我们已经读到了。
+	// 填进来之后 5.7 与 8.0 走同一条判定，内容启发式只剩「catalog 也没有」的兜底。
+	ColumnKinds []binaryKind
 }
 
 // TableIDSize is fixed at 6 for every server we support (5.1+); the FDE

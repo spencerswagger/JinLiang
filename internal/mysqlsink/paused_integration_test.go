@@ -62,6 +62,7 @@ func TestIntegrationPauseRegisterThenClear(t *testing.T) {
 	first := r.At
 	incremental := r
 	incremental.At = ""
+	incremental.Reason = pgsink.PauseReasonSchemaDrift // 第二次是另一个原因
 	incremental.Detail = "第二次"
 	if err := s.PauseTable(ctx, refOf("jl_b3_pause_a"), incremental); err != nil {
 		t.Fatalf("第二次登记失败: %v", err)
@@ -70,11 +71,12 @@ func TestIntegrationPauseRegisterThenClear(t *testing.T) {
 	if got2["jl_b3_pause_a"].At != first {
 		t.Fatalf("at 被覆盖了：%q → %q（第一次的时刻最有价值）", first, got2["jl_b3_pause_a"].At)
 	}
-	// reason 是机器判等用的稳定码，同样不覆盖（第二次换原因会让对账口径漂）。
-	if got2["jl_b3_pause_a"].Reason != pgsink.PauseReasonTypeChanged {
-		t.Fatalf("reason 被覆盖了：%q（必须是第一次那个稳定码）", got2["jl_b3_pause_a"].Reason)
+	// reason / detail 用**最新**这一次（「这张表现在为什么停着」），与 PG 侧同一口径。
+	// 早先这里保留过第一次的 reason，会让 reason 与 detail 互相矛盾
+	// （reason=type_changed，detail 却写着「列被改名」）。
+	if got2["jl_b3_pause_a"].Reason != pgsink.PauseReasonSchemaDrift {
+		t.Fatalf("reason 应跟随最新一次（schema_drift），实际 %q", got2["jl_b3_pause_a"].Reason)
 	}
-	// detail 相反：用最新的（用户要看的是当前差异）。
 	if got2["jl_b3_pause_a"].Detail != "第二次" {
 		t.Fatalf("detail 应更新成最新一次，实际 %q", got2["jl_b3_pause_a"].Detail)
 	}

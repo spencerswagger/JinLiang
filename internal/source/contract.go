@@ -81,6 +81,13 @@ type Column struct {
 	// 不落进契约就只能丢掉或硬塞进 Type——那会让跨字符集的 upsert 判重与排序悄悄不一致。
 	Charset   string `json:"charset,omitempty"`
 	Collation string `json:"collation,omitempty"`
+	// TypeOID 是源端**类型的身份**（PG: pg_type.oid；MySQL 源目前恒为 0 = 不知道）。
+	//
+	// 为什么要它：类型文本会在别名与 typmod 上骗人——`int8` / `bigint`、`numeric(12,2)` /
+	// `numeric` 在文本上不同但**可能是同一个类型**，反之「改成了 text」与「放宽 varchar 长度」
+	// 在文本上都叫变化、语义却一个是「暂停该表」一个是「追平即可」。比 OID 才是比身份。
+	// 0 表示这个连接器拿不到身份（那就退回文本比较，并在文档里写清代价）。
+	TypeOID int64 `json:"type_oid,omitempty"`
 }
 
 // Table is one catalog table.

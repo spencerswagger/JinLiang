@@ -184,7 +184,7 @@ func decodeCell(tm *TableMap, col int, data []byte) (source.Value, int, error) {
 		}
 		return source.Value{Kind: source.KindUint, U: fixedInt(data[:l])}, l, nil
 	case typeBlob, typeTinyBlob, typeMediumBlob, typeLongBlob, typeGeometry, typeVector:
-		return decodeBlob(col, data, int(meta))
+		return decodeBlob(col, data, int(meta), tm.columnBinaryKind(col))
 	case typeJSON:
 		prefix := int(meta)
 		if prefix <= 0 || prefix > 4 {
@@ -206,13 +206,14 @@ func decodeCell(tm *TableMap, col int, data []byte) (source.Value, int, error) {
 		}
 		return source.Value{Kind: source.KindJSON, S: text}, prefix + length, nil
 	case typeVarchar:
-		return decodeStringCell(col, data, int(meta), false)
+		// VARCHAR 与 VARBINARY 共用这个类型字节：只能靠**排序规则**分（binary=63 是字节）。
+		return decodeStringCell(col, data, int(meta), tm.columnBinaryKind(col))
 	case typeVarString:
-		// VARBINARY 按定义就是字节，不按内容猜（见 decodeStringCell 的注释）。
-		return decodeStringCell(col, data, int(meta), true)
+		// 老版本/特殊写法直接把 VARBINARY 标成 VAR_STRING：按定义就是字节，不按内容猜。
+		return decodeStringCell(col, data, int(meta), binBinary)
 	case typeString:
-		// CHAR / ENUM / SET 走这条；binary 字符集的 CHAR 由内容启发式判（下面 stringOrBytes）。
-		return decodeStringCell(col, data, packedLen, false)
+		// CHAR 与 BINARY 也共用类型字节，同样只能靠排序规则分。
+		return decodeStringCell(col, data, packedLen, tm.columnBinaryKind(col))
 	case typeInvalid:
 		return source.Value{}, 0, fmt.Errorf("第 %d 列的列类型是 INVALID，表结构可能在拉流期间被改了", col)
 	default:
@@ -226,7 +227,7 @@ func errShort(col, want, got int) error {
 	return fmt.Errorf("第 %d 列需要 %d 字节，行镜像只剩 %d 字节", col, want, got)
 }
 
-func decodeStringCell(col int, data []byte, maxLen int, binaryCol bool) (source.Value, int, error) {
+func decodeStringCell(col int, data []byte, maxLen int, kind binaryKind) (source.Value, int, error) {
 	var length, prefix int
 	switch {
 	case maxLen < 256:
@@ -244,17 +245,26 @@ func decodeStringCell(col int, data []byte, maxLen int, binaryCol bool) (source.
 		return source.Value{}, 0, errShort(col, prefix+length, len(data))
 	}
 	raw := data[prefix : prefix+length]
-	// 二进制列（VARBINARY / binary 字符集）原样交字节；其余按字符串。
+	// 判定顺序：**这一版 binlog 的排序规则** > catalog 补的 kind > 内容启发式。
+	//   - binBinary：按定义就是字节，内容长什么样都不影响（`BINARY(4)='abcd'` 也是字节）；
+	//   - binText：按字符存，交字符串；
+	//   - binUnknown：排序规则与 catalog 都给不出（5.7 且 catalog 列数对不上）时按内容判。
 	//
-	// 待办（已知缺口，下一轮）：`binaryCol` 现在由调用方按**类型字节**判断，
-	// 而真正的判据是「这一列的排序规则是不是 binary」——TABLE_MAP 的
-	// `collationFor(col)==63`（FULL 与 MINIMAL 都有）。所以 `BINARY(4)='abcd'`
-	// 这种「内容恰好是合法 UTF-8 的二进制列」仍会被当字符串（pgsink 侧走
-	// `$n::text::bytea`，值以反斜杠开头时会被 PG 静默改写）。见 notes §5.4。
-	if binaryCol {
+	// **别把「退回字节」当成安全兜底**：下游 MySQL 端原样写回是对的，但 PG 端把
+	// KindBytes 写成 `\x..` 字面量（`::text::text`），存进去不是原始字节也不报错。
+	// 真正的闸应该在 sink（目标列是文本 + 值来自非 UTF-8 文本列 → 明确失败），
+	// 这里只负责「按已知元数据解码」，不替下游保证语义。
+	switch kind {
+	case binBinary:
 		return source.Value{Kind: source.KindBytes, B: append([]byte(nil), raw...)}, prefix + length, nil
+	case binText:
+		if v := stringOrBytes(raw); v.Kind == source.KindString {
+			return v, prefix + length, nil
+		}
+		return source.Value{Kind: source.KindBytes, B: append([]byte(nil), raw...)}, prefix + length, nil
+	default:
+		return stringOrBytes(raw), prefix + length, nil
 	}
-	return stringOrBytes(raw), prefix + length, nil
 }
 
 // stringOrBytes keeps invalid UTF-8 as bytes instead of mangling it: a BLOB
@@ -285,7 +295,7 @@ func isPrintableUTF8(b []byte) bool {
 	return true
 }
 
-func decodeBlob(col int, data []byte, prefix int) (source.Value, int, error) {
+func decodeBlob(col int, data []byte, prefix int, kind binaryKind) (source.Value, int, error) {
 	if prefix < 1 || prefix > 4 {
 		return source.Value{}, 0, fmt.Errorf("第 %d 列的大字段长度前缀 %d 不认识", col, prefix)
 	}
@@ -297,10 +307,22 @@ func decodeBlob(col int, data []byte, prefix int) (source.Value, int, error) {
 		return source.Value{}, 0, errShort(col, prefix+length, len(data))
 	}
 	raw := data[prefix : prefix+length]
-	if v := stringOrBytes(raw); v.Kind == source.KindString {
-		return v, prefix + length, nil
+	// BLOB 与 TEXT 共用类型字节（契约 docs/TYPE-MAPPING.md）：TEXT 交字符串、BLOB 交字节，
+	// 拿不到排序规则时退回内容启发式。
+	switch kind {
+	case binBinary:
+		return source.Value{Kind: source.KindBytes, B: append([]byte(nil), raw...)}, prefix + length, nil
+	case binText:
+		if v := stringOrBytes(raw); v.Kind == source.KindString {
+			return v, prefix + length, nil
+		}
+		return source.Value{Kind: source.KindBytes, B: append([]byte(nil), raw...)}, prefix + length, nil
+	default:
+		if v := stringOrBytes(raw); v.Kind == source.KindString {
+			return v, prefix + length, nil
+		}
+		return source.Value{Kind: source.KindBytes, B: append([]byte(nil), raw...)}, prefix + length, nil
 	}
-	return source.Value{Kind: source.KindBytes, B: append([]byte(nil), raw...)}, prefix + length, nil
 }
 
 // decodeDecimal implements MySQL's packed DECIMAL (strings/decimal.c).

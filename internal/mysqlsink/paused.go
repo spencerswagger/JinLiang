@@ -19,6 +19,13 @@ import (
 //
 //	{"orders":{"reason":"type_changed","at":"…","detail":"…","resume":"recopy","skipped_rows":1284}}
 //
+// 字段的**时态**（与 PG 侧一致，写进这里免得两边再漂）：
+//
+//	at          第一次登记的时刻，永不覆盖
+//	reason      最新一次的原因码（稳定码：type_changed / schema_drift）
+//	detail      最新一次的差异描述（人话）
+//	skipped_*   累计值（跳过窗口的行数与首末位点，重登记不清零）
+//
 // 五条硬约束（改这段代码前先读）：
 //  1. **key = 目标端裸表名**，与 `_jl_chunk.table_name` 逐字节同源（不带 schema）。
 //  2. **只碰这一列**：登记是独立一条 UPDATE，绝不与 `position` 同一条——位点只能由数据事务推进。
@@ -33,6 +40,115 @@ import (
 
 // pausedTableColumn 是 `_jl_meta` 上那一列的名字（与 PG 侧逐字相同）。
 const pausedTableColumn = "paused_tables"
+
+// StoredJobHash 读回状态行里记的 job_hash（`EnsureMeta` 写的那一个）。
+//
+// 谁在用：引擎的 `reconcilePaused` 拿它做**跨轮存活判据**——任务语义变了（`job_hash` 变了），
+// 旧的「这张表停着」就不再成立，要连记录一起清掉。它**不在** PauseRegistry 的六个方法里
+// （契约 §4.2 只列了六个），所以 MySQL 目标端要单独实现这一个，否则片 C 拼不齐。
+//
+// 与 `paused_tables` 的关系（写清楚免得被误解成「同事务」）：
+//   - `job_hash` 由 `EnsureMeta` 在 prepare 写，但**只在插入时写**（冲突分支刻意不刷新它，
+//     否则读回来恒等于本轮 hash，跨轮存活判据就恒真了）；
+//   - `paused_tables` 由 `PauseTable` 单独一个事务写；
+//   - 两者**不在同一个事务**，也不需要：判据是「读回来的 hash 是否等于本轮 hash」，
+//     读晚一点只会更准（本轮 hash 在 prepare 就定了）。真正要保证的是「读得到」——
+//     没有这个方法，reconcile 在 MySQL 目标端就会因为拿不到 hash 而把记录全清（或干脆不判）。
+//
+// 没有状态行（首次运行前）返回空串：引擎把「空」当成「没有历史」处理（`sameJob` 为真）。
+func (s *Sink) StoredJobHash(ctx context.Context) (string, error) {
+	var h sql.NullString
+	err := s.db.QueryRowContext(ctx,
+		"SELECT job_hash FROM `_jl_meta` WHERE job_key = ?", s.opt.JobKey).Scan(&h)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("读任务指纹（job_hash）失败: %w", err)
+	}
+	return h.String, nil
+}
+
+// 暂停的**执行面**（写路径到底认不认这些记录）——这个值**由引擎回答，不由 sink 回答**。
+//
+// 为什么不在 sink 上判断：sink 根本不知道引擎有没有把它包进 `pauseSink`
+// （MySQL 目标端今天故意不绑，Core #99 的理由是恢复路径仍在 PG 侧）。让 sink 自报
+// 「我被绑定了没有」就是替别人声明，而且绑定时忘了改它也不会红——同一个坑
+// preflight 的 PAUSE-01 刚踩过。所以这里只给词汇表，值由调用方填进 `PauseView`。
+const (
+	// PauseEnforcementStorageOnly：记录能写能读能清，但引擎侧没接管——**被记录的表仍在被写入**。
+	PauseEnforcementStorageOnly = "storage-only"
+	// PauseEnforcementEngineBound：引擎按表跳过已生效（片 C 绑定之后）。
+	PauseEnforcementEngineBound = "engine-bound"
+)
+
+// PauseView 是「暂停」这件事**面向展示**的完整状态（status / doctor / UI 都读它）。
+//
+// 为什么不是直接返回 `map[string]PausedTable`：那样调用方只能看到记录，看不到
+// 「这些记录到底管不管用」。三个附加事实缺一不可——
+//   - Dirty：库里的 JSON 坏了（已按「无暂停」继续，但用户必须知道）；
+//   - Enforcement：写路径认不认这些记录（**由引擎填**，见上面的常量）；
+//   - ReadErr：读失败时把错误原样带出来，绝不返回空集合假装「没有暂停」。
+type PauseView struct {
+	Records map[string]pgsink.PausedTable
+	Tables  []string
+	Dirty   bool
+	// Enforcement 由**引擎**填（storage-only / engine-bound）；留空时按「不知道」处理。
+	Enforcement string
+	ReadErr     error
+}
+
+// PauseSummary 汇总本任务的暂停状态（读失败也返回一个 PauseView，错误放在 ReadErr 里）。
+//
+// 注意 `Enforcement` 这里**不填**：它取决于引擎有没有接管，Data 侧无法也不该判断。
+func (s *Sink) PauseSummary(ctx context.Context) PauseView {
+	v := PauseView{}
+	rec, dirty, err := s.readPaused(ctx)
+	if err != nil {
+		v.ReadErr = err
+		return v
+	}
+	v.Records, v.Dirty = rec, dirty
+	v.Tables = pgsink.PausedKeys(rec)
+	return v
+}
+
+// RenderPauseView 把 PauseView 渲染成给人看的几行（status / doctor 直接拼进输出）。
+//
+// 做成**纯函数**：Core 那侧不用连库就能测文案；`Enforcement` 由调用方填。
+//
+// 文案原则：**先说记录，再说它管不管用**，而且两句都不能撒谎——
+//   - storage-only 时「仍在被写入」必须说（否则「已暂停」三个字本身就是假话）；
+//   - storage-only 时**不能**说「重跑会重搬/会自动解除」：引擎不认这些记录，
+//     重跑既不 `MarkTableRecopyPending` 也不重搬，更不会解除。只能让用户手工对齐并核对数据。
+func RenderPauseView(v PauseView) []string {
+	if v.ReadErr != nil {
+		return []string{"暂停记录     读不到：" + v.ReadErr.Error() +
+			"（不要当成「没有暂停」——先修权限/连接再判断）"}
+	}
+	if len(v.Tables) == 0 {
+		if v.Dirty {
+			return []string{"暂停记录     那一列不是合法 JSON，已按「没有暂停」继续；请把这行发给我们"}
+		}
+		return nil
+	}
+	out := []string{fmt.Sprintf("暂停记录     %d 张表：%s", len(v.Tables), strings.Join(v.Tables, "、"))}
+	switch v.Enforcement {
+	case PauseEnforcementStorageOnly:
+		out = append(out,
+			"              ⚠ 这些记录**只存在存储层**（pause enforcement="+PauseEnforcementStorageOnly+"）："+
+				"当前目标端的引擎侧尚未接管暂停，被记录的表**仍在被写入**，目标端数据可能与源端不一致。",
+			"              本版**不会**自动重搬、也不会自动解除这些记录：请手工把结构对齐并核对数据；"+
+				"引擎侧接管之后才会走「整表重搬补齐 → 搬成解除」。")
+	case PauseEnforcementEngineBound:
+		out = append(out,
+			"              结构对齐后重跑即可：本轮会整表重搬补齐，搬成之后记录才会解除。")
+	default:
+		out = append(out,
+			"              （写路径是否已接管暂停未知：调用方没有给出 enforcement 值）")
+	}
+	return out
+}
 
 // ErrPauseUnsupported 表示 MySQL 目标端这条连接**没法**登记暂停（列补不上：缺权限/只读/老库）。
 //
@@ -78,15 +194,13 @@ func (s *Sink) PauseTable(ctx context.Context, ref source.TableRef, rec pgsink.P
 	}
 	cur, err := s.mutatePaused(ctx, ref.Table, func(m map[string]pgsink.PausedTable) error {
 		if old, ok := m[ref.Table]; ok {
-			// at / reason **都不覆盖**：第一次的时刻与原因最有价值，而且 reason 是机器判等用的
-			// （第二次因为别的原因又停一次，把 type_changed 改成 schema_drift 会让对账口径漂）。
-			// resume 跟着本次判定走（所有权可能变了）；detail 用新的（用户要看的是当前差异）。
+			// **三个字段三种时态**（与 PG 侧逐字对齐，见文件头）：
+			//   - at：**第一次**登记的时刻，永不覆盖（用户要能看出「停了多久」）；
+			//   - reason / detail：**最新**这一次的（「这张表现在为什么停着」）；
+			//   - skipped_*：累计值，重登记不清零（同一段欠账）。
+			// 早先这里保留过「第一次的 reason」，但那会让 reason 与 detail 互相矛盾
+			// （reason=type_changed，detail 却写着「列被改名」），诊断时反而要二次解释。
 			rec.At = old.At
-			if old.Reason != "" {
-				// 旧记录没有原因码（手写进库/更早的版本）时不要把空码钉死：
-				// 空 reason 在本文件的不变量里等于「没登记过」。
-				rec.Reason = old.Reason
-			}
 			if rec.Resume == "" {
 				rec.Resume = old.Resume
 			}

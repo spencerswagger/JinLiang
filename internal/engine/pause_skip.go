@@ -64,7 +64,12 @@ func (p *pauseSink) Apply(ctx context.Context, evs []source.Event, pos source.Po
 	}
 	for attempt := 0; ; attempt++ {
 		kept, skipped, rows := p.filter(evs)
-		err := p.inner.Apply(ctx, kept, pos)
+		// 通用目标端（MySQL）没有 sink 侧的 schema 缓存：漂移检测由引擎补一层。
+		// 命中就当成「这张表结构对不上」，与 inner 返回 PausableError 走同一条路。
+		err := error(p.r.detectRelationDrift(ctx, kept))
+		if err == nil {
+			err = p.inner.Apply(ctx, kept, pos)
+		}
 		if err == nil {
 			p.noteSkipped(ctx, skipped, rows, pos)
 			return nil
