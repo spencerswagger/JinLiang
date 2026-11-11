@@ -339,16 +339,17 @@ jobs:
             echo "- 全量+增量：见上一步日志"
             echo "- kill -9：判据「重启重搬 0 行」"
             echo "- 块记账（阻塞）：搬运期逐块 + 完成后表标记 rows = 各块之和"
-            echo "- 块级续跑（单表口径）不在本 job：见独立跟踪 job chunk-resume-tracking（不阻塞合并）"
+            echo "- 块级续跑（单表口径）不在本 job：见独立 job「块级续跑（单表口径）」（阻塞）"
           } >> "$GITHUB_STEP_SUMMARY"
 
   chunk-resume-tracking:
-    name: 【跟踪·不阻塞】块级续跑（单表口径）
-    # 为什么单列：generic 全量路径还没读块进度——`copyGeneric` 把 `nil` 传给
-    # SnapshotChunksFrom（internal/engine/target.go:456），`executeGeneric` 从不读
-    # `ChunkProgress`，所以**当前必然整轮重搬**。这是结构性红，不是「等实现会自己绿」的
-    # 开关问题；放在门禁 job 里会把整条门禁堵死，所以单列成跟踪 job（job 级别不阻塞）。
-    # 责任人 Core；转阻塞条件：读路径接通 且 该格重搬行数 ≤1 块（单表口径）。
+    name: 块级续跑（单表口径）
+    # 为什么单列（而不是并进 mysql-mysql）：这一格要**两个独立 MySQL 实例**再跑一遍
+    # killcopy，并进主 job 会把运行时长翻倍；单列成独立 job 照样是 required check。
+    # 原本它是「已知红 / 不阻塞」：generic 全量路径没读块进度（`copyGeneric` 把 nil 传给
+    # SnapshotChunksFrom，`executeGeneric` 从不读 `ChunkProgress`）。**#106 已接通读路径**，
+    # 这一步连同 job 一起转阻塞（job 级 continue-on-error 已删，名字里的「不阻塞」也去掉）。
+    # 责任人 Core；再退化时 known_red.py verify 会判红。
     # **#106 已接通读路径，本 job 现在是阻塞的**：原先挂在这里的 job 级
     # continue-on-error 会把末尾 known_red.py verify 的 rc=1 一起吞掉（必红却不拦）。
     runs-on: ubuntu-latest
