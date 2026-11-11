@@ -10,25 +10,12 @@ name: merge-gate
 # 为什么矩阵在 Actions 上跑：沙盒/开发机只有 MySQL 8.0，5.7 / 8.4 需要 docker。
 
 on:
+  # 这里**故意不写 paths 过滤**：这五个 job 现在是 main 的 required checks，
+  # 而「workflow 因 paths 过滤没跑」会让 check 永远停在 Expected，把只改文档的 PR
+  # 全堵死（GitHub 文档：path/branch 过滤导致的跳过 = Pending）。
+  # 需要「只在该跑的时候跑」时，用下面 changes job 的 job 级 if——job 被 if 跳过
+  # 会正常上报 skipped（对 required check 视为成功），不会挂住 PR。
   pull_request:
-    paths:
-      - "internal/engine/**"
-      - "internal/pgsink/**"
-      - "internal/mysqlsource/**"
-      - "internal/mysqlsink/**"
-      # 这四类是门禁的输入面：方向表（支持哪些组合）、分类语义、MySQL↔PG 值规范化、CLI 退出码
-      - "internal/core/**"
-      - "internal/source/**"
-      - "internal/mysqlcanon/**"
-      - "cmd/**"
-      - "scripts/gate_checks.py"
-      - "scripts/mutation_gate.py"
-      - "scripts/merge_gate.sh"
-      - "scripts/acceptance_matrix.sh"
-      - "scripts/review_gate_logic.py"
-      - "scripts/known_red.py"
-      - "scripts/probe_pause_wording.sh"
-      - ".github/workflows/merge-gate.yml"
   workflow_dispatch:
     inputs:
       rows:
@@ -42,7 +29,33 @@ on:
         default: "0"
 
 jobs:
+  changes:
+    name: 门禁输入面判定
+    runs-on: ubuntu-latest
+    outputs:
+      gate: ${{ steps.d.outputs.gate }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: d
+        name: 有没有碰到门禁的输入面
+        run: |
+          set -e
+          base="${{ github.base_ref }}"
+          if [ -z "$base" ]; then echo "gate=true" >> "$GITHUB_OUTPUT"; exit 0; fi
+          git fetch --no-tags --quiet origin "$base" || true
+          files=$(git diff --name-only "origin/$base...HEAD" || true)
+          echo "改动文件："; printf '%s\n' "$files"
+          if printf '%s\n' "$files" | grep -qE '^(internal/(engine|pgsink|mysqlsource|mysqlsink|core|source|mysqlcanon)/|cmd/|scripts/(gate_checks|mutation_gate|merge_gate|acceptance_matrix|review_gate_logic|known_red|probe_pause_wording|exit_codes|b1_mysql_to_mysql)\.|\.github/workflows/merge-gate\.yml)'; then
+            echo "gate=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "gate=false" >> "$GITHUB_OUTPUT"
+          fi
+
   logic:
+    needs: changes
+    if: needs.changes.outputs.gate == 'true'
     name: 判据自检 + 反向注入（logic）
     runs-on: ubuntu-latest
     steps:
@@ -64,6 +77,8 @@ jobs:
         run: python3 scripts/mutation_gate.py --tier logic
 
   engine-mutation:
+    needs: changes
+    if: needs.changes.outputs.gate == 'true'
     name: 反向注入（engine：位点 / 暂停 / 块进度）
     runs-on: ubuntu-latest
     steps:
@@ -133,6 +148,8 @@ jobs:
           path: mutation-engine.json
 
   acceptance:
+    needs: changes
+    if: needs.changes.outputs.gate == 'true'
     name: 三组合 × MySQL ${{ matrix.mysql }}
     runs-on: ubuntu-latest
     strategy:
@@ -263,6 +280,8 @@ jobs:
           path: acceptance-${{ matrix.mysql }}.json
 
   mysql-mysql:
+    needs: changes
+    if: needs.changes.outputs.gate == 'true'
     name: MySQL→MySQL（双实例：全量 / 增量 kill / 块记账）
     # 参数与本地验收一致：ROWS=20000、两个独立实例（源 53306 / 目标 53307）。
     # 为什么必须两个实例：同实例时目标端的写入会进源端 binlog，读到自己刚写的行。
@@ -343,6 +362,8 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   chunk-resume-tracking:
+    needs: changes
+    if: needs.changes.outputs.gate == 'true'
     name: 块级续跑（单表口径）
     # 为什么单列（而不是并进 mysql-mysql）：这一格要**两个独立 MySQL 实例**再跑一遍
     # killcopy，并进主 job 会把运行时长翻倍；单列成独立 job 照样是 required check。
