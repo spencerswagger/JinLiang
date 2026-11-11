@@ -199,7 +199,7 @@ jobs:
           # 不能用 mysqladmin ping：它在「拒绝访问」时也返回 0（8.x 初始化期间就是这样），
           # 会让我们以为库已就绪，下一步 GRANT 直接 Access denied。
           for i in $(seq 1 120); do
-            docker exec my-src mysql -uroot -proot -N -e 'select 1' >/dev/null 2>&1 && exit 0
+            docker exec my-src mysql -h127.0.0.1 -P3306 -uroot -proot -N -e 'select 1' >/dev/null 2>&1 && exit 0
             sleep 2
           done
           docker logs my-src; exit 1
@@ -217,7 +217,7 @@ jobs:
           done
           docker inspect my-dst >/dev/null
           for i in $(seq 1 120); do
-            docker exec my-dst mysql -uroot -proot -N -e 'select 1' >/dev/null 2>&1 && exit 0
+            docker exec my-dst mysql -h127.0.0.1 -P3306 -uroot -proot -N -e 'select 1' >/dev/null 2>&1 && exit 0
             sleep 2
           done
           docker logs my-dst; exit 1
@@ -226,10 +226,10 @@ jobs:
           set -e
           # 用 ALL PRIVILEGES 而不是点名 REPLICATION SLAVE：8.4 已经把那个名字换掉了
           # （REPLICATION REPLICA），5.7/8.0/8.4 只有这一句都认。
-          docker exec my-src mysql -uroot -proot -e "
+          docker exec my-src mysql -h127.0.0.1 -P3306 -uroot -proot -e "
             GRANT ALL PRIVILEGES ON *.* TO 'jinliang'@'%' WITH GRANT OPTION;
             CREATE DATABASE IF NOT EXISTS jinliang_test; FLUSH PRIVILEGES; SELECT VERSION();"
-          docker exec my-dst mysql -uroot -proot -e "
+          docker exec my-dst mysql -h127.0.0.1 -P3306 -uroot -proot -e "
             CREATE DATABASE IF NOT EXISTS jinliang_target; FLUSH PRIVILEGES; SELECT VERSION();"
       - name: 三组合验收（行数 + md5 + 耗时；MySQL→PG 追加 kill -9 重搬 0 行）
         env:
@@ -261,9 +261,9 @@ jobs:
           JINLIANG_TEST_RECLAIM_SLOTS: "1"
         run: |
           set -e
-          echo "服务端版本：$(docker exec my-src mysql -uroot -proot -N -e 'SELECT VERSION()')"
+          echo "服务端版本：$(docker exec my-src mysql -h127.0.0.1 -P3306 -uroot -proot -N -e 'SELECT VERSION()')"
           echo "状态语句探测（能力探测，不按版本号分支）："
-          if docker exec my-src mysql -uroot -proot -e 'SHOW BINARY LOG STATUS' >/dev/null 2>&1; then
+          if docker exec my-src mysql -h127.0.0.1 -P3306 -uroot -proot -e 'SHOW BINARY LOG STATUS' >/dev/null 2>&1; then
             echo "  SHOW BINARY LOG STATUS 可用（8.4+ 路径）"
           else
             echo "  SHOW BINARY LOG STATUS 不可用 → 回退 SHOW MASTER STATUS（5.7/8.0 路径）"
@@ -304,7 +304,7 @@ jobs:
           done
           docker inspect my-src >/dev/null
           for i in $(seq 1 120); do
-            docker exec my-src mysql -uroot -proot -N -e 'select 1' >/dev/null 2>&1 && exit 0
+            docker exec my-src mysql -h127.0.0.1 -P3306 -uroot -proot -N -e 'select 1' >/dev/null 2>&1 && exit 0
             sleep 2
           done
           docker logs my-src; exit 1
@@ -321,16 +321,16 @@ jobs:
           done
           docker inspect my-dst >/dev/null
           for i in $(seq 1 120); do
-            docker exec my-dst mysql -uroot -proot -N -e 'select 1' >/dev/null 2>&1 && exit 0
+            docker exec my-dst mysql -h127.0.0.1 -P3306 -uroot -proot -N -e 'select 1' >/dev/null 2>&1 && exit 0
             sleep 2
           done
           docker logs my-dst; exit 1
       - name: 补权限
         run: |
           set -e
-          docker exec my-src mysql -uroot -proot -e "
+          docker exec my-src mysql -h127.0.0.1 -P3306 -uroot -proot -e "
             GRANT ALL PRIVILEGES ON *.* TO 'jinliang'@'%' WITH GRANT OPTION; FLUSH PRIVILEGES;"
-          docker exec my-dst mysql -uroot -proot -e "
+          docker exec my-dst mysql -h127.0.0.1 -P3306 -uroot -proot -e "
             GRANT ALL PRIVILEGES ON *.* TO 'jinliang'@'%' WITH GRANT OPTION; FLUSH PRIVILEGES;"
       - name: 构建
         run: |
@@ -391,7 +391,7 @@ jobs:
             echo "第 $attempt 次起 my-src 失败，5s 后重试"; sleep 5
           done
           for i in $(seq 1 120); do
-            docker exec my-src mysql -uroot -proot -N -e 'select 1' >/dev/null 2>&1 && exit 0
+            docker exec my-src mysql -h127.0.0.1 -P3306 -uroot -proot -N -e 'select 1' >/dev/null 2>&1 && exit 0
             sleep 2
           done
           docker logs my-src; exit 1
@@ -407,15 +407,15 @@ jobs:
             echo "第 $attempt 次起 my-dst 失败，5s 后重试"; sleep 5
           done
           for i in $(seq 1 120); do
-            docker exec my-dst mysql -uroot -proot -N -e 'select 1' >/dev/null 2>&1 && exit 0
+            docker exec my-dst mysql -h127.0.0.1 -P3306 -uroot -proot -N -e 'select 1' >/dev/null 2>&1 && exit 0
             sleep 2
           done
           docker logs my-dst; exit 1
       - name: 补权限
         run: |
           set -e
-          docker exec my-src mysql -uroot -proot -e "GRANT ALL PRIVILEGES ON *.* TO 'jinliang'@'%' WITH GRANT OPTION; FLUSH PRIVILEGES;"
-          docker exec my-dst mysql -uroot -proot -e "GRANT ALL PRIVILEGES ON *.* TO 'jinliang'@'%' WITH GRANT OPTION; FLUSH PRIVILEGES;"
+          docker exec my-src mysql -h127.0.0.1 -P3306 -uroot -proot -e "GRANT ALL PRIVILEGES ON *.* TO 'jinliang'@'%' WITH GRANT OPTION; FLUSH PRIVILEGES;"
+          docker exec my-dst mysql -h127.0.0.1 -P3306 -uroot -proot -e "GRANT ALL PRIVILEGES ON *.* TO 'jinliang'@'%' WITH GRANT OPTION; FLUSH PRIVILEGES;"
       - name: 构建
         run: |
           mkdir -p dist
