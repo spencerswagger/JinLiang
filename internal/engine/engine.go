@@ -986,8 +986,15 @@ func (r *runner) prepare(ctx context.Context) error {
 			r.skippedTables = map[string]bool{}
 		}
 		r.skippedTables[ref.Table] = true
-		r.note(ctx, "表 "+pe.Table()+" 的结构和源端对不上（"+pe.Reason()+"）：暂停这张表，"+
-			"本轮不搬它的存量，其它表照常跑；结构对齐后重跑会整表重搬补齐")
+		if r.mode() == "interval" {
+			// interval 不做按表暂停（契约 §1.6 例外段）：它的写路径不过 `pauseSink`，
+			// 说「暂停这张表、其它表照常跑」是假话——它会照旧写这张表，然后多半直接报错。
+			r.note(ctx, "表 "+pe.Table()+" 的结构和源端对不上（"+pe.Reason()+"）：interval 模式不做按表暂停，"+
+				"本轮会照旧写它（结构没对齐时通常直接失败）；先手工对齐目标端结构再重跑，或改用 continuous+initial")
+		} else {
+			r.note(ctx, "表 "+pe.Table()+" 的结构和源端对不上（"+pe.Reason()+"）：暂停这张表，"+
+				"本轮不搬它的存量，其它表照常跑；结构对齐后重跑会整表重搬补齐")
+		}
 	}
 	// prepare 阶段降级成提示的判定（用户表多出的列不算漂移）——必须发出来，不许无声。
 	// **位置很关键：必须在 EnsureSchema 之后**——`prepareNotes` 是在它调用的
@@ -1230,7 +1237,8 @@ func (r *runner) reconcilePaused(ctx context.Context) error {
 			// 用户自己的表：不许自动清空、不许自动重搬。清它等于删用户数据，
 			// 而不清就 upsert 又会把暂停期间被跳过的 DELETE 永久留在目标端（假一致）。
 			r.note(ctx, "表 "+key+" 暂停中，且它是目标端既有表（不是本任务建的）：不会自动清空重搬。"+
-				"请在 `jinliang status` 里按提示选一条——重建这张表 / 手工清空 / 把它移出同步范围")
+				"请自己选一条：重建这张表 / 手工清空它 / 把它移出 content.tables。"+
+				"`jinliang status` 这一版还没有暂停明细，别去那儿找")
 			continue
 		}
 		ref := r.targetRef(source.TableRef{Schema: r.targetSchema(), Table: key})

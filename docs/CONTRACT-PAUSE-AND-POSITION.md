@@ -1,11 +1,16 @@
-# 契约：按表暂停 × 异构增量位点（冻结版 v1.2）
+# 契约：按表暂停 × 异构增量位点（冻结版 v1.3）
 
-> **落地状态**（2026-11-11 冻结；v1.2 按已合代码 `c72f36c` 校准）：A 片 `#93`、B 片 `#97`、C 片（存储层）`#95`、
-> 止损三条 `#99` 均已合入。**剩片 D**＝MySQL 目标端绑 `pauseReg` + `pauseRegistry` 补 `StoredJobHash` +
-> `status`/`doctor` 的暂停展示（见 §6）。
+> **落地状态**（2026-11-11 冻结；v1.3 按 main `64f6bb1` 校准）：A 片 `#93`、B 片 `#97`、C 片（存储层）`#95`、
+> 止损三条 `#99`、**片 D `#102`**（MySQL 目标端绑 `pauseReg` + 通用侧恢复四步
+> `planGenericRecopy` / `truncateForcedRecopy` / `finishGenericRecopy` + `detectPrepareDrift` / `detectRelationDrift`）、
+> **`#105`**（`mysqlsink.StoredJobHash` + 未绑时的暂停可见性）均已合入。
+> **三组合上的表级暂停都成立**（MySQL 目标端不再是「明确失败」）。
+> **本文件范围内唯一的欠账**：`status`/`doctor` 的暂停展示（§1.8，片 D2）——若要「看跳过多少行」，只能读目标库
+> `_jl_meta.paused_tables` 那一列；`jinliang status` 这一版没有这一节，码表也不许再把用户指过去。
+> `interval`（水位轮询）**本版不做按表暂停**（§1.6 例外段）：它没有「跳过」通道，结构不一致时照旧写这张表（多半直接报错）。
 > 语义口径（跳过 + 位点前进 + 恢复整表重搬、`copyDoneFor` 不再是判据）已随 `#93`/`#99` 生效；改口径要重新裁决并升 v2。
 >
-> 基线：语义章节对 main `c72f36c`（`applyForcedRecopy` / `reconcilePaused` / `pause_skip.go` 的现行实现）；
+> 基线：语义章节对 main `64f6bb1`（`applyForcedRecopy` / `reconcilePaused` / `pause_skip.go` / `pause_generic.go` 的现行实现）；
 > §5 的「现状」列行号锚**冻结基线** `67db571`（评审已逐条核对命中），闭环状态标在裁决列末尾。
 > 冲突清单见 §5；实现方红线见 §1.5、§4.6。
 
@@ -95,6 +100,10 @@
 1. **判定权在引擎，不在 sink**（已落地 `#93`）。引擎 prepare 时读一次（`LoadPausedTables`），此后持有内存集合；
    写路径由 `internal/engine/pause_skip.go` 的 `pauseSink` 在提交前按表过滤；`sink.Apply` 收到什么写什么，
    **不再做暂停判定**（`pgsink` 里那个整批拒绝已经删掉，`TablePausedError` 只剩类型给码表用）。
+   **例外：`interval` 根本不过 `pauseSink`**——它的写路径是 `runIntervalRound` 里的
+   `r.sink.ApplyRowsRange` / `r.sink.BulkApply`（`internal/engine/interval.go:225,241` 一带），
+   没有批、没有变更流，也就没有「跳过」的位置。所以 **interval 本版不做按表暂停**（见 §1.6 例外段）；
+   本节第 2–5 条与 A1–A6 断言**只对 `continuous*` / `once` / `full_interval` 成立**。
 2. **登记先行**：streaming 里第一次发现某表的结构对不上时，**先把 `paused_tables` 落库（独立事务），
    成功后才允许这一批跳过该表**。登记失败 → 整批失败（位点不动、目标端 0 行）。
    ——这一条替代旧红线「暂停绝不与位点同一条 UPDATE」：仍然是两条独立的写（登记一条、位点随数据事务一条），
@@ -122,16 +131,18 @@
 ### 1.6 恢复：`reconcilePaused` 建「欠一次整表重搬」→ `applyForcedRecopy` 接进计划 → 搬成才解除
 
 > **实现见 `internal/engine/pause_skip.go`（`pauseSink` / `pauseRegistry`）与 `internal/engine/engine.go` 的
-> `reconcilePaused` / `applyForcedRecopy` / `commitPlan` / `snapshot`（main `c72f36c`）。** 本节只冻结口径，
+> `reconcilePaused` / `applyForcedRecopy` / `commitPlan` / `snapshot`（main `64f6bb1`；MySQL 目标端那条同构路径在
+> `internal/engine/pause_generic.go`，`#102`）。** 本节只冻结口径，
 > 不另发明机制；写代码时以这几处为准，口径与本节能对上就不用改文档。
 
 1. **对齐判定**：prepare 里 `EnsureSchema` 之后、`decideCopyPlan` 之前（顺序是判据的一部分：早于 planCopy
    才叫「本轮就搬」，晚了就变成「这轮先跳过、下轮才搬」，多停一轮）。此刻「没报 `PausableError`/E1015」＝对齐；
    `schema_drift` 只在 `_jl_object` 有 `table:<schema>.<table>` 的表上判。
    **本轮刚发现不一致的表（`skippedTables`）不算对齐**——拿旧结构重搬一遍只会白跑一轮，还会把目标表清空。
-2. **触发**：`reconcilePaused` 逐条处理仍在范围内的记录，三种走法——`interval`/`continuous` 直接解除（并说明
-   「解除 ≠ 两侧一致，要补齐请跑 full」，它们没有存量）；`resume=manual` 不解除也不重搬（note 给三条选项）；
+2. **触发**：`reconcilePaused` 逐条处理仍在范围内的记录，三种走法——`continuous*` 直接解除（并说明
+   「解除 ≠ 两侧一致，要补齐请跑 full」；它不排存量搬运，所以停在这里等于永远不恢复）；`resume=manual` 不解除也不重搬（note 给三条选项）；
    **其余** → `MarkTableRecopyPending(ref)`（清该表 `_jl_chunk` 全部行，**含 `chunk_no=0`**）+ 记 `forceRecopy[table]` + note。
+   `interval` 与这三种都不一样，见本节末尾**例外段**。
 3. **为什么必须是显式判据（不能指望「清标记 ⇒ planCopy 自然重搬」）**：
    - **单表**（最常见）：块标记被清 → 整本块账为空 → 落到「老状态兼容」那条 → `copySkip`，
      整个搬运阶段都不跑，暂停记录永远删不掉，而每轮还发一句「本轮整表重搬」——说了不做；
@@ -150,13 +161,36 @@
    别再引入第四个「派生完成标志」。
 
 - **`resume=manual`**（`on_exists=append`/`keep`，用户自己的表）：不许自动清空、不许自动重搬。
-  保持 `paused`，`status` 里给三条选项（recreate / 手工清 / 把表移出范围），选完再重跑。
+  保持 `paused`；三条出路（重建这张表 / 手工清空 / 把表移出范围）由 **note 里说清**（`status` 的那一节是 D2、还没做，
+  见 §1.8——文案不许说「去 status 里选」）。选完再重跑。
 - **对齐只在轮次边界判**：streaming 里暂停表的 `EvDDL` 不应用、也不当轮判对齐（§1.3），
   本轮继续跳过，下一轮 prepare 走第 1–6 步。中途重搬会和正在消费的流抢同一张表
   （视图位点与全局位点之间会出现缺口），不在流式阶段做。
 - **重搬中途 kill -9**：记录保留、块标记部分推进，下一轮重新判回 `recopy_pending` 并从块边界续跑，**不解除**。
-- **`interval` / `continuous`** 没有存量可搬：结构一对齐就解除（并明说「解除 ≠ 两侧一致，要补齐请跑 full」），
+- **`continuous*`** 不排存量搬运：结构一对齐就解除（并明说「解除 ≠ 两侧一致，要补齐请跑 full」），
   否则会永远停在暂停里。
+
+#### 例外段：`interval` **本版不做按表暂停**（2026-11-12 裁决，采纳 Owl II 建议 a）
+
+`interval`（水位轮询）**没有「跳过一张表」的位置**，所以它不在这套状态机里——别照 §1.5/§1.6 去改它：
+
+| 事实 | 代码位置 | 后果 |
+|---|---|---|
+| 写路径不过 `pauseSink`：`runIntervalRound` 直接 `ApplyRowsRange` / `BulkApply` | `internal/engine/interval.go:225,241` | `paused_tables` 里的表**照旧被搬**，`skipped_rows` 不会增长 |
+| 没有批、没有变更流，只有「水位页」 | `drainWatermark` / `copyOneTable` | 没有「这一批跳过该表、位点照常前进」这种事可做 |
+| `prepare` 对 interval 早退（不跑 `decideCopyPlan`） | `internal/engine/engine.go:1023` | 「欠一次整表重搬」的通道不存在，`forceRecopy` 对它没有意义 |
+
+因此 interval 的**唯一**口径是：
+
+1. **结构不一致 ＝ 照旧写这张表**（没有「只停一张表」这条通道）：`prepare` 仍会登记一条记录，但 interval 的写路径
+   不读它，于是**多数情况写入直接报错**（整轮失败，用户看到的是驱动错误，不一定带 E1015），
+   少数能隐式转换的类型则**照旧写进去**。两种都不是「暂停」，别按批式路径的预期去读 note。
+   真要修这条得给 interval 造一条跳过通道（成本：写路径、水位记账、重搬三处都要动），本版不做。
+2. **用户该做什么**：先把目标端结构与源端手工对齐（改列类型 / 补列），再重跑 interval。
+   要「只停一张表 + 自动整表重搬补齐」，请改用 `continuous+initial` 或 `full_interval`。
+3. **残留记录**：interval 轮次里 `reconcilePaused` 仍会把「范围还在、结构已对齐」的记录**删掉**
+   （写路径根本没用它，留着只会让人以为「停着」）；结构还没对齐的记录留着，等它对齐后那一轮清掉。
+   它**不会**让 interval 停止写这张表——这一点必须由 `status`（D2，未落地）或本篇文档说明，不许沉默。
 
 ### 1.7 失败与部分失败补偿矩阵
 
@@ -166,17 +200,23 @@
 | 暂停表的事件解析失败（脏行） | 整批失败（与现有解码失败同口径） | 不能把「读不懂」当成「可以扔」 |
 | 重搬失败（结构仍不一致） | 保留 `paused`，更新 `detail`/`last_seen`，不动 `at`/`reason` | 第一次的时刻与原因最有价值 |
 | 重搬失败（网络/锁） | 保留 `paused` + 块进度，可续跑 | 半个重搬不能让表回到 `active` |
-| 目标端没有暂停存储（`pauseRegistryOf()` 返回 nil） | `registerPause` 明确失败：`pauseUnsupportedError` → 挂 `E1014`（`CodeUnsupportedDirection`），文案给两条出路（手工对齐后重跑 / 把表移出范围） | 严禁「UPDATE 影响 0 行当成功」；也不许把「不支持」说成「已经暂停了」 |
+| 目标端没有暂停存储（`pauseRegistryOf()` 返回 nil；MySQL 目标端已随 `#102` 绑上，只剩「sink 没实现那六个方法」的理论情形） | `registerPause` 明确失败：`pauseUnsupportedError` → 挂 `E1014`（`CodeUnsupportedDirection`），文案给两条出路（手工对齐后重跑 / 把表移出范围） | 严禁「UPDATE 影响 0 行当成功」；也不许把「不支持」说成「已经暂停了」 |
 | 跳过计数写库失败 | **不让这一批失败**，只发 note「数字不准」 | 数据+位点已提交，判失败＝假失败（`pauseSink.noteSkipped` 的注释） |
 | 记录指向的表已不在范围 | prepare 删记录 + note | 跨轮存活判据（现状 `reconcilePaused` 已实现，保留） |
 
 ### 1.8 观测与续跑
 
-- `status`：新增一节（不是新表）：`paused[] = {table, reason, at, detail, resume, skipped_rows, skipped_from, last_skipped_pos}`；
-  `SKIP` 态的表在概览里单列一行「已暂停 N 张（其中 M 张待重搬）」。（**片 D 未落地**：现在只有 note 事件，
-  `internal/engine/status.go` 的 `Status` 里还没有这一节。）
-- `doctor`：有暂停表 → **warn，不阻断**，文案「这些表在重搬完成前与源端不一致；结构对齐后重跑会自动整表重搬补齐」。
-- 事件流：首次暂停 / 重搬开始 / 重搬完成并解除，各一条 note（带表名、原因码、窗口位点）。
+> **现状（main `64f6bb1`）**：`status` / `doctor` 的暂停展示**都还没做**（片 D2，本文件唯一欠账）。
+> `internal/engine/status.go` 的 `Status` 结构体里没有这一节，`internal/doctor/doctor.go` 也不读 `paused_tables`——
+> 所以**任何文案都不许把用户指去 `jinliang status` 找跳过行数**（那里没有）。
+> 现在能拿到的事实只有两处：目标库 `_jl_meta.paused_tables` 那一列（JSON，含 `skipped_rows` / `last_skipped_pos`），
+> 以及运行中的 note 事件（「表 X 已暂停（原因码 …）」/「已恢复」）。
+
+- `status`（**D2，未落地**）：计划新增一节（不是新表）：`paused[] = {table, reason, at, detail, resume, skipped_rows, skipped_from, last_skipped_pos}`；
+  `SKIP` 态的表在概览里单列一行「已暂停 N 张（其中 M 张待重搬）」。
+  落地前码表的「看哪里」必须指向 `_jl_meta.paused_tables`（`internal/core/codes.go` 的 E1015 `Risk`）。
+- `doctor`（**D2，未落地**）：有暂停表 → **warn，不阻断**，文案「这些表在重搬完成前与源端不一致；结构对齐后重跑会自动整表重搬补齐」。
+- 事件流：首次暂停 / 重搬开始 / 重搬完成并解除，各一条 note（带表名、原因码、窗口位点）。**这一条已落地**（`#93`/`#102`）。
 - 续跑：`paused_tables` 是**跨轮事实**，重启后仍暂停（结构没改就不该恢复写）。
   它**不进** `planCopy` 的判据（续跑判据只看位点可重放 + 块进度，见 §2.3）。
 
@@ -366,7 +406,8 @@ type pauseRegistry interface {
 ```
 
 - **就这六个方法**，多一个都不进这个接口：`PausedDirty`（脏 JSON → 本轮按「无暂停」）、
-  `ChunkProgress` / `MarkTableDone`（块记账）留在具体 sink 上，用可选断言取。
+  `ChunkProgress` / `MarkTableDone`（块记账）、**`StoredJobHash`**（`#105` 已给 MySQL 侧实现，
+  `internal/mysqlsink/paused.go:59`；`reconcilePaused` 用可选断言取，取不到就按「同一个任务」处理）留在具体 sink 上。
   `PausedTable` 类型暂时寄生在 `pgsink` 包里（两个 sink 共用一份，别各造一份结构体）。
 - 取值入口是 `r.pauseRegistryOf()`（`engine.go:1842`）：显式绑定的 `pauseReg` 优先，否则退回 `r.sink`；
   **返回 nil 表示该目标端没有暂停存储**——此时 `registerPause` 必须明确失败（`pauseUnsupportedError`），
@@ -400,11 +441,15 @@ type pauseRegistry interface {
 
 ### 4.5 Core / Data 勾选清单
 
-> 状态（对 main `c72f36c`）：**Core 侧已落地**（`#93`：`pause_skip.go` 的 `pauseSink` + `forceRecopy` + `applyForcedRecopy`；
+> 状态（对 main `64f6bb1`）：**Core 侧已落地**（`#93`：`pause_skip.go` 的 `pauseSink` + `forceRecopy` + `applyForcedRecopy`；
 > `#99`：删 `copyDoneFor`、收窄收尾解除、`pauseSink` 守卫改成看 `pauseReg`）；**`#97`** 收口 `source.ClassOf`；
-> **Data 侧存储层已落地**（`#95`：`mysqlsink/paused.go` + `chunk.go`）。
-> **仍缺**：`r.pauseReg` 只在 PG 路径绑定（`engine.go:924`），MySQL 目标端还是 nil → `pauseSink.Apply` 直接透传
-> ——「MySQL 目标端的表级暂停」在绑上之前不成立；另有 `StoredJobHash` 不在 `pauseRegistry` 接口里（绑之前要补）。
+> **`#102`** 收口片 D 的引擎侧：MySQL 目标端绑 `pauseReg`（`internal/engine/target.go:142-149`）+
+> 通用侧恢复四步（`pause_generic.go`：`planGenericRecopy` / `truncateForcedRecopy` / `finishGenericRecopy`，
+> 外加 `detectPrepareDrift` / `detectRelationDrift` 两处漂移检测）。
+> **Data 侧全落地**（`#95`：`mysqlsink/paused.go` + `chunk.go`；`#105`：`StoredJobHash` + 未绑时的暂停可见性；
+> `#103`：完成标记随块重放刷新）。
+> **本文件范围内只剩一处欠账：`status`/`doctor` 的暂停展示（§1.8，片 D2）**。
+> `interval` 不做按表暂停（§1.6 例外段）——那是**裁决**，不是欠账。
 
 **Core**
 - [x] 引擎持有暂停集合，`sink.Apply` 删掉暂停判定（`pgsink` 不再产生 `TablePausedError`）
@@ -413,15 +458,17 @@ type pauseRegistry interface {
 - [x] `NoteSkipped` 每批累加一次（行数 + `last_skipped_pos`）
 - [x] `reconcilePaused` 改判据：对齐后 `MarkTableRecopyPending` + `forceRecopy`，**不再**用 `copyDoneFor`
 - [x] 重搬搬成 → `ClearPausedTable` 单 key + note
-- [x] `resume=manual` 的用户表：不自动清空、不自动重搬，`status` 给三条选项
-- [ ] `status` / `doctor` 的暂停展示（§1.8）——现状只有 note 事件，`status` 结构体里还没有这一节
+- [x] `resume=manual` 的用户表：不自动清空、不自动重搬，note 给三条出路（`status` 那节是 D2，文案不许指过去）
+- [ ] **`status` / `doctor` 的暂停展示（§1.8，片 D2）**——`Status` 结构体里还没有这一节，`doctor` 也不读 `paused_tables`
 - [x] `classifyError` 去 `pgsource.` 依赖（`source.ClassOf`，§4.4）
-- [x] `E1015` 三句文案与 `codes_test` 断言（Now/Next/Risk 已改；用例 `TestSchemaMismatchSaysOnlyThatTableStops`）
+- [x] `E1015` 三句文案与 `codes_test` 断言（Now/Next/Risk 已改；用例 `TestSchemaMismatchSaysOnlyThatTableStops`；
+      「看哪里」已从 `status` 改指 `_jl_meta.paused_tables`，用例钉住）
 - [x] 删死代码 `copyDoneFor`（`c72f36c` 已删除，只剩注释里的历史说明）
-- [ ] **MySQL 目标端绑 `pauseReg`**：`r.pauseReg = sink` 目前只在 PG 路径（`engine.go:924`），
-      MySQL 目标端 `pauseReg` 仍是 nil → `pauseSink.Apply` 直接透传。另 `StoredJobHash` 不在 `pauseRegistry` 里
-      （`engine.go:1142` 的注释），绑之前要先把这两块补齐
-- [x] 用例：A1–A6 + 恢复（清空+块标记+搬成解除）+ 重搬中途 kill -9 保留记录（`#93`/`#99` 的 7 个用例文件）
+- [x] **MySQL 目标端绑 `pauseReg`**（`#102`）：`prepareGeneric` 里 `gs.(pauseRegistry)` 命中才绑，
+      且**先有恢复路径才绑**（`planGenericRecopy` / `finishGenericRecopy`）；绑之前 `pauseReg==nil` 仍明确失败
+      （`TestPauseRegistrationOnMySQLTargetFailsLoudly` 钉的是这条能力位，不是「MySQL 不支持」）
+- [x] 用例：A1–A6 + 恢复（清空+块标记+搬成解除）+ 重搬中途 kill -9 保留记录（`#93`/`#99`/`#102` 的用例文件；
+      `#107` 把 PG 侧重复用例换成 MySQL 目标端覆盖）
 
 **Data**
 - [x] `mysqlsink` 加 `paused_tables` 列——**写法是「先查 `information_schema.COLUMNS` 再 `ALTER`」**
@@ -430,8 +477,10 @@ type pauseRegistry interface {
 - [x] 块记账 + `MarkTableRecopyPending`（`internal/mysqlsink/chunk.go`，删该表全部块行含 `chunk_no=0`）
 - [x] `mysqlsink.Apply` 不做暂停判定
 - [x] 缺列时 `PauseTable` 明确失败 + `preflight PAUSE-01` 不再替引擎许诺
-- [ ] `chunk_no=0` 重放不刷新（`rows` 字段）——影响「重搬 0 行」的单表核对口径
-- [ ] 用例：MySQL 目标端暂停登记/解除各一格；「UPDATE 影响 0 行」必须报错（不许静默）
+- [x] `StoredJobHash`（`internal/mysqlsink/paused.go:59`，`#105`；不在六方法接口里，引擎用可选断言取）
+- [x] `chunk_no=0` 重放刷新 `rows`（`#103`；用例 `TestIntegrationChunkStampRefreshesOnReplay`）
+- [x] 用例：MySQL 目标端暂停登记/解除、单 key 保留其它表、记账、补列/明确失败、JSON 形状、两步写崩溃
+      （`paused_integration_test.go` / `paused_crash_integration_test.go` / `pause_view_integration_test.go`）
 
 ### 4.6 实现方红线（越一条就打回）
 
@@ -442,14 +491,16 @@ type pauseRegistry interface {
 5. 不许把暂停表的数据事件「写一半」（整表整事件跳过，不出现半批）。
 6. 不许在引擎里按版本号或 `import` 具体连接器包做判定。
 7. 不许用 `TableMap`/DDL 文本推列名与列定义；一律重读 `information_schema`。
-8. 不许声称「暂停期间数据会一致」——不一致窗口由 `status` 明示，直到重搬完成。
+8. 不许声称「暂停期间数据会一致」——不一致窗口必须由 **note 事件 + 目标库 `_jl_meta.paused_tables`** 明示
+   （`status` 那一节是 D2、未落地），直到重搬完成。
 
 ---
 
 ## §5 与现实现的冲突点（逐条给裁决）
 
 > 「现状」列是**冻结基线** `67db571` 的行号（评审已核对命中）。基线之后已落地：`#93`（A）、`#95`（C 存储层）、
-> `#97`（B）、`#99`（止损三条：删 `copyDoneFor`、收窄收尾解除、MySQL 侧接线准备）。
+> `#97`（B）、`#99`（止损三条：删 `copyDoneFor`、收窄收尾解除、MySQL 侧接线准备）、`#102`（片 D 引擎侧：
+> MySQL 目标端绑 `pauseReg` + 通用侧恢复四步）、`#105`（`StoredJobHash`）。
 > 闭环状态标在「裁决」列末尾的 ×；**行号仍以基线为准**，要复查请 checkout 那个 commit，不要按当前 main 的行号找。
 
 | # | 现状（main `67db571`） | 裁决 |
@@ -459,8 +510,7 @@ type pauseRegistry interface {
 | 3 | `internal/engine/integration_paused_test.go:29` 断言「A=0 B=0、位点逐字节相等」 | **反转**：A=0、**B=1**、位点前进、A 的 `skipped_rows=1`（§1.5 A1/A2） ×已闭环 `#93` |
 | 4 | `internal/core/codes.go:215-243` E1015：Next「位点没推进…不会重搬历史」、Risk「其它表也不会继续推进」、注释要求 grep 该短语 | **改文案**：只停该表 / 其它表继续 / 恢复等于整表重搬（会重搬该表存量）。`codes_test.go` 的断言短语同步换 ×已闭环 `#93`（文案＋`TestSchemaMismatchSaysOnlyThatTableStops`） |
 | 5 | `notes/contract-paused-tables.md` §1.5「暂停期间位点不推进」、§3 E1015 措辞、§4 R1「登记绝不与位点同一条 UPDATE 的顺序约束」 | **作废**，以本文件 §1.5/§1.6/§3 为准；note 顶部已加横幅 |
-| 6 | `internal/engine/pause_mysql_test.go:19`：MySQL 目标端 `PauseTable` 明确失败 | **保留到存储层落地**；`#95` 已给 MySQL 同构列，`#99` 已把 `pauseSink` 的守卫改成 `pauseReg`（不再看 `r.sink`）。
-**仍缺**：`r.pauseReg` 只在 PG 路径绑定（`engine.go:924`），MySQL 目标端还是 nil → 透传 ×存储层已闭环 `#95` |
+| 6 | `internal/engine/pause_mysql_test.go:19`：MySQL 目标端 `PauseTable` 明确失败 | **实现已闭环**：`#95` 给 MySQL 同构列，`#99` 把 `pauseSink` 的守卫改成 `pauseReg`，`#102` 在 `prepareGeneric` 里真绑上（`target.go:142-149`）。用例**保留并改口径**：它现在钉的是「`pauseReg==nil` 时的能力位」（显式失败、E1014），不是「MySQL 不支持」 ×已闭环 `#95`/`#102` |
 | 7 | `internal/engine/engine.go:1627` `classifyError` 依赖 `pgsource.IsXxx` | **改**：连接器给语义错误，引擎按 `source.ClassOf` 判（§4.4） ×已闭环 `#97` |
 | 8 | `mysqlsink` 无 `paused_tables`、无 `_jl_chunk` 记账 | **Data 补齐**；补齐前 MySQL 目标端暂停必须明确失败（不许静默丢记录） ×已闭环 `#95`（补列走「先查 `information_schema` 再 ALTER」） |
 | 9 | `docs/STATE-SCHEMA.md` 的 `_jl_meta` 列清单里没有 `paused_tables` | 本文件 §1.4 先定形状；`STATE-SCHEMA.md` 的更新排在 ① 合入**之后**（它描述的是行为，不能先合） |
@@ -476,14 +526,16 @@ type pauseRegistry interface {
 | **A** | 跳过 + 位点前进 + 登记先行 + `reconcilePaused` 改判据 + `applyForcedRecopy` + 用例反转 | Core | 已合 `#93` |
 | **B** | `classifyError` 去 `pgsource.` 依赖（`source.ClassOf`） | Core | 已合 `#97` |
 | **C** | `mysqlsink` 同构暂停列 + 块记账 + `MarkTableRecopyPending` | Data | 已合 `#95` |
-| **D** | MySQL 目标端绑 `pauseReg`（表级暂停在三组合上都成立）+ `pauseRegistry` 补 `StoredJobHash` + `status`/`doctor` 展示 | Core | **未做**（E1015 文案与删 `copyDoneFor` 已随 `#93`/`#99` 落地，不在这片里） |
+| **D** | MySQL 目标端绑 `pauseReg`（表级暂停在三组合上都成立）+ `pauseRegistry` 补 `StoredJobHash` | Core/Data | **已合**：绑定 + 通用侧恢复四步 `#102`；`StoredJobHash` + 未绑时的可见性 `#105`；完成标记随块重放刷新 `#103` |
+| **D2** | `status` 的 `paused[]` 一节 + `doctor` 的 warn（§1.8） | Core | **未做**（本文件范围内唯一欠账；落地前所有文案指向 `_jl_meta.paused_tables`） |
 
 **验收（每条都要能证伪，不接受「看起来对」）**
 
-1. 表级暂停真跑：A 表改类型、B 表持续插入 → 目标端 A 停、B 跟得上、`status` 显示 A 暂停与跳过行数。
+1. 表级暂停真跑：A 表改类型、B 表持续插入 → 目标端 A 停、B 跟得上；跳过行数**目前只能**从
+   `_jl_meta.paused_tables` 读（`status` 那一节是 D2，未落地——不要用「status 里能看到」当验收条件）。
 2. 恢复追平：目标端对齐 A 的结构 → 重跑 → A 被**清空**重搬 + 增量收敛 → 两端行数与逐行 md5 一致。
 3. 三种组合各给行数 + md5 + 耗时：MySQL→MySQL / MySQL→PG / PG→MySQL（口径与 PR #89 的 1.2 相同）；
-   **表级暂停在三种组合上都要真跑一次**（MySQL 目标端要等片 D）。
+   **表级暂停在三种组合上都要真跑一次**（MySQL 目标端的绑定随 `#102` 已合，不再等片 D）。
 4. 增量 `kill -9` 后重启：**整轮重搬 0 行**（`rowsCopied==0` ∧ `plan.Kind==copySkip`；单表口径见 §2.3）、
    位点只前进、行数与 md5 与源端一致。
 5. 版本覆盖：`mysql-matrix` **4 腿**（5.7 / 8.0 / 8.4 / 9，`.github/workflows/mysql-matrix.yml`）
