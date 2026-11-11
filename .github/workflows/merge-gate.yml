@@ -26,6 +26,8 @@ on:
       - "scripts/merge_gate.sh"
       - "scripts/acceptance_matrix.sh"
       - "scripts/review_gate_logic.py"
+      - "scripts/known_red.py"
+      - "scripts/probe_pause_wording.sh"
       - ".github/workflows/merge-gate.yml"
   workflow_dispatch:
     inputs:
@@ -113,6 +115,17 @@ jobs:
       - name: 退出码台账对账（实现能过了但断言还挂着 → 拦）
         if: always()
         run: python3 scripts/known_red.py verify --id exit-code-3 --result "${{ steps.exit3.outcome }}"
+      - name: 轮次提示探针（三种 mode 的 PAUSE-01 口径，断言失败即红）
+        # #90 P2：脚本以前只打印不断言、CI 也不跑。这里真跑三种 mode（continuous+initial /
+        # interval / full_interval），口径与 DECISIONS #19 / 契约 §1.6 例外段不一致就红。
+        env:
+          BIN: ./dist/jinliang
+          JINLIANG_TEST_PG_DSN: postgres://jinliang:jinliang@127.0.0.1:55432/jinliang_test?sslmode=disable
+          JINLIANG_TEST_PG_SRC_DSN: postgres://jinliang:jinliang@127.0.0.1:55433/jinliang_src?sslmode=disable
+        run: |
+          set -e
+          CGO_ENABLED=0 go build -trimpath -o dist/jinliang ./cmd/jinliang
+          timeout -k 10 900 bash scripts/probe_pause_wording.sh
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -336,7 +349,8 @@ jobs:
     # `ChunkProgress`，所以**当前必然整轮重搬**。这是结构性红，不是「等实现会自己绿」的
     # 开关问题；放在门禁 job 里会把整条门禁堵死，所以单列成跟踪 job（job 级别不阻塞）。
     # 责任人 Core；转阻塞条件：读路径接通 且 该格重搬行数 ≤1 块（单表口径）。
-    continue-on-error: true
+    # **#106 已接通读路径，本 job 现在是阻塞的**：原先挂在这里的 job 级
+    # continue-on-error 会把末尾 known_red.py verify 的 rc=1 一起吞掉（必红却不拦）。
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -387,12 +401,11 @@ jobs:
       - name: 块级续跑（known-red：单表口径，重启搬 ≈ 未搬完 ±1 块）
         # 责任人：Core（引擎读侧，不是 Data：写侧 #95 已落，`_jl_chunk` 真有 2 行）
         # 转绿用例：scripts/b1_mysql_to_mysql.sh killcopy（单表口径：重启搬 ≈ 未搬完 ±1 块）
-        # 移除 continue-on-error 的触发条件：Core 接通读路径（`copyGeneric` 把 nil 传给
-        #   `SnapshotChunksFrom`，internal/engine/target.go:456；`executeGeneric` 只看
-        #   `fresh || full_interval || len(forceRecopy)>0`，从不读 `ChunkProgress`），
-        #   且该格重启重搬行数 ≤1 块。
+        # 移除 continue-on-error 的触发条件：Core 接通读路径（`copyGeneric` 不再把 nil 传给
+        #   `SnapshotChunksFrom`，`executeGeneric` 读 `ChunkProgress`）且该格重搬行数 ≤1 块。
+        #   **#106 已落地 → 这条已激活**（step 级 continue-on-error 已删），
+        #   台账条目保留用于对账（实现再退化时 known_red.py verify 会判红）。
         id: killcopy
-        continue-on-error: true
         env:
           JINLIANG_TEST_MYSQL_SRC_DSN: mysql://jinliang:jinliang@127.0.0.1:43306/jinliang_src
           JINLIANG_TEST_MYSQL_DST_DSN: mysql://jinliang:jinliang@127.0.0.1:43307/jinliang_target

@@ -106,3 +106,40 @@ run_mode() {
 }
 
 for m in continuous+initial interval full_interval; do run_mode "$m"; done
+
+# ── 断言（#90 P2：以前只打印，口径错了也 exit 0）─────────────────
+# 判据来自 DECISIONS #19 / 契约 §1.6 例外段：
+#   批式（continuous+initial / full_interval）→ 真按表暂停：出现「本轮暂停这张表，其它表继续」+「本轮不搬它的存量」
+#   interval → **不做**按表暂停：必须出现 PAUSE-01 的 warn，且不得出现「只停它自己」这种它做不到的承诺
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+rc=0
+fail() { echo "PROBE FAIL: $*" >&2; rc=1; }
+
+for f in "$WORK/continuous+initial.probe.log" "$WORK/full_interval.probe.log"; do
+  [ -f "$f" ] || { fail "缺批式日志 $f（这一轮没跑成）"; continue; }
+  grep -q "本轮暂停这张表，其它表继续" "$f" || fail "$(basename "$f")：批式缺「本轮暂停这张表，其它表继续」（按表暂停没生效）"
+  grep -q "本轮不搬它的存量" "$f" || fail "$(basename "$f")：批式缺「本轮不搬它的存量」"
+done
+
+iv="$WORK/interval.probe.log"
+if [ ! -f "$iv" ]; then
+  fail "缺 interval 日志 $iv"
+else
+  grep -q "定时增量不做按表暂停" "$iv" || fail "interval 目标端没有 warn：应出现 PAUSE-01「定时增量不做按表暂停」"
+  if grep -q "只停它自己" "$iv"; then
+    fail "interval 日志出现了「只停它自己」——那是它做不到的承诺（契约 §1.6 例外段）"
+  fi
+  if grep -q "本轮暂停这张表，其它表继续" "$iv"; then
+    fail "interval 日志出现了批式的「本轮暂停这张表」——两种 mode 的口径混了"
+  fi
+fi
+
+# 另一侧目标端（MySQL）的 interval 文案走预检、这里不起 MySQL 实例：静态钉住它没被删。
+grep -q "定时增量在 MySQL 目标端没接" "$ROOT/internal/preflight/b0.go" \
+  || fail "internal/preflight/b0.go 里 MySQL 目标端的 interval warn 文案不见了"
+
+if [ "$rc" -ne 0 ]; then
+  echo "probe: 口径断言失败（见上）" >&2
+  exit 1
+fi
+echo "probe: 三种 mode 的轮次提示与契约一致（批式按表暂停 / interval 明确不做）"

@@ -154,8 +154,16 @@ SELFTEST = [
 ]
 
 
+# 条数下限：删掉「必须红」的用例 = 悄悄放宽判据（Owl II 实测：删掉 fp 占位符那两条，
+# mutation_gate --tier logic 仍然 9/9 绿）。少一条就判失败。
+MIN_CASES = 24
+
+
 def selftest():
     bad = 0
+    if len(SELFTEST) < MIN_CASES:
+        bad += 1
+        print("selftest: FAIL 判据条数 %d < 下限 %d —— 删用例等于放宽判据" % (len(SELFTEST), MIN_CASES))
     for name, (ok, why), want in SELFTEST:
         if ok != want:
             bad += 1
