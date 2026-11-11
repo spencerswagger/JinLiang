@@ -111,6 +111,11 @@ FOR EACH ROW EXECUTE FUNCTION jl_fail_pause()`); err != nil {
 		srcEP: ep,
 		tgtEP: ep,
 		sink:  s,
+		// 必须显式绑定：`pauseSink.Apply` 在 `r.pauseReg == nil` 时是**原样透传**
+		// （#99 加的快速路径，避免没绑时 SIGSEGV）。生产里 PG 目标端在 prepare 就
+		// `r.pauseReg = sink`（engine.go:949），裸 runner 不绑就测不到登记这条路径——
+		// 之前这条用例正是因此变成「透传后直接上抛」，断言永远拿不到 registerPause 的包裹语。
+		pauseReg: s,
 	}
 	inner := &failingApplier{err: &pgsink.TypeChangedError{
 		TableName: "pausefail_a", Detail: "v: 目标 bigint / 源 numeric(12,2)",

@@ -390,3 +390,44 @@ Panel 裁决：新增 `ExitNeedsAction = 3`，派生 `失败 1 > 用户停止 13
 
 没动的：`--stop-when-idle` 仍退 0；`verify`(1) 与 `status --verify`(5) 同事实两码本次不碰；
 `internal/engine/integration_mysql_type_pause_test.go` 归 Core，一个字没动。
+
+---
+
+# Owl II 四条必改（2026-11-11 晚，本轮）
+
+审查结论：反向注入本身有牙（logic + engine 本地复跑全红），问题在**门会漏**。四条逐条：
+
+| # | 落点 | 一句话改法 | 自证 |
+|---|---|---|---|
+| 1 | `main` 分支保护 | 把 merge-gate 的 job 全部加进 required checks（admin 实查） | `gh api .../protection/required_status_checks` → 13 个 context（6 旧 + 7 新） |
+| 2 | `.github/workflows/merge-gate.yml` | `chunk-resume-tracking` 的 **job 级** `continue-on-error` 删掉（它会把末尾 `known_red.py verify` 的 rc=1 吞掉）；#106 已落地 → killcopy 步骤同时**激活**，job 改名去掉「不阻塞」 | CI：该 job 现在真阻塞（见下「基础设施」） |
+| 3 | `scripts/known_red.py` | `job:` 型条目不再恒真：核对「那个 job 里真有 `known_red.py verify --id <id>`」，缺 job / 缺步骤都判红；`chunk-resume-wiring` 的 probe 从 `job:mysql-mysql` 改回真实探针 `mysqlsink-writes-chunks` | selftest 8/8（新增 fixture `testdata/known-red-no-verify.yml`）；`check` 输出里出现探针自述「chunk.go 里已经有写 `_jl_chunk` 的动作」 |
+| 4 | `scripts/acceptance_matrix.sh` / `gate_checks.py` / `mutation_gate.py` | 0 格与少跑格判失败；selftest 条数下限 24；新增 `fp-empty-accepted` 注入 | `--only " "` → exit 2；删两条 fp 用例 → `1/22 条判据不符合预期` exit 1；logic 档 10/10 KILLED |
+
+## 顺带两处「必改清单」之外的必需改动
+
+- **required check 与 workflow 级 `paths` 是互斥的**：workflow 因 paths 过滤没跑时，check 会永远停在
+  `Expected`，只改文档的 PR 全被堵死（GitHub 文档明写 path/branch 过滤= Pending）。
+  所以把 `paths` 换成 `changes` job + job 级 `if`：job 被 `if` 跳过会上报 **skipped**（required check 视为成功）。
+  判定规则与原 paths 清单一致。
+- **MySQL 就绪探测改走 TCP**：`docker exec <c> mysql -uroot ...`（socket）会命中官方镜像**初始化期**的
+  临时实例（`--skip-networking`），探测「秒过」；紧接着正式实例重启、socket 未建好 → 下一步 grant 报
+  `ERROR 2002`。改探 `-h127.0.0.1 -P3306` 后只在正式实例就绪时通过。这条是 job 级 `continue-on-error`
+  删掉**之后才暴露**的既有红。
+
+## required checks（实查输出，13 条）
+
+```
+build / testmatrix / schema / control-plane / race / b1-engine
+判据自检 + 反向注入（logic）
+反向注入（engine：位点 / 暂停 / 块进度）
+三组合 × MySQL 5.7 / 8.0 / 8.4
+MySQL→MySQL（双实例：全量 / 增量 kill / 块记账）
+块级续跑（单表口径）
+```
+
+## 两个变异（Owl II 点名的「假绿」形状）
+
+1. **0 格**：`scripts/acceptance_matrix.sh --only " "` → `acceptance: --only 没给出任何组合（0 格可跑）——这不是通过`，**exit 2**。
+2. **`-` 指纹**：把 `parse_fp` 的 `if len(digest) < 8 or digest == "-":` 改成 `if False:` → `selftest` 必红（`fp 占位符` 那条）；
+   若连那条用例一起删掉，`MIN_CASES=24` 仍判红（实测 `1/22 条判据不符合预期`，exit 1）。
