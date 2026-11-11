@@ -1,0 +1,13 @@
+# 自证用 fixture：已知红步骤的注释**缺「责任人」**——三件套不完整，台账自检必须判失败。
+# 用整份文件而不是改真 workflow 的理由：真 workflow 每天要跑，不能为了自证把它改坏。
+name: fixture
+on: workflow_dispatch
+jobs:
+  demo:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 块级续跑（known-red：单表口径，重启搬 ≈ 未搬完 ±1 块）
+        # 转绿用例：b1_mysql_to_mysql.sh killcopy
+        # 移除 continue-on-error 的触发条件：读路径接通
+        continue-on-error: true
+        run: echo fixture

@@ -1,0 +1,24 @@
+name: fixture-known-red-no-verify
+# fixture：`job:` 型台账条目的 job 存在，但**没有** known_red.py verify 步骤。
+# known_red.py selftest 用它钉住「跨 job 不是恒真放行」：缺对账步骤必须判红。
+on:
+  workflow_dispatch:
+
+jobs:
+  engine-mutation:
+    name: 反向注入（engine：位点 / 暂停 / 块进度）
+    runs-on: ubuntu-latest
+    steps:
+      - name: 暂停的 run 必须退 3（欠账不是失败）
+        id: exit3
+        # 责任人：Panel/Core
+        # 转绿用例：TestPausedRunExitsNeedsAction
+        # 移除 continue-on-error 的触发条件：引擎派生 ExitNeedsAction=3 落地
+        continue-on-error: true
+        run: echo fixture
+      # 故意漏掉「台账对账」那一步（fixture 就是要测它不在时的行为）
+
+  logic:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo fixture
