@@ -43,11 +43,22 @@ jobs:
         run: |
           set -e
           base="${{ github.base_ref }}"
+          # fail-closed：判定不出来就按「碰到了」处理，让门禁真跑。
+          # 反例（改造前）：`git fetch … || true` + `git diff … || true` → 空清单 →
+          # gate=false → 五个 required check 全 skipped（= 通过），changes 自己还绿：
+          # 等于「门禁没跑也能合，而且没有一处红」。
+          gate_on_failure() {
+            echo "::warning::$1 —— 按「碰到门禁输入面」处理（fail-closed，门禁会真跑）"
+            echo "gate=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
           if [ -z "$base" ]; then echo "gate=true" >> "$GITHUB_OUTPUT"; exit 0; fi
-          git fetch --no-tags --quiet origin "$base" || true
-          files=$(git diff --name-only "origin/$base...HEAD" || true)
+          git fetch --no-tags --quiet origin "$base" || gate_on_failure "取不到 base 分支 $base"
+          files=$(git diff --name-only "origin/$base...HEAD") || gate_on_failure "git diff origin/$base...HEAD 失败"
+          [ -n "$files" ] || gate_on_failure "改动清单为空（本不该发生）"
           echo "改动文件："; printf '%s\n' "$files"
-          if printf '%s\n' "$files" | grep -qE '^(internal/(engine|pgsink|mysqlsource|mysqlsink|core|source|mysqlcanon)/|cmd/|scripts/(gate_checks|mutation_gate|merge_gate|acceptance_matrix|review_gate_logic|known_red|probe_pause_wording|exit_codes|b1_mysql_to_mysql)\.|\.github/workflows/merge-gate\.yml)'; then
+          # internal/preflight 也是门禁输入面（#90 的 pause-wording 探针就依赖它）。
+          if printf '%s\n' "$files" | grep -qE '^(internal/(engine|pgsink|mysqlsource|mysqlsink|core|source|mysqlcanon|preflight)/|cmd/|scripts/(gate_checks|mutation_gate|merge_gate|acceptance_matrix|review_gate_logic|known_red|probe_pause_wording|exit_codes|b1_mysql_to_mysql)\.|\.github/workflows/merge-gate\.yml)'; then
             echo "gate=true" >> "$GITHUB_OUTPUT"
           else
             echo "gate=false" >> "$GITHUB_OUTPUT"
