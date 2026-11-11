@@ -503,6 +503,19 @@ for combo in $LIST; do
   fi
 done
 
+# 0 格 / 少跑格一律判失败：`--only " "` 时 for 一次都不进，旧脚本会打印
+# 「全部通过」并 exit 0——门没开却说门是好的（Owl II 实测）。
+set -- $LIST
+WANT=$#
+if [ "$WANT" -eq 0 ]; then
+  echo "acceptance: --only 没给出任何组合（0 格可跑）——这不是通过" >&2
+  exit 2
+fi
+if [ ${#RESULTS[@]} -ne "$WANT" ]; then
+  echo "acceptance: 只产出 ${#RESULTS[@]} 格，期望 $WANT 格——判失败" >&2
+  exit 1
+fi
+
 echo
 echo "| 组合 | 目标表名 | 源行数 | 目标行数 | 源 md5 | 目标 md5 | 快照(s) | 增量(s) | 结论 |"
 echo "|---|---|---|---|---|---|---|---|---|"

@@ -49,7 +49,7 @@ REGISTRY = [
         unblock="引擎 generic 全量路径读块进度（当前 copyGeneric 把 nil 传给 SnapshotChunksFrom，"
                 "internal/engine/target.go:456；executeGeneric 从不读 ChunkProgress → 必然整轮重搬）；"
                 "接通且该格重搬行数 ≤1 块后转阻塞。注：块记账本身已落（#95），已是**阻塞**步骤",
-        probe="job:mysql-mysql",
+        probe="mysqlsink-writes-chunks",
     ),
 ]
 
@@ -185,6 +185,27 @@ def classify(landed, suspended):
     return True, "已知红（等实现，步骤挂起中）"
 
 
+def cross_job_ok(text, job, entry_id):
+    """`job:` 型条目**不许恒真**：确认那个 job 里真的挂着 known_red.py verify --id <id>。
+
+    之前这里是「probe 以 job: 开头就直接 ok」，于是两条台账都写成 job: 型，logic job
+    自查永远绿；`mysqlsink-writes-chunks` 探针写好了也从没被调用过（probe 指成了
+    `job:mysql-mysql`）。现在这里做结构性核对：
+      · 工作流里没有这个 job            → 判红（台账指向不存在的 job）；
+      · 该 job 里没有 verify --id <id>  → 判红（没人对账=恒真放行）。
+    真正的判定仍由那个 job 的 verify 步骤做（它拿得到检测器这一步的 outcome）。
+    """
+    m = re.search(r"(?m)^  %s:\s*$" % re.escape(job), text)
+    if not m:
+        return False, "工作流里没有 job %r：台账指向了不存在的 job" % job
+    rest = text[m.end():]
+    nxt = re.search(r"(?m)^  [A-Za-z0-9_-]+:\s*$", rest)
+    block = rest[:nxt.start()] if nxt else rest
+    if not re.search(r"known_red\.py verify\s+--id\s+%s\b" % re.escape(entry_id), block):
+        return False, "job %r 里没有 `known_red.py verify --id %s`：没人对账=恒真放行" % (job, entry_id)
+    return True, "由 job %s 的 verify 步骤真实对账（跨 job，本 job 不重复判定）" % job
+
+
 def check(only=None, workflow=None, probes=None):
     yaml = _yaml()
     workflow = workflow or WORKFLOW
@@ -207,9 +228,10 @@ def check(only=None, workflow=None, probes=None):
                 bad += 1
                 continue
         if e["probe"].startswith("job:"):
-            rows.append((e, None, suspended,
-                         "由 %s job 的 verify 步骤对账（%s）" % (e["probe"][4:], "步骤仍挂起" if suspended else "步骤已激活"),
-                         True))
+            ok, why = cross_job_ok(text, e["probe"][4:], e["id"])
+            rows.append((e, None, suspended, why, ok))
+            if not ok:
+                bad += 1
             continue
         if not found:
             rows.append((e, False, False, "步骤不在工作流里（台账与 YAML 失联）", False))
@@ -294,10 +316,25 @@ def selftest():
         print("selftest: FAIL 缺责任人的 fixture 应被点出 ['责任人']，实际 %r" % (fx_missing,))
     else:
         print("selftest: ok   三件套缺一项 = 判失败（fixture）")
+    # `job:` 型条目：缺 verify 步骤必须判红（否则「跨 job」就是恒真放行的后门）
+    fx_cross = os.path.join(ROOT, "scripts/testdata/known-red-no-verify.yml")
+    ok, why = cross_job_ok(open(fx_cross, encoding="utf-8").read(), "engine-mutation", "exit-code-3")
+    if ok:
+        bad += 1
+        print("selftest: FAIL job: 型条目缺 verify 步骤也应判红，实际放行（%s）" % why)
+    else:
+        print("selftest: ok   job: 型条目缺 verify 步骤 = 判红（fixture）")
+    ok, why = cross_job_ok(open(WORKFLOW, encoding="utf-8").read(), "engine-mutation", "exit-code-3")
+    if not ok:
+        bad += 1
+        print("selftest: FAIL 真 workflow 里 exit-code-3 的对账步骤不见了：%s" % why)
+    else:
+        print("selftest: ok   真 workflow 里 exit-code-3 有 verify 步骤")
+
     if bad:
         print("selftest: %d 条不符合预期" % bad)
         return 1
-    print("selftest: %d 条判据全部符合预期" % (len(SELFTEST) + 2))
+    print("selftest: %d 条判据全部符合预期" % (len(SELFTEST) + 4))
     return 0
 
 

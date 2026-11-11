@@ -10,23 +10,12 @@ name: merge-gate
 # 为什么矩阵在 Actions 上跑：沙盒/开发机只有 MySQL 8.0，5.7 / 8.4 需要 docker。
 
 on:
+  # 这里**故意不写 paths 过滤**：这五个 job 现在是 main 的 required checks，
+  # 而「workflow 因 paths 过滤没跑」会让 check 永远停在 Expected，把只改文档的 PR
+  # 全堵死（GitHub 文档：path/branch 过滤导致的跳过 = Pending）。
+  # 需要「只在该跑的时候跑」时，用下面 changes job 的 job 级 if——job 被 if 跳过
+  # 会正常上报 skipped（对 required check 视为成功），不会挂住 PR。
   pull_request:
-    paths:
-      - "internal/engine/**"
-      - "internal/pgsink/**"
-      - "internal/mysqlsource/**"
-      - "internal/mysqlsink/**"
-      # 这四类是门禁的输入面：方向表（支持哪些组合）、分类语义、MySQL↔PG 值规范化、CLI 退出码
-      - "internal/core/**"
-      - "internal/source/**"
-      - "internal/mysqlcanon/**"
-      - "cmd/**"
-      - "scripts/gate_checks.py"
-      - "scripts/mutation_gate.py"
-      - "scripts/merge_gate.sh"
-      - "scripts/acceptance_matrix.sh"
-      - "scripts/review_gate_logic.py"
-      - ".github/workflows/merge-gate.yml"
   workflow_dispatch:
     inputs:
       rows:
@@ -40,7 +29,33 @@ on:
         default: "0"
 
 jobs:
+  changes:
+    name: 门禁输入面判定
+    runs-on: ubuntu-latest
+    outputs:
+      gate: ${{ steps.d.outputs.gate }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: d
+        name: 有没有碰到门禁的输入面
+        run: |
+          set -e
+          base="${{ github.base_ref }}"
+          if [ -z "$base" ]; then echo "gate=true" >> "$GITHUB_OUTPUT"; exit 0; fi
+          git fetch --no-tags --quiet origin "$base" || true
+          files=$(git diff --name-only "origin/$base...HEAD" || true)
+          echo "改动文件："; printf '%s\n' "$files"
+          if printf '%s\n' "$files" | grep -qE '^(internal/(engine|pgsink|mysqlsource|mysqlsink|core|source|mysqlcanon)/|cmd/|scripts/(gate_checks|mutation_gate|merge_gate|acceptance_matrix|review_gate_logic|known_red|probe_pause_wording|exit_codes|b1_mysql_to_mysql)\.|\.github/workflows/merge-gate\.yml)'; then
+            echo "gate=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "gate=false" >> "$GITHUB_OUTPUT"
+          fi
+
   logic:
+    needs: changes
+    if: needs.changes.outputs.gate == 'true'
     name: 判据自检 + 反向注入（logic）
     runs-on: ubuntu-latest
     steps:
@@ -62,6 +77,8 @@ jobs:
         run: python3 scripts/mutation_gate.py --tier logic
 
   engine-mutation:
+    needs: changes
+    if: needs.changes.outputs.gate == 'true'
     name: 反向注入（engine：位点 / 暂停 / 块进度）
     runs-on: ubuntu-latest
     steps:
@@ -113,6 +130,17 @@ jobs:
       - name: 退出码台账对账（实现能过了但断言还挂着 → 拦）
         if: always()
         run: python3 scripts/known_red.py verify --id exit-code-3 --result "${{ steps.exit3.outcome }}"
+      - name: 轮次提示探针（三种 mode 的 PAUSE-01 口径，断言失败即红）
+        # #90 P2：脚本以前只打印不断言、CI 也不跑。这里真跑三种 mode（continuous+initial /
+        # interval / full_interval），口径与 DECISIONS #19 / 契约 §1.6 例外段不一致就红。
+        env:
+          BIN: ./dist/jinliang
+          JINLIANG_TEST_PG_DSN: postgres://jinliang:jinliang@127.0.0.1:55432/jinliang_test?sslmode=disable
+          JINLIANG_TEST_PG_SRC_DSN: postgres://jinliang:jinliang@127.0.0.1:55433/jinliang_src?sslmode=disable
+        run: |
+          set -e
+          CGO_ENABLED=0 go build -trimpath -o dist/jinliang ./cmd/jinliang
+          timeout -k 10 900 bash scripts/probe_pause_wording.sh
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -120,6 +148,8 @@ jobs:
           path: mutation-engine.json
 
   acceptance:
+    needs: changes
+    if: needs.changes.outputs.gate == 'true'
     name: 三组合 × MySQL ${{ matrix.mysql }}
     runs-on: ubuntu-latest
     strategy:
@@ -250,6 +280,8 @@ jobs:
           path: acceptance-${{ matrix.mysql }}.json
 
   mysql-mysql:
+    needs: changes
+    if: needs.changes.outputs.gate == 'true'
     name: MySQL→MySQL（双实例：全量 / 增量 kill / 块记账）
     # 参数与本地验收一致：ROWS=20000、两个独立实例（源 53306 / 目标 53307）。
     # 为什么必须两个实例：同实例时目标端的写入会进源端 binlog，读到自己刚写的行。
@@ -326,17 +358,21 @@ jobs:
             echo "- 全量+增量：见上一步日志"
             echo "- kill -9：判据「重启重搬 0 行」"
             echo "- 块记账（阻塞）：搬运期逐块 + 完成后表标记 rows = 各块之和"
-            echo "- 块级续跑（单表口径）不在本 job：见独立跟踪 job chunk-resume-tracking（不阻塞合并）"
+            echo "- 块级续跑（单表口径）不在本 job：见独立 job「块级续跑（单表口径）」（阻塞）"
           } >> "$GITHUB_STEP_SUMMARY"
 
   chunk-resume-tracking:
-    name: 【跟踪·不阻塞】块级续跑（单表口径）
-    # 为什么单列：generic 全量路径还没读块进度——`copyGeneric` 把 `nil` 传给
-    # SnapshotChunksFrom（internal/engine/target.go:456），`executeGeneric` 从不读
-    # `ChunkProgress`，所以**当前必然整轮重搬**。这是结构性红，不是「等实现会自己绿」的
-    # 开关问题；放在门禁 job 里会把整条门禁堵死，所以单列成跟踪 job（job 级别不阻塞）。
-    # 责任人 Core；转阻塞条件：读路径接通 且 该格重搬行数 ≤1 块（单表口径）。
-    continue-on-error: true
+    needs: changes
+    if: needs.changes.outputs.gate == 'true'
+    name: 块级续跑（单表口径）
+    # 为什么单列（而不是并进 mysql-mysql）：这一格要**两个独立 MySQL 实例**再跑一遍
+    # killcopy，并进主 job 会把运行时长翻倍；单列成独立 job 照样是 required check。
+    # 原本它是「已知红 / 不阻塞」：generic 全量路径没读块进度（`copyGeneric` 把 nil 传给
+    # SnapshotChunksFrom，`executeGeneric` 从不读 `ChunkProgress`）。**#106 已接通读路径**，
+    # 这一步连同 job 一起转阻塞（job 级 continue-on-error 已删，名字里的「不阻塞」也去掉）。
+    # 责任人 Core；再退化时 known_red.py verify 会判红。
+    # **#106 已接通读路径，本 job 现在是阻塞的**：原先挂在这里的 job 级
+    # continue-on-error 会把末尾 known_red.py verify 的 rc=1 一起吞掉（必红却不拦）。
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -387,12 +423,11 @@ jobs:
       - name: 块级续跑（known-red：单表口径，重启搬 ≈ 未搬完 ±1 块）
         # 责任人：Core（引擎读侧，不是 Data：写侧 #95 已落，`_jl_chunk` 真有 2 行）
         # 转绿用例：scripts/b1_mysql_to_mysql.sh killcopy（单表口径：重启搬 ≈ 未搬完 ±1 块）
-        # 移除 continue-on-error 的触发条件：Core 接通读路径（`copyGeneric` 把 nil 传给
-        #   `SnapshotChunksFrom`，internal/engine/target.go:456；`executeGeneric` 只看
-        #   `fresh || full_interval || len(forceRecopy)>0`，从不读 `ChunkProgress`），
-        #   且该格重启重搬行数 ≤1 块。
+        # 移除 continue-on-error 的触发条件：Core 接通读路径（`copyGeneric` 不再把 nil 传给
+        #   `SnapshotChunksFrom`，`executeGeneric` 读 `ChunkProgress`）且该格重搬行数 ≤1 块。
+        #   **#106 已落地 → 这条已激活**（step 级 continue-on-error 已删），
+        #   台账条目保留用于对账（实现再退化时 known_red.py verify 会判红）。
         id: killcopy
-        continue-on-error: true
         env:
           JINLIANG_TEST_MYSQL_SRC_DSN: mysql://jinliang:jinliang@127.0.0.1:43306/jinliang_src
           JINLIANG_TEST_MYSQL_DST_DSN: mysql://jinliang:jinliang@127.0.0.1:43307/jinliang_target

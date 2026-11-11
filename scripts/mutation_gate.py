@@ -48,6 +48,16 @@ MUTATIONS = [
         note="篡改期望 md5 / 把内容指纹比对关掉",
     ),
     dict(
+        name="fp-empty-accepted",
+        tier="logic",
+        file="scripts/gate_checks.py",
+        find='    if len(digest) < 8 or digest == "-":',
+        replace='    if False:  # SABOTAGE: 空指纹 / 占位符也当一致（拿不到数据就放行）',
+        cmd=[sys.executable, "scripts/gate_checks.py", "selftest"],
+        signal="selftest 退出 1（fp 占位符那条必须红；删掉它则条数下限 24 判红）",
+        note="放宽 parse_fp 接受 `-`：拿不到数据就放行（B5 事故的形状）",
+    ),
+    dict(
         name="rows-count-neutered",
         tier="logic",
         file="scripts/gate_checks.py",
