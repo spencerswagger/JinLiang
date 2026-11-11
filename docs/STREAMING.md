@@ -47,6 +47,9 @@ reliability:
   ack 机制；MySQL 不需要服务端 ack）。
 - 未提交的批次绝不 advance -- 否则重启会跳过未落库的变更。
 
+租约边界、`kill -9` 的回退窗口（恒为 0，重放窗口 ≤ 一个批次）、GTID 与 file+pos 的续跑轴固化、
+「重搬 0 行」的判据，全部冻结在 [CONTRACT-PAUSE-AND-POSITION.md §2](CONTRACT-PAUSE-AND-POSITION.md)（实现随 ①/③ 分片落地）。
+
 ## 4. 心跳与延迟测量
 
 - 源端每 10s 发一次心跳事件（无变更时也发），用于判断「是否卡住」和测量基线的端到端延迟。

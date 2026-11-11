@@ -234,8 +234,11 @@ var specs = []Spec{
 		// 这三句说的事必须与实现一致（docs/CONTRACT-PAUSE-AND-POSITION.md §1.5/§1.6）：
 		// 命中暂停表的行**整条跳过**、其它表照写、位点照常前进；恢复 = 结构对齐后整表重搬。
 		// 谁改文案都要保住「其它表照常继续」这个短语（用例 TestSchemaMismatchSaysOnlyThatTableStops 会 grep 它）。
-		Risk: "这张表在重搬完成前与源端不一致：跳过的那段变更不会写入，具体欠了多少看 status 里的 " +
-			"skipped_rows；其它表照常继续。结构对齐后重跑会**清空这张表再整表重搬**" +
+		// 「看哪里」必须指向**真实存在**的位置：`jinliang status` 这一版没有暂停这一节（片 D2 未落地，
+		// 见 §1.8），所以指到目标库 `_jl_meta.paused_tables` 那一列——那是唯一的第一手记录。
+		// 别再把用户指去 status 里找 skipped_rows：他找不到，只会以为是我们没记（2026-11-12 Owl II 必改 3）。
+		Risk: "这张表在重搬完成前与源端不一致：跳过的那段变更不会写入，欠多少看目标库 _jl_meta 的 " +
+			"paused_tables 列（JSON 里的 skipped_rows）；其它表照常继续。结构对齐后重跑会**清空这张表再整表重搬**" +
 			"（不这么做，暂停期间的删除会变成目标端的幻行留在那里）",
 	},
 	{

@@ -4,6 +4,7 @@
 #   ROWS=200000 scripts/b1_mysql_to_mysql.sh ./dist/jinliang           # 全量 → 增量
 #   ROWS=200000 scripts/b1_mysql_to_mysql.sh ./dist/jinliang kill      # 增量跑到一半 kill -9 → 重启
 #   ROWS=200000 scripts/b1_mysql_to_mysql.sh ./dist/jinliang killcopy  # 全量中途 kill -9 → 块级续跑
+#   ROWS=200000 scripts/b1_mysql_to_mysql.sh ./dist/jinliang accounting # 块记账本身（阻塞判据；不需要续跑接线）
 #
 # 需要两个 **不同的 MySQL 实例**（源库一个、目标库一个）：
 #   JINLIANG_TEST_MYSQL_SRC_DSN  源
@@ -17,6 +18,13 @@ set -euo pipefail
 
 BIN=${1:-./dist/jinliang}
 MODE=${2:-full}
+GC="$(cd "$(dirname "$0")" && pwd)/gate_checks.py"
+# killcopy 要在「块」这一级证伪：表 2 万行、块 2000 行 → 至少 8 个块，
+# kill 之后_已提交的块_不许重搬。块太大（默认 5 万）时一张表只有一个块，
+# 这一格就退化成「整表重搬」也看不出来。
+if { [ "$MODE" = "killcopy" ] || [ "$MODE" = "accounting" ]; } && [ -z "${CHUNK_ROWS:-}" ]; then
+  CHUNK_ROWS=2000
+fi
 ROWS=${ROWS:-200000}
 SRC=${JINLIANG_TEST_MYSQL_SRC_DSN:-}
 DST=${JINLIANG_TEST_MYSQL_DST_DSN:-${JINLIANG_TEST_MYSQL_DSN:-}}
@@ -126,6 +134,54 @@ export JINLIANG_TEST_MYSQL_DST_DSN=$DST
 
 echo "== 4. 第一轮：全量 → 增量 =="
 T0=$(date +%s.%N)
+# ── 块记账本身（阻塞判据）───────────────────────────────────────
+# 只验「目标端有没有认真记账」，不依赖引擎的续跑读路径——后者还没接（Core）。
+# 记账契约（Data #95）：搬运中每个块一行（chunk_no>0、done=1、rows=该块行数）；
+# 表搬完后写 chunk_no=0 的表标记，且它的 rows **必须等于各块之和**（= 表行数）。
+if [ "$MODE" = "accounting" ]; then
+  "$BIN" run --job b4-mysql-to-mysql --data-dir "$DATA" --stop-after 600s > "$WORK/run1.log" 2>&1 &
+  PID=$!
+  for _ in $(seq 1 600); do
+    grep -q "第 2 块" "$WORK/run1.log" 2>/dev/null && break
+    sleep 0.05
+  done
+  kill -9 "$PID" 2>/dev/null || true
+  wait "$PID" 2>/dev/null || true
+
+  ROWS_IN=$(dst "SELECT COUNT(*) FROM m2m_orders" 2>/dev/null || echo 0)
+  BLOCKS=$(dst "SELECT COUNT(*) FROM _jl_chunk WHERE chunk_no>0 AND done=1" 2>/dev/null || echo 0)
+  ROWS_DONE=$(dst "SELECT COALESCE(SUM(\`rows\`),0) FROM _jl_chunk WHERE chunk_no>0 AND done=1" 2>/dev/null || echo 0)
+  echo "   全量中途 kill -9：目标端 $ROWS_IN/$ROWS 行；已提交块 ${BLOCKS} 个 / ${ROWS_DONE} 行"
+
+  # ① 搬运中必须逐块记账
+  if [ "${BLOCKS:-0}" -lt 1 ]; then
+    echo "FAIL: 没有一个 done=1 的块——搬运期块记账没写（记账口径①）"; exit 1
+  fi
+  # ② 记账不许虚报（块行数合计不能超过目标端实有行数）
+  if [ "${ROWS_DONE:-0}" -gt "${ROWS_IN:-0}" ]; then
+    echo "FAIL: 已提交块合计 ${ROWS_DONE} 行 > 目标端实有 ${ROWS_IN} 行（记账虚报）"; exit 1
+  fi
+
+  # ③ 跑完一轮：表标记 chunk_no=0 必须在，且 rows == 各块之和 == 表行数
+  timeout 600 "$BIN" run --job b4-mysql-to-mysql --data-dir "$DATA" --stop-when-idle 5s > "$WORK/run2.log" 2>&1 || true
+  TBL_DONE=$(dst "SELECT COUNT(*) FROM _jl_chunk WHERE chunk_no=0 AND done=1" 2>/dev/null || echo 0)
+  TBL_ROWS=$(dst "SELECT COALESCE(MAX(\`rows\`),0) FROM _jl_chunk WHERE chunk_no=0 AND done=1" 2>/dev/null || echo 0)
+  SUM_BLOCKS=$(dst "SELECT COALESCE(SUM(\`rows\`),0) FROM _jl_chunk WHERE chunk_no>0" 2>/dev/null || echo 0)
+  ALL_ROWS=$(dst "SELECT COUNT(*) FROM m2m_orders" 2>/dev/null || echo 0)
+  echo "   跑完后：表标记 ${TBL_DONE}（rows=${TBL_ROWS}），各块之和 ${SUM_BLOCKS}，表行数 ${ALL_ROWS}"
+  if [ "${TBL_DONE:-0}" -lt 1 ]; then
+    echo "FAIL: 表搬完了却没有 chunk_no=0 的完成标记（记账口径③）"; exit 1
+  fi
+  if [ "${TBL_ROWS:-0}" -ne "${SUM_BLOCKS:-0}" ]; then
+    echo "FAIL: 表标记 rows=${TBL_ROWS} ≠ 各块之和 ${SUM_BLOCKS}（记账口径③）"; exit 1
+  fi
+  if [ "${ALL_ROWS:-0}" -ne "$ROWS" ] || [ "${TBL_ROWS:-0}" -ne "$ROWS" ]; then
+    echo "FAIL: 表标记 ${TBL_ROWS} / 实际 ${ALL_ROWS}，应为 $ROWS"; exit 1
+  fi
+  echo "PASS: 块记账成立（搬运期 ${BLOCKS} 块 / ${ROWS_DONE} 行；完成后表标记 rows=${TBL_ROWS} = 各块之和 = 表行数）"
+  exit 0
+fi
+
 if [ "$MODE" = "killcopy" ]; then
   "$BIN" run --job b4-mysql-to-mysql --data-dir "$DATA" --stop-after 600s > "$WORK/run1.log" 2>&1 &
   PID=$!
@@ -135,18 +191,41 @@ if [ "$MODE" = "killcopy" ]; then
   done
   kill -9 "$PID" 2>/dev/null || true
   wait "$PID" 2>/dev/null || true
-  MID=$(dst "SELECT COUNT(*) FROM m2m_orders" || echo 0)
-  echo "   全量中途 kill -9：目标端此刻 $MID/$ROWS 行"
-  echo "   块进度最后一条边界：$(dst "SELECT COALESCE(range_to,'(空)') FROM _jl_chunk ORDER BY chunk_no DESC LIMIT 1" || echo 无)"
+  MID=$(dst "SELECT COUNT(*) FROM m2m_orders" 2>/dev/null || echo 0)
+  CHUNKROWS=$(dst "SELECT COUNT(*) FROM _jl_chunk" 2>/dev/null || echo 0)
+  CHUNKLAST=$(dst "SELECT COALESCE(range_to,'(空)') FROM _jl_chunk ORDER BY chunk_no DESC LIMIT 1" 2>/dev/null || echo 无)
+  echo "   全量中途 kill -9：目标端此刻 $MID/$ROWS 行（块 ${CHUNK_ROWS:-50000} 行/块）"
+  echo "   _jl_chunk 行数：$CHUNKROWS；最后一条边界：$CHUNKLAST"
+
+  # ── 判据 1：块记账必须存在 ─────────────────────────────────────
+  # 没有块记账时，重启只能整轮重搬，而旧脚本只比「两端最终一致」——整轮重搬也能一致，
+  # 于是这一格长期是假绿（kill 在 4000/20000 行时 _jl_chunk 0 行、重启又搬 20000 行，仍 PASS）。
+  if [ "${CHUNKROWS:-0}" -le 0 ]; then
+    echo "FAIL: _jl_chunk 里 0 行 —— 目标端没写块记账（mysqlsink 的块级续跑还没接上）。"
+    echo "      这一格不能算通过：没有块边界，'续跑' 只能是整轮重搬（旧脚本正因此假绿）。"
+    echo "      等块记账落地后这一格会自动变绿；在此之前它**必须红**。"
+    exit 1
+  fi
+
   timeout 600 "$BIN" run --job b4-mysql-to-mysql --data-dir "$DATA" --stop-when-idle 5s > "$WORK/run2.log" 2>&1 || true
+  # 重启这一轮搬了多少行：generic 路径的收尾行是「复制 N 行」。
   RESUME_ROWS=$(grep -oE "复制 [0-9]+ 行" "$WORK/run2.log" | tail -1 | grep -oE "[0-9]+" || echo 0)
-  echo "   续跑重搬 $RESUME_ROWS 行（应为 $((ROWS - MID)) 左右，即只搬没搬完的）"
+  EXPECT=$((ROWS - MID))                 # 没搬完、必须补的行数
+  echo "   中断 $MID 行 → 重启搬 $RESUME_ROWS 行（未搬完 $EXPECT 行；口径②=单表续跑）"
+  # ── 判据 2（单表口径）：只允许「中断时正在写的那一块」回滚重来 ─────────────
+  # 注意：这不是「重启重搬 0 行」（那是整轮口径，用在 MySQL→PG 的 kill 那格）。
+  python3 "$GC" recopy --scope table --resumed "$RESUME_ROWS" --remaining "$EXPECT" \
+    --chunk "${CHUNK_ROWS:-50000}" || {
+    echo "FAIL: 重启搬 $RESUME_ROWS 行，未搬完 $EXPECT 行（±1 块 ${CHUNK_ROWS:-50000}）：这不是块级续跑。"
+    echo "--- run2.log 尾部 ---"; tail -20 "$WORK/run2.log"; exit 1
+  }
+
   T1=$(date +%s.%N)
   echo "   续跑耗时 $(python3 -c "print(f'{$T1-$T0:.2f}')")s"
   S=$(fp src); D=$(fp dst)
   echo "   源端 $S / 目标 $D"
   [ "$S" = "$D" ] || { echo "FAIL: 块级续跑之后两端不一致"; exit 1; }
-  echo "PASS: MySQL → MySQL 全量中途 kill -9，续跑后两端一致 $S"
+  echo "PASS: MySQL → MySQL 全量中途 kill -9，块进度 $CHUNKROWS 行，单表续跑（重启搬 $RESUME_ROWS ≈ 未搬完 $EXPECT ±1 块），两端一致 $S"
   exit 0
 fi
 

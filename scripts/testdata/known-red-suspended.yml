@@ -1,0 +1,11 @@
+# 自证用 fixture：一个「已知红步骤仍挂着 continue-on-error」的最小工作流。
+# `known_red.py selftest` 拿它构造「实现已落地 + 步骤仍挂起」的场景，要求门禁判 1。
+name: fixture
+on: workflow_dispatch
+jobs:
+  demo:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 块级续跑（known-red：单表口径，重启搬 ≈ 未搬完 ±1 块）
+        continue-on-error: true
+        run: echo fixture
