@@ -1,0 +1,12 @@
+# MySQL 9.7.4 实例口径（源 :53346 / 目标 :53347，本地 mysqld，非容器）
+# mysqld: /.toolchain/mysql-9.7.4/usr/bin/mysqld  Ver 9.7.4 for Linux on x86_64 (MySQL Community Server - GPL)
+# 起法（可复跑）：
+#   scripts/version_stack.sh up 9.7.4 /.toolchain/mysql-9.7.4/usr 53346 53347
+#   eval "$(scripts/version_stack.sh env 9.7.4 53346 53347)"
+#   MATRIX3_NO_STACK=1 ROWS=20000 OUT=notes/matrix3/versions/9.7.4 scripts/matrix3.sh
+#
+# 指纹算式：MySQL 9.x 已移除内置 MD5()（ERROR 1305），acceptance_matrix.sh 用
+#   SELECT MD5('x') 做能力探测 → 自动切 SHA2(...,256) / PG encode(sha256(...),'hex')。
+#   两端同一算式，判据不放松；本目录 md5 列是 64 位十六进制，就是 SHA-256。
+mysql=9.7.4
+binlog=1/ROW/FULL

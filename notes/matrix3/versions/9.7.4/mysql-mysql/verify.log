@@ -1,0 +1,6 @@
+校验 2026-11-11T19:14:54Z（job_key=-）
+
+[data] OK（1 表，180 ms）
+  统计：map[blocks_checked:20 blocks_mismatched:0 checksum:5df89db1b2da0da7 fingerprint_comparable:true full_scan_rows:20000 matched:20000 rows_source:20000 rows_target:20000 sample_matched:100 sampled:100 tables_aggregate_only:0 tables_full_scan:1 tables_no_pk:0]
+
+结论：数据级 ✓（行级全表比对 1 表）
