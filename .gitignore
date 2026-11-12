@@ -16,3 +16,6 @@ bench/latest.json
 /.gitmsg
 /.commitmsg
 .work/
+
+# 本地栈数据目录（scripts/local_stack.sh；不入库）
+.localdb/

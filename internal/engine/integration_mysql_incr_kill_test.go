@@ -51,15 +51,12 @@ func TestMySQLSourceIncrementalResumeAfterSIGKILL(t *testing.T) {
 		amount DECIMAL(12,2) NULL,
 		created_at DATETIME(6) NULL
 	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`)
+	// 造数**不用 WITH RECURSIVE**：MySQL 5.7 没有 CTE（也没有 cte_max_recursion_depth
+	// 这个变量），而 5.7 在矩阵里要真跑。VALUES 直接拼，5.7/8.0/8.4 都认。
 	const step = 5000
 	for lo := 1; lo <= myIncrRows; lo += step {
 		hi := lo + step - 1
-		myExec(t, my, "SET SESSION cte_max_recursion_depth=1000000")
-		myExec(t, my, "INSERT INTO "+table+` (id,payload,amount,created_at)
-			SELECT n, CONCAT('row-', n), (n % 10000) / 100,
-			       TIMESTAMPADD(SECOND, -n, '2026-01-01 00:00:00')
-			FROM (WITH RECURSIVE seq AS (SELECT `+strconv.Itoa(lo)+` AS n UNION ALL
-			      SELECT n+1 FROM seq WHERE n < `+strconv.Itoa(hi)+`) SELECT n FROM seq) s`)
+		myExec(t, my, "INSERT INTO "+table+" (id,payload,amount,created_at) VALUES "+mySeedValues(lo, hi))
 	}
 	defer func() {
 		myExec(t, my, "DROP TABLE IF EXISTS "+table)
@@ -172,11 +169,8 @@ func TestMySQLSourceIncrementalResumeAfterSIGKILL(t *testing.T) {
 	// 全量重搬补不了（全量的视图比它早）、跳过更补不了。这一段也让
 	// 「杀了之后目标端确实落后」成为确定性事实，不靠掐时间。
 	const downtime = 500
-	myExec(t, my, "INSERT INTO "+table+` (id,payload,amount,created_at)
-		SELECT n, CONCAT('down-', n), 2.5, NOW(6) FROM (WITH RECURSIVE seq AS
-		(SELECT `+strconv.Itoa(myIncrRows+myIncrExtra+1)+` AS n UNION ALL
-		 SELECT n+1 FROM seq WHERE n < `+strconv.Itoa(myIncrRows+myIncrExtra+downtime)+`)
-		SELECT n FROM seq) s`)
+	myExec(t, my, "INSERT INTO "+table+" (id,payload,amount,created_at) VALUES "+
+		myDownValues(myIncrRows+myIncrExtra+1, myIncrRows+myIncrExtra+downtime))
 	myExec(t, my, "UPDATE "+table+" SET payload='touched' WHERE id BETWEEN 1 AND 100")
 	myExec(t, my, "DELETE FROM "+table+" WHERE id BETWEEN 200 AND 249")
 
@@ -268,6 +262,36 @@ func mySchemaOf(db string) string {
 		return "jinliang_src"
 	}
 	return db
+}
+
+// mySeedValues 拼存量行（id, 'row-id', 金额, 时间）。
+//
+// 为什么不在 SQL 里用 WITH RECURSIVE 生成：MySQL 5.7 不支持 CTE。矩阵要在 5.7 上跑这条
+// 用例，造数就不能依赖 8.0 的语法（#89 合入时只在 8.0 的 job 跑过，5.7 腿一开就红）。
+func mySeedValues(lo, hi int) string {
+	var b strings.Builder
+	for i := lo; i <= hi; i++ {
+		if i > lo {
+			b.WriteByte(',')
+		}
+		n := strconv.Itoa(i)
+		b.WriteString("(" + n + ",'row-" + n + "',(" + n + " % 10000) / 100," +
+			"TIMESTAMPADD(SECOND,-" + n + ",'2026-01-01 00:00:00'))")
+	}
+	return b.String()
+}
+
+// myDownValues 拼「停机期间源端写入」的行。
+func myDownValues(lo, hi int) string {
+	var b strings.Builder
+	for i := lo; i <= hi; i++ {
+		if i > lo {
+			b.WriteByte(',')
+		}
+		n := strconv.Itoa(i)
+		b.WriteString("(" + n + ",'down-" + n + "',2.5,NOW(6))")
+	}
+	return b.String()
 }
 
 // myValues 拼一批 VALUES（(lo,'row-lo',…), …）。

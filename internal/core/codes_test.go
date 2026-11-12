@@ -195,6 +195,16 @@ func TestSchemaMismatchSaysOnlyThatTableStops(t *testing.T) {
 	if !strings.Contains(spec.Next[1], "其它表继续") {
 		t.Errorf("Next 必须说明「只停这一张表、其它表继续」，得到 %q", spec.Next[1])
 	}
+	// **「看哪里」必须真实存在**（Owl II 必改 3）：`jinliang status` 这一版没有暂停这一节
+	// （片 D2 未落地，契约 §1.8），文案却让人「看 status 里的 skipped_rows」——用户照着找，
+	// 找不到只会以为是我们没记。第一手记录只有目标库 `_jl_meta.paused_tables` 那一列。
+	// 等 D2 落地（status 里真有 paused[]）再把这条换成「status 里能看到」也不迟。
+	if strings.Contains(spec.Risk, "status 里") {
+		t.Errorf("Risk 不许把用户指去 `jinliang status` 里找待办/行数（那里没有这一节）：%q", spec.Risk)
+	}
+	if !strings.Contains(spec.Risk, "paused_tables") {
+		t.Errorf("Risk 必须给出一个真实存在的「看哪里」：目标库 _jl_meta 的 paused_tables 列，得到 %q", spec.Risk)
+	}
 }
 
 // TestSchemaMismatchReasonTimingNotOneToOne：原因码与发现时机**不是一一对应**。

@@ -265,14 +265,18 @@ func TestTypeMappingChecksAppearInPreflight(t *testing.T) {
 	}
 }
 
-// PAUSE-01 的两句话必须与实现同源（契约 docs/CONTRACT-PAUSE-AND-POSITION.md §1.5/§1.6）。
+// PAUSE-01 的两句话必须与实现同源（契约 docs/CONTRACT-PAUSE-AND-POSITION.md §1.5/§1.6 + DECISIONS #19）。
 //
-// 这里曾经写反过：`#93` 把「按表暂停」改成「只停该表 + 其它表照常 + 位点照常前进」，
-// codes.go 的 E1015 三句跟着改了，`PAUSE-01`(OK) 却还写着「位点不推进」——
-// 用户按预检报告判断「停一张表还是整条同步」，这句话必须跟着行为走。
-// 两条各自钉住：PG 目标端是新口径，非 PG 目标端仍是「整条停下等手工对齐」（那份能力还没落地）。
+// 这里曾经写反过两次：
+//   - `#93` 把「按表暂停」改成「只停该表 + 其它表照常 + 位点照常前进」，codes.go 的 E1015 三句跟着改了，
+//     `PAUSE-01`(OK) 却还写着「位点不推进」；
+//   - `#102` 把 MySQL 目标端也接上之后，MySQL 那格还写着「引擎侧还没接 / 整条同步会停下来」——
+//     同一份报告里两句话互相矛盾。
+//
+// 现在两个目标端（批式模式）都是新口径；**`interval` 是唯一例外**：它没有跳过通道（§1.6 例外段），
+// 所以 interval 下必须 warn，且**不许**出现「只停它自己」。
 func TestPause01TextMatchesPerTablePauseSemantics(t *testing.T) {
-	mk := func(targetKind string) source.Report {
+	mkMode := func(targetKind, mode string) source.Report {
 		return Run(Input{
 			SourceKind: "postgres", TargetKind: targetKind,
 			SourceVer: "16.2", TargetVer: "8.0.36",
@@ -280,33 +284,52 @@ func TestPause01TextMatchesPerTablePauseSemantics(t *testing.T) {
 			SourceCat:  catalog(source.Table{TableRef: source.TableRef{Table: "orders"}, HasStablePK: true}),
 			TargetCat:  catalog(),
 			Tables:     []string{"orders"},
-			Mode:       "continuous+initial",
+			Mode:       mode,
 			OnExists:   "error",
 			BatchRows:  500,
 		})
 	}
+	mk := func(targetKind string) source.Report { return mkMode(targetKind, "continuous+initial") }
 
-	pg, ok := statusOf(mk("postgres"), "PAUSE-01")
-	if !ok {
-		t.Fatal("PG 目标端必须有 PAUSE-01")
-	}
-	for _, want := range []string{"只停它自己", "位点照常前进", "整表重搬"} {
-		if !strings.Contains(pg.Detail, want) {
-			t.Errorf("PAUSE-01(OK) 应写明 %q（只停该表 / 位点前进 / 重搬补齐），得到：%s", want, pg.Detail)
+	for _, tgt := range []string{"postgres", "mysql"} {
+		// 批式模式（continuous* / once / full_interval）：只停该表、位点前进、整表重搬补齐。
+		rep, ok := statusOf(mk(tgt), "PAUSE-01")
+		if !ok {
+			t.Fatalf("%s 目标端必须有 PAUSE-01", tgt)
+		}
+		if rep.Status != source.StatusOK {
+			t.Errorf("%s 目标端的批式模式应是 ok（按表暂停已接），得到 %v", tgt, rep.Status)
+		}
+		for _, want := range []string{"只停它自己", "位点照常前进", "整表重搬"} {
+			if !strings.Contains(rep.Detail, want) {
+				t.Errorf("%s 的 PAUSE-01 应写明 %q（只停该表 / 位点前进 / 重搬补齐），得到：%s",
+					tgt, want, rep.Detail)
+			}
+		}
+		for _, bad := range []string{"位点不推进", "还没接", "整条同步会停下来"} {
+			if strings.Contains(rep.Detail, bad) {
+				t.Errorf("%s 的 PAUSE-01 里出现了 %q：那是 #102 之前的假话（那时 MySQL 没绑 pauseReg）",
+					tgt, bad)
+			}
 		}
 	}
-	if strings.Contains(pg.Detail, "位点不推进") {
-		t.Error("PAUSE-01(OK) 里的「位点不推进」已经是假话：#93 之后位点照常前进")
-	}
 
-	my, ok := statusOf(mk("mysql"), "PAUSE-01")
-	if !ok {
-		t.Fatal("非 PG 目标端也要有 PAUSE-01（要在 plan 里就说清能力缺失）")
-	}
-	if my.Status != source.StatusWarn {
-		t.Fatalf("非 PG 目标端应是 warn（不阻断），得到 %v", my.Status)
-	}
-	if !strings.Contains(my.Detail, "整条同步会停下来") {
-		t.Errorf("非 PG 目标端仍是「整条停下等手工对齐」，这句话不能改错：%s", my.Detail)
+	// interval：没有跳过通道 → warn，且不许承诺「只停它自己」。
+	for _, tgt := range []string{"postgres", "mysql"} {
+		rep, ok := statusOf(mkMode(tgt, "interval"), "PAUSE-01")
+		if !ok {
+			t.Fatalf("%s 目标端 + interval 也要有 PAUSE-01", tgt)
+		}
+		if rep.Status != source.StatusWarn {
+			t.Errorf("%s + interval 应是 warn（interval 不做按表暂停），得到 %v", tgt, rep.Status)
+		}
+		if strings.Contains(rep.Detail, "只停它自己") {
+			t.Errorf("%s + interval 的 PAUSE-01 不许说「只停它自己」（interval 没有这条通道）：%s",
+				tgt, rep.Detail)
+		}
+		if !strings.Contains(rep.Detail, "手工") && !strings.Contains(rep.Detail, "没接") {
+			t.Errorf("%s + interval 的 PAUSE-01 必须给一条真能走的路（手工对齐 / 换成批式模式）：%s",
+				tgt, rep.Detail)
+		}
 	}
 }

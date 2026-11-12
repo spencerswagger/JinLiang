@@ -179,6 +179,11 @@ func TestPauseTableRegistersKeyKeepsPositionAndRecovers(t *testing.T) {
 	if n != 251 {
 		t.Fatalf("重搬后应剩 251 行（300+1 新行−50 删除），实际 %d：清表没做干净就是幻行", n)
 	}
+	// 口径③【暂停恢复】：该表重搬行数 == 该表行数，**允许 ≠ 0**。
+	// 与「重启后重搬 0 行」（口径①/②）是两个度量：恢复就是要整表重搬补齐跳过窗口。
+	if res2.RowsCopied != 251 {
+		t.Fatalf("口径③：暂停表应整表重搬 251 行（允许非 0，但必须等于表行数），实际 %d", res2.RowsCopied)
+	}
 	t.Logf("按表暂停：位点 %q → %q（前进）；A 的那 1 行没写、B 的照写；"+
 		"跳过记账 %d 行（起点 %s）；对齐后整表重搬 %d 行并解除，两端指纹一致，重搬追平用时 %.0fms",
 		posBefore, posAfter, paused[ta].SkippedRows, paused[ta].SkippedFrom,
