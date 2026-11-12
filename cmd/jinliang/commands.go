@@ -421,7 +421,38 @@ func cmdRun(args []string) error {
 	if runErr != nil {
 		return runErr
 	}
+	// 退出码是引擎**单点派生**的（engine.DecideExit：失败 1 > 停止 130 > 有暂停表 3 > 0），
+	// CLI 只负责把它交给进程，**不在这里重新推导**。
+	//
+	// 为什么必须显式写这一段：#109 之前这里只认 ExitStopped，于是「有表被暂停」那一轮
+	// 打印出「退出码 3」却 `return nil` → 进程退 0。日志说 3、`$?` 是 0，容器与 CI 读的是
+	// `$?`，用户看到的是「一切正常」，欠账被静默吞掉——比报错更糟。
+	if res.ExitCode != engine.ExitOK {
+		return &exitError{code: res.ExitCode, msg: needsActionNote(job.Name, res.Paused)}
+	}
 	return nil
+}
+
+// needsActionNote 是「跑完了但有欠账」（退出码 3）那一行要讲清的话。
+//
+// 四段齐（提示即文档）：发生了什么 / 为什么 / 你能做什么（含命令）/ 风险。
+// 退出码本身是粗信号，权威是 status --json 的 paused_tables —— 所以这里必须给出那条命令，
+// 否则用户只拿到一个 3，无从下手。
+func needsActionNote(jobRef string, paused []engine.PausedTableStat) string {
+	if len(paused) == 0 {
+		// 将来 blocked/「需要确认」也复用 3，那时未必有暂停表。
+		return fmt.Sprintf("跑完了，但有需要你处理的事（退出码 %d）。看 `jinliang status --job %s --json`",
+			engine.ExitNeedsAction, jobRef)
+	}
+	names := make([]string, 0, len(paused))
+	for _, p := range paused {
+		names = append(names, p.Table)
+	}
+	return fmt.Sprintf("跑完了，但有 %d 张表被暂停（%s）：这几张表的数据还不全，其它表已经同步完。"+
+		"这不是失败——看 `jinliang status --job %s --json` 的 paused_tables 拿到表名与欠的行数；"+
+		"把目标端结构对齐（例如按 detail 里给的源端类型改列）后重跑，那几张表会整表重搬补齐"+
+		"（风险：重搬会先清空这几张表在目标端的现有内容）",
+		len(paused), strings.Join(names, "、"), jobRef)
 }
 
 // registerResyncFlags 是 --resync / --yes 的**唯一注册点**。

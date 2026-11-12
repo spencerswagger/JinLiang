@@ -5,10 +5,10 @@ package engine_test
 // Panel 裁决（基于 `c72f36c`）：**有暂停表的 run 不许退 0**，要退 `ExitNeedsAction = 3`。
 // 派生单点：失败 1 > 用户停止 130 > 正常收尾且有暂停表 3 > 0。
 //
-// 这条用例现在**必然是红的**：主干还没有 3 这一档（`ExitOK/ExitFailed/ExitStopped` 之外
-// 没有第四个常量，暂停场景走 `drain(ExitOK)`）。所以它挂在构建标签 `exitcode3` 后面，
-// 由 `merge-gate` 的**跟踪 job**（不阻塞合并）每天跑；实现落地那天它会变绿，
-// 而 `known-red.py` 的 verify 会判「断言未激活」逼着把它转成阻塞步骤。
+// 它先在主干上是红的（当时 `ExitOK/ExitFailed/ExitStopped` 之外没有第四档，暂停场景走
+// `drain(ExitOK)`），挂在构建标签 `exitcode3` 后面由 `merge-gate` 的跟踪 job 每天跑；
+// #109 把 `ExitNeedsAction` 与 `DecideExit` 落地后它转绿，`known-red.py` 的 verify 也把
+// 那一步从「continue-on-error」转成了阻塞判据（台账条目 exit-code-3 = 已收口）。
 //
 // 为什么单独一条、不复用暂停用例：行为所有权归 Gate，但**断言面**是新的——
 // 原来只断言「只停一张表 / 位点前进 / 恢复追平」，没有一条盯**退出码**。
@@ -22,8 +22,8 @@ import (
 	"github.com/spencerswagger/jinliang/internal/engine"
 )
 
-// needsAction 与 Panel 裁决的取值一致（主干还没有这个常量，落地后改回引用常量）。
-const needsAction = 3
+// needsAction 跟着引擎常量走，不再写死数字（写死会在改档位时静默放过）。
+const needsAction = engine.ExitNeedsAction
 
 func TestPausedRunExitsNeedsAction(t *testing.T) {
 	srcDSN, dstDSN := dsns(t)

@@ -15,6 +15,7 @@ import (
 	"github.com/spencerswagger/jinliang/internal/control"
 	"github.com/spencerswagger/jinliang/internal/engine"
 	"github.com/spencerswagger/jinliang/internal/pgsink"
+	"github.com/spencerswagger/jinliang/internal/state"
 )
 
 // 按表暂停（docs/CONTRACT-PAUSE-AND-POSITION.md §1.5/§1.6）：**只停该表**。
@@ -74,9 +75,30 @@ func TestPauseTableRegistersKeyKeepsPositionAndRecovers(t *testing.T) {
 	if gerr != nil {
 		t.Fatal(gerr)
 	}
-	if run.FinishReason != "completed" {
-		t.Fatalf("这一轮应正常收尾（表级暂停不是 run 失败），得到 finish_reason=%q code=%q last_error=%s",
-			run.FinishReason, run.Code, run.LastError)
+	// 收尾口径（#109 Panel 裁决 / SPEC §74 第 3 档）：表级暂停**不是失败**，但也不是
+	// `completed`——「跑完了、有表被暂停、那几张表数据还不全」是第三种事实，三处同时表达：
+	// phase 仍是 done、finish_reason=paused_tables、退出码 3。旧断言写死 `completed`
+	// 会让「欠账」在历史页与容器退出码里都看不见（退 0 = 用户以为全好了）。
+	//
+	// 为什么不用 state.Paused 表达：那个阶段 HoldsLease()=true，会把「停一张表」
+	// 变成「整个任务停摆」。
+	if run.Phase != state.Done {
+		t.Fatalf("表级暂停不是 run 失败，阶段应仍是 done，得到 %q（finish_reason=%q）",
+			run.Phase, run.FinishReason)
+	}
+	if run.FinishReason != control.FinishPausedTables {
+		t.Fatalf("有表被暂停时 finish_reason 应为 %q，得到 %q code=%q last_error=%s",
+			control.FinishPausedTables, run.FinishReason, run.Code, run.LastError)
+	}
+	// 退出码是 CI / 容器唯一能看的粗信号：必须是 3。退 0 是这一版要修的 bug，
+	// 退 1 是把「停一张表」当失败。
+	if res.ExitCode != engine.ExitNeedsAction {
+		t.Fatalf("有表被暂停时 Result.ExitCode 应为 %d（ExitNeedsAction），得到 %d",
+			engine.ExitNeedsAction, res.ExitCode)
+	}
+	if run.ExitCode == nil || *run.ExitCode != engine.ExitNeedsAction {
+		t.Fatalf("runs 行里的 exit_code 也必须是 %d（容器/CI 读的就是它），得到 %v",
+			engine.ExitNeedsAction, run.ExitCode)
 	}
 
 	// ④ 位点**必须前进**（跳过这张表不等于停下整条同步）+ 暂停 key 与块标记同源

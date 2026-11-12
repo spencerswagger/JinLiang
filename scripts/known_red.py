@@ -38,7 +38,8 @@ REGISTRY = [
         owner="Panel/Core",
         detector="TestPausedRunExitsNeedsAction（-tags='integration exitcode3'）",
         unblock="引擎派生 ExitNeedsAction=3（失败 1 > 停止 130 > 正常收尾且有暂停表 3 > 0）；"
-                "落地后删掉这一步的 continue-on-error。当前主干没有这一档，暂停场景仍退 0",
+                "#109 已落地，这一步的 continue-on-error 已删（现为阻塞判据）；"
+                "条目保留在台账里，对账人仍是 engine-mutation 的 verify 步骤",
         probe="job:engine-mutation",
     ),
     dict(
