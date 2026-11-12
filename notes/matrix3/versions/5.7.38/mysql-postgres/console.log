@@ -1,0 +1,15 @@
+== mysql-postgres ==
+-- 15:16:00 mysql→pg 快照开始（20000 行）
+gate: OK   [mysql→pg 快照] 20000 行，内容指纹一致 56f0ee0aa328b9411c44a0405d294dad
+-- 15:16:06 mysql→pg 快照完成 0.48s
+-- 15:16:07 mysql→pg 增量三笔
+gate: OK   [mysql→pg 增量] 20000 行，内容指纹一致 330ccea0293f33177530c2a6933dad45
+-- 15:16:13 mysql→pg 增量追平 0.13s
+结论：数据级 ✓（行级全表比对 1 表；跨端指纹不可比，已改用逐行比对）
+RESULT combo=mysql-postgres target=public.acc_mp rows=20000 md5=330ccea0293f33177530c2a6933dad45 seconds=0.61 src_rows=20000 dst_rows=20000 src_md5=330ccea0293f33177530c2a6933dad45 dst_md5=330ccea0293f33177530c2a6933dad45 snapshot_seconds=0.48 incremental_seconds=0.13 status=pass mysql=5.7.38-log paused=0 snapshot_wall=6.77s
+
+| 组合 | 目标表名 | 源行数 | 目标行数 | 源 md5 | 目标 md5 | 快照(s) | 增量(s) | 结论 |
+|---|---|---|---|---|---|---|---|---|
+| mysql-postgres | public.acc_mp | 20000 | 20000 | `330ccea0293f33177530c2a6933dad45` | `330ccea0293f33177530c2a6933dad45` | 0.48 | 0.13 | pass |
+JSON：/worktrees/JL-DATA/notes/matrix3/versions/5.7.38/mysql-postgres/result.json
+acceptance: 全部通过

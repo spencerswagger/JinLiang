@@ -1,0 +1,449 @@
+name: merge-gate
+
+# #59 合并门禁的「能拦住错误合并」那一层。
+#
+# 与 review-gate.yml 的分工：
+#   review-gate.yml —— 人/结论这一侧（最新 review 锚在当前 head、明确放行）；
+#   merge-gate.yml  —— 事实这一侧（判据自检 + 反向注入 + 三组合验收）。
+# 两者都绿才允许合并；本文件把「测试跑绿了」升级成「把实现改坏，测试会红」。
+#
+# 为什么矩阵在 Actions 上跑：沙盒/开发机只有 MySQL 8.0，5.7 / 8.4 需要 docker。
+
+on:
+  # 这里**故意不写 paths 过滤**：这五个 job 现在是 main 的 required checks，
+  # 而「workflow 因 paths 过滤没跑」会让 check 永远停在 Expected，把只改文档的 PR
+  # 全堵死（GitHub 文档：path/branch 过滤导致的跳过 = Pending）。
+  # 需要「只在该跑的时候跑」时，用下面 changes job 的 job 级 if——job 被 if 跳过
+  # 会正常上报 skipped（对 required check 视为成功），不会挂住 PR。
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      rows:
+        description: "验收行数（排查时用 2000）"
+        default: "20000"
+      only:
+        description: "只跑某个组合（mysql-postgres / postgres-mysql / mysql-mysql；空=全部）"
+        default: ""
+      debug:
+        description: "1 = bash -x 打印每一步"
+        default: "0"
+
+jobs:
+  changes:
+    name: 门禁输入面判定
+    runs-on: ubuntu-latest
+    outputs:
+      gate: ${{ steps.d.outputs.gate }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: d
+        name: 有没有碰到门禁的输入面
+        run: |
+          set -e
+          base="${{ github.base_ref }}"
+          # fail-closed：判定不出来就按「碰到了」处理，让门禁真跑。
+          # 反例（改造前）：`git fetch … || true` + `git diff … || true` → 空清单 →
+          # gate=false → 五个 required check 全 skipped（= 通过），changes 自己还绿：
+          # 等于「门禁没跑也能合，而且没有一处红」。
+          gate_on_failure() {
+            echo "::warning::$1 —— 按「碰到门禁输入面」处理（fail-closed，门禁会真跑）"
+            echo "gate=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+          if [ -z "$base" ]; then echo "gate=true" >> "$GITHUB_OUTPUT"; exit 0; fi
+          git fetch --no-tags --quiet origin "$base" || gate_on_failure "取不到 base 分支 $base"
+          files=$(git diff --name-only "origin/$base...HEAD") || gate_on_failure "git diff origin/$base...HEAD 失败"
+          [ -n "$files" ] || gate_on_failure "改动清单为空（本不该发生）"
+          echo "改动文件："; printf '%s\n' "$files"
+          # internal/preflight 也是门禁输入面（#90 的 pause-wording 探针就依赖它）。
+          if printf '%s\n' "$files" | grep -qE '^(internal/(engine|pgsink|mysqlsource|mysqlsink|core|source|mysqlcanon|preflight)/|cmd/|scripts/(gate_checks|mutation_gate|merge_gate|acceptance_matrix|review_gate_logic|known_red|probe_pause_wording|exit_codes|b1_mysql_to_mysql)\.|\.github/workflows/merge-gate\.yml)'; then
+            echo "gate=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "gate=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  logic:
+    needs: changes
+    if: needs.changes.outputs.gate == 'true'
+    name: 判据自检 + 反向注入（logic）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # known-red 台账要跑一条 `-tags=knownred` 用例来判断「实现落地没有」，所以这个 job 也要 Go
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.x"
+      - name: 已知红台账（责任人 / 转绿用例 / 移除 continue-on-error 的条件）
+        run: python3 scripts/known_red.py check
+      - name: 判据自检（门禁自己的判据必须能红）
+        run: python3 scripts/gate_checks.py selftest
+      - name: review 门禁自检（#59：锚定 / 否决词 / 解冲突放行）
+        run: python3 scripts/review_gate_logic.py selftest
+      - name: 反向注入（改坏判据 → 自检必须红）
+        run: python3 scripts/mutation_gate.py --tier logic
+
+  engine-mutation:
+    needs: changes
+    if: needs.changes.outputs.gate == 'true'
+    name: 反向注入（engine：位点 / 暂停 / 块进度）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.x"
+      - name: 起 PG（wal_level=logical）
+        run: |
+          set -e
+          docker run -d --name pg -p 55432:5432 \
+            -e POSTGRES_USER=jinliang -e POSTGRES_PASSWORD=jinliang -e POSTGRES_DB=jinliang_test \
+            postgres:16 -c wal_level=logical -c max_replication_slots=40 -c max_wal_senders=40
+          docker run -d --name pg-src -p 55433:5432 \
+            -e POSTGRES_USER=jinliang -e POSTGRES_PASSWORD=jinliang -e POSTGRES_DB=jinliang_src \
+            postgres:16 -c wal_level=logical -c max_replication_slots=40 -c max_wal_senders=40
+          for c in pg pg-src; do
+            ok=0
+            for _ in $(seq 1 90); do
+              docker exec "$c" psql -U jinliang -d postgres -tAc 'select 1' >/dev/null 2>&1 && { ok=1; break; }
+              sleep 2
+            done
+            [ "$ok" = 1 ] || { docker logs "$c"; exit 1; }
+          done
+      - name: 注入实现 → 对应用例必须红
+        env:
+          JINLIANG_TEST_PG_DSN: postgres://jinliang:jinliang@127.0.0.1:55432/jinliang_test?sslmode=disable
+          JINLIANG_TEST_PG_SRC_DSN: postgres://jinliang:jinliang@127.0.0.1:55433/jinliang_src?sslmode=disable
+          JINLIANG_TEST_RECLAIM_SLOTS: "1"
+        run: python3 scripts/mutation_gate.py --tier engine --json mutation-engine.json
+      - name: 回归：停止请求之后的真实流错误不许被记成「已停止」（含裸 io.EOF）
+        # Core #99 已落地（isLocalClose 只认本地关闭四种形态，裸 io.EOF 不认），
+        # 按「实现落地 ⇒ 断言必须激活」的规则，这一步现在是**阻塞**判据。
+        env:
+          JINLIANG_TEST_PG_DSN: postgres://jinliang:jinliang@127.0.0.1:55432/jinliang_test?sslmode=disable
+        run: go test -count=1 -v -timeout 5m -run '^TestStopRequestDoesNotSwallowLateRealError$' ./internal/engine/
+      - name: 暂停的 run 必须退 3（欠账不是失败）
+        id: exit3
+        # 责任人：Panel/Core（退出码派生是引擎/控制面的事，不在 Gate）
+        # 转绿用例：TestPausedRunExitsNeedsAction（-tags='integration exitcode3'）
+        # 移除 continue-on-error 的触发条件：引擎派生 ExitNeedsAction=3 落地
+        #   （失败 1 > 停止 130 > 正常收尾且有暂停表 3 > 0）；**当前主干没有这一档，暂停场景仍退 0**。
+        continue-on-error: true
+        env:
+          JINLIANG_TEST_PG_DSN: postgres://jinliang:jinliang@127.0.0.1:55432/jinliang_test?sslmode=disable
+          JINLIANG_TEST_PG_SRC_DSN: postgres://jinliang:jinliang@127.0.0.1:55433/jinliang_src?sslmode=disable
+          JINLIANG_TEST_RECLAIM_SLOTS: "1"
+        run: go test -tags='integration exitcode3' -count=1 -v -timeout 5m -run '^TestPausedRunExitsNeedsAction$' ./internal/engine/
+      - name: 退出码台账对账（实现能过了但断言还挂着 → 拦）
+        if: always()
+        run: python3 scripts/known_red.py verify --id exit-code-3 --result "${{ steps.exit3.outcome }}"
+      - name: 轮次提示探针（三种 mode 的 PAUSE-01 口径，断言失败即红）
+        # #90 P2：脚本以前只打印不断言、CI 也不跑。这里真跑三种 mode（continuous+initial /
+        # interval / full_interval），口径与 DECISIONS #19 / 契约 §1.6 例外段不一致就红。
+        env:
+          BIN: ./dist/jinliang
+          JINLIANG_TEST_PG_DSN: postgres://jinliang:jinliang@127.0.0.1:55432/jinliang_test?sslmode=disable
+          JINLIANG_TEST_PG_SRC_DSN: postgres://jinliang:jinliang@127.0.0.1:55433/jinliang_src?sslmode=disable
+        run: |
+          set -e
+          CGO_ENABLED=0 go build -trimpath -o dist/jinliang ./cmd/jinliang
+          timeout -k 10 900 bash scripts/probe_pause_wording.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mutation-engine
+          path: mutation-engine.json
+
+  acceptance:
+    needs: changes
+    if: needs.changes.outputs.gate == 'true'
+    name: 三组合 × MySQL ${{ matrix.mysql }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mysql: ["5.7", "8.0", "8.4"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.x"
+      - name: 备好客户端
+        run: |
+          set -e
+          command -v psql >/dev/null || { sudo apt-get update -qq; sudo apt-get install -y -qq postgresql-client; }
+      - name: 起 PG 源 / PG 目标（都开 wal_level=logical）
+        run: |
+          set -e
+          docker run -d --name pg-src -p 55432:5432 \
+            -e POSTGRES_USER=jinliang -e POSTGRES_PASSWORD=jinliang -e POSTGRES_DB=jinliang_src \
+            postgres:16 -c wal_level=logical -c max_replication_slots=40 -c max_wal_senders=40
+          docker run -d --name pg-dst -p 55433:5432 \
+            -e POSTGRES_USER=jinliang -e POSTGRES_PASSWORD=jinliang -e POSTGRES_DB=jinliang_test \
+            postgres:16 -c wal_level=logical -c max_replication_slots=40 -c max_wal_senders=40
+          for c in pg-src pg-dst; do
+            ok=0
+            for _ in $(seq 1 90); do
+              docker exec "$c" psql -U jinliang -d postgres -tAc 'select 1' >/dev/null 2>&1 && { ok=1; break; }
+              sleep 2
+            done
+            [ "$ok" = 1 ] || { docker logs "$c"; exit 1; }
+          done
+      - name: 起 MySQL 源（${{ matrix.mysql }}，开 binlog ROW/FULL）
+        run: |
+          set -e
+          # 端口偶发被占（runner 上残留进程）会让整腿假红：重试 3 次，每次都先清同名容器
+          for attempt in 1 2 3; do
+            docker rm -f my-src >/dev/null 2>&1 || true
+            docker run -d --name my-src -p 53306:3306 \
+              -e MYSQL_ROOT_PASSWORD=root -e MYSQL_DATABASE=jinliang_src \
+              -e MYSQL_USER=jinliang -e MYSQL_PASSWORD=jinliang \
+              mysql:${{ matrix.mysql }} \
+              --server-id=1 --log-bin=mysql-bin --binlog-format=ROW --binlog-row-image=FULL && break
+            echo "第 $attempt 次起 my-src 失败，5s 后重试"; sleep 5
+          done
+          docker inspect my-src >/dev/null
+          # 不能用 mysqladmin ping：它在「拒绝访问」时也返回 0（8.x 初始化期间就是这样），
+          # 会让我们以为库已就绪，下一步 GRANT 直接 Access denied。
+          for i in $(seq 1 120); do
+            docker exec my-src mysql -h127.0.0.1 -P3306 -uroot -proot -N -e 'select 1' >/dev/null 2>&1 && exit 0
+            sleep 2
+          done
+          docker logs my-src; exit 1
+      - name: 起 MySQL 目标（${{ matrix.mysql }}，开 binlog —— 目标端也要能被校验）
+        run: |
+          set -e
+          for attempt in 1 2 3; do
+            docker rm -f my-dst >/dev/null 2>&1 || true
+            docker run -d --name my-dst -p 53307:3306 \
+              -e MYSQL_ROOT_PASSWORD=root -e MYSQL_DATABASE=jinliang_target \
+              -e MYSQL_USER=jinliang -e MYSQL_PASSWORD=jinliang \
+              mysql:${{ matrix.mysql }} \
+              --server-id=2 --log-bin=mysql-bin --binlog-format=ROW --binlog-row-image=FULL && break
+            echo "第 $attempt 次起 my-dst 失败，5s 后重试"; sleep 5
+          done
+          docker inspect my-dst >/dev/null
+          for i in $(seq 1 120); do
+            docker exec my-dst mysql -h127.0.0.1 -P3306 -uroot -proot -N -e 'select 1' >/dev/null 2>&1 && exit 0
+            sleep 2
+          done
+          docker logs my-dst; exit 1
+      - name: 补权限 + 报版本
+        run: |
+          set -e
+          # 用 ALL PRIVILEGES 而不是点名 REPLICATION SLAVE：8.4 已经把那个名字换掉了
+          # （REPLICATION REPLICA），5.7/8.0/8.4 只有这一句都认。
+          docker exec my-src mysql -h127.0.0.1 -P3306 -uroot -proot -e "
+            GRANT ALL PRIVILEGES ON *.* TO 'jinliang'@'%' WITH GRANT OPTION;
+            CREATE DATABASE IF NOT EXISTS jinliang_test; FLUSH PRIVILEGES; SELECT VERSION();"
+          docker exec my-dst mysql -h127.0.0.1 -P3306 -uroot -proot -e "
+            CREATE DATABASE IF NOT EXISTS jinliang_target; FLUSH PRIVILEGES; SELECT VERSION();"
+      - name: 三组合验收（行数 + md5 + 耗时；MySQL→PG 追加 kill -9 重搬 0 行）
+        env:
+          JINLIANG_TEST_MYSQL_SRC_DSN: mysql://jinliang:jinliang@127.0.0.1:53306/jinliang_src
+          JINLIANG_TEST_MYSQL_DST_DSN: mysql://jinliang:jinliang@127.0.0.1:53307/jinliang_target
+          JINLIANG_TEST_PG_SRC_DSN: postgres://jinliang:jinliang@127.0.0.1:55432/jinliang_src?sslmode=disable
+          JINLIANG_TEST_PG_DSN: postgres://jinliang:jinliang@127.0.0.1:55433/jinliang_test?sslmode=disable
+          MYSQL_VERSION: ${{ matrix.mysql }}
+          ROWS: ${{ inputs.rows || '20000' }}
+          ONLY: ${{ inputs.only || '' }}
+        run: |
+          set -e
+          mkdir -p .localdb/bin
+          CGO_ENABLED=0 go build -trimpath -o .localdb/bin/jinliang ./cmd/jinliang
+          # 外面再套一层 timeout：脚本内部虽然每步都有 timeout，但「卡在哪个循环」这件事
+          # 只能靠 job 自己能结束 + 日志才看得出来（第一次跑就是 job 永远 in_progress）。
+          if [ "${{ inputs.debug || '0' }}" = "1" ]; then FLAG="bash -x"; else FLAG="bash"; fi
+          ARGS=(--rows "${ROWS:-20000}" --kill --json "acceptance-${{ matrix.mysql }}.json")
+          [ -n "$ONLY" ] && ARGS+=(--only "$ONLY")
+          timeout -k 10 900 $FLAG scripts/acceptance_matrix.sh "${ARGS[@]}"
+      # 引擎层（不是连接器契约层）的 kill -9 回归：三个版本各跑一遍，判据是「重搬 0 行」。
+      # 这里**不按版本号分支**：源端用哪条状态语句由 `mysqlsource` 的能力探测决定
+      # （先试 SHOW BINARY LOG STATUS，再退 SHOW MASTER STATUS；8.4 删了后者）。
+      # 下面先打印服务端版本与探测结果，红的时候能一眼看出是「版本没覆盖」还是「行为退化」。
+      - name: 引擎层 kill -9（MySQL ${{ matrix.mysql }} → PG，重搬 0 行）
+        env:
+          JINLIANG_TEST_MYSQL_SRC_DSN: mysql://jinliang:jinliang@127.0.0.1:53306/jinliang_src
+          JINLIANG_TEST_PG_DSN: postgres://jinliang:jinliang@127.0.0.1:55433/jinliang_test?sslmode=disable
+          JINLIANG_TEST_RECLAIM_SLOTS: "1"
+        run: |
+          set -e
+          echo "服务端版本：$(docker exec my-src mysql -h127.0.0.1 -P3306 -uroot -proot -N -e 'SELECT VERSION()')"
+          echo "状态语句探测（能力探测，不按版本号分支）："
+          if docker exec my-src mysql -h127.0.0.1 -P3306 -uroot -proot -e 'SHOW BINARY LOG STATUS' >/dev/null 2>&1; then
+            echo "  SHOW BINARY LOG STATUS 可用（8.4+ 路径）"
+          else
+            echo "  SHOW BINARY LOG STATUS 不可用 → 回退 SHOW MASTER STATUS（5.7/8.0 路径）"
+          fi
+          go test -tags=integration -count=1 -v -timeout 10m -run '^TestMySQLSourceIncrementalResumeAfterSIGKILL$' ./internal/engine/
+      - name: 结果表进 job summary
+        if: always()
+        run: |
+          { echo "### MySQL ${{ matrix.mysql }}"; echo; cat acceptance-${{ matrix.mysql }}.json 2>/dev/null || true; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: acceptance-mysql-${{ matrix.mysql }}
+          path: acceptance-${{ matrix.mysql }}.json
+
+  mysql-mysql:
+    needs: changes
+    if: needs.changes.outputs.gate == 'true'
+    name: MySQL→MySQL（双实例：全量 / 增量 kill / 块记账）
+    # 参数与本地验收一致：ROWS=20000、两个独立实例（源 53306 / 目标 53307）。
+    # 为什么必须两个实例：同实例时目标端的写入会进源端 binlog，读到自己刚写的行。
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.x"
+      - name: 起 MySQL 源（8.0，开 binlog ROW/FULL）
+        run: |
+          set -e
+          for attempt in 1 2 3; do
+            docker rm -f my-src >/dev/null 2>&1 || true
+            docker run -d --name my-src -p 33306:3306 \
+              -e MYSQL_ROOT_PASSWORD=root -e MYSQL_DATABASE=jinliang_src \
+              -e MYSQL_USER=jinliang -e MYSQL_PASSWORD=jinliang \
+              mysql:8.0 --server-id=1 --log-bin=mysql-bin --binlog-format=ROW --binlog-row-image=FULL && break
+            echo "第 $attempt 次起 my-src 失败，5s 后重试"; sleep 5
+          done
+          docker inspect my-src >/dev/null
+          for i in $(seq 1 120); do
+            docker exec my-src mysql -h127.0.0.1 -P3306 -uroot -proot -N -e 'select 1' >/dev/null 2>&1 && exit 0
+            sleep 2
+          done
+          docker logs my-src; exit 1
+      - name: 起 MySQL 目标（8.0）
+        run: |
+          set -e
+          for attempt in 1 2 3; do
+            docker rm -f my-dst >/dev/null 2>&1 || true
+            docker run -d --name my-dst -p 33307:3306 \
+              -e MYSQL_ROOT_PASSWORD=root -e MYSQL_DATABASE=jinliang_target \
+              -e MYSQL_USER=jinliang -e MYSQL_PASSWORD=jinliang \
+              mysql:8.0 --server-id=2 --log-bin=mysql-bin --binlog-format=ROW --binlog-row-image=FULL && break
+            echo "第 $attempt 次起 my-dst 失败，5s 后重试"; sleep 5
+          done
+          docker inspect my-dst >/dev/null
+          for i in $(seq 1 120); do
+            docker exec my-dst mysql -h127.0.0.1 -P3306 -uroot -proot -N -e 'select 1' >/dev/null 2>&1 && exit 0
+            sleep 2
+          done
+          docker logs my-dst; exit 1
+      - name: 补权限
+        run: |
+          set -e
+          docker exec my-src mysql -h127.0.0.1 -P3306 -uroot -proot -e "
+            GRANT ALL PRIVILEGES ON *.* TO 'jinliang'@'%' WITH GRANT OPTION; FLUSH PRIVILEGES;"
+          docker exec my-dst mysql -h127.0.0.1 -P3306 -uroot -proot -e "
+            GRANT ALL PRIVILEGES ON *.* TO 'jinliang'@'%' WITH GRANT OPTION; FLUSH PRIVILEGES;"
+      - name: 构建
+        run: |
+          mkdir -p dist
+          CGO_ENABLED=0 go build -trimpath -o dist/jinliang ./cmd/jinliang
+      - name: 全量 → 增量（20000 行）
+        env: &m2m-env
+          JINLIANG_TEST_MYSQL_SRC_DSN: mysql://jinliang:jinliang@127.0.0.1:33306/jinliang_src
+          JINLIANG_TEST_MYSQL_DST_DSN: mysql://jinliang:jinliang@127.0.0.1:33307/jinliang_target
+          ROWS: "20000"
+        run: timeout -k 10 900 bash scripts/b1_mysql_to_mysql.sh ./dist/jinliang
+      - name: 增量中途 kill -9 → 重搬 0 行
+        env: *m2m-env
+        run: timeout -k 10 900 bash scripts/b1_mysql_to_mysql.sh ./dist/jinliang kill
+      - name: 块进度记账（阻塞：搬运期逐块 + 完成后表标记 rows = 各块之和）
+        # Data #95 已落地，这条现在是**阻塞**判据（不再挂 continue-on-error）。
+        # 判据不依赖引擎的续跑读路径：只验目标端有没有认真记账。
+        env: *m2m-env
+        run: timeout -k 10 900 bash scripts/b1_mysql_to_mysql.sh ./dist/jinliang accounting
+      - name: 结果进 job summary
+        if: always()
+        run: |
+          {
+            echo "### MySQL→MySQL（ROWS=20000，双实例）"
+            echo "- 全量+增量：见上一步日志"
+            echo "- kill -9：判据「重启重搬 0 行」"
+            echo "- 块记账（阻塞）：搬运期逐块 + 完成后表标记 rows = 各块之和"
+            echo "- 块级续跑（单表口径）不在本 job：见独立 job「块级续跑（单表口径）」（阻塞）"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  chunk-resume-tracking:
+    needs: changes
+    if: needs.changes.outputs.gate == 'true'
+    name: 块级续跑（单表口径）
+    # 为什么单列（而不是并进 mysql-mysql）：这一格要**两个独立 MySQL 实例**再跑一遍
+    # killcopy，并进主 job 会把运行时长翻倍；单列成独立 job 照样是 required check。
+    # 原本它是「已知红 / 不阻塞」：generic 全量路径没读块进度（`copyGeneric` 把 nil 传给
+    # SnapshotChunksFrom，`executeGeneric` 从不读 `ChunkProgress`）。**#106 已接通读路径**，
+    # 这一步连同 job 一起转阻塞（job 级 continue-on-error 已删，名字里的「不阻塞」也去掉）。
+    # 责任人 Core；再退化时 known_red.py verify 会判红。
+    # **#106 已接通读路径，本 job 现在是阻塞的**：原先挂在这里的 job 级
+    # continue-on-error 会把末尾 known_red.py verify 的 rc=1 一起吞掉（必红却不拦）。
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.x"
+      - name: 起 MySQL 源（8.0）
+        run: |
+          set -e
+          for attempt in 1 2 3; do
+            docker rm -f my-src >/dev/null 2>&1 || true
+            docker run -d --name my-src -p 43306:3306 \
+              -e MYSQL_ROOT_PASSWORD=root -e MYSQL_DATABASE=jinliang_src \
+              -e MYSQL_USER=jinliang -e MYSQL_PASSWORD=jinliang \
+              mysql:8.0 --server-id=1 --log-bin=mysql-bin --binlog-format=ROW --binlog-row-image=FULL && break
+            echo "第 $attempt 次起 my-src 失败，5s 后重试"; sleep 5
+          done
+          for i in $(seq 1 120); do
+            docker exec my-src mysql -h127.0.0.1 -P3306 -uroot -proot -N -e 'select 1' >/dev/null 2>&1 && exit 0
+            sleep 2
+          done
+          docker logs my-src; exit 1
+      - name: 起 MySQL 目标（8.0）
+        run: |
+          set -e
+          for attempt in 1 2 3; do
+            docker rm -f my-dst >/dev/null 2>&1 || true
+            docker run -d --name my-dst -p 43307:3306 \
+              -e MYSQL_ROOT_PASSWORD=root -e MYSQL_DATABASE=jinliang_target \
+              -e MYSQL_USER=jinliang -e MYSQL_PASSWORD=jinliang \
+              mysql:8.0 --server-id=2 --log-bin=mysql-bin --binlog-format=ROW --binlog-row-image=FULL && break
+            echo "第 $attempt 次起 my-dst 失败，5s 后重试"; sleep 5
+          done
+          for i in $(seq 1 120); do
+            docker exec my-dst mysql -h127.0.0.1 -P3306 -uroot -proot -N -e 'select 1' >/dev/null 2>&1 && exit 0
+            sleep 2
+          done
+          docker logs my-dst; exit 1
+      - name: 补权限
+        run: |
+          set -e
+          docker exec my-src mysql -h127.0.0.1 -P3306 -uroot -proot -e "GRANT ALL PRIVILEGES ON *.* TO 'jinliang'@'%' WITH GRANT OPTION; FLUSH PRIVILEGES;"
+          docker exec my-dst mysql -h127.0.0.1 -P3306 -uroot -proot -e "GRANT ALL PRIVILEGES ON *.* TO 'jinliang'@'%' WITH GRANT OPTION; FLUSH PRIVILEGES;"
+      - name: 构建
+        run: |
+          mkdir -p dist
+          CGO_ENABLED=0 go build -trimpath -o dist/jinliang ./cmd/jinliang
+      - name: 块级续跑（known-red：单表口径，重启搬 ≈ 未搬完 ±1 块）
+        # 责任人：Core（引擎读侧，不是 Data：写侧 #95 已落，`_jl_chunk` 真有 2 行）
+        # 转绿用例：scripts/b1_mysql_to_mysql.sh killcopy（单表口径：重启搬 ≈ 未搬完 ±1 块）
+        # 移除 continue-on-error 的触发条件：Core 接通读路径（`copyGeneric` 不再把 nil 传给
+        #   `SnapshotChunksFrom`，`executeGeneric` 读 `ChunkProgress`）且该格重搬行数 ≤1 块。
+        #   **#106 已落地 → 这条已激活**（step 级 continue-on-error 已删），
+        #   台账条目保留用于对账（实现再退化时 known_red.py verify 会判红）。
+        id: killcopy
+        env:
+          JINLIANG_TEST_MYSQL_SRC_DSN: mysql://jinliang:jinliang@127.0.0.1:43306/jinliang_src
+          JINLIANG_TEST_MYSQL_DST_DSN: mysql://jinliang:jinliang@127.0.0.1:43307/jinliang_target
+          ROWS: "20000"
+        run: timeout -k 10 900 bash scripts/b1_mysql_to_mysql.sh ./dist/jinliang killcopy
+      - name: 已知红台账对账（实现能过了但断言还挂着 → 拦）
+        if: always()
+        run: python3 scripts/known_red.py verify --id chunk-resume-wiring --result "${{ steps.killcopy.outcome }}"

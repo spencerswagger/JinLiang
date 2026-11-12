@@ -47,7 +47,8 @@ func (r *runner) planGenericRecopy(ctx context.Context) {
 		}
 		if pgsink.NormalizedResume(one.Resume) == pgsink.ResumeManual {
 			r.note(ctx, "表 "+key+" 暂停中，且它是目标端既有表（不是本任务建的）：不会自动清空重搬。"+
-				"请在 `jinliang status` 里按提示选一条——重建这张表 / 手工清空 / 把它移出同步范围")
+				"请自己选一条：重建这张表 / 手工清空它 / 把它移出 content.tables。"+
+				"`jinliang status` 这一版还没有暂停明细，别去那儿找")
 			continue
 		}
 		srcRef := source.TableRef{Schema: r.targetSchema(), Table: key}

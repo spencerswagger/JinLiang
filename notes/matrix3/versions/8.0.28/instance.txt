@@ -1,0 +1,36 @@
+# MySQL 8.0.28 实例口径（源 :53316 / 目标 :53317，本地 mysqld，非容器）
+# mysqld: /.toolchain/mysql/bin/mysqld  Ver 8.0.28 for Linux on x86_64 (MySQL Community Server - GPL)
+== my
+version	8.0.28
+binlog_format	ROW
+binlog_row_image	FULL
+binlog_row_metadata	MINIMAL
+character_set_server	utf8mb4
+collation_server	utf8mb4_0900_ai_ci
+enforce_gtid_consistency	OFF
+gtid_mode	OFF
+log_bin	ON
+lower_case_table_names	0
+max_allowed_packet	67108864
+server_id	101
+sql_mode	ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION
+-- 认证相关
+authentication_policy	*,,
+default_authentication_plugin	caching_sha2_password
+== my2
+version	8.0.28
+binlog_format	ROW
+binlog_row_image	FULL
+binlog_row_metadata	MINIMAL
+character_set_server	utf8mb4
+collation_server	utf8mb4_0900_ai_ci
+enforce_gtid_consistency	OFF
+gtid_mode	OFF
+log_bin	ON
+lower_case_table_names	0
+max_allowed_packet	67108864
+server_id	102
+sql_mode	ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION
+-- 认证相关
+authentication_policy	*,,
+default_authentication_plugin	caching_sha2_password

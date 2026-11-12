@@ -1,0 +1,3 @@
+EXPORT_MD5 combo=mysql-mysql source=3960340335b4cd0c314d989823288db1 target=3960340335b4cd0c314d989823288db1 rows_src=20000 rows_dst=20000 equal=yes
+EXPORT_MD5 combo=mysql-pg source=3960340335b4cd0c314d989823288db1 target=3960340335b4cd0c314d989823288db1 rows_src=20000 rows_dst=20000 equal=yes
+EXPORT_MD5 combo=pg-mysql source=3960340335b4cd0c314d989823288db1 target=3960340335b4cd0c314d989823288db1 rows_src=20000 rows_dst=20000 equal=yes

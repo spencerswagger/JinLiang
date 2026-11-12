@@ -1,0 +1,32 @@
+# MySQL 5.7.38 实例口径（源 :53326 / 目标 :53327，本地 mysqld，非容器）
+# mysqld: /.toolchain/mybase-5.7.38/bin/mysqld  Ver 5.7.38 for linux-glibc2.12 on x86_64 (MySQL Community Server (GPL))
+== my
+version	5.7.38-log
+binlog_format	ROW
+binlog_row_image	FULL
+character_set_server	latin1
+collation_server	latin1_swedish_ci
+enforce_gtid_consistency	OFF
+gtid_mode	OFF
+log_bin	ON
+lower_case_table_names	0
+max_allowed_packet	4194304
+server_id	101
+sql_mode	ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_AUTO_CREATE_USER,NO_ENGINE_SUBSTITUTION
+-- 认证相关
+default_authentication_plugin	mysql_native_password
+== my2
+version	5.7.38-log
+binlog_format	ROW
+binlog_row_image	FULL
+character_set_server	latin1
+collation_server	latin1_swedish_ci
+enforce_gtid_consistency	OFF
+gtid_mode	OFF
+log_bin	ON
+lower_case_table_names	0
+max_allowed_packet	4194304
+server_id	102
+sql_mode	ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_AUTO_CREATE_USER,NO_ENGINE_SUBSTITUTION
+-- 认证相关
+default_authentication_plugin	mysql_native_password
