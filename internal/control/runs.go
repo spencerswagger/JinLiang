@@ -3,6 +3,7 @@ package control
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -50,6 +51,9 @@ type Run struct {
 	HeartbeatAt string `json:"heartbeat_at,omitempty"`
 	// OwnerInstance is the control-plane instance that started the run.
 	OwnerInstance string `json:"owner_instance,omitempty"`
+	// PausedTables 是这一轮结束时仍暂停的表（JSON 数组；空表示没有）。
+	// 退出码 3 只是粗信号，这一列才是「哪几张表、欠多少行」的权威。
+	PausedTables string `json:"paused_tables,omitempty"`
 	// FinishReason explains how it ended: completed | failed | stopped | interrupted.
 	FinishReason string `json:"finish_reason,omitempty"`
 }
@@ -64,6 +68,9 @@ const (
 	FinishFailed      = "failed"
 	FinishStopped     = "stopped"
 	FinishInterrupted = "interrupted"
+	// FinishPausedTables 表示「跑完了，但有表因结构不一致被暂停」（退出码 3）。
+	// 它与 completed 的区别只在「数据全不全」，不是失败——phase 仍是 done。
+	FinishPausedTables = "paused_tables"
 )
 
 // StartRun inserts a run row in the given phase and kind.
@@ -199,6 +206,30 @@ func (s *Store) FinishRunWithCode(ctx context.Context, runID string, to state.Ph
 		return s.GetRun(ctx, runID)
 	}
 	return run, nil
+}
+
+// FinishRunWithPauses 收尾并落「本轮仍暂停的表」（JSON 数组；nil 表示没有）。
+//
+// 照 `FinishRunWithCode` 的形状：先正常收尾，再补一列。分两步是因为 paused_tables
+// 只是一份**展示/审计**数据，不该让收尾本身因为它失败而失败。
+func (s *Store) FinishRunWithPauses(ctx context.Context, runID string, to state.Phase,
+	lastError string, exitCode int, finishReason string, pauses any) (Run, error) {
+	run, err := s.FinishRun(ctx, runID, to, lastError, exitCode, finishReason)
+	if err != nil {
+		return run, err
+	}
+	if pauses == nil {
+		return run, nil
+	}
+	blob, jerr := json.Marshal(pauses)
+	if jerr != nil {
+		return run, jerr
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE runs SET paused_tables = ? WHERE id = ?`,
+		string(blob), runID); err != nil {
+		return run, err
+	}
+	return s.GetRun(ctx, runID)
 }
 
 // SetRunCode 只补错误码（用于「先记错误、后确定分类」的场景）。

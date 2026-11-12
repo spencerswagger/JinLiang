@@ -341,3 +341,40 @@ func TestPauseSinkApplyRetriesAfterSuccessfulRegistration(t *testing.T) {
 		t.Fatalf("提交成功后要记一次跳过账，实际 %d 次", reg.skipped)
 	}
 }
+
+// `pause` 事件必须带「哪几张表、欠多少行」（Panel 裁决：退出码只是粗信号，
+// 权威是事件与字段）。这条不需要库：`emitHook` 在 `Store == nil` 时也会被调到。
+func TestPauseEventCarriesPausedTables(t *testing.T) {
+	reg := &fakePauseReg{}
+	inner := &countingSink{}
+	r := pausedRunner()
+	r.pauseReg = reg
+	r.doc = control.JobDoc{Target: control.TargetDoc{Schema: "public"}}
+
+	var got []control.Event
+	r.emitHook = func(ev control.Event) { got = append(got, ev) }
+
+	pe := &pgsink.TypeChangedError{TableName: "orders", Detail: "列 v：目标端 bigint / 源 numeric"}
+	if err := r.registerPause(context.Background(), pe); err != nil {
+		t.Fatalf("登记应成功: %v", err)
+	}
+	_ = inner
+
+	var ev *control.Event
+	for i := range got {
+		if got[i].Type == "pause" {
+			ev = &got[i]
+			break
+		}
+	}
+	if ev == nil {
+		t.Fatalf("登记成功后必须发一条 pause 事件（前端/CI 靠它拿表名，退出码装不下），实际事件：%+v", got)
+	}
+	stats, ok := ev.PausedTables.([]PausedTableStat)
+	if !ok || len(stats) != 1 {
+		t.Fatalf("pause 事件要带暂停表清单，得到 %#v", ev.PausedTables)
+	}
+	if stats[0].Table != "orders" || stats[0].Reason != pgsink.PauseReasonTypeChanged {
+		t.Fatalf("事件里的表名/原因码不对：%+v", stats[0])
+	}
+}

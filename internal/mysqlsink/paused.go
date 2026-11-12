@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/spencerswagger/jinliang/internal/dsn"
 	"github.com/spencerswagger/jinliang/internal/pgsink"
 	"github.com/spencerswagger/jinliang/internal/source"
 )
@@ -177,6 +178,50 @@ func (s *Sink) PausedTables(ctx context.Context) (map[string]pgsink.PausedTable,
 
 // PausedDirty 报告库里那一列不是合法 JSON（已按「无暂停」处理，引擎据此发 note）。
 func (s *Sink) PausedDirty() bool { return s.pausedDirty }
+
+// ReadPausedTables 只读暂停记录（status / doctor / UI 用，包级函数，不需要 Open 一个 Sink）。
+//
+// 与 PG 侧 `pgsink.ReadPausedTables` **逐字段同形**：三个返回值含义见那边的注释。
+// 唯一的差异是「没有暂停」的判据多一条——MySQL 老库的 `_jl_meta` 可能**没有这一列**
+// （补列是写路径才做的事，见 `ensurePausedColumn`）：没有列 = 谁也没法登记 = 没有暂停，
+// 这时候返回空 map 而不是报错，否则第一次 `status` 会被一句「列不存在」吓到。
+// 注意这里**不补列**：status 只读，不许顺手 ALTER。
+func ReadPausedTables(ctx context.Context, ep dsn.Endpoint, jobKey string) (map[string]pgsink.PausedTable, bool, error) {
+	db, err := sql.Open("mysql", driverDSN(ep))
+	if err != nil {
+		return nil, false, err
+	}
+	defer db.Close()
+
+	var n int
+	if err := db.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM information_schema.columns "+
+			"WHERE table_schema = DATABASE() AND table_name = '_jl_meta' AND column_name = ?",
+		pausedTableColumn).Scan(&n); err != nil {
+		return nil, false, fmt.Errorf("查 `_jl_meta` 有没有 %s 列失败: %w", pausedTableColumn, err)
+	}
+	if n == 0 {
+		return map[string]pgsink.PausedTable{}, false, nil
+	}
+
+	var raw sql.NullString
+	err = db.QueryRowContext(ctx,
+		"SELECT `"+pausedTableColumn+"` FROM `_jl_meta` WHERE job_key = ?", jobKey).Scan(&raw)
+	if err == sql.ErrNoRows {
+		return map[string]pgsink.PausedTable{}, false, nil // 还没有任务状态行：等于没有暂停
+	}
+	if err != nil {
+		return nil, false, fmt.Errorf("读暂停记录失败: %w", err)
+	}
+	if !raw.Valid || strings.TrimSpace(raw.String) == "" {
+		return map[string]pgsink.PausedTable{}, false, nil
+	}
+	out := map[string]pgsink.PausedTable{}
+	if jerr := json.Unmarshal([]byte(raw.String), &out); jerr != nil {
+		return map[string]pgsink.PausedTable{}, true, nil // 脏 JSON → 按无暂停，但要报 dirty
+	}
+	return out, false, nil
+}
 
 // PauseTable 登记一张表的暂停——**本次运行唯一的写点**（幂等 upsert 单 key）。
 //

@@ -32,9 +32,18 @@ import (
 // Exit codes are the contract spencer asked for (0 完成 / 1 失败 / 130 手动停止),
 // so a container or CI can tell "finished" from "someone pressed Ctrl-C".
 const (
-	ExitOK      = 0
-	ExitFailed  = 1
-	ExitStopped = 130
+	ExitOK     = 0
+	ExitFailed = 1
+	// ExitNeedsAction 是**规范里的第 3 档**（SPEC §74 / PLAN §55/66 早已写死）：
+	// 「跑完了，但有欠账需要人看一眼」。当前唯一的来源是「有表因结构不一致被暂停」。
+	//
+	// 它是**粗信号**，不是权威通道：整数装不下表名/欠行数/起始位点，而且 `continuous`
+	// 根本不退出。权威是 `status --json` 的暂停字段 + SSE `pause` 事件 + run 行字段。
+	// CI / 容器只拿它区分「全绿」与「跑完了但有欠账」。
+	//
+	// `blocked` / 「需要确认」这类未来状态**复用这个码**，不再新增数字。
+	ExitNeedsAction = 3
+	ExitStopped     = 130
 )
 
 // Options is one engine invocation.
@@ -79,6 +88,9 @@ type Result struct {
 	Elapsed    time.Duration
 	Mismatches []string
 	Note       string
+	// Paused 是本轮结束时仍处于暂停的表（`_jl_meta.paused_tables` 的内存镜像）。
+	// 有它就意味着「这一轮跑完了，但那几张表的数据还不全」——`ExitNeedsAction` 的唯一来源。
+	Paused []PausedTableStat
 	// Resync 非空表示这一轮做了整轮重搬（里面有旧位点与清掉的表，见 ResyncReport）。
 	Resync *ResyncReport
 }
@@ -197,6 +209,9 @@ func Run(ctx context.Context, opt Options) (Result, error) {
 		}(),
 	}
 	err = r.execute(ctx, &res)
+	// 暂停表快照要**在任何退出路径上**都填：CLI 打印、`runs` 行、`status` 都读它。
+	// 放在这里而不是 drain 里：失败/停止的路径不经过 drain。
+	res.Paused = r.pausedStats()
 	if err != nil && migrateErr != nil && strings.Contains(err.Error(), "paused_tables") {
 		// 迁移没成功、后面又撞上缺列：把迁移那条一起包进来，别让用户先读到无关的列错误。
 		err = fmt.Errorf("%w（另外：状态表迁移也没成功：%v）", err, migrateErr)
@@ -1847,20 +1862,31 @@ func (r *runner) drain(ctx context.Context, exit int, msg string) error {
 			r.note(dctx, "把书签往前推时出错（不影响已提交的数据）："+err.Error())
 		}
 	}
-	// finish_reason 说清「为什么结束」：正常跑完 completed、用户按停 stopped。
-	// 阶段都落 done——「停止」不是失败，别在历史页把它显示成失败。
+	// finish_reason 说清「为什么结束」：正常跑完 completed、用户按停 stopped、
+	// 跑完了但有表被暂停 → `paused_tables`（**phase 仍是 done**：用 `state.Paused` 的话
+	// 它 `HoldsLease()=true`，会把「停一张表」变成「整个任务停摆」）。
 	reason := control.FinishCompleted
-	if exit == ExitStopped {
+	paused := r.pausedStats()
+	switch {
+	case exit == ExitStopped:
 		reason = control.FinishStopped
+	case len(paused) > 0 && exit != ExitFailed:
+		reason = control.FinishPausedTables
 	}
-	if _, err := r.opt.Store.FinishRun(dctx, r.run.ID, state.Done, "", exit, reason); err != nil {
+	// 退出码**单点派生**（Panel 裁决）：drain 的调用方只表达「正常/失败/停止」，
+	// 有暂停表时必须落到 3，禁止退 0。
+	exit = DecideExit(r.phase, exit, paused)
+	r.exitCode = exit
+	if _, err := r.opt.Store.FinishRunWithPauses(dctx, r.run.ID, state.Done, "", exit, reason, paused); err != nil {
 		return err
 	}
 	if st := r.stateSink(); st != nil {
 		_ = st.SetPhase(dctx, string(state.Done))
 	}
 	r.phase = state.Done
-	r.emit(dctx, control.Event{Type: "done", Phase: state.Done, Message: msg})
+	// done 帧也带同一份暂停表：客户端可能是在收尾之后才连上的，只在 pause 事件里给不够。
+	r.emit(dctx, control.Event{Type: "done", Phase: state.Done, Message: msg,
+		FinishReason: reason, PausedTables: paused})
 	return nil
 }
 
@@ -1927,6 +1953,9 @@ func (r *runner) registerPause(ctx context.Context, err error) error {
 	})
 	r.note(ctx, "已暂停表 "+pe.Table()+"（原因码 "+pe.Reason()+"）：这张表的事件不再写入，其它表继续；"+
 		"跳过窗口会在结构对齐后由整表重搬补齐")
+	// 结构化事件（Panel 裁决：退出码只是粗信号，权威是事件/字段）。
+	// 前端必须同时订阅 `pause`，否则服务端发了也会被静默丢弃（见 app.js 的订阅列表）。
+	r.emit(ctx, control.Event{Type: "pause", PausedTables: r.pausedStats()})
 	return nil
 }
 

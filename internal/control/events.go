@@ -48,6 +48,9 @@ type Event struct {
 	// 有了它，前端才能分清「跑完了」与「被停止」——徽章（runs 行）早就分开了，
 	// 事件流此前没有。
 	FinishReason string `json:"finish_reason,omitempty"`
+	// PausedTables 只在 `pause` / `done` 事件上有意义：哪几张表被暂停、欠了多少行。
+	// 为什么要在事件里给：退出码是整数，装不下表名；而 `continuous` 根本不退出。
+	PausedTables any `json:"paused_tables,omitempty"`
 	// Stub marks events from a B0 skeleton run: nothing was actually moved.
 	// The UI shows a badge so nobody mistakes this for a real sync.
 	Stub bool `json:"stub,omitempty"`
@@ -223,7 +226,9 @@ func (b *Bus) Replay(jobID, epoch string, afterSeq int64) (events []Event, epoch
 // EventTypes is the closed set of event names the SSE stream may emit and the
 // browser subscribes to (web/static/app.js hardcodes the same list — 加新类型要
 // 同时改两处，否则浏览器会静默丢掉带 event: 的消息)。
-var EventTypes = []string{"phase", "progress", "note", "error", "done"}
+// EventTypes 是**前后端共享**的事件名清单。新增一类事件要同时改两处：
+// 这里 + `internal/httpapi/web/static/app.js` 的订阅列表——否则服务端发了，浏览器静默丢弃。
+var EventTypes = []string{"phase", "progress", "note", "error", "pause", "done"}
 
 // IsEventType reports whether t is one of EventTypes.
 func IsEventType(t string) bool {

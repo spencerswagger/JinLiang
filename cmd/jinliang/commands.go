@@ -421,7 +421,38 @@ func cmdRun(args []string) error {
 	if runErr != nil {
 		return runErr
 	}
+	// 退出码是引擎**单点派生**的（engine.DecideExit：失败 1 > 停止 130 > 有暂停表 3 > 0），
+	// CLI 只负责把它交给进程，**不在这里重新推导**。
+	//
+	// 为什么必须显式写这一段：#109 之前这里只认 ExitStopped，于是「有表被暂停」那一轮
+	// 打印出「退出码 3」却 `return nil` → 进程退 0。日志说 3、`$?` 是 0，容器与 CI 读的是
+	// `$?`，用户看到的是「一切正常」，欠账被静默吞掉——比报错更糟。
+	if res.ExitCode != engine.ExitOK {
+		return &exitError{code: res.ExitCode, msg: needsActionNote(job.Name, res.Paused)}
+	}
 	return nil
+}
+
+// needsActionNote 是「跑完了但有欠账」（退出码 3）那一行要讲清的话。
+//
+// 四段齐（提示即文档）：发生了什么 / 为什么 / 你能做什么（含命令）/ 风险。
+// 退出码本身是粗信号，权威是 status --json 的 paused_tables —— 所以这里必须给出那条命令，
+// 否则用户只拿到一个 3，无从下手。
+func needsActionNote(jobRef string, paused []engine.PausedTableStat) string {
+	if len(paused) == 0 {
+		// 将来 blocked/「需要确认」也复用 3，那时未必有暂停表。
+		return fmt.Sprintf("跑完了，但有需要你处理的事（退出码 %d）。看 `jinliang status --job %s --json`",
+			engine.ExitNeedsAction, jobRef)
+	}
+	names := make([]string, 0, len(paused))
+	for _, p := range paused {
+		names = append(names, p.Table)
+	}
+	return fmt.Sprintf("跑完了，但有 %d 张表被暂停（%s）：这几张表的数据还不全，其它表已经同步完。"+
+		"这不是失败——看 `jinliang status --job %s --json` 的 paused_tables 拿到表名与欠的行数；"+
+		"把目标端结构对齐（例如按 detail 里给的源端类型改列）后重跑，那几张表会整表重搬补齐"+
+		"（风险：重搬会先清空这几张表在目标端的现有内容）",
+		len(paused), strings.Join(names, "、"), jobRef)
 }
 
 // registerResyncFlags 是 --resync / --yes 的**唯一注册点**。
@@ -709,6 +740,25 @@ func cmdStatus(args []string) error {
 	fmt.Printf("阶段      %s\n", orDash(st.Phase))
 	fmt.Printf("位点      %s（更新于 %s）\n", orDash(st.Position), orDash(st.UpdatedAt))
 	fmt.Printf("落后      %s（书签占用 %s）\n", humanBytes(st.LagBytes), humanBytes(st.SlotBytes))
+	// 暂停表必须看见：这是「要不要处理」的唯一信号。空清单 + 空说明 = 确实没有暂停；
+	// 只有说明 = 读不到（未知），两者结论相反，所以**不合并成一句**。
+	if len(st.PausedTables) > 0 {
+		fmt.Printf("暂停表      %d 张（这些表的事件被跳过、其它表照写，位点照常前进）：\n", len(st.PausedTables))
+		for _, p := range st.PausedTables {
+			line := fmt.Sprintf("  - %s  原因码 %s", p.Table, p.Reason)
+			if p.SkippedRows > 0 {
+				line += fmt.Sprintf("，已跳过 %d 行", p.SkippedRows)
+			}
+			if p.Detail != "" {
+				line += "；" + p.Detail
+			}
+			fmt.Println(line)
+		}
+		fmt.Println("          结构对齐后要整表重搬一次才会解除（清空 + 从新视图搬）；在那之前这张表不完整。")
+	}
+	if st.PausedNote != "" {
+		fmt.Printf("暂停说明  %s\n", st.PausedNote)
+	}
 	if st.LastRun != nil {
 		fmt.Printf("最近一次  %s 开始，阶段 %s，%d 行", st.LastRun.StartedAt, st.LastRun.Phase, st.LastRun.RowsDone)
 		if st.LastRun.EndedAt != "" {

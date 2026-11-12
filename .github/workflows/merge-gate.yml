@@ -128,11 +128,12 @@ jobs:
         run: go test -count=1 -v -timeout 5m -run '^TestStopRequestDoesNotSwallowLateRealError$' ./internal/engine/
       - name: 暂停的 run 必须退 3（欠账不是失败）
         id: exit3
+        # 已收口（#109）：引擎派生 ExitNeedsAction=3 落地（失败 1 > 停止 130 > 正常收尾且有
+        # 暂停表 3 > 0），这一步从「已知红、continue-on-error」转成**阻塞判据**。
         # 责任人：Panel/Core（退出码派生是引擎/控制面的事，不在 Gate）
         # 转绿用例：TestPausedRunExitsNeedsAction（-tags='integration exitcode3'）
-        # 移除 continue-on-error 的触发条件：引擎派生 ExitNeedsAction=3 落地
-        #   （失败 1 > 停止 130 > 正常收尾且有暂停表 3 > 0）；**当前主干没有这一档，暂停场景仍退 0**。
-        continue-on-error: true
+        # 台账条目 exit-code-3 保留（known_red.py 的「已收口」态）——下面那条 verify 步骤
+        # 就是它的对账人，删掉它台账就变成恒真放行。
         env:
           JINLIANG_TEST_PG_DSN: postgres://jinliang:jinliang@127.0.0.1:55432/jinliang_test?sslmode=disable
           JINLIANG_TEST_PG_SRC_DSN: postgres://jinliang:jinliang@127.0.0.1:55433/jinliang_src?sslmode=disable
