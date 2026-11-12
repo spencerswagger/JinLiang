@@ -10,10 +10,11 @@
 - **已完成（中断前）**：PR #89（MySQL 源接引擎三处接线 + 增量 kill -9 续跑），CI 8+4 个 job 全绿，等 Owl II 评审。
 - **本轮补的是**：真 MySQL 源「DDL 改类型 → 只把那张表记成暂停 → 对齐后恢复追平」的链路，
   以及 `varchar` 长度单位这个**真 bug**（见 §5.1）。
-- **当时的缺口、现在已解**：开工时「只暂停该表」还等契约；收尾时 Ark 的裁决 A 已下
-  （`#90` 契约冻结、`#93` 落地：只停该表 + 位点照常前进 + 恢复时整表重搬）。
-  本 PR 不碰写路径，只提供它需要的输入（见 §6）；「其它表继续跑」**已经在主干生效**，
-  用例里旁证表断言的是「5 行」（旧契约下是 4 行）。
+- **当时的缺口、现在已解**：开工时「只暂停该表」还等契约；收尾时 Ark 的裁决 A 已下并落地
+  （`#90` 契约冻结 → `#93` 只停该表、**其它表照写**、位点照常前进、恢复时**整表重搬**补齐 →
+  `#102` 把同一条语义搬到 MySQL 目标端）。所以「其它表继续跑」**已经是主干行为**：
+  用例里旁证表断言「5 行」（旧契约下停在 4 行），被暂停那张表的行不写、位点照常前进。
+  本 PR 不碰写路径，只提供它需要的输入（见 §6）。
 
 ---
 
@@ -84,6 +85,11 @@ MySQL→PG 那条的位点（本轮改成真断言之后）：`675108 → 719304
 
 源端：`ALTER TABLE engine_my_type_change MODIFY COLUMN v VARCHAR(64) NULL`（原来是 `BIGINT`）。
 
+> 下面这段是**裁决 A 之前**（旧契约）真跑抓到的输出，留作对照：那时一条 DDL 改类型会
+> 让整 run 以 E1015 失败（退出码 1）、位点不动。现在的行为见 §6 与「契约已冻结」一节：
+> 只停这张表、其它表照写、位点照常前进；收尾**按控制面裁决应为** `ExitNeedsAction=3`
+> （「跑完了但有欠账」），该常量尚未落地，见后面的「实现状态」。
+
 ```
 [实时同步中] 源端 DDL 没有搬到目标端（本版不搬 DDL）：ALTER TABLE engine_my_type_change MODIFY COLUMN v VARCHAR(64) NULL。
              数据行照常同步；索引/约束/改类型需要手工在目标端执行
@@ -116,7 +122,8 @@ MySQL→PG 那条的位点（本轮改成真断言之后）：`675108 → 719304
 binlog 的 VARCHAR/CHAR 元数据是**字节**上限：utf8mb4 的 `VARCHAR(64)` → 256、`CHAR(10)` → 40。
 `typeNameAndArgs` 直接拿它拼 `varchar(256)` / `char(40)`：
 
-- E1015 / 暂停提示会说「源端 bigint → varchar(256)」「char(10) → char(40)」，用户明明写的是 64 / 10；
+- 类型不一致的提示（E1015 卡片与暂停记录里的 `detail`）会说「源端 bigint → varchar(256)」
+  「char(10) → char(40)」，用户明明写的是 64 / 10；
 - 目标端按 Relation 补列（`ADD COLUMN`）时会用这个错长度；
 - 类型字典比对（`compatibleType`）按这个字符串比，长度维度静默偏宽。
 
@@ -154,7 +161,11 @@ TEXT 与 BLOB 按尺寸档视为同类；**其余一律不同型 → 保留 binl
 ### 5.5 `char(10)` vs `character(10)`：一个 CHAR 列就能停掉整轮
 
 MySQL 侧写 `char(10)`，PG 的 `information_schema` 回 `character(10)`；`typeAliases` 里有
-`bpchar→character` 却没有 `char→character`，`compatibleType` 判不兼容 → prepare 期 E1015 整轮失败。
+`bpchar→character` 却没有 `char→character`，`compatibleType` 判不兼容 → E1015 的**原因码**报出来，
+处置是**只停那张表**（不是整轮失败）：
+- PG 目标端：`pgsink.EnsureSchema` 把 `PausableError` 收进 `pendingPauses` 继续看下一张；
+- MySQL 目标端：`detectPrepareDrift` 登记 + 本轮不搬它的存量（`#102`）。
+「prepare 期一撞就整轮失败」是 `#93` 之前的行为，已作废。
 修法：别名表加 `char → character`。判据：`TestCompatibleType` + 上面那张 chartypes 表的真库用例。
 
 ### 5.2 位点断言空转（我自己的用例，假绿）
@@ -195,5 +206,16 @@ MySQL 侧写 `char(10)`，PG 的 `information_schema` 回 `character(10)`；`typ
 - 旁证表**照跑到 5 行**（旧契约下停在 4 行）；
 - **位点照常前进**（旧契约下要求不动）；
 - 跳过的那一行靠**恢复时整表重搬**补回来（不是靠位点重放）；
-- run **不失败**，`--stop-when-idle` 正常收尾（旧契约下是 E1015 失败）。
+- run 的收尾：**跑完了，但有暂停表就是有欠账** —— 按控制面裁决应以 `ExitNeedsAction = 3`
+  （「跑完了但有欠账」，有暂停表禁止退 0）收尾。**既不是 0，也不是旧契约的「整 run 以 E1015 失败」**。
+  > 实现状态（**截至 main `64f6bb1`**）：`grep -rn 'ExitNeedsAction\|ExitPaused' internal/engine`
+  > 为空（现有常量只有 `ExitOK=0 / ExitFailed=1 / ExitStopped=130`），所以那一刻的真实输出
+  > 仍是退出码 0。**两个名字**是因为旧笔记里同一个码叫 `ExitPaused`
+  > （`notes/exit-paused-3-checklist.md`、`pause-per-table-A.md:64`），控制面这轮叫
+  > `ExitNeedsAction`——落地时以代码里的常量为准，并顺手把旧笔记标「已更名」。
+  > 常量落地后，把这段「实现状态」整段删掉。
 本 PR 不碰这条写路径，只给它提供「哪张表 + 源端前后类型」。
+
+> 归属：`internal/engine/integration_mysql_type_pause_test.go` 的注释与**退出码断言**
+> （要从「`code != 0` 即失败」改成断言 `3`）**由 Core 一次改完**，Data 侧不再动它——
+> 两件事同一个文件，各开一个分支必冲突。本笔记只负责把事实记对。
