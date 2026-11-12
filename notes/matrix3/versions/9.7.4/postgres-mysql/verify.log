@@ -1,6 +1,6 @@
-校验 2026-11-11T19:15:21Z（job_key=-）
+校验 2026-11-11T15:23:57Z（job_key=-）
 
-[data] OK（1 表，148 ms）
+[data] OK（1 表，196 ms）
   - WARN fingerprint_scope_mismatch ：指纹作用域不同（pg-hashtextextended-v1 vs mysql-canon-v1），两个指纹不可比，已改用逐行全表比对
       源端 pg-hashtextextended-v1 / 目标端 mysql-canon-v1
       能做什么：不需要处理：verify 已自动改用逐行全表比对；这条只是告诉你不要拿两端指纹直接比

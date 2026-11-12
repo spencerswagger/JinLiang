@@ -1,15 +1,15 @@
 == mysql-mysql ==
--- 19:14:43 mysql→mysql 快照开始（20000 行）
--- 19:14:50 mysql→mysql 快照完成 1.59s
+-- 15:23:19 mysql→mysql 快照开始（20000 行）
+-- 15:23:26 mysql→mysql 快照完成 1.62s
 gate: OK   [mysql→mysql 快照] 20000 行，内容指纹一致 f44174a6aa59bef8571ef8817990766f56ca28d793c9b8563f84aa791242997c
--- 19:14:51 mysql→mysql 增量三笔
+-- 15:23:26 mysql→mysql 增量三笔
 gate: OK   [mysql→mysql 增量] 20000 行，内容指纹一致 c99f849412d7f83a8f4335fb1b546838a5843d2c1f47d677e4fcab181de9422e
--- 19:14:54 mysql→mysql 增量追平 0.31s
+-- 15:23:30 mysql→mysql 增量追平 0.32s
 结论：数据级 ✓（行级全表比对 1 表）
-RESULT combo=mysql-mysql target=jinliang_target.acc_mm rows=20000 md5=c99f849412d7f83a8f4335fb1b546838a5843d2c1f47d677e4fcab181de9422e seconds=1.90 src_rows=20000 dst_rows=20000 src_md5=c99f849412d7f83a8f4335fb1b546838a5843d2c1f47d677e4fcab181de9422e dst_md5=c99f849412d7f83a8f4335fb1b546838a5843d2c1f47d677e4fcab181de9422e snapshot_seconds=1.59 incremental_seconds=0.31 status=pass mysql=9.7.4 paused=0 snapshot_wall=6.76s
+RESULT combo=mysql-mysql target=jinliang_target.acc_mm rows=20000 md5=c99f849412d7f83a8f4335fb1b546838a5843d2c1f47d677e4fcab181de9422e seconds=1.94 src_rows=20000 dst_rows=20000 src_md5=c99f849412d7f83a8f4335fb1b546838a5843d2c1f47d677e4fcab181de9422e dst_md5=c99f849412d7f83a8f4335fb1b546838a5843d2c1f47d677e4fcab181de9422e snapshot_seconds=1.62 incremental_seconds=0.32 status=pass mysql=9.7.4 paused=0 snapshot_wall=6.78s
 
 | 组合 | 目标表名 | 源行数 | 目标行数 | 源 md5 | 目标 md5 | 快照(s) | 增量(s) | 结论 |
 |---|---|---|---|---|---|---|---|---|
-| mysql-mysql | jinliang_target.acc_mm | 20000 | 20000 | `c99f849412d7f83a8f4335fb1b546838a5843d2c1f47d677e4fcab181de9422e` | `c99f849412d7f83a8f4335fb1b546838a5843d2c1f47d677e4fcab181de9422e` | 1.59 | 0.31 | pass |
-JSON：notes/matrix3/versions/9.7.4/mysql-mysql/result.json
+| mysql-mysql | jinliang_target.acc_mm | 20000 | 20000 | `c99f849412d7f83a8f4335fb1b546838a5843d2c1f47d677e4fcab181de9422e` | `c99f849412d7f83a8f4335fb1b546838a5843d2c1f47d677e4fcab181de9422e` | 1.62 | 0.32 | pass |
+JSON：/worktrees/JL-DATA/notes/matrix3/versions/9.7.4/mysql-mysql/result.json
 acceptance: 全部通过

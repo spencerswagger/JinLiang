@@ -1,4 +1,4 @@
 [
-{"combo": "mysql-postgres", "target": "public.acc_mp", "rows": "20000", "md5": "c99f849412d7f83a8f4335fb1b546838a5843d2c1f47d677e4fcab181de9422e", "seconds": "0.51", "src_rows": "20000", "dst_rows": "20000", "src_md5": "c99f849412d7f83a8f4335fb1b546838a5843d2c1f47d677e4fcab181de9422e", "dst_md5": "c99f849412d7f83a8f4335fb1b546838a5843d2c1f47d677e4fcab181de9422e", "snapshot_seconds": "0.37", "incremental_seconds": "0.14", "status": "pass", "mysql": "9.7.4", "paused": "0", "snapshot_wall": "6.44s"}
+{"combo": "mysql-postgres", "target": "public.acc_mp", "rows": "20000", "md5": "c99f849412d7f83a8f4335fb1b546838a5843d2c1f47d677e4fcab181de9422e", "seconds": "0.61", "src_rows": "20000", "dst_rows": "20000", "src_md5": "c99f849412d7f83a8f4335fb1b546838a5843d2c1f47d677e4fcab181de9422e", "dst_md5": "c99f849412d7f83a8f4335fb1b546838a5843d2c1f47d677e4fcab181de9422e", "snapshot_seconds": "0.48", "incremental_seconds": "0.13", "status": "pass", "mysql": "9.7.4", "paused": "0", "snapshot_wall": "6.44s"}
 
 ]

@@ -1,0 +1,35 @@
+== 只连不发：jinliang doctor（源/目标都是 MySQL 5.7.38；不搬数据，只连上做体检）
+津梁 dev
+  实例      7i4ooeldhjtfghrjis2rbnj6aa
+  数据目录  /worktrees/JL-DATA/.work/vb/root57/.localdb/doctor
+  控制库    /worktrees/JL-DATA/.work/vb/root57/.localdb/doctor/jinliang.db
+  密钥      key-file（/worktrees/JL-DATA/.work/vb/root57/.localdb/keys/doctor.key）
+  行数      连接 0 / 任务 0 / 运行 0 / 审计 0
+  体检：
+    [OK  ] control 实例 ID 正常
+           7i4ooeldhjtfghrjis2rbnj6aa
+    [OK  ] control 控制库完整
+           PRAGMA integrity_check = ok
+    [OK  ] control 控制库版本匹配
+           schema 5
+    [注意] control 还没有管理员口令
+           控制台任何人在本机打开都能改连接与任务
+           能做什么：跑一次 jinliang serve，打开页面设置口令；或用 --api-token 限制自动化访问
+    [OK  ] control 没有未收尾的运行
+    [OK  ] source  源库可以连上
+           5.7.38-log
+    [OK  ] source  变更流水可用
+           log_bin=ON, binlog_format=ROW
+    [OK  ] source  binlog 位点可读
+           mysql-bin.000004:1453
+    [OK  ] target  目标库可以连上
+           5.7.38-log
+    [注意] target  运行时表不完整
+           缺：_jl_version
+           能做什么：让 engine 重跑 EnsureSchema；不要手工建，结构必须与二进制一致
+    [OK  ] target  租约正常
+    [注意] target  目标端没有这个任务的记录
+           job_key=acc-pg-mysql
+           能做什么：确认 job_key 是否正确；新任务第一次跑会自己建
+  结论      正常
+exit=0

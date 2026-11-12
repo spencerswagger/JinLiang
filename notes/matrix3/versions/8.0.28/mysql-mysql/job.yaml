@@ -1,0 +1,15 @@
+version: 1
+job: acc-mysql-mysql
+source:
+  kind: mysql
+  dsn: env:JINLIANG_TEST_MYSQL_SRC_DSN
+  scope: {schema: jinliang_src}
+target:
+  kind: mysql
+  dsn: env:JINLIANG_TEST_MYSQL_DST_DSN
+  schema: jinliang_target
+  on_exists: append
+content:
+  tables:
+    acc_mm: {}
+mode: {frequency: continuous+initial}

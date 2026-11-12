@@ -1,0 +1,4 @@
+[
+{"combo": "mysql-postgres", "target": "public.acc_mp", "rows": "20000", "md5": "330ccea0293f33177530c2a6933dad45", "seconds": "0.61", "src_rows": "20000", "dst_rows": "20000", "src_md5": "330ccea0293f33177530c2a6933dad45", "dst_md5": "330ccea0293f33177530c2a6933dad45", "snapshot_seconds": "0.48", "incremental_seconds": "0.13", "status": "pass", "mysql": "5.7.38-log", "paused": "0", "snapshot_wall": "6.77s"}
+
+]
