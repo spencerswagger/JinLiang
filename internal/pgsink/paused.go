@@ -320,6 +320,45 @@ func parsePaused(raw string) (map[string]PausedTable, bool, error) {
 	return m, false, nil
 }
 
+// ReadPausedTables 只读「现在还停着哪几张表」（status / doctor / UI 用）。
+//
+// 为什么要有这个包级函数（而不是让调用方 Open 一个 Sink 再调 PausedTables）：
+// `status` 是**只读**命令，不能为了看一眼状态去 Open 一个会建 `_jl_meta`/`_jl_chunk`、
+// 探方言、探能力的 sink——那等于「看一眼状态」也顺手改目标库。这里只连一次、只读一列。
+//
+// 三个返回值各有含义，调用方必须分开处理（这是这条路径最容易退回旧 bug 的地方）：
+//   - rec：key 是目标端裸表名（与 `_jl_chunk.table_name` 同源）；
+//   - dirty：那一列不是合法 JSON（存储层已按「没有暂停」继续跑，但**status 不能装没事**）；
+//   - err：连不上 / 读失败。这两者与「没有暂停」是相反的结论，绝不能折叠成空 map。
+//
+// 「还没跑过」（`_jl_meta` 不存在、或没有本任务那一行）返回空 map + nil：
+// 那时候不可能有暂停记录，status 另有 Note 说「目标端还没有运行状态」。
+func ReadPausedTables(ctx context.Context, ep dsn.Endpoint, schema, jobKey string) (map[string]PausedTable, bool, error) {
+	if schema == "" {
+		schema = "public"
+	}
+	conn, err := pgwire.Connect(ctx, ep)
+	if err != nil {
+		return nil, false, err
+	}
+	defer conn.Close(ctx)
+	q := fmt.Sprintf(`SELECT COALESCE(paused_tables,'') FROM %s.%s WHERE job_key=$1`,
+		pgwire.Quote(schema), pgwire.Quote("_jl_meta"))
+	var raw string
+	err = conn.QueryRow(ctx, q, jobKey).Scan(&raw)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return map[string]PausedTable{}, false, nil
+	}
+	if err != nil {
+		// 42P01 = `_jl_meta` 还不存在：目标端从没跑过，等于没有暂停记录。
+		if pgwire.SQLState(err) == "42P01" {
+			return map[string]PausedTable{}, false, nil
+		}
+		return nil, false, fmt.Errorf("读暂停表失败: %w", err)
+	}
+	return parsePaused(raw)
+}
+
 // PausedKeys 是给日志/状态用的稳定顺序（map 的迭代顺序不能进文案与用例）。
 func PausedKeys(m map[string]PausedTable) []string {
 	out := make([]string, 0, len(m))

@@ -6,6 +6,7 @@ import (
 
 	"github.com/spencerswagger/jinliang/internal/control"
 	"github.com/spencerswagger/jinliang/internal/dsn"
+	"github.com/spencerswagger/jinliang/internal/mysqlsink"
 	"github.com/spencerswagger/jinliang/internal/pgsink"
 	"github.com/spencerswagger/jinliang/internal/state"
 )
@@ -29,7 +30,9 @@ type Status struct {
 	LastRun   *control.Run `json:"last_run,omitempty"`
 	// PausedTables 是「现在还停着哪几张表」。**读不到时是 null + PausedNote**，
 	// 不是空数组——空数组的意思是「没有暂停」，两者在「要不要处理」上是相反的结论。
-	PausedTables []PausedTableStat `json:"paused_tables,omitempty"`
+	// 所以这里**不能**加 omitempty：加上之后「读不到」与「没有暂停」在 JSON 里都没了这个键，
+	// 消费方再也分不开（`null` = 未知、`[]` = 确实没有）。
+	PausedTables []PausedTableStat `json:"paused_tables"`
 	PausedNote   string            `json:"paused_note,omitempty"`
 	Note         string            `json:"note,omitempty"`
 }
@@ -91,16 +94,8 @@ func StatusFor(ctx context.Context, opt Options) (Status, error) {
 		return st, nil
 	}
 	st.Tables = tableNames(r.tables)
-	// 暂停表：读不到就明说「未知」——空数组的意思是「没有暂停」，两者结论相反。
-	if reg := r.pauseRegistryOf(); reg != nil {
-		if rec, perr := reg.PausedTables(ctx); perr != nil {
-			st.PausedNote = "读不到暂停记录（不是「没有暂停」）：" + perr.Error()
-		} else {
-			st.PausedTables = pausedStatsOf(rec)
-		}
-	} else if r.tgtEP.Kind == dsn.KindMySQL {
-		st.PausedNote = "这个目标端还没有实现暂停记录（按表暂停在 MySQL 目标端暂不支持）"
-	}
+	st.PausedTables, st.PausedNote = statusPaused(ctx, r.tgtEP, schema, job.JobKey)
+
 	src, err := r.openSource(ctx)
 	if err != nil {
 		st.Note = "连不上源库：" + err.Error()
@@ -130,6 +125,66 @@ func StatusFor(ctx context.Context, opt Options) (Status, error) {
 	}
 	return st, nil
 }
+
+// statusPaused 按目标端 kind **直读** `_jl_meta.paused_tables`，给出对外形状 + 说明。
+//
+// 为什么直读、而不是走 `runner.pauseRegistryOf()`（这里原来就是那么写的，是个真 bug）：
+// `StatusFor` 造的 runner 只用来探源端表清单，**没有** sink / pauseReg —— 那两样是执行
+// 路径（prepare）才构造的。于是 `pauseRegistryOf()` 恒 nil，`status --json` 的
+// `paused_tables` 永远为空；而那条 else 分支还在打印「按表暂停在 MySQL 目标端暂不支持」
+// （#102 早就支持了，`mysqlsink` 的六个方法都在）。两件事叠加的结果是：
+// 真停了表的人打开 status，看到的是「没有暂停」+ 一句过期的话。
+//
+// 为什么不干脆 Open 一个 sink 再问它：status 是只读命令，Open 会建 `_jl_meta`/`_jl_chunk`、
+// 探方言、MySQL 侧还可能补列 —— 「看一眼状态」不该动目标库。这里只连一次、只读一列。
+//
+// 三种结论必须能分开（对外是三种不同的字段组合，见 Status.PausedTables 的注释）：
+//   - 读到、有记录 → PausedTables 非空，note 为空；
+//   - 读到、没有记录（含「目标端还没跑过」）→ **空数组**（`[]`，不是 null）+ note 为空；
+//   - 读不到 / 读到的不是合法 JSON → `null` + note，意思是**未知**（不是没有暂停）。
+func statusPaused(ctx context.Context, tgtEP dsn.Endpoint, schema, jobKey string) ([]PausedTableStat, string) {
+	switch tgtEP.Kind {
+	case dsn.KindPostgres:
+		rec, dirty, err := pgsink.ReadPausedTables(ctx, tgtEP, schema, jobKey)
+		if err != nil {
+			return nil, "读不到暂停记录（不是「没有暂停」）：" + err.Error()
+		}
+		if dirty {
+			return nil, pausedDirtyNote
+		}
+		return emptyInsteadOfNil(pausedStatsOf(rec)), ""
+	case dsn.KindMySQL:
+		rec, dirty, err := mysqlsink.ReadPausedTables(ctx, tgtEP, jobKey)
+		if err != nil {
+			return nil, "读不到暂停记录（不是「没有暂停」）：" + err.Error()
+		}
+		if dirty {
+			return nil, pausedDirtyNote
+		}
+		return emptyInsteadOfNil(pausedStatsOf(rec)), ""
+	}
+	// 目标端 kind 不认识：这段代码还没学会读它的暂停记录。**不许**静默返回空
+	// （空数组的意思是「没有暂停」，那是相反的结论）。
+	return nil, "这个目标端（" + tgtEP.Kind + "）的暂停记录还不支持读取：这次没读到，" +
+		"别把空当成「没有暂停」。你能做什么：用 PostgreSQL 或 MySQL 目标端，或先看目标库的 _jl_meta.paused_tables。" +
+		"风险：没有（status 只读，什么都没动）"
+}
+
+// emptyInsteadOfNil 把「读到了、没有暂停」变成空数组而不是 nil。
+//
+// 为什么要较这个真：`null` 与 `[]` 在这条路径上是**相反**的结论（未知 vs 没有暂停），
+// 而 Go 的 nil slice 序列化成 `null`、空 slice 序列化成 `[]` —— 不显式区分，
+// 消费方只能把「读失败」当成「没事」，那正是这次要修的 bug 的另一种形态。
+func emptyInsteadOfNil(s []PausedTableStat) []PausedTableStat {
+	if s == nil {
+		return []PausedTableStat{}
+	}
+	return s
+}
+
+// pausedDirtyNote 是「那一列不是合法 JSON」的说明（两份目标端共用一句，免得文案漂）。
+const pausedDirtyNote = "目标端 `_jl_meta.paused_tables` 不是合法 JSON：这一列已经按「没有暂停」处理，" +
+	"但它是脏数据，请人看一眼那一列（可能是手改过或被截断）。风险：本次只是读，没有写任何东西"
 
 // PausedTableStat 是一张暂停表对外的形状（status / 事件 / Result 共用一份）。
 //

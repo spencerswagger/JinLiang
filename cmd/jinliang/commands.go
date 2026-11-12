@@ -740,6 +740,25 @@ func cmdStatus(args []string) error {
 	fmt.Printf("阶段      %s\n", orDash(st.Phase))
 	fmt.Printf("位点      %s（更新于 %s）\n", orDash(st.Position), orDash(st.UpdatedAt))
 	fmt.Printf("落后      %s（书签占用 %s）\n", humanBytes(st.LagBytes), humanBytes(st.SlotBytes))
+	// 暂停表必须看见：这是「要不要处理」的唯一信号。空清单 + 空说明 = 确实没有暂停；
+	// 只有说明 = 读不到（未知），两者结论相反，所以**不合并成一句**。
+	if len(st.PausedTables) > 0 {
+		fmt.Printf("暂停表      %d 张（这些表的事件被跳过、其它表照写，位点照常前进）：\n", len(st.PausedTables))
+		for _, p := range st.PausedTables {
+			line := fmt.Sprintf("  - %s  原因码 %s", p.Table, p.Reason)
+			if p.SkippedRows > 0 {
+				line += fmt.Sprintf("，已跳过 %d 行", p.SkippedRows)
+			}
+			if p.Detail != "" {
+				line += "；" + p.Detail
+			}
+			fmt.Println(line)
+		}
+		fmt.Println("          结构对齐后要整表重搬一次才会解除（清空 + 从新视图搬）；在那之前这张表不完整。")
+	}
+	if st.PausedNote != "" {
+		fmt.Printf("暂停说明  %s\n", st.PausedNote)
+	}
 	if st.LastRun != nil {
 		fmt.Printf("最近一次  %s 开始，阶段 %s，%d 行", st.LastRun.StartedAt, st.LastRun.Phase, st.LastRun.RowsDone)
 		if st.LastRun.EndedAt != "" {
