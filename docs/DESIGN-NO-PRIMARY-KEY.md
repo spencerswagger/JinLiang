@@ -1,9 +1,12 @@
 # 设计：无主键表同步（insert-only / 显式唯一键）· v1 定稿
 
-> **状态：设计定稿，尚未实现。** 本文件描述的是**目标行为**，不是现状；
-> 每条口径都标了「今天能不能跑」。实现切片见 §5，落地状态由后续 PR 回填到本注。
+> **状态：v1 已落地（S1–S3），S4 未补。** 基线 `main` `a99337c`：S1 insert-only（`#116`）、
+> S2 改/删 → 按表暂停 + `PG-06` 源端前置（`#117`）、S3 `unique_key` 整片（`#120`）、
+> `E1017` 码表（`#119`）。**S4（测试矩阵格，§2.4）仍未补**——那 10/39/184 格是「应该跑」不是「已经在跑」。
 >
-> 基线：`main` `0143986`（`#112` 报错文案、`#113` MY-08 preflight + 单测、`#114` MY-08 矩阵 smoke 已合入）。
+> 下文口径 = **当前实现**（§1.1 已按 `a99337c` 刷新成落地后现状；§2.3 / §4.5 有落地记录）；
+> 仍标「挂账」的（§7）**确实还没做**，别当成已实现。
+>
 > 本文件**不改** `MY-08`/`MY-11` 的编号与语义，也**不推翻** `#112` 已改的 `ErrNoUniqueKey` 文案——只在它上面扩展一句。
 > 口径冲突时以本文件为准；本文件与 `docs/SPEC.md` 冲突时，先提出来由主持人裁决，不各自改。
 
@@ -14,26 +17,27 @@
 
 ## §1 口径选择：insert-only 与「显式业务唯一键」
 
-### 1.1 现状（逐条可核对，别凭印象）
+### 1.1 现状（逐条可核对，别凭印象；已按 `a99337c` 刷新）
 
 | 能力 | 现状 | 依据 |
 |---|---|---|
 | 源端采集无主键表 | **已支持**：PG 按 `ctid` 游标切块；MySQL 只能单连接顺序扫（`InnoDB` 隐藏 `rowid` 读不到），只有表级断点 | `internal/pgsource/pgsource.go:591-615`；`internal/mysqlsource/snapshot.go:279-299`、`chunksnapshot.go:405-410` |
 | 无主键表续跑 | **已支持（降级）**：不按块续，走 `chunkPlan.Recopy` → `recopyOne` 整表重来，只重来这一张 | `internal/engine/resume.go:235-260`、`engine.go:680-705` |
 | 源端「有没有主键」的探测 | **已有**：`source.Table.HasStablePK`，预检出 `SCOPE-02` warn | `internal/source/contract.go:92-105`、`internal/preflight/b0.go:265-310` |
-| PG 目标端写无主键表 | **已 insert-only**：`conflictClause` 无主键返回空串 → 多行纯 `INSERT` | `internal/pgsink/pgsink.go:2094-2097` |
-| PG 目标端删无主键表 | **直接报错**（无码、无四段式、整条任务停）：`表 x 没有主键，无法安全删除目标端对应行` | `internal/pgsink/pgsink.go:1729-1733` |
-| MySQL 目标端写无主键表 | **不成立**：写路径一律 upsert，目标无唯一键即 `ErrNoUniqueKey` 整批失败——**全量也走 `Apply`，所以全量就炸** | `internal/mysqlsink/apply.go:208-228`、`upsert.go:11-39`；`engine/target.go:498-540`（`copyGeneric` 也调 `Apply`） |
-| MySQL 目标端删 | `deleteSQL` 无主键直接报错 | `internal/mysqlsink/upsert.go:93-96` |
-| 目标端唯一键探测 | 只有 `mysqlsink.hasUniqueKey`：`COUNT(*) … NON_UNIQUE = 0`。**列组合、NULL、前缀索引全没看** | `internal/mysqlsink/upsert.go:18-39` |
-| 「有唯一键」≠「按主键 upsert」 | MySQL 的 `ON DUPLICATE KEY` **不指定冲突目标**，命中的是**任意**唯一索引：目标端恰好有另一条唯一索引时，我们会按它更新，语义与源端主键不一致，而且不报错 | `internal/mysqlsink/upsert.go:46-90`（拼 SQL 时没有冲突列清单） |
-| 目标端唯一键**预检** | **没有任何一条**（`TARGET-01` 只管「目标端已有同名表」） | `internal/preflight/b0.go:130-150` |
-| `verify` 无主键表 | 只做聚合（`all_partial`），明确标注 | `internal/verify/verify.go:207-290`、`:439` |
-| **PG 源**能不能解出无主键表的 `UPDATE`/`DELETE` | **不能（默认）**：pgoutput 要拿旧行做标识；`REPLICA IDENTITY` 是 `default(no-pk)` 时源端解码直接报错（`cannot update/delete … does not have a replica identity`），**整条流断**，而且重连会在同一段变更上再炸一遍 | `connect/postgres.go:155`（读 `relreplident`）、`:277`、`:303-315`（值域 `full`/`nothing`/`index`/`default(pk)`/`default(no-pk)`） |
-| `Table.ReplicaIdentity` 的消费者 | **一个都没有**：字段填了、预检不读、引擎不判 | 全库 grep 只有 `contract.go:102`、`connect/postgres.go:277/303`、`SPEC.md:91` |
+| PG 目标端写无主键表 | **insert-only（S1）**：`conflictClause` 在「无主键且没声明 `unique_key`」时返回空串 → 多行纯 `INSERT`；声明了则 `ON CONFLICT (声明列) DO UPDATE` | `internal/pgsink/pgsink.go` `conflictClause` |
+| PG 目标端删无主键表 | **按表暂停**：`deleteTx` 返回 `NoPKWriteError`（原因码 `no_pk_write`）→ 只停这张表、其它表照常、位点照常前进、退出码 3（S2 `#117`） | `internal/pgsink/pgsink.go` `deleteTx`；`internal/pgsink/paused.go` |
+| MySQL 目标端写无主键表 | **insert-only（S1）**：`insertOnly` → 多行纯 `INSERT`，不再因目标缺唯一键整批失败（**全量也走 `Apply`**，所以这条以前连全量都炸）；声明了 `unique_key` 才走 `ON DUPLICATE KEY UPDATE` | `internal/mysqlsink/apply.go` `applyUpserts`、`internal/mysqlsink/upsert.go` `insertSQL` |
+| MySQL 目标端删 | 无定位列 → `NoPKWriteError`（同上，按表暂停，不再是一句裸错误） | `internal/mysqlsink/upsert.go` `deleteSQL` |
+| 目标端唯一键探测 | **`TARGET-02` 五条判据**（唯一 / 非部分 / 非表达式 / 无前缀长度 / 列集合完全一致 / 列都 NOT NULL）+ 两个 sink 写前各核一次（`verifyDeclaredKey` / `ensureDeclared`，按表缓存）。`hasUniqueKey` 退化成「有没有任何唯一索引」 | `internal/preflight/b0.go` `targetUniqueKeyChecks`、`internal/mysqlsink/upsert.go`、`internal/pgsink/pgsink.go` |
+| 「有唯一键」≠「按主键 upsert」 | **仍未解（D9）**：MySQL 的 `ON DUPLICATE KEY` **不指定冲突目标**，命中的是**任意**唯一索引。声明 `unique_key` 只改 update-set 与 `DELETE` 的定位列，**不改**冲突判定——目标端另有一条唯一索引时仍可能按它更新 | `internal/mysqlsink/upsert.go` `upsertSQL`（拼 SQL 时没有冲突列清单） |
+| 目标端唯一键**预检** | **`TARGET-02` 已落地（S3 `#120`）**：ok / warn / blocked 三档，另有「可空列」单独一档 warn（NULL 互不相等 → 重放会插重复）；声明核对不过 → blocked 且点名哪条判据不过 | `internal/preflight/b0.go`；用例 `internal/preflight/target02_test.go` |
+| `verify` 无主键表 | 仍只做聚合（`all_partial`）；文案已改成「本版只比行数（声明 `unique_key` 后仍不做行级比对，见 D2）」，不再承诺没实现的能力 | `internal/verify/verify.go` |
+| **PG 源**能不能解出无主键表的 `UPDATE`/`DELETE` | **默认不能**：pgoutput 要旧行标识，`REPLICA IDENTITY` 是 `default(no-pk)`/`nothing` 时源端解码就报错、整条流断且重连在同一段再炸。**`PG-06` 已落地（S2 `#117`）**：预检读 `ReplicaIdentity`，不是 `full`/`index` 就 warn + autofix `ALTER TABLE … REPLICA IDENTITY FULL`（分区表叶子代做不了，D10） | `internal/preflight/b0.go` `pgReplicaIdentityCheck`；`internal/source/contract.go` `Table.ReplicaIdentity` |
+| `Table.ReplicaIdentity` 的消费者 | **现在有**：`PG-06` 预检读它（之前字段填了、零消费者） | `internal/preflight/b0.go` |
 | 可跑方向 | PG→PG（全量+增量）、PG→MySQL（**只全量**）、MySQL→PG（全量+增量）；**MySQL→MySQL 未接通** | `internal/core/direction.go:39-46` |
 
-**三个真实缺口**（本设计就补这三个）：
+**三个真实缺口 —— v1 已全部补上（`#116` / `#117` / `#120`）**：这一段保留下来是因为它记录了「为什么要有这套设计」，
+不是待办清单；对应实现见上面那张表的「落地后」列。
 
 1. MySQL 目标端**根本没有 insert-only 路径** → 无主键表连全量都跑不了；
 2. 无主键表收到 BACKFILL/UPDATE/DELETE 时，PG 目标端抛一句裸错误**整条任务停**（连带几十张无关的表），
@@ -178,11 +182,13 @@ A 是地板，B 是天花板。
 `internal/pgsink/paused.go:32-50`）。它与 `E1015` 的区别：E1015 是「结构对不上」，E1017 是「结构没错，但没有身份」。
 `Detail` 里写人话（哪张表、哪条变更、需要什么），不写进 Message。
 
-**`E1017` 的来源跑法**：进码表时（`#119`）第三条做法 `unique_key` **暂缓**——S3 未落地，而 `jobspec` 是 strict 解析，
-把「声明 `unique_key`」写进「你现在能做什么」会让用户直接撞「未知字段」，比不说更糟。所以码表当前的 Next 是
-三条**真能走通**的路（加主键/唯一索引 · 换 `once`/`full_interval` · 移出 `content.tables` 后重新 import）。
-S3 合入时必须一次性改三处：码表 Next 补第三条 · `docs/ERRORS.md` 那一行同步 ·
-`internal/core/codes_noidentity_test.go` 的 `uniqueKeyConfigLanded` 改 `true`（漏了它，用例会红，正好当提醒）。
+**`E1017` 的落地记录（`#119` 建码 → `#120` 补第三条）**：`#119` 建码时只写**当时真能走通**的路（加键 / 换 `once`·`full_interval` /
+移出 `content.tables`），「声明 `unique_key`」按 `uniqueKeyConfigLanded` 开关暂缓——`jobspec` 是 strict 解析，
+提前写它会让用户撞「未知字段」，比不说更糟。S3（`#120`，`main` `a99337c`）把字段、校验、`TARGET-02` 与两个 sink 的
+写前核对一起落地后，三处**同批**改完：码表 `Next` 第二条（`unique_key` 独占一条，并写明前提「指向目标端**已有**的唯一索引、
+列都非空」）· `docs/ERRORS.md` 那一行 · `internal/core/codes_noidentity_test.go` 的开关置 `true`。
+`Next` 仍是 3 步（`codes_test.go` 的机械上限 1–3 步），所以第 3 步把「换 `once`/`full_interval`」与「移出 `content.tables`」
+合并——两者都是「绕开逐行定位」，而 `unique_key` 是唯一「不改源表结构又能定位」的路，必须独占一条。
 
 > **PG 源的前置（R5，评审 P1）**：上面 `Risk` 那三句「只停这张表、其它表照常、位点照常前进」**只在
 > `REPLICA IDENTITY` 到位时成立**。PG 源的无主键表若是 `default(no-pk)`，源端在解出第一条 `UPDATE`/`DELETE`
@@ -284,6 +290,17 @@ Detail 必须**分档写**，不许共用一句话（这是 `PAUSE-01` 的教训
 （`contract.go:92-105`），所以要在 `connect.mysql`/`connect.postgres` 的 `Catalog` 里补
 `UniqueKeys [][]string`（非主键、非部分、非表达式、全列的唯一索引）。这是 v1 唯一**新增字段**的契约扩展
 （`ReplicaIdentity` 早就有了，只是没人读——见 §3.5），必须同步 `docs/CONNECTOR-SDK.md` 的 Catalog 字段表。
+
+**落地后比这张表多出三种结论**（`#120` 实现，都是同一张卡片的不同 Detail，不是新探测项）：
+
+- **声明了 `unique_key` 但目标端还没有这张表** → `blocked`：我们建表只建源端主键（无主键表就没有），
+  声明要求「目标端**已有**唯一索引」，所以先建表建索引、或去掉声明用 insert-only。
+  （`once`/`full_interval` 例外：整轮重搬用不上行身份，声明按「被忽略」提示，不 blocked。）
+- **目标端那条键含可空列** → 声明时是 `blocked`（§4.3 判据 5 不过，Detail 点名哪一列允许为空）；
+  源端有主键、只是目标端那条唯一索引可空时是 `warn`（`ON CONFLICT` 照收，但 NULL 互不相等 → 重放/重复投递会插出多行）。
+  两种都**不能**与「键不存在」共用一句话（`#120` Owl 复核必改 2）。
+- **目标端另有唯一索引、但与声明/源端主键不同组** → 声明时 `blocked`（判据 3：列集合必须完全一致）；
+  源端有主键时 `warn`：MySQL 侧就是 `D9`（按别的键更新），PG 侧是 `42P10`（upsert 直接失败）。只提示，不阻断。
 
 ### 3.5 `PG-06`（**源端**）：`REPLICA IDENTITY FULL` 是「只停这张表」的前提（评审 P1）
 
@@ -398,6 +415,11 @@ control.JobDoc.Content.Tables[t].UniqueKey
 8. `internal/verify/verify.go:439` 那句「增量只能 insert-only」在声明 `unique_key` 后不再准确 →
    文案改成「这张表没有主键：本版只比行数（声明 `unique_key` 后仍不做行级比对，见挂账 D2）」。**别**承诺没实现的能力。
 
+**落地状态（`main` `a99337c`）**：1–8 **全部已落地**（1/2/3 随 `#120`、4 随 `#119`、5–8 随 `#120` 的文档对齐；
+`docs/SPEC.md` 的 `PG-06` 已拆成两句、`TARGET-02` 独立成行，`CONNECTOR-SDK.md` 已有 `UniqueKeys`）。
+还欠一处**内容**：第 1 条虽然落了文案，但它的 ② 指向 `unique_key`——而触发这个错误的典型情形是
+「源端**有**主键、目标端缺键」，那种表上声明会被忽略（§4.2 第 4 条），照 ② 做不会好转。记在 §7 `D11`。
+
 ---
 
 ## §5 实现切片（给 Core / Data / Gate 派活用）
@@ -450,6 +472,7 @@ control.JobDoc.Content.Tables[t].UniqueKey
 | D8 | `jinliang status` 的暂停展示（含 `skipped_rows`） | 已知债（契约 §1.8 片 D2）；**文案不许再把用户指去 status 找它** |
 | D9 | MySQL 目标端 upsert **不指定冲突列**：命中任意唯一索引即可更新，可能与源端主键语义不一致 | 与「无主键表」相邻但不同源；v1 只在 `TARGET-02` 的 Detail 里点明，改 SQL 形状要连带改 5.7 的 `VALUES()` 变体，属独立一片 |
 | D10 | 分区表叶子的 `REPLICA IDENTITY` 批量代做（catalog 只列父表，`connect/postgres.go:172-174` 跳过子分区） | 要先把 `pg_inherits` 枚举接进 catalog，否则代做只能改到父表；v1 明说不代做 + 给 SQL 模板 |
+| D11 | `mysqlsink` 的 `ErrNoUniqueKey` 文案第 ② 条指向 `unique_key`，但该错误被触发的典型情形是「源端**有**主键、目标端缺键」——那种表上声明会被忽略（§4.2 第 4 条），照做不会好转 | 它和 `E1017`（无身份族码）是两条不同的路：`ErrNoUniqueKey` 说的是「身份明确、目标端定位不了」，正解是「把目标端那条键补成与源端主键一致，或换空 `target.schema` 让任务自己建表」（`TARGET-02` 的 warn 档就是这么写的）。改文案要同时收窄到 `rel==nil` 那一小撮，属独立一片 |
 
 ---
 
