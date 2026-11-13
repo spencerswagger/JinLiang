@@ -1,15 +1,20 @@
 //go:build integration
 
-// 矩阵 smoke 格：MY-08 存储引擎走真库（SPEC:76 的拍板口径——MyISAM 无事务，
-// warn 照跑并标注，不阻断）。
+// 矩阵 smoke 格：MY-08 引擎事务能力走真库（SPEC MY-08：按服务器自报的
+// information_schema.ENGINES.TRANSACTIONS 判，无事务 → 降级照跑并标注）。
 //
-// 单测（internal/preflight/b0_test.go）钉的是 engineChecks 的判断逻辑；这一格钉
-// 的是「生产同款装配」：引擎名必须从 connect/mysql.go 的 information_schema.TABLES
-// 一路带进 preflight.Input.SourceCat——中间任何一环把 Engine 丢了，MY-08 就哑火。
-// MyISAM 与 MRG_MyISAM 一并覆盖；对同批 InnoDB 表断言不误伤、不阻断。
+// 单测（internal/preflight/engine_test.go）钉的是判据本身；这一格钉的是「生产同款
+// 装配」的两条链路，任一条断了 MY-08 就哑火：
+//   - 引擎名从 information_schema.TABLES 带进 Catalog.Table.Engine；
+//   - 事务能力从 information_schema.ENGINES 带进 Catalog.Engines（两处 Catalog() 都要填，
+//     connect/mysql.go 是预检那条、mysqlsource/snapshot.go 是引擎那条）。
+//
+// 覆盖 MyISAM / MRG_MyISAM / MEMORY / CSV / ARCHIVE（都是 TRANSACTIONS=NO），
+// 对同批 InnoDB 断言不误伤、不阻断。
 //
 // CI：mysql-matrix.yml 已把 ./internal/mysqlsource/ 的 integration 用例在
-// 5.7/8.0/8.4/9 四档全扫进去，无需改 workflow。MyISAM/MRG_MyISAM 四档都可建。
+// 5.7/8.0/8.4/9 四档全扫进去，无需改 workflow。五个引擎四档都可建
+// （ARCHIVE 要求所有列 NOT NULL，CSV/ARCHIVE 不能建索引）。
 package mysqlsource
 
 import (
@@ -50,6 +55,9 @@ func TestIntegrationMyISAMPreflightWarnCreatesJobableReport(t *testing.T) {
 	exec(t, s, "DROP TABLE IF EXISTS "+quoteIdent(db)+".jl_smoke_mrg")
 	exec(t, s, "DROP TABLE IF EXISTS "+quoteIdent(db)+".jl_smoke_myisam")
 	exec(t, s, "DROP TABLE IF EXISTS "+quoteIdent(db)+".jl_smoke_innodb")
+	exec(t, s, "DROP TABLE IF EXISTS "+quoteIdent(db)+".jl_smoke_memory")
+	exec(t, s, "DROP TABLE IF EXISTS "+quoteIdent(db)+".jl_smoke_csv")
+	exec(t, s, "DROP TABLE IF EXISTS "+quoteIdent(db)+".jl_smoke_archive")
 	exec(t, s, "CREATE TABLE "+quoteIdent(db)+".jl_smoke_myisam ("+
 		"id INT PRIMARY KEY, note VARCHAR(32) NULL) ENGINE=MyISAM")
 	exec(t, s, "CREATE TABLE "+quoteIdent(db)+".jl_smoke_mrg ("+
@@ -57,10 +65,19 @@ func TestIntegrationMyISAMPreflightWarnCreatesJobableReport(t *testing.T) {
 		"UNION=("+quoteIdent(db)+".jl_smoke_myisam) INSERT_METHOD=LAST")
 	exec(t, s, "CREATE TABLE "+quoteIdent(db)+".jl_smoke_innodb ("+
 		"id INT PRIMARY KEY, note VARCHAR(32) NULL) ENGINE=InnoDB")
+	// MEMORY 有事务外的另一层代价（重启即空），但能建主键；
+	// CSV / ARCHIVE 不能建索引（⇒ 恒无主键，归 SCOPE-02），ARCHIVE 还不接受可空列。
+	exec(t, s, "CREATE TABLE "+quoteIdent(db)+".jl_smoke_memory ("+
+		"id INT PRIMARY KEY, note VARCHAR(32) NULL) ENGINE=MEMORY")
+	exec(t, s, "CREATE TABLE "+quoteIdent(db)+".jl_smoke_csv (id INT NOT NULL) ENGINE=CSV")
+	exec(t, s, "CREATE TABLE "+quoteIdent(db)+".jl_smoke_archive (id INT NOT NULL) ENGINE=ARCHIVE")
 	defer func() {
 		exec(t, s, "DROP TABLE IF EXISTS "+quoteIdent(db)+".jl_smoke_mrg")
 		exec(t, s, "DROP TABLE IF EXISTS "+quoteIdent(db)+".jl_smoke_myisam")
 		exec(t, s, "DROP TABLE IF EXISTS "+quoteIdent(db)+".jl_smoke_innodb")
+		exec(t, s, "DROP TABLE IF EXISTS "+quoteIdent(db)+".jl_smoke_memory")
+		exec(t, s, "DROP TABLE IF EXISTS "+quoteIdent(db)+".jl_smoke_csv")
+		exec(t, s, "DROP TABLE IF EXISTS "+quoteIdent(db)+".jl_smoke_archive")
 	}()
 
 	// 生产 PreflightJob 的同款装配：connect.Open → Version/Probe/Catalog。
@@ -90,6 +107,9 @@ func TestIntegrationMyISAMPreflightWarnCreatesJobableReport(t *testing.T) {
 		{"jl_smoke_myisam", "MyISAM"},
 		{"jl_smoke_mrg", "MRG_MyISAM"},
 		{"jl_smoke_innodb", "InnoDB"},
+		{"jl_smoke_memory", "MEMORY"},
+		{"jl_smoke_csv", "CSV"},
+		{"jl_smoke_archive", "ARCHIVE"},
 	} {
 		got := engineOf(cat, want.table)
 		if got == "" {
@@ -100,30 +120,52 @@ func TestIntegrationMyISAMPreflightWarnCreatesJobableReport(t *testing.T) {
 		}
 	}
 
+	// 判据的输入必须是服务器自报：接线断了（Engines 为空）这里先红，
+	// 而不是等到「预检降级、收尾不标注」那种假绿。
+	if tx, ok := cat.Engines["INNODB"]; !ok || !tx {
+		t.Fatalf("Catalog.Engines[INNODB] 应为 true（实际 %v，ok=%v）：两处 Catalog() 的 ENGINE 探测断了", tx, ok)
+	}
+	for _, e := range []string{"MYISAM", "MRG_MYISAM", "MEMORY", "CSV", "ARCHIVE"} {
+		if tx, ok := cat.Engines[e]; !ok || tx {
+			t.Fatalf("Catalog.Engines[%s] 应为 false（实际 %v，ok=%v）", e, tx, ok)
+		}
+	}
+
 	rep := preflight.Run(preflight.Input{
 		JobName:    "smoke-myisam",
 		SourceKind: "mysql", TargetKind: "postgres",
 		SourceVer: ver, TargetVer: "16.2",
 		SourceCaps: caps,
 		SourceCat:  &cat,
-		Tables:     []string{"jl_smoke_myisam", "jl_smoke_mrg", "jl_smoke_innodb"},
-		Mode:       "continuous+initial",
-		OnExists:   "error",
-		BatchRows:  500,
+		Tables: []string{"jl_smoke_myisam", "jl_smoke_mrg", "jl_smoke_memory",
+			"jl_smoke_csv", "jl_smoke_archive", "jl_smoke_innodb"},
+		Mode:      "continuous+initial",
+		OnExists:  "error",
+		BatchRows: 500,
 	})
 	c, ok := statusOfCheck(rep, "MY-08")
 	if !ok {
-		t.Fatalf("选中表里有 MyISAM/MRG_MyISAM，应有 MY-08：%+v", rep.Checks)
+		t.Fatalf("选中表里有五个无事务引擎，应有 MY-08：%+v", rep.Checks)
 	}
 	if c.Status != source.StatusWarn {
-		t.Fatalf("MY-08 = %s，SPEC 口径是 warn 照跑并标注（无事务，不物理阻断）：%s", c.Status, c.Detail)
+		t.Fatalf("MY-08 = %s，SPEC 口径是 warn 降级（无事务，不物理阻断）：%s", c.Status, c.Detail)
 	}
 	if !rep.CanStart {
-		t.Fatalf("MyISAM 照跑，CanStart 不该被压成 false：%+v", rep.Checks)
+		t.Fatalf("降级照跑，CanStart 不该被压成 false：%+v", rep.Checks)
 	}
-	for _, want := range []string{"jl_smoke_myisam", "jl_smoke_mrg"} {
+	// information_schema 回报的引擎名大小写不统一（MRG_MYISAM 全大写，历史文档写 MRG_MyISAM），
+	// 所以按小写比：要的是「点名真实引擎名」，不是「大小写跟文档一致」。
+	detailLower := strings.ToLower(c.Detail)
+	for _, want := range []string{"jl_smoke_myisam(myisam)", "jl_smoke_mrg(mrg_myisam)",
+		"jl_smoke_memory(memory)", "jl_smoke_csv(csv)", "jl_smoke_archive(archive)"} {
+		if !strings.Contains(detailLower, strings.ToLower(want)) {
+			t.Errorf("MY-08 明细应点名 %s（带真实引擎名）：%s", want, c.Detail)
+		}
+	}
+	// 引擎特有代价：命中才追加（SPEC MY-08 的四段文案之后）。
+	for _, want := range []string{"重启/崩溃即空", "不支持任何索引"} {
 		if !strings.Contains(c.Detail, want) {
-			t.Errorf("MY-08 明细应点名 %s：%s", want, c.Detail)
+			t.Errorf("MY-08 应带上引擎特有代价 %q：%s", want, c.Detail)
 		}
 	}
 	if strings.Contains(c.Detail, "jl_smoke_innodb") {

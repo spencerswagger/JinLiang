@@ -8,13 +8,16 @@ import (
 	"github.com/spencerswagger/jinliang/internal/source"
 )
 
+// catalog 建一个「服务器已经自报了引擎事务能力」的目录桩（8.0.28 实测值）。
+// 判据读的是 Catalog.Engines（SPEC MY-08），没有它的目录等于「没读到能力」——
+// 那种情况由 engine_test.go 的第 6 格单独钉死，不让每个用例都被它影响。
 func catalog(tables ...source.Table) *source.Catalog {
 	for i := range tables {
 		if tables[i].Schema == "" {
 			tables[i].Schema = "public"
 		}
 	}
-	return &source.Catalog{Tables: tables}
+	return &source.Catalog{Tables: tables, Engines: realEngines()}
 }
 
 func statusOf(rep source.Report, id string) (source.Check, bool) {

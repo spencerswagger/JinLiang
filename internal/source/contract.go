@@ -111,6 +111,16 @@ type Table struct {
 type Catalog struct {
 	Tables []Table    `json:"tables"`
 	Views  []TableRef `json:"views"`
+	// Engines 是**服务器自报的引擎事务能力**（`information_schema.ENGINES` 的
+	// `TRANSACTIONS` 列）：键 = 大写引擎名，值 = `TRANSACTIONS='YES'`。
+	//
+	// 这是 SPEC MY-08 的判据输入，属于 **Catalog 而不是 CapSet**：CapSet 是服务器级
+	// 能力键，而「这张表的引擎有没有事务」是**逐表**的，塞进 CapSet 会逼出一个按引擎名
+	// 的键空间。
+	//
+	// 键不存在 = 服务器没说（老版本没有这列 / 读失败 / 插件引擎没装）——按「没有事务」
+	// 处理（`preflight.JudgeEngines`）：**读不到能力 ≠ 有事务**。空 map 不是错误。
+	Engines map[string]bool `json:"engines,omitempty"`
 }
 
 // Scope selects tables by schema plus include/exclude patterns.

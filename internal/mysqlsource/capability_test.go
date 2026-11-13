@@ -229,7 +229,7 @@ func TestProbeChecksAreActionable(t *testing.T) {
 }
 
 func TestProbeMariaDBBlockedKeepsMy08FreeForEngineCheck(t *testing.T) {
-	// docs/SPEC.md:107 的 MY-08 是「表的存储引擎」（MyISAM → warn 照跑）；
+	// docs/SPEC.md §3「MySQL」的 MY-08 是「表的存储引擎有没有事务」（降级照跑）；
 	// MariaDB 检查之前错占了 MY-08（blocked），口径对不上——现在挪到 MY-11。
 	f := newProbeFixture(t, "11.4.2-MariaDB-1:11.4.2+maria~ubu2404")
 	f.vars = map[string]string{"log_bin": "1", "binlog_format": "ROW", "binlog_row_image": "FULL"}

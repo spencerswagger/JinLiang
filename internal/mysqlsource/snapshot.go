@@ -104,7 +104,37 @@ func (s *Source) Catalog(ctx context.Context, scope source.Scope) (source.Catalo
 		}
 		cat.Tables = append(cat.Tables, *t)
 	}
+	cat.Engines = s.readEngines(ctx)
 	return cat, nil
+}
+
+// readEngines 读服务器自报的引擎事务能力（SPEC MY-08 的判据输入）。
+//
+// 与 internal/connect/mysql.go 的 readEngines 是同一条 SQL、两个入口：引擎/快照
+// 走这个 Catalog()，预检/控制面走那个。只填一处就会出现「预检说降级、收尾不标注」
+// （或反过来）——这正是 MY-08 最容易漏的一格。
+//
+// 读失败不阻断：返回 nil，判据把每张表都当「没有事务」→ 降级（宁可多一句，
+// 也不许一次假绿）。
+func (s *Source) readEngines(ctx context.Context) map[string]bool {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT ENGINE, COALESCE(TRANSACTIONS,'') FROM information_schema.ENGINES`)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	out := map[string]bool{}
+	for rows.Next() {
+		var engine, tx string
+		if err := rows.Scan(&engine, &tx); err != nil {
+			return nil
+		}
+		out[strings.ToUpper(engine)] = strings.EqualFold(strings.TrimSpace(tx), "YES")
+	}
+	if err := rows.Err(); err != nil {
+		return nil
+	}
+	return out
 }
 
 // SnapshotNote records how the consistency point was taken and what the

@@ -258,7 +258,10 @@ func (p *Prober) checks(res *ProbeResult, vars map[string]string, grants string,
 	}
 	if strings.EqualFold(res.Server.Flavor, "mariadb") {
 		out = append(out, source.Check{
-			// MY-08 在 docs/SPEC.md:107 是「表的存储引擎」（MyISAM → warn 照跑），
+			// MY-08 在 docs/SPEC.md §3「MySQL」是「表的存储引擎**有没有事务**」
+			//（判据 = 服务器自报的 information_schema.ENGINES.TRANSACTIONS，
+			// 降级照跑；唯一入口 preflight.JudgeEngines，本文件不参与——Prober 只有
+			// 服务器级变量与 grant，拿不到 Catalog.Table.Engine）。
 			// 这条 MariaDB 检查之前错占了 MY-08；MY-09/MY-10 也已留给 SPEC 的
 			// 认证插件 / 主从角色，所以用下一个空号 MY-11。
 			ID: "MY-11", Title: "这是 MariaDB，本期不支持",
