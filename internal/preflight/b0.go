@@ -529,25 +529,26 @@ func existingTargetTables(cat *source.Catalog, tables []string) []string {
 //
 // 一张卡按档聚合：有 blocked 就 blocked，否则有 warn 就 warn（红线 §6.7：同一份报告不许两句互相矛盾）。
 func targetUniqueKeyChecks(in Input) []source.Check {
-	if in.TargetCat == nil {
-		// 目标表清单没读到：TARGET-01 已经说了「开跑时会再检查」，这里不重复、也不假装知道。
+	if in.TargetCat == nil || in.SourceCat == nil {
+		// 任一侧目录没读到：不假装核对过（TARGET-01 / SCOPE-01 已经说过各自的缺失）。
 		return nil
+	}
+	src := map[string]*source.Table{}
+	for i := range in.SourceCat.Tables {
+		src[in.SourceCat.Tables[i].Table] = &in.SourceCat.Tables[i]
 	}
 	tgt := map[string]*source.Table{}
 	for i := range in.TargetCat.Tables {
 		tgt[in.TargetCat.Tables[i].Table] = &in.TargetCat.Tables[i]
 	}
-	srcPK := map[string]bool{}
-	if in.SourceCat != nil {
-		for _, t := range in.SourceCat.Tables {
-			srcPK[t.Table] = t.HasStablePK
-		}
-	}
+	// 整轮重搬的模式（once / full_interval）不需要行身份：目标端每轮被清空重写，
+	// 与 SCOPE-02「无主键表不影响这个模式」同口径——这里再说「改成 once」就是自打脸（红线 §6.7）。
+	wholeTable := in.Mode == "once" || in.Mode == "full_interval"
 
 	var blocked, warnNoPK, warnIgnored, warnNoMatch, warnOtherKey []string
 	blockedWhy := map[string]string{}
 	for _, name := range in.Tables {
-		hasPK, known := srcPK[name]
+		st, known := src[name]
 		if !known {
 			continue // SCOPE-01 会报「源端没有这张表」，这里不重复
 		}
@@ -555,19 +556,26 @@ func targetUniqueKeyChecks(in Input) []source.Check {
 		t := tgt[name]
 
 		switch {
-		case hasPK && len(declared) > 0:
+		case st.HasStablePK && len(declared) > 0:
 			// §2.2 格 7：表已有主键，声明被忽略（照主键走），只提示一句。
 			warnIgnored = append(warnIgnored, name)
-		case hasPK:
+		case st.HasStablePK:
 			// 源端有主键：目标端将来由我们建表时自带主键；复用用户表时才可能缺键。
-			if t == nil || len(t.PrimaryKey) > 0 {
-				continue // 目标端还没有这张表（建表时按源端主键建），或已经有主键
+			if t == nil {
+				continue // 目标端还没有这张表：建表时按源端主键建
 			}
-			if len(t.UniqueKeys) == 0 {
+			if len(t.PrimaryKey) > 0 && sameColumnSet(t.PrimaryKey, st.PrimaryKey) {
+				continue // 目标端主键与源端一致
+			}
+			switch {
+			case len(t.PrimaryKey) > 0:
+				// 目标端有主键，但和源端不是同一组列：无所谓「按源端主键更新」。
+				warnOtherKey = append(warnOtherKey, name)
+			case len(t.UniqueKeys) == 0:
 				// 一条唯一索引都没有：upsert 直接不成立（ErrNoUniqueKey）。
 				warnNoMatch = append(warnNoMatch, name)
-			} else {
-				// 有唯一索引但不是源端主键那组：upsert 会照它更新，语义不等于「按源端主键」。
+			default:
+				// 有唯一索引但不是源端主键那组。
 				warnOtherKey = append(warnOtherKey, name)
 			}
 		case len(declared) > 0:
@@ -585,6 +593,9 @@ func targetUniqueKeyChecks(in Input) []source.Check {
 				blockedWhy[name] = why
 			}
 		default:
+			if wholeTable {
+				continue // 整轮重搬：目标端每轮重写，不需要行身份
+			}
 			// 源端无主键、也没声明：insert-only。目标端即使有唯一索引也不会被自动使用（R1）。
 			warnNoPK = append(warnNoPK, name)
 		}
@@ -607,20 +618,23 @@ func targetUniqueKeyChecks(in Input) []source.Check {
 	if len(warnNoPK) > 0 {
 		sort.Strings(warnNoPK)
 		parts = append(parts, fmt.Sprintf("%s 没有主键也没声明 unique_key：目标端只追加（改/删会让这张表暂停并欠一次整表重搬；重放窗口内可能重复行）。"+
-			"要 upsert 就在 content.tables.<表> 里写 unique_key: [列…]（必须是目标端已有、列都非空的唯一索引），或把 mode.frequency 改成 once / full_interval",
+			"要 upsert 就在 content.tables.<表> 里写 unique_key: [列…]（必须是目标端已有、列都非空的唯一索引/主键），或把 mode.frequency 改成 once / full_interval",
 			preview(warnNoPK)))
 		affected = append(affected, warnNoPK...)
 	}
 	if len(warnIgnored) > 0 {
 		sort.Strings(warnIgnored)
-		parts = append(parts, fmt.Sprintf("%s 源端已有主键：unique_key 声明被忽略（按主键走，行为不变）——别以为换了身份",
-			preview(warnIgnored)))
+		parts = append(parts, fmt.Sprintf("%s 源端已有主键：unique_key 声明被忽略（按主键走，行为不变）——"+
+			"只有你把主键列用 columns.exclude 排掉、行身份真的缺了，它才会生效", preview(warnIgnored)))
 		affected = append(affected, warnIgnored...)
 	}
 	if len(warnOtherKey) > 0 {
 		sort.Strings(warnOtherKey)
-		parts = append(parts, fmt.Sprintf("%s 源端有主键、目标表却只有另一组唯一索引：upsert 会照那组索引更新（不是按源端主键）——两者不重合时会改到「另一条」记录，建议把目标端主键对齐源端",
-			preview(warnOtherKey)))
+		advice := "upsert 会照目标端现有的唯一键（或主键）更新，不是按源端主键；两者不重合时会改到「另一条」记录，建议把目标端主键对齐源端"
+		if in.TargetKind != "mysql" {
+			advice = "upsert 会失败（PostgreSQL 的 ON CONFLICT 要的那组键在目标端不存在，报 42P10）；给目标表加上与源端一致的主键或唯一索引，或把这几张表改成只追加"
+		}
+		parts = append(parts, fmt.Sprintf("%s 源端有主键，但目标表的主键/唯一键和它不一致：%s", preview(warnOtherKey), advice))
 		affected = append(affected, warnOtherKey...)
 	}
 	if len(warnNoMatch) > 0 {
@@ -632,28 +646,50 @@ func targetUniqueKeyChecks(in Input) []source.Check {
 
 	status := source.StatusWarn
 	title := "目标端的唯一键有需要你知道的地方"
+	code := ""
 	if len(blocked) > 0 {
 		status = source.StatusBlocked
 		title = "声明的 unique_key 与目标端事实不符"
+		// 挂 E1017（没有行身份族码）：没有码时 engine 会回落到 E1001「源库没开变更流水」，
+		// 用户会去改 wal_level——完全指错方向（Owl PR #120 P1）。
+		code = string(core.CodeNoIdentity)
 	}
 	return []source.Check{{
-		ID: "TARGET-02", Title: title, Status: status,
+		ID: "TARGET-02", Title: title, Status: status, Code: code,
 		Detail:   strings.Join(parts, "；"),
 		Affected: affected, Who: "you",
 	}}
 }
 
+// sameColumnSet 报告两组列名是否完全相同（顺序无关，重复视作不同）。
+func sameColumnSet(a, b []string) bool {
+	if len(a) != len(b) || len(a) == 0 {
+		return false
+	}
+	want := map[string]bool{}
+	for _, c := range a {
+		want[c] = true
+	}
+	if len(want) != len(a) {
+		return false
+	}
+	for _, c := range b {
+		if !want[c] {
+			return false
+		}
+	}
+	return true
+}
+
 // uniqueKeyMatches 实现 §4.3 的目标端核对判据（五条全过才算「唯一键可用」）。
+// 候选索引 = 目录里的唯一索引 **∪ 主键**（主键本身就是唯一索引，`ON CONFLICT`/
+// `ON DUPLICATE KEY` 都命中它；把它排除会把「目标端已有主键」判成 blocked）。
 // 目录层已过滤掉部分/表达式/前缀索引（connect 的两个 Catalog），这里补两条：
 //   - 列集合与声明**完全一致**（顺序无关，不多不少）；
-//   - 每一列都 NOT NULL（两边都把 NULL 当互不相等）。
+//   - 每一列都 NOT NULL（两边都把 NULL 当互不相等；主键列天然非空）。
 //
 // 不过时返回一句能直接写进卡片的「哪条判据不过」，不返回布尔完事。
 func uniqueKeyMatches(t *source.Table, declared []string) (bool, string) {
-	want := map[string]bool{}
-	for _, c := range declared {
-		want[c] = true
-	}
 	nullable := map[string]bool{}
 	have := map[string]bool{}
 	for _, c := range t.Columns {
@@ -665,31 +701,31 @@ func uniqueKeyMatches(t *source.Table, declared []string) (bool, string) {
 			return false, fmt.Sprintf("目标端没有列 %s（声明的列必须都在目标表里）", c)
 		}
 	}
+	candidates := append([][]string{}, t.UniqueKeys...)
+	if len(t.PrimaryKey) > 0 {
+		// 主键列一定非空：把可空性放宽，按「非空」参与判断。
+		candidates = append(candidates, t.PrimaryKey)
+		for _, c := range t.PrimaryKey {
+			nullable[c] = false
+		}
+	}
 	var existing []string
-	for _, key := range t.UniqueKeys {
-		if len(key) == len(declared) {
-			same := true
-			for _, c := range key {
-				if !want[c] {
-					same = false
-					break
-				}
-			}
-			if same {
-				for _, c := range key {
-					if nullable[c] {
-						return false, fmt.Sprintf("唯一索引 (%s) 的列 %s 允许为空：NULL 互不相等，这组列不构成唯一性", strings.Join(key, ", "), c)
-					}
-				}
-				return true, ""
+	for _, key := range candidates {
+		existing = append(existing, "("+strings.Join(key, ", ")+")")
+		if !sameColumnSet(key, declared) {
+			continue
+		}
+		for _, c := range key {
+			if nullable[c] {
+				return false, fmt.Sprintf("唯一索引 (%s) 的列 %s 允许为空：NULL 互不相等，这组列不构成唯一性", strings.Join(key, ", "), c)
 			}
 		}
-		existing = append(existing, "("+strings.Join(key, ", ")+")")
+		return true, ""
 	}
 	if len(existing) == 0 {
-		return false, "目标端这张表没有任何可用唯一索引（要求：非主键、非部分、非表达式、无前缀长度）"
+		return false, "目标端这张表没有任何可用唯一索引或主键（要求：非部分、非表达式、无前缀长度）"
 	}
-	return false, fmt.Sprintf("目标端唯一索引是 %s，与声明 (%s) 的列集合不一致",
+	return false, fmt.Sprintf("目标端唯一索引/主键是 %s，与声明 (%s) 的列集合不一致",
 		strings.Join(existing, "、"), strings.Join(declared, ", "))
 }
 

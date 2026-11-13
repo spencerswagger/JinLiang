@@ -45,17 +45,19 @@ type declaredCheck struct {
 	why string
 }
 
-// declaredKeyFor 返回这张表生效的声明行身份；源端有主键时声明被忽略（§4.2 第 4 条：
-// 主键就是身份，换一组列当身份会让同一条数据两次同步用两个身份）。
+// declaredKeyFor 返回这张表生效的声明行身份；源端有**可用**主键时声明被忽略
+// （§4.2 第 4 条：主键就是身份，换一组列当身份会让同一条数据两次同步用两个身份）。
+// 「可用」= 主键列没被 columns.include/exclude 排掉（判据与 pgsink 的 hasPK 同一份）。
 func (s *Sink) declaredKeyFor(table source.TableRef, rel *source.Table) []string {
-	if rel != nil && rel.HasStablePK {
+	if hasUsablePK(rel) {
 		return nil
 	}
 	return s.opt.UniqueKeys[table.Table]
 }
 
 // verifyDeclaredKey 实现 §4.3 的目标端核对判据（五条全过才算「唯一键可用」）：
-// 存在非主键、非部分、非表达式、无前缀长度、列集合与声明完全一致、且列都 NOT NULL 的唯一索引。
+// 存在一条唯一索引（**含主键**——主键本来就是唯一索引，`ON DUPLICATE KEY` 也命中它）、
+// 非部分、非表达式、无前缀长度、列集合与声明完全一致、且列都 NOT NULL。
 // 目录层（connect.Catalog）已过滤掉部分/表达式/前缀索引，这里再按同一判据复核一遍：
 // 从声明到写入之间目标端可能被改过（索引被删/换），运行时要响，而不是静默写重复（R3）。
 func (s *Sink) verifyDeclaredKey(ctx context.Context, table source.TableRef, key []string) (bool, string, error) {
@@ -66,7 +68,7 @@ func (s *Sink) verifyDeclaredKey(ctx context.Context, table source.TableRef, key
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT INDEX_NAME, COLUMN_NAME FROM information_schema.STATISTICS
 		WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND NON_UNIQUE = 0
-		  AND INDEX_NAME <> 'PRIMARY' AND SUB_PART IS NULL AND COLUMN_NAME IS NOT NULL
+		  AND SUB_PART IS NULL AND COLUMN_NAME IS NOT NULL
 		ORDER BY INDEX_NAME, SEQ_IN_INDEX`,
 		s.schemaOf(table), table.Table)
 	if err != nil {
@@ -114,7 +116,7 @@ func (s *Sink) verifyDeclaredKey(ctx context.Context, table source.TableRef, key
 		}
 	}
 	if match == nil {
-		res := declaredCheck{ok: false, why: "目标端这张表没有与声明逐列一致的可用唯一索引（要求：非主键、非部分、非表达式、无前缀长度）"}
+		res := declaredCheck{ok: false, why: "目标端这张表没有与声明逐列一致的可用唯一索引/主键（要求：非部分、非表达式、无前缀长度）"}
 		if len(existing) > 0 {
 			res.why = fmt.Sprintf("目标端唯一索引是 %s，与声明 (%s) 的列集合不一致",
 				strings.Join(existing, "、"), strings.Join(key, ", "))

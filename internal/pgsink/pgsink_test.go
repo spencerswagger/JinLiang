@@ -296,8 +296,7 @@ func TestCompatibleTypeUnboundedArgs(t *testing.T) {
 // 声明列覆盖全部列时 DO NOTHING（重复命中即为一致，更新声明列本身没有意义）。
 func TestConflictClauseUsesDeclaredKey(t *testing.T) {
 	ti := &tableInfo{cols: []string{"tenant_id", "event_no", "payload"},
-		declared: []string{"tenant_no_missing"}}
-	ti.declared = []string{"tenant_id", "event_no"}
+		declared: []string{"tenant_id", "event_no"}}
 	got := conflictClause(ti)
 	if !strings.Contains(got, `ON CONFLICT ("tenant_id", "event_no") DO UPDATE SET`) {
 		t.Fatalf("声明身份的 upsert 尾句不对: %s", got)

@@ -1362,6 +1362,8 @@ func (s *Sink) alignRelationTx(ctx context.Context, tx pgx.Tx, ev source.Event) 
 		}
 	}
 	if len(added) > 0 {
+		// 结构变了：声明核对的结论要重新问一遍（不能让「上次核过」挡住下一次核对）。
+		delete(s.declaredChecked, key)
 		log.Printf("%s 跟随源端新增了 %d 列（%s）", ev.Table.Table, len(added), strings.Join(added, ", "))
 	}
 	return nil
@@ -2237,7 +2239,7 @@ func (s *Sink) ensureDeclared(ctx context.Context, ti *tableInfo) error {
 		JOIN pg_namespace n ON n.oid = c.relnamespace
 		JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = ANY(%s)
 		WHERE n.nspname = $1 AND c.relname = $2
-		  AND x.indisunique AND NOT x.indisprimary
+		  AND x.indisunique
 		  AND x.indpred IS NULL AND x.indexprs IS NULL
 		ORDER BY ic.relname, array_position(%s, a.attnum)`, keyExpr, keyExpr)
 	rows, err := s.conn.Query(ctx, q, ti.ref.Schema, ti.ref.Table)
@@ -2288,7 +2290,7 @@ func (s *Sink) ensureDeclared(ctx context.Context, ti *tableInfo) error {
 	why := ""
 	if match == nil {
 		if len(existing) == 0 {
-			why = "目标端这张表没有任何可用唯一索引（要求：非主键、非部分、非表达式）"
+			why = "目标端这张表没有任何可用唯一索引或主键（要求：非部分、非表达式）"
 		} else {
 			why = fmt.Sprintf("目标端唯一索引是 %s，与声明 (%s) 的列集合不一致",
 				strings.Join(existing, "、"), strings.Join(key, ", "))

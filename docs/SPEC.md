@@ -98,7 +98,7 @@
 | ID | 检查 | 不通过时 |
 |---|---|---|
 | TARGET-01 | 目标端是否已有同名表 | `on_exists=error`（默认）时 blocked：改 `append`，或换 schema |
-| TARGET-02 | 目标端能不能定位这一行：主键，或你在 `content.tables.<表>.unique_key` 里声明的唯一键（要求目标端已有**非主键、非部分、非表达式、无前缀长度、列集合完全一致、且列都 NOT NULL** 的唯一索引） | 声明与事实不符 → **blocked**（并点名哪条判据不过）；源端无主键又没声明 → warn（只追加，改/删会让这张表暂停）；源端已有主键时声明被忽略 + warn。口径见 `DESIGN-NO-PRIMARY-KEY.md §3.4/§4.3` |
+| TARGET-02 | 目标端能不能定位这一行：主键，或你在 `content.tables.<表>.unique_key` 里声明的唯一键（要求目标端已有**主键或唯一索引**，且非部分、非表达式、无前缀长度、列集合完全一致、列都 NOT NULL） | 声明与事实不符 → **blocked**（挂 `E1017`，并点名哪条判据不过）；源端无主键又没声明 → warn（只追加，改/删会让这张表暂停）；`once`/`full_interval` 下不需要行身份，不提示；源端已有主键时声明被忽略 + warn。口径见 `DESIGN-NO-PRIMARY-KEY.md §3.4/§4.3` |
 
 ### MySQL
 | ID | 检查 | 不通过时 |

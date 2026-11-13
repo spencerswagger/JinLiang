@@ -1031,3 +1031,54 @@ func TestIntegrationDeclaredUniqueKeyMismatchFails(t *testing.T) {
 		t.Fatalf("失败时不能写行，实际 %d", n)
 	}
 }
+
+// 声明比真实索引「宽」时，一条 DELETE 会按声明列删掉整组行——所以核对必须在
+// **Apply 入口、整批前置**，不能只挂在 upsert 分支（Owl PR #120 P0）。
+func TestIntegrationDeclaredKeyMismatchBlocksDeleteToo(t *testing.T) {
+	s := openSink(t, func(o *Options) {
+		o.OnExists = OnExistsAppend
+		// 目标端唯一索引是 (tenant_id,event_no)，声明只写了 tenant_id。
+		o.UniqueKeys = map[string][]string{"jl_b5_del": {"tenant_id"}}
+	})
+	dropTable(t, s, "jl_b5_del")
+	defer dropTable(t, s, "jl_b5_del")
+	if _, err := s.db.ExecContext(context.Background(),
+		"CREATE TABLE `jl_b5_del` (tenant_id int NOT NULL, event_no varchar(16) NOT NULL, payload varchar(32), UNIQUE KEY uk_event (tenant_id,event_no))"); err != nil {
+		t.Fatalf("建表: %v", err)
+	}
+	if _, err := s.db.ExecContext(context.Background(),
+		"INSERT INTO `jl_b5_del` VALUES (1,'e1','a'),(1,'e2','b')"); err != nil {
+		t.Fatalf("灌数据: %v", err)
+	}
+	rel := &source.Table{
+		TableRef: source.TableRef{Table: "jl_b5_del"},
+		Columns: []source.Column{
+			{Name: "tenant_id", Type: "int"},
+			{Name: "event_no", Type: "varchar(16)"},
+			{Name: "payload", Type: "varchar(32)", Nullable: true},
+		},
+		HasStablePK: false,
+	}
+	// 只有一条 DELETE 的批次：没有 upsert 分支可挂核对，正是漏洞所在。
+	del := []source.Event{
+		{Kind: source.EvBegin, TxID: "tx"},
+		{Kind: source.EvDelete, TxID: "tx", Table: source.TableRef{Table: "jl_b5_del"},
+			Relation: rel,
+			Old: source.Row{Table: source.TableRef{Table: "jl_b5_del"}, Values: []source.Value{
+				{Kind: source.KindInt, I: int64(1)}, {Kind: source.KindString, S: "e1"}, {Kind: source.KindString, S: "a"}}}},
+		{Kind: source.EvCommit, TxID: "tx"},
+	}
+	err := s.Apply(context.Background(), del, posOf(t, "mysql:v1:file=binlog.000001;pos=1000;coord=mysql_file_pos"))
+	if err == nil {
+		t.Fatal("声明与目标端索引不一致时，DELETE 也必须被拦下（否则会删掉整组行还返回成功）")
+	}
+	if !errors.Is(err, ErrNoUniqueKey) {
+		t.Fatalf("错误应可判为 ErrNoUniqueKey: %v", err)
+	}
+	if n := countRows(t, s, "jl_b5_del"); n != 2 {
+		t.Fatalf("被拦下时一行都不能删，实际剩 %d 行", n)
+	}
+	if p, _ := s.MetaPosition(context.Background()); strings.Contains(p, "pos=1000") {
+		t.Fatalf("失败时位点不能前进: %q", p)
+	}
+}

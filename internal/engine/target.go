@@ -894,20 +894,8 @@ func (r *runner) targetRef(ref source.TableRef) source.TableRef {
 // key 用**裸表名**：源端与目标端只差 schema，裸表名两边一致，所以同一份 map
 // 既能喂 preflight（源端口径）也能喂 sink.Options.UniqueKeys（目标端口径，§4.4）。
 func (r *runner) declaredUniqueKeys() map[string][]string {
-	if r.doc.Content == nil || len(r.doc.Content.Tables) == 0 {
-		return nil
-	}
-	out := map[string][]string{}
-	for name, t := range r.doc.Content.Tables {
-		if len(t.UniqueKey) == 0 {
-			continue
-		}
-		out[name] = append([]string(nil), t.UniqueKey...)
-	}
-	if len(out) == 0 {
-		return nil
-	}
-	return out
+	// 解析口径只写一份：`control.JobDoc.DeclaredUniqueKeys`（key 用裸表名）。
+	return r.doc.DeclaredUniqueKeys()
 }
 
 // relationOf 给出这张表这一版的列定义（引擎据此告诉目标端「值按什么列序」）。

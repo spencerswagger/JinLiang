@@ -47,11 +47,8 @@ const (
 )
 
 // codeNoIdentity 是无主键表收到改/删时的错误码（E1017，docs/DESIGN-NO-PRIMARY-KEY.md §2.3）。
-//
-// 码表条目（`core.CodeNoIdentity` + `docs/ERRORS.md` 那一行）由 Ark 同批落 codes.go——
-// 本片只接线：条目到位后把这里换成 `core.CodeNoIdentity` 即可，语义一个字都不变。
-// 条目到位前 `core.Lookup` 不命中，last_error 仍带 `[E1017]`，不会静默降级。
-const codeNoIdentity = core.Code("E1017")
+// 码表条目在 `core.CodeNoIdentity`（#119 已落）；这里只是给分类那一段一个短名字。
+const codeNoIdentity = core.CodeNoIdentity
 
 // Options is one engine invocation.
 type Options struct {

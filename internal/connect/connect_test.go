@@ -154,6 +154,8 @@ func TestPostgresCatalogCollectsUniqueIndexes(t *testing.T) {
 		"CREATE UNIQUE INDEX jl_uk_c ON public." + table + " (c)",                                 // 可空列：照收，由预检判
 		"CREATE UNIQUE INDEX jl_uk_partial ON public." + table + " (note) WHERE note IS NOT NULL", // 部分索引：不收
 		"CREATE UNIQUE INDEX jl_uk_expr ON public." + table + " (lower(note))",                    // 表达式索引：不收
+		// INCLUDE 列只是覆盖列，不参与唯一性：漏了 indnkeyatts 切片就会多出 note（PG 11+）。
+		"CREATE UNIQUE INDEX jl_uk_inc ON public." + table + " (a, b) INCLUDE (note)",
 	}
 	for _, q := range stmts {
 		if _, err := db.ExecContext(ctx, q); err != nil {
@@ -175,19 +177,22 @@ func TestPostgresCatalogCollectsUniqueIndexes(t *testing.T) {
 			got = tbl.UniqueKeys
 		}
 	}
-	want := map[string]bool{"a,b": true, "c": true}
-	if len(got) != len(want) {
-		t.Fatalf("应收到 2 组唯一键（a,b 与 c），实际 %v", got)
+	// (a,b) 出现两次（jl_uk_ab 与带 INCLUDE 的 jl_uk_inc），外加 (c)：三组，但没有 note。
+	want := map[string]int{"a,b": 2, "c": 1}
+	if len(got) != 3 {
+		t.Fatalf("应收到 3 组唯一键（a,b ×2 与 c），实际 %v", got)
 	}
 	for _, key := range got {
 		joined := strings.Join(key, ",")
-		if !want[joined] {
-			t.Fatalf("多收了不该收的唯一索引 %v（部分/表达式索引必须滤掉）", key)
+		if want[joined] == 0 {
+			t.Fatalf("多收了不该收的唯一索引 %v（部分/表达式/INCLUDE 列必须滤掉）", key)
 		}
-		delete(want, joined)
+		want[joined]--
 	}
-	if len(want) != 0 {
-		t.Fatalf("漏了唯一索引 %v", want)
+	for k, n := range want {
+		if n != 0 {
+			t.Fatalf("唯一索引 (%s) 少了 %d 组", k, n)
+		}
 	}
 }
 

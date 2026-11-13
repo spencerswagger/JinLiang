@@ -49,6 +49,14 @@ func (s *Sink) Apply(ctx context.Context, evs []source.Event, pos source.Positio
 			"不该把这张表的行交到这里）", ev.Table.Table)
 	}
 
+	// 声明的 unique_key 必须在写任何一行之前核对（§4.3 五条判据）：
+	// 放在 Apply 入口、整批一起判，而不是分散在每个写分支里——**DELETE 也要过**。
+	// 反例（Owl PR #120 P0）：只核对 upsert 路径时，声明 [tenant] 而目标端唯一索引是
+	// (tenant,event_no)，一条 DELETE 会按 tenant 删掉这个租户下的**所有**行，还返回成功。
+	if err := s.checkDeclared(ctx, evs); err != nil {
+		return err
+	}
+
 	if !batchHasImplicitCommit(evs) {
 		tx, err := s.db.BeginTx(ctx, nil)
 		if err != nil {
@@ -217,20 +225,8 @@ func (s *Sink) applyUpserts(ctx context.Context, tx *sql.Tx, evs []source.Event)
 	var stmt string
 	switch {
 	case len(declared) > 0:
-		// 用户声明了行身份（unique_key）：upsert 多了一组「按它定位」的列。
-		// 声明必须与目标端索引逐列一致（§4.3）——MySQL 的 ON DUPLICATE KEY 命中任意
-		// 唯一索引，声明与索引不一致时不会报错，只会静默按别的键更新（R3）。
-		ok, why, err := s.verifyDeclaredKey(ctx, table, declared)
-		if err != nil {
-			return err
-		}
-		if !ok {
-			return fmt.Errorf("%w：%s 声明了 unique_key (%s)，但目标端核对不过：%s。"+
-				"三种做法任选：① 在目标端建一条与声明逐列一致的唯一索引（推荐）；"+
-				"② 改声明去匹配目标端已有的唯一索引；③ 去掉声明，这张表退回 insert-only（只追加）。"+
-				"风险：声明与事实不符时 upsert 会静默写重复，所以这里必须停",
-				ErrNoUniqueKey, qualified(table), strings.Join(declared, ", "), why)
-		}
+		// 声明已核过（checkDeclared 在 Apply 入口整批前置）；这里只按它改写法：
+		// 更新集排除声明列，避免 `键列=EXCLUDED.键列` 这种无意义甚至改键的赋值。
 		updateCols = exclude(cols, declared)
 		stmt = s.upsertSQL(table, cols, len(evs), updateCols)
 	case insertOnly(rel):
@@ -275,17 +271,73 @@ func (s *Sink) applyUpserts(ctx context.Context, tx *sql.Tx, evs []source.Event)
 	return nil
 }
 
-// insertOnly 判定一张表是否只能 insert-only：源端没有稳定主键（R1：身份只认源端）。
+// checkDeclared 在写任何一行之前核对「声明的 unique_key vs 目标端实际索引」。
+//
+// 判据见 docs/DESIGN-NO-PRIMARY-KEY.md §4.3（五条全过才算唯一键可用）。为什么要在
+// **入口整批判**而不是只在 upsert 分支：DELETE 也靠声明列定位——声明比真实索引宽时
+// （声明 [tenant]、索引 (tenant,event_no)），一条 DELETE 会误删整组行且返回成功。
+// 每张表只核一次（declaredCache），同批其它事件不重复查库。
+func (s *Sink) checkDeclared(ctx context.Context, evs []source.Event) error {
+	seen := map[string]bool{}
+	for _, ev := range evs {
+		if ev.Table.Table == "" || seen[ev.Table.Table] {
+			continue
+		}
+		key := s.declaredKeyFor(ev.Table, ev.Relation)
+		if len(key) == 0 {
+			continue
+		}
+		seen[ev.Table.Table] = true
+		ok, why, err := s.verifyDeclaredKey(ctx, ev.Table, key)
+		if err != nil {
+			return err
+		}
+		if ok {
+			continue
+		}
+		return fmt.Errorf("%w：%s 声明了 unique_key (%s)，但目标端核对不过：%s。"+
+			"三种做法任选：① 在目标端建一条与声明逐列一致的唯一索引（推荐）；"+
+			"② 改声明去匹配目标端已有的唯一索引；③ 去掉声明，这张表退回 insert-only（只追加）。"+
+			"风险：声明与事实不符时 upsert 会按别的键更新、删除会多删，所以这里必须停",
+			ErrNoUniqueKey, qualified(ev.Table), strings.Join(key, ", "), why)
+	}
+	return nil
+}
+
+// insertOnly 判定一张表是否只能 insert-only：源端没有**可用**的稳定主键（R1：身份只认源端）。
 // Relation 缺失（拿不到源端目录）时**不猜**——没有身份信息就按老规矩要求目标端唯一键，
 // 避免把 upsert 悄悄降级成纯 INSERT。
 func insertOnly(rel *source.Table) bool {
-	return rel != nil && !rel.HasStablePK
+	return rel != nil && !hasUsablePK(rel)
+}
+
+// hasUsablePK 报告源端主键是不是**真的能用**：有稳定主键，且主键列都在这次交付的列里。
+//
+// 为什么多这一条：`columns.include/exclude` 可能把主键列排掉，那时目标端根本没有
+// 那几列可定位——upsert 的 SQL 会拼出「引用了不存在的列」。pgsink 早就是这个口径
+// （`buildTables` 里 pkIdx 不全就按无主键处理），这里对齐，免得「预检说按主键、写路径
+// 却按声明」两套身份（Owl PR #120 P2）。
+func hasUsablePK(rel *source.Table) bool {
+	if rel == nil || !rel.HasStablePK || len(rel.PrimaryKey) == 0 {
+		return false
+	}
+	have := map[string]bool{}
+	for _, c := range rel.Columns {
+		have[strings.ToLower(c.Name)] = true
+	}
+	for _, k := range rel.PrimaryKey {
+		if !have[strings.ToLower(k)] {
+			return false
+		}
+	}
+	return true
 }
 
 // clearDeclaredCache 在目标端结构变了（DDL 跟随/重建索引）后失效声明核对结果。
 func (s *Sink) clearDeclaredCache(table string) {
+	prefix := "." + table + "\x00"
 	for k := range s.declaredCache {
-		if strings.HasSuffix(k, "."+table+"\x00") || strings.Contains(k, "."+table+"\x00") {
+		if strings.Contains(k, prefix) {
 			delete(s.declaredCache, k)
 		}
 	}

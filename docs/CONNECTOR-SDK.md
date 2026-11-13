@@ -35,7 +35,7 @@ connectors/<name>/
 | `Columns`（顺序） | 行值的**唯一**权威顺序（`Row.Values` 按它排） | 列错位 → 静默写错列 |
 | `PrimaryKey` | 源端主键列名（顺序有意义） | upsert/delete 定位不到行 |
 | `HasStablePK` | 源端有没有**稳定**主键（视图/无主键表为 false） | 被误当 upsert 表 → 重放插重复行 |
-| `UniqueKeys` | 目标端侧要核对的唯一索引列组（`[][]string`，每项一组列） | 声明 `unique_key` 的表核对不到索引 → 预检 `TARGET-02` 永远 blocked |
+| `UniqueKeys` | 目标端侧要核对的唯一索引列组（`[][]string`，每项一组列；**不含主键**——主键由 `PrimaryKey` 单独给，预检会把两者都当候选） | 声明 `unique_key` 的表核对不到索引 → 预检 `TARGET-02` 永远 blocked |
 
 `UniqueKeys` **只用于核对用户声明**（`content.tables.<表>.unique_key`），**不用来发现行身份**：
 身份只认源端主键或用户声明（R1）。收进来的索引必须已经过滤掉部分索引、表达式索引与前缀索引，
