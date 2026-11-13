@@ -34,10 +34,19 @@ func tgtTable(name string, pk []string, uniq [][]string, nullable ...string) sou
 }
 
 func srcTable(name string, hasPK bool) source.Table {
+	return srcTablePK(name, hasPK, "id")
+}
+
+// srcTablePK 让用例能指定源端主键列：否则「源端主键与目标端不同组」这类用例会被
+// 默认的 ["id"] 撞上目标端的 PK(id)，变成假绿（Owl PR #120 第 3 轮）。
+func srcTablePK(name string, hasPK bool, pk ...string) source.Table {
 	t := source.Table{TableRef: source.TableRef{Schema: "public", Table: name}, HasStablePK: hasPK}
 	if hasPK {
-		t.PrimaryKey = []string{"id"}
-		t.Columns = []source.Column{{Name: "id", Type: "bigint"}, {Name: "payload", Type: "text"}}
+		t.PrimaryKey = pk
+		for _, c := range pk {
+			t.Columns = append(t.Columns, source.Column{Name: c, Type: "bigint"})
+		}
+		t.Columns = append(t.Columns, source.Column{Name: "payload", Type: "text"})
 	}
 	return t
 }
@@ -403,12 +412,13 @@ func TestTarget02DeclaredIgnoredInWholeTableModeEvenIfTableMissing(t *testing.T)
 }
 
 // 目标端主键与源端不同组、但另有一条「源端主键那几列」的唯一索引：upsert 定位得到，别误报。
+// 源端主键必须**真的**是那组唯一索引的列，否则测不到新分支（假绿）。
 func TestTarget02DifferentPKButMatchingUniqueKeyIsOK(t *testing.T) {
 	rep := Run(Input{
 		SourceKind: "postgres", TargetKind: "postgres",
 		SourceVer: "16.2", TargetVer: "16.2",
 		SourceCaps: source.CapSet{source.CapCDC: {Supported: true}},
-		SourceCat:  catalog(srcTable("orders", true)),
+		SourceCat:  catalog(srcTablePK("orders", true, "tenant_id", "event_no")),
 		TargetCat:  catalog(tgtTable("orders", []string{"id"}, [][]string{{"tenant_id", "event_no"}})),
 		Tables:     []string{"orders"},
 		Mode:       "continuous+initial",
@@ -418,5 +428,32 @@ func TestTarget02DifferentPKButMatchingUniqueKeyIsOK(t *testing.T) {
 	c, ok := statusOf(rep, "TARGET-02")
 	if !ok || c.Status != source.StatusOK {
 		t.Fatalf("目标端另有与源端主键同列的唯一索引时应 ok，得到 %+v", c)
+	}
+}
+
+// 那组键存在但含可空列：ON CONFLICT 照收（不报 42P10），真实风险是 NULL 行互不冲突 →
+// 重放插重复。文案必须说的是这个风险，不能沿用「键不存在」（Owl PR #120 第 3 轮必改 2）。
+func TestTarget02MatchingKeyWithNullableColumnWarnsAboutNulls(t *testing.T) {
+	rep := Run(Input{
+		SourceKind: "postgres", TargetKind: "postgres",
+		SourceVer: "16.2", TargetVer: "16.2",
+		SourceCaps: source.CapSet{source.CapCDC: {Supported: true}},
+		SourceCat:  catalog(srcTablePK("orders", true, "tenant_id", "event_no")),
+		// 目标端 PK(id) 不同组，唯一索引 (tenant_id,event_no) 命中源端主键，但 event_no 可空。
+		TargetCat: catalog(tgtTable("orders", []string{"id"}, [][]string{{"tenant_id", "event_no"}}, "event_no")),
+		Tables:    []string{"orders"},
+		Mode:      "continuous+initial",
+		OnExists:  "append",
+		BatchRows: 500,
+	})
+	c, ok := statusOf(rep, "TARGET-02")
+	if !ok || c.Status != source.StatusWarn {
+		t.Fatalf("可空列应 warn，得到 %+v", c)
+	}
+	if strings.Contains(c.Detail, "42P10") {
+		t.Fatalf("那组键是存在的，不该说「不存在/42P10」：%s", c.Detail)
+	}
+	if !strings.Contains(c.Detail, "NULL 互不相等") {
+		t.Fatalf("要说清真实风险（NULL 行互不冲突 → 重复），得到：%s", c.Detail)
 	}
 }

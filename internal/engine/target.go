@@ -105,7 +105,7 @@ func newTargetSink(ctx context.Context, r *runner) (targetSink, error) {
 			InstanceID: r.instID,
 			SourceKind: catalogEngine(r.srcEP.Kind),
 			OnExists:   mysqlsink.OnExists(r.doc.Target.OnExists),
-			UniqueKeys: r.declaredUniqueKeys(),
+			UniqueKeys: r.sinkDeclaredUniqueKeys(),
 		})
 		if err != nil {
 			return nil, fmt.Errorf("连不上 MySQL 目标端（%s）: %w", r.tgtEP.Redacted(), err)
@@ -893,15 +893,24 @@ func (r *runner) targetRef(ref source.TableRef) source.TableRef {
 // declaredUniqueKeys 是用户声明的行身份（content.tables.<表>.unique_key），
 // key 用**裸表名**：源端与目标端只差 schema，裸表名两边一致，所以同一份 map
 // 既能喂 preflight（源端口径）也能喂 sink.Options.UniqueKeys（目标端口径，§4.4）。
+// declaredUniqueKeys 是**预检**用的声明（raw）：声明写错了要能提示，哪怕当前模式用不上它。
+// 解析口径只写一份：`control.JobDoc.DeclaredUniqueKeys`（key 用裸表名）。
 func (r *runner) declaredUniqueKeys() map[string][]string {
-	// 整轮重搬的模式（once / full_interval）每轮清空重写，行身份用不上：
-	// 声明在这里**不生效**（与预检 TARGET-02 同口径），别让写路径拿它去 upsert。
+	return r.doc.DeclaredUniqueKeys()
+}
+
+// sinkDeclaredUniqueKeys 是**写路径**用的声明：整轮重搬的模式（once / full_interval）
+// 每轮清空重写，行身份用不上，声明在这里不生效——别让 sink 拿它去 upsert / 定位删除。
+//
+// 为什么和 declaredUniqueKeys 分开：预检要看到用户写了什么（写错了要提示），
+// sink 只该拿到「这张模式下真的会生效」的那份。两者混用会让同一条任务的
+// `jinliang plan` 与 run 的预检给出两份不同的报告（Owl PR #120 第 3 轮）。
+func (r *runner) sinkDeclaredUniqueKeys() map[string][]string {
 	switch r.doc.Mode.Frequency {
 	case "once", "full_interval":
 		return nil
 	}
-	// 解析口径只写一份：`control.JobDoc.DeclaredUniqueKeys`（key 用裸表名）。
-	return r.doc.DeclaredUniqueKeys()
+	return r.declaredUniqueKeys()
 }
 
 // relationOf 给出这张表这一版的列定义（引擎据此告诉目标端「值按什么列序」）。

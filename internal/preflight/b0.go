@@ -545,7 +545,7 @@ func targetUniqueKeyChecks(in Input) []source.Check {
 	// 与 SCOPE-02「无主键表不影响这个模式」同口径——这里再说「改成 once」就是自打脸（红线 §6.7）。
 	wholeTable := in.Mode == "once" || in.Mode == "full_interval"
 
-	var blocked, warnNoPK, warnIgnored, warnNoMatch, warnOtherKey []string
+	var blocked, warnNoPK, warnIgnored, warnNoMatch, warnOtherKey, warnNullable []string
 	blockedWhy := map[string]string{}
 	for _, name := range in.Tables {
 		st, known := src[name]
@@ -578,7 +578,14 @@ func targetUniqueKeyChecks(in Input) []source.Check {
 				// 目标端主键与源端不同组：但如果另有一条唯一索引正好是源端主键那几列，
 				// upsert 定位得到（PG 的 ON CONFLICT / MySQL 的 ON DUPLICATE KEY 都认唯一索引），
 				// 那就不是问题（Owl PR #120 第 2 轮 P2-2 的真库反例）。
-				if ok, _ := uniqueKeyMatches(t, st.PrimaryKey); ok {
+				ok, why := uniqueKeyMatches(t, st.PrimaryKey)
+				if ok {
+					continue
+				}
+				if strings.Contains(why, "允许为空") {
+					// 那组列可空：ON CONFLICT 照收（不报 42P10），但 NULL 互不相等 →
+					// 带 NULL 的行不会互相冲突，重放就会插重复。真实风险 ≠ 「键不存在」。
+					warnNullable = append(warnNullable, fmt.Sprintf("%s：%s", name, why))
 					continue
 				}
 				warnOtherKey = append(warnOtherKey, name)
@@ -612,7 +619,8 @@ func targetUniqueKeyChecks(in Input) []source.Check {
 		}
 	}
 
-	if len(blocked) == 0 && len(warnNoPK) == 0 && len(warnIgnored) == 0 && len(warnNoMatch) == 0 && len(warnOtherKey) == 0 {
+	if len(blocked) == 0 && len(warnNoPK) == 0 && len(warnIgnored) == 0 && len(warnNoMatch) == 0 &&
+		len(warnOtherKey) == 0 && len(warnNullable) == 0 {
 		return []source.Check{{ID: "TARGET-02", Title: "目标端的唯一键够用", Status: source.StatusOK,
 			Detail: "选中的表都能按主键（或声明的 unique_key）定位到行"}}
 	}
@@ -638,6 +646,13 @@ func targetUniqueKeyChecks(in Input) []source.Check {
 		parts = append(parts, fmt.Sprintf("%s 源端已有主键（或整轮重搬模式用不上行身份）：unique_key 声明被忽略——"+
 			"按主键 / 整表重搬走，行为不变（列过滤能力落地后，主键列被排掉时声明才会生效）", preview(warnIgnored)))
 		affected = append(affected, warnIgnored...)
+	}
+	if len(warnNullable) > 0 {
+		sort.Strings(warnNullable)
+		parts = append(parts, fmt.Sprintf("%s 目标端的唯一索引/主键含可空列：ON CONFLICT 照收，但 NULL 互不相等——"+
+			"带 NULL 的行不会互相冲突，重放/重复投递会插出多行。你能做的：把那几列改成 NOT NULL，或换一组非空的唯一索引",
+			preview(warnNullable)))
+		affected = append(affected, warnNullable...)
 	}
 	if len(warnOtherKey) > 0 {
 		sort.Strings(warnOtherKey)

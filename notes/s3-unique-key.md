@@ -39,3 +39,15 @@
   写成「列过滤能力落地后…才会生效」，不承诺今天做不到的事；`hasUsablePK` 的列判据今天恒真，与
   pgsink 保持同形。
 - `checkDeclared` 的去重 key 改成 `schema.table`（与 `declaredCache` 同口径）。
+
+## Owl 第 3 轮（cfb5c74 复核）
+
+- 必改 1（假绿）：`srcTable` 把源端主键写死 `["id"]`，撞上目标 `PK(id)` 走了前面那句
+  `sameColumnSet` 早退 → 新分支一次没进。拆出 `srcTablePK(name, hasPK, pk...)`，那条用例
+  现在源端主键是 `tenant_id,event_no`（变异验证：删掉新分支会红）。
+- 必改 2：新分支把 `uniqueKeyMatches` 的 `why` 丢了——「键存在但含可空列」被说成「不存在/42P10」。
+  现在按 `why` 分流：可空列单独一档 warn（真实风险＝NULL 互不相等 → 重放插重复）。
+- P2-1（口径分叉）：拆成 `declaredUniqueKeys()`（预检，raw）与 `sinkDeclaredUniqueKeys()`
+  （写路径，once/full_interval 返回 nil），`engine.go` 的预检吃 raw、两个 sink 吃过滤后的；
+  用例 `TestDeclaredUniqueKeysSplitByMode` 钉住。
+- P2-2（engine 那半零用例）：同上那个用例覆盖两种整轮重搬模式。

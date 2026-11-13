@@ -117,7 +117,7 @@ func (r *runner) openSink(ctx context.Context) (*pgsink.Sink, error) {
 		// pgsink 用这份 catalog 建表、找唯一键，拿源端 schema 去建会报「没有这个 schema」。
 		Catalog:    r.targetCatalog(),
 		SourceKind: catalogEngine(r.srcEP.Kind),
-		UniqueKeys: r.declaredUniqueKeys(),
+		UniqueKeys: r.sinkDeclaredUniqueKeys(),
 	})
 }
 
