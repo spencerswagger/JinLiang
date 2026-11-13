@@ -1113,6 +1113,21 @@ func (s *Sink) Apply(ctx context.Context, evs []source.Event, pos source.Positio
 				evs[j].Table == ev.Table {
 				j++
 			}
+			// 无主键表只 INSERT（设计 §1.2 路线 A）。改行没有定位依据：既不降级成
+			// INSERT 插一版新的（§1.5 已否，目标端会越滚越多），也不按全列条件去改。
+			// 按表暂停/整表重搬是下一个切片（S2）；在那之前这里**明确失败**，
+			// 不留下半批数据。
+			if ti := s.tables[ev.Table.Schema+"."+ev.Table.Table]; ti != nil && !ti.hasPK {
+				for _, e := range evs[i:j] {
+					if e.Kind == source.EvUpdate {
+						return fmt.Errorf("%s 没有主键：本版对无主键表只做 insert-only（新增照写），"+
+							"收到改行（UPDATE）时目标端无法定位是哪一行。"+
+							"风险：这是整批失败，本轮其它表也会停在同一个位点。"+
+							"做法：给源表加主键，或从 content.tables 去掉这张表后重新 import",
+							pgwire.Qualified(ev.Table.Schema, ev.Table.Table))
+					}
+				}
+			}
 			if err := s.upsertBatchTx(ctx, tx, evs[i:j]); err != nil {
 				return err
 			}

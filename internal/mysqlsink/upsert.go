@@ -10,8 +10,11 @@ import (
 
 // ErrNoUniqueKey 表示目标表没有唯一键/主键，upsert 无法幂等。
 //
-// 为什么不退化成纯 INSERT：重放（断线重连、崩溃重启）会再插一遍，产生重复行——
-// 那是**静默的数据损坏**，比一条明确的错误危险得多（docs/CONFLICT.md）。
+// 什么时候还会见到它：**源端有主键、目标端缺键**（源端身份明确了，目标端却定位不了），
+// 或声明了 unique_key 但目标端索引对不上（设计 §4.3）。源端本来就无主键的表不走这条路：
+// 那是 insert-only（只 INSERT，重放可能重复，口径见 docs/DESIGN-NO-PRIMARY-KEY.md §1.2）。
+// 为什么不把有身份的表也退化成纯 INSERT：重放（断线重连、崩溃重启）会再插一遍，
+// 产生重复行——那是**静默的数据损坏**，比一条明确的错误危险得多（docs/CONFLICT.md）。
 var ErrNoUniqueKey = fmt.Errorf("目标表没有唯一键，无法做 upsert")
 
 // hasUniqueKey 查目标表有没有唯一键（含主键）。结果按表缓存。
@@ -32,6 +35,39 @@ func (s *Sink) hasUniqueKey(ctx context.Context, table source.TableRef) (bool, e
 	ok := n > 0
 	s.uniqueCache[key] = ok
 	return ok, nil
+}
+
+// insertSQL 造一条多行纯 INSERT（无主键表的 insert-only 写路径）。
+//
+// 口径：`docs/DESIGN-NO-PRIMARY-KEY.md` §1.2 路线 A——表没有行身份时目标端只 INSERT，
+// 从不 UPDATE/DELETE。**不拼 `ON DUPLICATE KEY`**：那要求唯一键，而无主键表没有；
+// 重放窗口内可能插重复行，这是设计接受的代价（R1：写路径不拿目标端索引猜行身份）。
+func insertSQL(table source.TableRef, cols []string, rows int) string {
+	var b strings.Builder
+	b.WriteString("INSERT INTO ")
+	b.WriteString(qualified(table))
+	b.WriteString(" (")
+	for i, c := range cols {
+		if i > 0 {
+			b.WriteString(",")
+		}
+		b.WriteString(quoteIdent(c))
+	}
+	b.WriteString(") VALUES ")
+	for r := 0; r < rows; r++ {
+		if r > 0 {
+			b.WriteString(",")
+		}
+		b.WriteString("(")
+		for i := range cols {
+			if i > 0 {
+				b.WriteString(",")
+			}
+			b.WriteString("?")
+		}
+		b.WriteString(")")
+	}
+	return b.String()
 }
 
 // upsertSQL 造一条多行 upsert：
