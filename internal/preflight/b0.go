@@ -106,8 +106,8 @@ func Run(in Input) source.Report {
 	checks = append(checks, scopeChecks(in)...)
 
 	// ── MySQL 源端存储引擎（SPEC MY-08）───────────────────────
-	// MyISAM 没有事务：崩溃时目标端可能与源端不一致，但同步本身能跑——
-	// 按 docs/SPEC.md:107 的拍板口径 warn 照跑并标注，不阻断。
+	// 无事务引擎（MyISAM/MEMORY/CSV/ARCHIVE/BLACKHOLE…）：全量不是一致性切面，
+	// 但同步本身能跑——按 docs/SPEC.md §3 MY-08 的口径降级照跑并标注，不阻断。
 	checks = append(checks, engineChecks(in)...)
 
 	// ── PG 源端行标识（PG-06，无主键表进增量的前置）──────────
@@ -471,8 +471,8 @@ func quoteIdent(s string) string {
 	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
 }
 
-// engineChecks 是 SPEC MY-08（表的存储引擎）：MySQL 源端选中表里有 MyISAM
-// （含 MRG_MyISAM）时 **warn 降级**——无事务，全量不是一致性切面，照跑并标注。
+// engineChecks 是 SPEC MY-08（表的存储引擎有没有事务）：选中的表里只要有一张
+// 无事务（或引擎名查不到），就 **warn 降级**——照跑，但全量不是一致性切面。
 //
 // 判据只有 JudgeEngines 一处（engine.go）：这里不自己判「哪些表算无事务」，
 // 否则文档/收尾/预检迟早三处三套说法。SourceCat 没读到时不发这条（不阻断），
@@ -483,7 +483,8 @@ func engineChecks(in Input) []source.Check {
 		return nil
 	}
 	return []source.Check{{
-		ID: "MY-08", Title: "部分表用 MyISAM 引擎（无事务）",
+		// 标题不许写死 MyISAM：MEMORY 也降级之后「用 MyISAM 引擎」就是假话（SPEC MY-08 措辞约束）。
+		ID: "MY-08", Title: "部分表用无事务引擎",
 		Status: source.StatusWarn,
 		Detail: EngineDegradeNote(j),
 		SQL:    j.SQL,

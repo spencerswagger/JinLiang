@@ -241,5 +241,35 @@ func (m *MySQL) Catalog(ctx context.Context, scope source.Scope) (source.Catalog
 		}
 		cat.Tables = append(cat.Tables, *t)
 	}
+	cat.Engines = readEngines(ctx, m.db)
 	return cat, nil
+}
+
+// readEngines 读服务器自报的引擎事务能力（SPEC MY-08 的判据输入）。
+//
+// 两个 Catalog() 都要填（这里是预检/控制面那条，另一条在
+// internal/mysqlsource/snapshot.go）：只改一处会出现「预检说降级、收尾不标注」。
+//
+// 读失败**不阻断**（与 SCOPE-01 同口径）：返回空 map，判据会把每张表都当
+// 「没有事务」→ 降级。这是故意的——宁可多一句提示，也不许一次假绿。
+func readEngines(ctx context.Context, db *sql.DB) map[string]bool {
+	out := map[string]bool{}
+	rows, err := db.QueryContext(ctx,
+		`SELECT ENGINE, COALESCE(TRANSACTIONS,'') FROM information_schema.ENGINES`)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var engine, tx string
+		if err := rows.Scan(&engine, &tx); err != nil {
+			return nil
+		}
+		// 键一律大写：information_schema.TABLES 回报 MRG_MYISAM，历史文档写 MRG_MyISAM。
+		out[strings.ToUpper(engine)] = strings.EqualFold(strings.TrimSpace(tx), "YES")
+	}
+	if err := rows.Err(); err != nil {
+		return nil
+	}
+	return out
 }
