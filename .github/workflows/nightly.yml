@@ -239,7 +239,9 @@ jobs:
       - name: 无主键变体 × MySQL ${{ matrix.mysql }} → PG 16（T4 抽样，本周 due 才跑）
         # MySQL 侧的版本档是 5.7 / 8.0 / 8.4 / 9.4，登记表里 9.x 的标签是 "9"：
         # 执行器的版本过滤认前缀（9.4 命中 9），不会因为标签写法不同而漏格。
-        run: python3 scripts/nopk_matrix.py --layer nightly --link mysql-pg --src-version "${{ matrix.mysql }}" --dst-version 16 --if-due --expect-cells 1 --json "nopk-t4-mp-${MY}.json"
+        # --expect-cells 的口径是「链数 × 场景数」，不是链数：MySQL→PG 每条链 3 场景，
+        # 所以这里恒 3（--if-due 只把格标成 not-due，不减少选中数）；PG→MySQL 只全量，那一条是 1。
+        run: python3 scripts/nopk_matrix.py --layer nightly --link mysql-pg --src-version "${{ matrix.mysql }}" --dst-version 16 --if-due --expect-cells 3 --json "nopk-t4-mp-${MY}.json"
         env:
           MY: ${{ matrix.mysql }}
 

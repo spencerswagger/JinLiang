@@ -102,4 +102,8 @@ case "${1:-}" in
     exit 64
     ;;
 esac
-echo "nopk_dbs: 起好了（PG $PG_SRC_PORT/$PG_DST_PORT，MySQL $MY_SRC_PORT/$MY_DST_PORT）"
+case "${1:-}" in
+  pg)    echo "nopk_dbs: 起好了（PG 源 :$PG_SRC_PORT / 目标 :$PG_DST_PORT）" ;;
+  mysql) echo "nopk_dbs: 起好了（MySQL 源 :$MY_SRC_PORT / 目标 :$MY_DST_PORT）" ;;
+  cross) echo "nopk_dbs: 起好了（PG :$PG_SRC_PORT/:$PG_DST_PORT，MySQL :$MY_SRC_PORT/:$MY_DST_PORT）" ;;
+esac
