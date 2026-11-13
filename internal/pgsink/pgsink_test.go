@@ -309,3 +309,40 @@ func TestConflictClauseUsesDeclaredKey(t *testing.T) {
 		t.Fatalf("声明列覆盖全部列时应为 DO NOTHING，得到 %q", got)
 	}
 }
+
+// 判据对齐（Owl 对 S1 的非阻塞项，S3 一并清）：主键列被列过滤排掉时，目标端根本没有
+// 那几列可定位——`hasPK` 必须为 false（按无主键处理），与 mysqlsink 的 `hasUsablePK` 同一口径。
+// 两边判据一旦漂移，「预检说按主键、写路径却按声明 / insert-only」就会出现两套身份。
+func TestBuildTablesDropsUnusablePrimaryKey(t *testing.T) {
+	cat := source.Catalog{Tables: []source.Table{
+		{
+			// 主键 id 被 columns.exclude 排掉：剩下的列里没有 id。
+			TableRef:   source.TableRef{Schema: "public", Table: "pk_excluded"},
+			PrimaryKey: []string{"id"},
+			Columns:    []source.Column{{Name: "v", Type: "text"}},
+		},
+		{
+			TableRef:   source.TableRef{Schema: "public", Table: "pk_kept"},
+			PrimaryKey: []string{"id"},
+			Columns:    []source.Column{{Name: "id", Type: "bigint"}, {Name: "v", Type: "text"}},
+		},
+	}}
+	tables, _ := buildTables(cat, "")
+
+	excluded := tables["public.pk_excluded"]
+	if excluded.hasPK {
+		t.Fatal("主键列不在列里时 hasPK 必须为 false（否则 upsert 会引用不存在的列）")
+	}
+	if len(excluded.pkIdx) != 0 {
+		t.Fatalf("定位下标必须为空，得到 %v", excluded.pkIdx)
+	}
+	// 无身份 + 声明 → 声明生效（与 mysqlsink 的 declaredKeyFor 同口径）。
+	excluded.declared = []string{"v"}
+	if got := conflictClause(excluded); !strings.Contains(got, `ON CONFLICT ("v")`) {
+		t.Fatalf("声明生效时应按声明列做 ON CONFLICT，得到 %q", got)
+	}
+
+	if !tables["public.pk_kept"].hasPK {
+		t.Fatal("主键列都在时 hasPK 必须为 true")
+	}
+}

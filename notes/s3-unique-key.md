@@ -51,3 +51,15 @@
   （写路径，once/full_interval 返回 nil），`engine.go` 的预检吃 raw、两个 sink 吃过滤后的；
   用例 `TestDeclaredUniqueKeysSplitByMode` 钉住。
 - P2-2（engine 那半零用例）：同上那个用例覆盖两种整轮重搬模式。
+
+## Owl 对 S1 的非阻塞项（挂到 S3 一起清）——已清
+
+「pgsink 的 `ti.hasPK` 在 PK 列被 exclude 时也是 false，与 mysqlsink 判据不一致」：
+
+- pgsink 早在 `buildTables` 里就有这条规则（`pkIdx` 不全 → `hasPK=false`），但 mysqlsink 当时只看
+  `rel.HasStablePK`，于是同一张表在两边可能是两套身份（一边按主键 upsert，一边 insert-only）。
+- S3 里把 mysqlsink 对齐：新增 `hasUsablePK(rel)`＝有稳定主键 **且** 主键列都在本次交付的列里；
+  `insertOnly()` 与 `declaredKeyFor()` 都走它，`hasUsablePK` 的注释直接点名「与 pgsink 同判据」。
+- 用例：mysqlsink `TestInsertOnlyDecision`（新增「主键列不在搬运列里 → insert-only」一档）；
+  pgsink `TestBuildTablesDropsUnusablePrimaryKey`（hasPK=false、pkIdx 空、声明生效走
+  `ON CONFLICT ("v")`、主键完整的表仍 hasPK=true）——两边各钉一半，防止以后再漂。
