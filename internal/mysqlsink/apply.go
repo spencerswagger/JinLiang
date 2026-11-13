@@ -216,8 +216,8 @@ func (s *Sink) applyUpserts(ctx context.Context, tx *sql.Tx, evs []source.Event)
 		return err
 	}
 	if !ok {
-		return fmt.Errorf("%w：%s。三种做法任选：① 给目标表加主键/唯一索引（推荐，与源端一致）；"+
-			"② 用 content.tables.<表>.columns 显式指定业务唯一键；③ 把该表设成 insert-only 并接受重放可能重复（不推荐）。"+
+		return fmt.Errorf("%w：%s。两种做法任选：① 给目标表加主键/唯一索引（推荐，与源端一致）；"+
+			"② 不想再跟这张表：把它从 content.tables 里去掉后重新 import。"+
 			"风险：加唯一索引需要目标端已有数据无重复，建索引期间会短暂阻塞写入",
 			ErrNoUniqueKey, qualified(table))
 	}
