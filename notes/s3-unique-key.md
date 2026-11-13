@@ -63,3 +63,13 @@
 - 用例：mysqlsink `TestInsertOnlyDecision`（新增「主键列不在搬运列里 → insert-only」一档）；
   pgsink `TestBuildTablesDropsUnusablePrimaryKey`（hasPK=false、pkIdx 空、声明生效走
   `ON CONFLICT ("v")`、主键完整的表仍 hasPK=true）——两边各钉一半，防止以后再漂。
+
+## S3 完成标准四件事（主持人派工）
+
+1. `Options.UniqueKeys` + sink 五条核对接线 —— PR #120 主体（两个 sink 写前核对、声明列 upsert/delete）。
+2. pgsink 旧 UPDATE 死代码 —— S1 遗留的「无主键收到 UPDATE → 返回非可暂停 error」已随 S3 删除；
+   现在唯一入口是 `checkNoIdentityWrites` → `*NoPKWriteError`（可暂停），组循环里只剩 upsert/delete 分支。
+3. `ti.hasPK` 与 mysqlsink 判据对齐 —— `hasUsablePK` + 两侧用例（0733212）。
+4. 三处同改（Ark 在 #119 钉的开关）—— 码表 `Next` 补 `unique_key` 那条 / `docs/ERRORS.md` 同一行 /
+   `uniqueKeyConfigLanded = true`。**注意码表硬约束 Next 1–3 步**，所以四条做法合进第 3 步：
+   ① 加主键/唯一索引 ② 声明 unique_key ③ once/full_interval（+ 或从 content.tables 去掉后重新 import）。
