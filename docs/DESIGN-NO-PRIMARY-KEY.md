@@ -123,7 +123,7 @@ A 是地板，B 是天花板。
 | `SCOPE-02`（已有，改文案） | **源端**选中的表没有稳定主键 | 按 mode 四档（§3） | `preflight/b0.go:265-310`，今天统一 warn 且只在非 `once`/`full_interval` 发 |
 | `TARGET-02`（**新增**） | **目标端**这张表有没有可用于 upsert/删除的唯一键；用户声明的 `unique_key` 是否真的对得上 | ok / warn / blocked 三档 | 不存在 |
 | `PG-06`（**新增实现，保号**：只承担源端那一半） | PG 源 + 无主键表 + 增量：`REPLICA IDENTITY` 是不是 `FULL`（不是就源端解码报错、整条流断） | warn + autofix | 文字在 `SPEC.md:91`，**代码零消费**（`Table.ReplicaIdentity` 填了没人读） |
-| `MY-08`（不动） | MySQL 源端表的**存储引擎**（MyISAM → warn 照跑） | warn | `preflight/b0.go:313-352`（`#113`） |
+| `MY-08`（保号；口径见 `SPEC.md §3`） | MySQL 源端表的**存储引擎有没有事务**（只有 `information_schema.ENGINES.TRANSACTIONS = 'YES'` 才算有；`MyISAM` / `MRG_MYISAM` / `MEMORY` / `CSV` / `ARCHIVE` / `BLACKHOLE` 全是 `NO`，引擎名查不到同样降级） | warn（**降级**：照跑 + 收尾标注「不是一致性切面」） | `preflight/engine.go` 的 `JudgeEngines`（`#126`；`#113`/`#114` 先落的是 warn 卡片） |
 | `MY-11`（不动） | MariaDB → blocked | blocked | `mysqlsource/capability.go:261-270`（`#113` 从 MY-08 挪过来） |
 
 **本设计不占用任何 `MY-x`**，理由三条：
@@ -264,7 +264,11 @@ Detail 必须**分档写**，不许共用一句话（这是 `PAUSE-01` 的教训
 | 风险的性质 | **概率性**：崩溃/断电时目标端可能不一致 | **确定性**：改/删**每一写都写不进去** |
 | 用户能做什么 | 改引擎（停机重建表）或接受 | 加主键/唯一键、声明 `unique_key`、或换 `once`/`full_interval` |
 | 是否影响「结果正确」 | 不影响正常路径 | 影响：跳过窗口内目标端与源端不一致，等重搬才收敛 |
-| 档位结论 | 一律 warn | `once`/`full_interval` ok、`continuous` warn、`interval` **blocked** |
+| 档位结论 | 一律 warn（降级） | `once`/`full_interval` ok、`continuous` warn、`interval` **blocked** |
+
+**再加一格（2026-11-13 定稿，`SPEC.md §3` MY-08）**：`CSV` / `ARCHIVE` 不支持任何索引（8.0.28 实测
+`max 0 keys allowed` / `ADD PRIMARY KEY` 报 1030），所以这类表**恒无主键**，会**同时**命中 MY-08（降级：没有事务）
+与 `SCOPE-02`（身份）。两张卡各管一半、不合并；`interval` 下以 `SCOPE-02` 的 blocked 为准（更严的那张）。
 
 ### 3.3 为什么 `interval` 是 blocked（而不是学 MY-08 一律 warn）
 
