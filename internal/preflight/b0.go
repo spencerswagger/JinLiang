@@ -319,7 +319,32 @@ func scopeChecks(in Input) []source.Check {
 // `interval` 是 **blocked**（每轮按水位重读同一批行，没有身份=第二轮起必然重复，
 // 这是这个模式在我们手里做不到，不是「有风险但可以跑」），其余（continuous / 空）是 warn。
 func noPKCheck(in Input, noPK []string, replIdentity map[string]string) source.Check {
+	// S3：**已声明 unique_key** 的表不在这张卡里算「无身份」——它到底能不能定位，
+	// 由 TARGET-02 核对目标端事实来裁决（对不上仍然 blocked，整体照样进不去）。
+	// 不排除会出现「同一份报告里 SCOPE-02 让用户去声明 unique_key、用户声明了、
+	// 这张卡还在拦他」的自相矛盾（红线 §6.7，Owl PR #120 第 4 轮）。
+	//
+	// 例外：`TargetCat == nil`（读不到目标端，TARGET-02 根本不出卡）→ 没人裁决，
+	// 这里保守按无身份处理（blocked/warn 都还能救；放行后跑起来才炸没法救）。
+	declared := 0
+	if in.TargetCat != nil && len(in.UniqueKeys) > 0 {
+		kept := noPK[:0]
+		for _, name := range noPK {
+			if len(in.UniqueKeys[name]) > 0 {
+				declared++
+				continue
+			}
+			kept = append(kept, name)
+		}
+		noPK = kept
+	}
 	if len(noPK) == 0 {
+		if declared > 0 {
+			return source.Check{ID: "SCOPE-02", Title: "无主键的表已经声明了 unique_key",
+				Status: source.StatusOK,
+				Detail: fmt.Sprintf("这 %d 张表没有主键，但你声明了 unique_key，"+
+					"行身份改由目标端核对（见 TARGET-02）：核对通过就能 upsert 与删除，核对不过会被拦下来", declared)}
+		}
 		return source.Check{ID: "SCOPE-02", Title: "选中的表都有主键",
 			Status: source.StatusOK, Detail: "可以安全地做 upsert"}
 	}

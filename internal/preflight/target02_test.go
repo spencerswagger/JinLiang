@@ -460,3 +460,78 @@ func TestTarget02MatchingKeyWithNullableColumnWarnsAboutNulls(t *testing.T) {
 		t.Fatalf("Affected 只能放裸表名（其它档都是这个口径），得到 %v", c.Affected)
 	}
 }
+
+// interval + 无主键 + 已声明 unique_key：SCOPE-02 不能一边让用户去声明、一边又把声明了的表拦下
+// （红线 §6.7：同一份报告不许自相矛盾；设计 §2.2 格 4 也写着「声明 + 核对通过 → 模式任意」）。
+func TestIntervalNoPKWithDeclarationIsNotBlocked(t *testing.T) {
+	rep := Run(Input{
+		SourceKind: "postgres", TargetKind: "postgres",
+		SourceVer: "16.2", TargetVer: "16.2",
+		SourceCaps:  source.CapSet{source.CapCDC: {Supported: true}},
+		SourceCat:   catalog(srcTable("events", false)),
+		TargetCat:   catalog(tgtTable("events", nil, [][]string{{"tenant_id", "event_no"}})),
+		Tables:      []string{"events"},
+		Mode:        "interval",
+		Incremental: "updated_at",
+		OnExists:    "append",
+		BatchRows:   500,
+		UniqueKeys:  map[string][]string{"events": {"tenant_id", "event_no"}},
+	})
+	if c, ok := statusOf(rep, "SCOPE-02"); ok && c.Status == source.StatusBlocked {
+		t.Fatalf("已声明 unique_key 的表不该被 SCOPE-02 拦下：%+v", c)
+	}
+	if c, ok := statusOf(rep, "TARGET-02"); !ok || c.Status != source.StatusOK {
+		t.Fatalf("声明核对通过，TARGET-02 应为 ok，得到 %+v", c)
+	}
+	if !rep.CanStart {
+		t.Fatal("声明核对通过时 interval 必须能开跑（运行时靠声明列去重）")
+	}
+}
+
+// 同一组合法声明，但目标端没有对应索引：整体仍然进不去，而且拦人的应该是 TARGET-02（不是 SCOPE-02）。
+func TestIntervalDeclaredButTargetMismatchStillBlocked(t *testing.T) {
+	rep := Run(Input{
+		SourceKind: "postgres", TargetKind: "postgres",
+		SourceVer: "16.2", TargetVer: "16.2",
+		SourceCaps: source.CapSet{source.CapCDC: {Supported: true}},
+		SourceCat:  catalog(srcTable("events", false)),
+		TargetCat:  catalog(tgtTable("events", nil, nil)),
+		Tables:     []string{"events"},
+		Mode:       "interval",
+		OnExists:   "append",
+		BatchRows:  500,
+		UniqueKeys: map[string][]string{"events": {"tenant_id", "event_no"}},
+	})
+	if rep.CanStart {
+		t.Fatal("声明与目标端对不上时必须拦住")
+	}
+	c, ok := statusOf(rep, "TARGET-02")
+	if !ok || c.Status != source.StatusBlocked {
+		t.Fatalf("拦人的该是 TARGET-02，得到 %+v", c)
+	}
+	if c.Code != string(core.CodeNoIdentity) {
+		t.Fatalf("TARGET-02 blocked 应挂 E1017，得到 %q", c.Code)
+	}
+}
+
+// 读不到目标端（TargetCat == nil）→ TARGET-02 不出卡，没人裁决声明；
+// 这时 SCOPE-02 仍保守把无主键表算进去（blocked 还能救，放行后跑起来才炸没法救）。
+func TestIntervalDeclaredWithoutTargetCatalogStaysBlocked(t *testing.T) {
+	rep := Run(Input{
+		SourceKind: "postgres", TargetKind: "postgres",
+		SourceVer: "16.2", TargetVer: "16.2",
+		SourceCaps: source.CapSet{source.CapCDC: {Supported: true}},
+		SourceCat:  catalog(srcTable("events", false)),
+		Tables:     []string{"events"},
+		Mode:       "interval",
+		OnExists:   "append",
+		BatchRows:  500,
+		UniqueKeys: map[string][]string{"events": {"tenant_id", "event_no"}},
+	})
+	if rep.CanStart {
+		t.Fatal("目标端读不到时不能凭一声明放行")
+	}
+	if c, ok := statusOf(rep, "SCOPE-02"); !ok || c.Status != source.StatusBlocked {
+		t.Fatalf("保守口径：SCOPE-02 应仍 blocked，得到 %+v", c)
+	}
+}

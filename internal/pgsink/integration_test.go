@@ -593,3 +593,47 @@ func TestIntegrationDeclaredUniqueKeyNullableFails(t *testing.T) {
 		t.Fatalf("错误要点明含 NULL 的列不构成唯一性: %v", err)
 	}
 }
+
+// 快照分页（BulkApply）也走 upsert，所以声明核对必须和 Apply 同口径：
+// 声明与目标端索引对不上时，用户应该拿到四段式（可行动），而不是驱动的原始 42P10。
+func TestIntegrationBulkApplyChecksDeclaredKey(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	const table = "jl_b5_decl_bulk"
+	cat := source.Catalog{Tables: []source.Table{{
+		TableRef: source.TableRef{Schema: "public", Table: table},
+		Columns: []source.Column{
+			{Name: "tenant_id", Type: "bigint"},
+			{Name: "event_no", Type: "text"},
+			{Name: "payload", Type: "text", Nullable: true},
+		},
+	}}}
+	// 声明只写 tenant_id，但目标表唯一索引是 (tenant_id,event_no)：核对不过。
+	s := openSinkFor(t, cat, func(o *Options) {
+		o.UniqueKeys = map[string][]string{table: {"tenant_id"}}
+	})
+	drop := func() { _, _ = s.conn.Exec(ctx, "DROP TABLE IF EXISTS public."+table) }
+	drop()
+	if _, err := s.conn.Exec(ctx, "CREATE TABLE public."+table+
+		" (tenant_id bigint NOT NULL, event_no text NOT NULL, payload text, UNIQUE (tenant_id, event_no))"); err != nil {
+		t.Fatalf("建表: %v", err)
+	}
+	defer drop()
+	if _, err := s.EnsureSchema(ctx, cat); err != nil {
+		t.Fatalf("append 策略应沿用已有表: %v", err)
+	}
+	ti := s.tables["public."+table]
+	rows := [][]any{{int64(1), "e1", "x"}}
+	err := s.BulkApply(ctx, ti, 0, rows, "", "", "")
+	if err == nil {
+		t.Fatal("声明与目标端唯一索引不一致时，快照分页必须停下")
+	}
+	if !strings.Contains(err.Error(), "声明了 unique_key") || !strings.Contains(err.Error(), "三种做法") {
+		t.Fatalf("要出四段式（发生了什么/为什么/你能做什么/风险），得到：%v", err)
+	}
+	// 顺带：一行都不该写进去。
+	if n, cErr := s.Count(ctx, source.TableRef{Schema: "public", Table: table}); cErr != nil || n != 0 {
+		t.Fatalf("核对不过时不许写行，实际 %d err=%v", n, cErr)
+	}
+}

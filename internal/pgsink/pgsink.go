@@ -954,6 +954,11 @@ func (s *Sink) BulkApply(ctx context.Context, ti *tableInfo, chunkNo int, rows [
 	if ti == nil {
 		return fmt.Errorf("内部错误：目标端没有这张表的定义")
 	}
+	// 快照/增量分页也走 upsert（`conflictClause` 认声明身份），所以和 Apply 一样
+	// 在写之前核对一次：否则声明与目标端索引对不上时，用户拿到的是驱动的原始 42P10。
+	if err := s.ensureDeclared(ctx, ti); err != nil {
+		return err
+	}
 	tx, err := s.conn.Begin(ctx)
 	if err != nil {
 		return err
@@ -1018,6 +1023,10 @@ func (s *Sink) ApplyRowsRange(ctx context.Context, ref source.TableRef, rows [][
 	ti := s.tables[ref.Schema+"."+ref.Table]
 	if ti == nil {
 		return fmt.Errorf("内部错误：目标端没有这张表的定义")
+	}
+	// 与 Apply 同口径：声明身份写之前核对（interval 每轮重读同一批行，靠它去重）。
+	if err := s.ensureDeclared(ctx, ti); err != nil {
+		return err
 	}
 	tx, err := s.conn.Begin(ctx)
 	if err != nil {
@@ -2217,6 +2226,9 @@ func castedHoldersFor(ti *tableInfo, rows int) string {
 // PG 的 `ON CONFLICT (…)` 在没有匹配唯一索引时会直接报错（不会静默写错），
 // 但报错要能行动：这里提前拦、给四段式，而不是让驱动吐一句 constraint 名。
 func (s *Sink) ensureDeclared(ctx context.Context, ti *tableInfo) error {
+	if len(ti.declared) == 0 {
+		return nil // 没声明就没有要核对的东西（主键表 / insert-only 表）
+	}
 	cacheKey := ti.ref.Schema + "." + ti.ref.Table
 	if s.declaredChecked[cacheKey] {
 		return nil

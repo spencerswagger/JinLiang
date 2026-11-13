@@ -73,3 +73,19 @@
 4. 三处同改（Ark 在 #119 钉的开关）—— 码表 `Next` 补 `unique_key` 那条 / `docs/ERRORS.md` 同一行 /
    `uniqueKeyConfigLanded = true`。**注意码表硬约束 Next 1–3 步**，所以四条做法合进第 3 步：
    ① 加主键/唯一索引 ② 声明 unique_key ③ once/full_interval（+ 或从 content.tables 去掉后重新 import）。
+
+## Owl 第 4 轮（c06a891）必改：interval + 声明被 SCOPE-02 自打脸
+
+现象：`interval` + 无主键 + 声明 `unique_key` + 目标端有对应唯一索引时——
+SCOPE-02 blocked 且**让用户去声明 unique_key**（用户已经声明了），TARGET-02 却 ok，`CanStart=false`。
+设计 §2.2 格 4 本来就是「声明 + 核对通过 → 模式任意」，运行时 `ApplyRowsRange` 也确实按声明列去重。
+
+修法：
+- `noPKCheck` 把**已声明**的表从「无身份」里摘掉（裁决交给 TARGET-02，对不上仍 blocked）；
+  `TargetCat == nil`（TARGET-02 不出卡）时保守保留，谁也不放行。
+- `pgsink.ensureDeclared` 加空声明早退，并在 `BulkApply` / `ApplyRowsRange` 里各补一次核对——
+  快照分页与 interval 分页也走 `conflictClause`，对不上时该给四段式，而不是驱动的原始 42P10。
+- 用例：`TestIntervalNoPKWithDeclarationIsNotBlocked`（能开跑）、
+  `TestIntervalDeclaredButTargetMismatchStillBlocked`（拦人是 TARGET-02 且挂 E1017）、
+  `TestIntervalDeclaredWithoutTargetCatalogStaysBlocked`（读不到目标端不许放行）、
+  `TestIntegrationBulkApplyChecksDeclaredKey`（快照分页被拦、一行不写）。
