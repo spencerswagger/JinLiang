@@ -29,13 +29,16 @@
 | 「有唯一键」≠「按主键 upsert」 | MySQL 的 `ON DUPLICATE KEY` **不指定冲突目标**，命中的是**任意**唯一索引：目标端恰好有另一条唯一索引时，我们会按它更新，语义与源端主键不一致，而且不报错 | `internal/mysqlsink/upsert.go:46-90`（拼 SQL 时没有冲突列清单） |
 | 目标端唯一键**预检** | **没有任何一条**（`TARGET-01` 只管「目标端已有同名表」） | `internal/preflight/b0.go:130-150` |
 | `verify` 无主键表 | 只做聚合（`all_partial`），明确标注 | `internal/verify/verify.go:207-290`、`:439` |
+| **PG 源**能不能解出无主键表的 `UPDATE`/`DELETE` | **不能（默认）**：pgoutput 要拿旧行做标识；`REPLICA IDENTITY` 是 `default(no-pk)` 时源端解码直接报错（`cannot update/delete … does not have a replica identity`），**整条流断**，而且重连会在同一段变更上再炸一遍 | `connect/postgres.go:155`（读 `relreplident`）、`:277`、`:303-315`（值域 `full`/`nothing`/`index`/`default(pk)`/`default(no-pk)`） |
+| `Table.ReplicaIdentity` 的消费者 | **一个都没有**：字段填了、预检不读、引擎不判 | 全库 grep 只有 `contract.go:102`、`connect/postgres.go:277/303`、`SPEC.md:91` |
 | 可跑方向 | PG→PG（全量+增量）、PG→MySQL（**只全量**）、MySQL→PG（全量+增量）；**MySQL→MySQL 未接通** | `internal/core/direction.go:39-46` |
 
 **三个真实缺口**（本设计就补这三个）：
 
 1. MySQL 目标端**根本没有 insert-only 路径** → 无主键表连全量都跑不了；
 2. 无主键表收到 BACKFILL/UPDATE/DELETE 时，PG 目标端抛一句裸错误**整条任务停**（连带几十张无关的表），
-   MySQL 目标端更早死在 `ErrNoUniqueKey`；
+   MySQL 目标端更早死在 `ErrNoUniqueKey`；**PG 源还多一道前置**：`REPLICA IDENTITY` 不是 `FULL` 时，
+   源端解码就报错，连「只停这张表」的机会都没有（见 R5）；
 3. 目标端「到底有没有唯一键」开跑前看不到，用户第一次知情是在 `last_error` 里。
 
 ### 1.2 两条路线
@@ -52,7 +55,7 @@
 3–5 人日的投入换不来可用；只做 B，则所有无主键表都被迫改配置才能跑，与「不拒绝，只提示」相悖。
 A 是地板，B 是天花板。
 
-### 1.3 组合规则（四条，实现时不许改）
+### 1.3 组合规则（五条，实现时不许改）
 
 - **R1 身份判定只认源端。** 一张表按什么身份写，只看两件事：源端 `HasStablePK`，或用户显式声明 `unique_key`。
   **绝不因为「目标端恰好有个唯一索引」就自动把 insert-only 升成 upsert**——那是拿别人的索引猜你的行身份，
@@ -64,6 +67,16 @@ A 是地板，B 是天花板。
 - **R4 没有身份的表，改/删不猜。** 既不「把 UPDATE 当 INSERT 插一版」（目标端留两版，行数膨胀且越滚越多），
   也不「按全表条件 DELETE」（会清空目标表）。只做一件事：**这一批先登记暂停、跳过它、位点照常前进**，
   欠一次整表重搬（复用 `#93`/`#102` 的按表暂停机制，见 §2.3）。
+- **R5 「只停这张表」是有前置的：PG 源必须先让解码拿得到旧行标识。**
+  pgoutput 解 `UPDATE`/`DELETE` 要旧行标识；无主键 + `default(no-pk)`（或 `nothing`）时**源端解码就报错**，
+  整条流断（重连会在同一段变更上再炸一遍，不会自愈）。所以对 PG 源的无主键表：
+  增量模式下**要么**把 `REPLICA IDENTITY` 设成 `FULL`（可代做，见 §3.5；已是 `USING INDEX` 也算过），
+  **要么**这张表不进增量（`once`/`full_interval`，或移出 `content.tables`）。
+  **没确认这件事，不许承诺「只停这张表、其它表照常」**。
+  MySQL 源侧对应的是 `binlog_row_image=FULL`（`MY-03`，autofixable），不存在这道坎。
+
+  另外：即使拿到整行旧镜像，**也不按「全列匹配」去删**——无主键表恰恰可能有重复行，
+  一次 `DELETE … WHERE 所有列` 会删掉多行。R4 不因为 RI FULL 而放宽。
 
 ### 1.4 进 v1 / 挂账
 
@@ -73,9 +86,11 @@ A 是地板，B 是天花板。
 2. 无主键表收到 `EvUpdate`/`EvDelete` → 新原因码 `no_pk_write` 的 `PausableError`
    → 按表暂停 + `skipped_rows` 记账 + 退出码 3 → 下一轮整表重搬补齐
    （`EvTruncate` 不受影响：它是表级动作，不需要行身份）；
-3. `content.tables.<表>.unique_key`：字段 + 校验 + 目标端唯一索引核对 + 两个 sink 的 upsert/delete 用它；
-4. 预检 `SCOPE-02` 按 mode 分四档（§3）；新增 `TARGET-02` 目标端唯一键三档；
-5. 码表 `E1017` + `docs/ERRORS.md` 同批落地；`ErrNoUniqueKey` 文案点名 `unique_key`（`#112` 挂账收口）。
+3. **`PG-06` 落地为源端前置**（R5）：PG 源 + 无主键表 + 增量 → 读 `Table.ReplicaIdentity`，
+   不是 `full`/`index` 就给 autofix `ALTER TABLE … REPLICA IDENTITY FULL`（属主权限前提，见 §3.5）；
+4. `content.tables.<表>.unique_key`：字段 + 校验 + 目标端唯一索引核对 + 两个 sink 的 upsert/delete 用它；
+5. 预检 `SCOPE-02` 按 mode 分四档（§3）；新增 `TARGET-02` 目标端唯一键三档；
+6. 码表 `E1017` + `docs/ERRORS.md` 同批落地；`ErrNoUniqueKey` 文案点名 `unique_key`（`#112` 挂账收口）。
 
 **挂账（不进 v1，写进 §7）**
 
@@ -106,6 +121,7 @@ A 是地板，B 是天花板。
 |---|---|---|---|
 | `SCOPE-02`（已有，改文案） | **源端**选中的表没有稳定主键 | 按 mode 四档（§3） | `preflight/b0.go:265-310`，今天统一 warn 且只在非 `once`/`full_interval` 发 |
 | `TARGET-02`（**新增**） | **目标端**这张表有没有可用于 upsert/删除的唯一键；用户声明的 `unique_key` 是否真的对得上 | ok / warn / blocked 三档 | 不存在 |
+| `PG-06`（**新增实现，保号**：只承担源端那一半） | PG 源 + 无主键表 + 增量：`REPLICA IDENTITY` 是不是 `FULL`（不是就源端解码报错、整条流断） | warn + autofix | 文字在 `SPEC.md:91`，**代码零消费**（`Table.ReplicaIdentity` 填了没人读） |
 | `MY-08`（不动） | MySQL 源端表的**存储引擎**（MyISAM → warn 照跑） | warn | `preflight/b0.go:313-352`（`#113`） |
 | `MY-11`（不动） | MariaDB → blocked | blocked | `mysqlsource/capability.go:261-270`（`#113` 从 MY-08 挪过来） |
 
@@ -117,6 +133,9 @@ A 是地板，B 是天花板。
 2. `MY-09`/`MY-10` 是 SPEC 的**保留位**（认证插件、主从角色），不许挪用；`MY-11` 已被 MariaDB 检查占用。
 3. 目标端检查在本仓库已有家族：`TARGET-01`（目标端已有同名表）。目标端唯一键就是 `TARGET-02`，
    不新开前缀、不新开 `TARGET-03`（声明的核对也并进同一条的三档里——同一件事的不同结论，不是两条检查）。
+   **`PG-06` 不折进 `TARGET-02`**：`SPEC.md:91` 那一行本来就写了两件事——`REPLICA IDENTITY`（**源端**属性）与
+   「目标表有主键」。前半留 `PG-06` 保号、由本设计实现；后半归 `TARGET-02`。合成一条会让「源端能不能解出这一行」
+   和「目标端能不能定位这一行」两件事长得一样，排障时根本分不开。
 
 > **下一个可用的 MySQL 源端编号是 `MY-12`**（`MY-08` 引擎 / `MY-09` 认证 / `MY-10` 角色 / `MY-11` MariaDB 之外）。
 > 将来若真要做「源端唯一键自动推荐」，用 `MY-12`，别回头挤 `08…11`。
@@ -134,7 +153,8 @@ A 是地板，B 是天花板。
 | 4 | 无主键 + 声明 `unique_key`，目标端核对通过 | 任意 | 任意 | `TARGET-02` ok | `auto` | 声明被采纳：upsert + 删除定位都成立（用户无需再做别的） | — |
 | 5 | 无主键 + 声明 `unique_key`，目标端核对**不过** | 任意 | 任意 | `TARGET-02` **blocked** | `blocked` | 声明与目标端事实不符：那条唯一索引不存在/含 NULL/是前缀索引 | 同上 |
 | 6 | 有主键 | 任意 | 目标端没有可用唯一键（`append` 复用用户表） | `TARGET-02` warn | `costly` | upsert 会失败；加索引或换空 schema。**目标端若只有另一条无关的唯一索引，今天会被判成「有键」并照它更新**（见 §1.1 那行，挂账 D9） | — |
-| 7 | 有主键 | 任意 | 任意 | `TARGET-02` warn | `auto` | 表已有主键：`unique_key` 声明被忽略（按主键走） | — |
+| 7 | 有主键 **+ 声明了 `unique_key`** | 任意 | 任意 | `TARGET-02` warn | `auto` | 表已有主键：`unique_key` 声明被**忽略**（按主键走，行为不变）——只是别让用户以为换了身份 | — |
+| 8 | 无主键 | `continuous` / `continuous+initial`，**源端是 PG** | 任意 | `PG-06` warn（可代做） | `costly` | 这张表拿不到旧行标识（`REPLICA IDENTITY` 既不是 `FULL` 也不是 `USING INDEX`）：源端在第一次改/删时**整条流会断**（不是只停这张表）；代做 `ALTER TABLE … REPLICA IDENTITY FULL`（需表属主），代价是源端变更流水变大 | — |
 
 格 3 为什么是 `blocked` 而不是 `warn`：见 §3.3（与 MY-08 的差异不是随意的）。
 
@@ -158,6 +178,11 @@ A 是地板，B 是天花板。
 `internal/pgsink/paused.go:32-50`）。它与 `E1015` 的区别：E1015 是「结构对不上」，E1017 是「结构没错，但没有身份」。
 `Detail` 里写人话（哪张表、哪条变更、需要什么），不写进 Message。
 
+> **PG 源的前置（R5，评审 P1）**：上面 `Risk` 那三句「只停这张表、其它表照常、位点照常前进」**只在
+> `REPLICA IDENTITY` 到位时成立**。PG 源的无主键表若是 `default(no-pk)`，源端在解出第一条 `UPDATE`/`DELETE`
+> **之前**就报错并断开——那时我们连事件都收不到，`E1017` 根本发不出来，用户看到的是「同步连接反复断开」。
+> 所以在 PG 源上，`PG-06`（§3.5）必须先过：预检给 autofix，代做不了就明说「这张表不能进增量」。
+
 **`ErrNoUniqueKey` 保留，语义收窄**（不删）：它以后只在「用户声明了 `unique_key`，但运行时发现目标端索引消失/不匹配」
 或「源端有主键、目标端缺对应唯一键」时出现。文案按 Owl `#112` 挂账同步点名 `unique_key`（§4.5 第 1 条）。
 
@@ -171,6 +196,9 @@ A 是地板，B 是天花板。
 **S-NP1** 全量搬完（insert-only 落全量，行数与源端一致）·
 **S-NP2** 增量纯 INSERT（不暂停、位点前进）·
 **S-NP3** 增量加一次 `UPDATE`/`DELETE`（→ 该表暂停 + `skipped_rows` + 退出码 3 → 下一轮重搬后收敛）。
+
+**夹具要求**：S-NP3 在 **PG 源**上必须先给这张表设 `REPLICA IDENTITY FULL`（§3.5）——不设的话用例在源端解码
+就断了，测的是 PostgreSQL 而不是我们。这一步是前置动作，**不计入新增格数**（同一格内多一条 setup SQL）。
 
 | 矩阵层 | 链路 | 变体场景 | 新增格 | 今天能跑？ |
 |---|---|---|---|---|
@@ -205,7 +233,7 @@ A 是地板，B 是天花板。
 | 模式 | 状态 | 卡片标题 | 为什么是这个档 |
 |---|---|---|---|
 | `once` / `full_interval` | **ok** | 无主键表不影响这个模式 | 每轮 `copyFresh` + `markClean`（`resume.go:183-196`），结果等于源端当前状态，不需要行身份。代价（搬完前是部分数据）写进 Detail，不单开卡片。**边角**：第二轮起会先清本任务写过的行；若这张目标表是你自己的（`append`），会按既有口径停下来让你选（`reusedTableRecopyError`，本设计不改它） |
-| `continuous` / `continuous+initial` | **warn** | 部分表没有主键：只追加，改/删会让它暂停 | insert-only 能跑，`UPDATE`/`DELETE` 触发按表暂停并欠一次重搬——有代价、可接受、用户要知情 |
+| `continuous` / `continuous+initial` | **warn** | 部分表没有主键：只追加，改/删会让它暂停 | insert-only 能跑，`UPDATE`/`DELETE` 触发按表暂停并欠一次重搬——有代价、可接受、用户要知情。**PG 源另有一句**：`REPLICA IDENTITY` 不是 `FULL` 时整条流会断，不是「只停这张表」（§3.5），卡片必须同时出现 |
 | `interval` | **blocked** | 定时增量 + 无主键：每轮必然重复 | 见 §3.3 |
 | 未指定 / 空 | **warn** | 同 `continuous` | 解析阶段缺省按增量口径，宁可多说一句 |
 
@@ -241,15 +269,38 @@ Detail 必须**分档写**，不许共用一句话（这是 `PAUSE-01` 的教训
 
 | 目标端情况 | 状态 | Detail 要点 |
 |---|---|---|
-| 目标表有主键（或与源端主键同列的唯一索引） | ok | 直接可以 upsert |
+| 目标表有主键（或与源端主键同列的唯一索引） | ok | 直接可以 upsert。注意这一格只说**目标端**：源端若还额外声明了 `unique_key`，按 §2.2 格 7「忽略 + 一条 warn」处理，与本格不冲突 |
 | 目标表没有可用唯一键，源端也无主键且没声明 | warn | 「只追加」+ 指到 `content.tables.<表>.unique_key` 与 `once`/`full_interval` 两条路 |
 | 声明了 `unique_key`，但目标端没有匹配的唯一索引（§4.3 判据） | **blocked** | 逐条点名哪条判据不过（不存在 / 含 NULL / 前缀索引 / 列不一致），给三条改法 |
 | 源端有主键、目标端缺对应唯一键（`on_exists=append` 复用用户表） | warn | upsert 会失败；加索引或换空 `target.schema` |
 
 `TARGET-02` 需要目标端 catalog 带上**唯一索引**：现有 `source.Table` 只有 `PrimaryKey`
 （`contract.go:92-105`），所以要在 `connect.mysql`/`connect.postgres` 的 `Catalog` 里补
-`UniqueKeys [][]string`（非主键、非部分、非表达式、全列的唯一索引）。这是 v1 唯一的**契约结构扩展**，
-必须同步 `docs/CONNECTOR-SDK.md` 的 Catalog 字段表。
+`UniqueKeys [][]string`（非主键、非部分、非表达式、全列的唯一索引）。这是 v1 唯一**新增字段**的契约扩展
+（`ReplicaIdentity` 早就有了，只是没人读——见 §3.5），必须同步 `docs/CONNECTOR-SDK.md` 的 Catalog 字段表。
+
+### 3.5 `PG-06`（**源端**）：`REPLICA IDENTITY FULL` 是「只停这张表」的前提（评审 P1）
+
+在 PG 源上，「无主键表收到改/删 → 只停这张表」这个承诺**有前置条件**：pgoutput 解码 `UPDATE`/`DELETE` 时
+必须能从源端拿到旧行标识。无主键且 `REPLICA IDENTITY` 是 `default(no-pk)`（或 `nothing`）时，
+**walsender 在解码阶段就报错**（`cannot update/delete … does not have a replica identity`），连接断开；
+我们连事件都收不到，`E1017` 根本发不出来，用户看到的是「同步连接反复断开」，而且重连会在**同一段变更上再炸**。
+
+| 项 | 内容 |
+|---|---|
+| 触发条件 | 源端 `postgres` ∧ 模式含变更流（`continuous` / `continuous+initial`）∧ 选中表 `HasStablePK=false` |
+| 探测数据 | `source.Table.ReplicaIdentity`（值域 `full` / `index` / `nothing` / `default(pk)` / `default(no-pk)`，`connect/postgres.go:303-315`）——**已有字段，不新增查询** |
+| 通过判据 | `full` 或 `index`（`USING INDEX` 也能让解码拿到旧行标识）。`nothing` / `default(no-pk)` **不通过** |
+| 不通过时 | warn + autofix：`ALTER TABLE <schema>.<表> REPLICA IDENTITY FULL` |
+| 代做的前提 | 需要对这张表有**属主**权限（该 ALTER 要 owner，superuser 亦可）。拿不到就只给 SQL 与风险，**不假装能代做** |
+| 代价（必须写进卡片） | 源端变更流水会带上**整行旧镜像** → WAL 体积变大（大字段表尤其明显）。这是「能解出改/删」的固定成本 |
+| 分区表 | `relreplident` 是每张关系各自的属性，**父表 ALTER 不覆盖叶子**；而 catalog 里子分区**不单列**（`connect/postgres.go:172-174` 直接跳过，父表只标 `Partitioned`）→ 本版**不发 autofix**，改为明确告警：「这张是分区表，叶子要逐张设置，本版不代做」+ 给 SQL 模板（挂账 D10） |
+| 代做不了时 | 三条路：① 让 DBA 跑那条 ALTER；② 这张表不进增量（`once` / `full_interval`）；③ 移出 `content.tables`。**不许**写成「照跑就行」 |
+| MySQL 源的对照 | `binlog_row_image=FULL` 已由 `MY-03` 管（autofixable），不存在这道坎。**不要**给 MySQL 源抄一条 PG-06 |
+
+> 这一节和 `TARGET-02` **不是同一件事**：`PG-06` 问「源端能不能把这一行解出来」，`TARGET-02` 问「目标端能不能定位这一行」。
+> 合成一条的后果是排障时分不清是源端断流还是目标端写不进去，所以 `SPEC.md:91` 那一行要拆成两句（§8）。
+> 即使 RI 变成 `FULL`、我们拿到了整行旧镜像，**也不按「全列匹配」删**（R5 末段）——无主键表可能有重复行。
 
 ---
 
@@ -326,12 +377,15 @@ control.JobDoc.Content.Tables[t].UniqueKey
 ### 4.5 报错文案同步项（挂账清单，实现切片 S3 同批收口）
 
 1. **`internal/mysqlsink/apply.go:218-222` 的 `ErrNoUniqueKey` 文案**（Owl 在 `#112` 的挂账）：
-   现在只有「① 加主键/唯一索引 ② 从 `content.tables` 去掉」。要**加一条**：
-   「或声明 `unique_key: [列…]`（指向目标端已有的唯一索引）」。风险句保留。
+   现在只有「① 加主键/唯一索引 ② 从 `content.tables` 去掉」，且开头写着「**两种做法任选**」。
+   要**加第三条**「或声明 `unique_key: [列…]`（指向目标端已有的唯一索引）」，同时把「两种」改成「**三种**」——
+   数词不改，用户会以为第三条是附注；风险句保留。
 2. `internal/mysqlsink/upsert.go:93-96` `deleteSQL` 的裸错误 → 换成 `E1017` 四段式（或 `PausableError` + `no_pk_write`）。
 3. `internal/pgsink/pgsink.go:1729-1733` `deleteTx` 的裸错误 → 同上（**这是今天最刺眼的一处**：用户看到一句话，任务就停了）。
 4. `internal/core/codes.go` 加 `CodeNoIdentity Code = "E1017"` + `specs` 条目；`docs/ERRORS.md` 加行。
-5. `docs/SPEC.md:91` 的 `PG-06` 标注「实现形态 = `TARGET-02`」（跨引擎同一条），避免同一件事写成两条检查。
+5. `docs/SPEC.md:91` 的 `PG-06` **保号、拆两句**：源端那一半（`REPLICA IDENTITY`，本设计 §3.5 实现）留 `PG-06`；
+   目标表主键那一半归 `TARGET-02`。**不能**把整条折进 `TARGET-02`（评审 P1）——「源端解不出这一行」与
+   「目标端定位不了这一行」是两道不同的闸，合成一条排障时分不开。
 6. `docs/STREAMING.md:77`、`docs/CONFLICT.md:6`、`docs/SNAPSHOT.md:12-13`、`docs/VERIFY.md:40`、`docs/OPEN-QUESTIONS.md#1`：
    各加一句「口径见 `DESIGN-NO-PRIMARY-KEY.md`」，不再各自表述。
 7. `docs/CONNECTOR-SDK.md`：Catalog 字段表加 `UniqueKeys`（§3.4）。
@@ -345,15 +399,16 @@ control.JobDoc.Content.Tables[t].UniqueKey
 | 片 | 内容 | 涉及模块 | 验收（可执行） | 估 |
 |---|---|---|---|---|
 | **S1** insert-only 写路径 | MySQL 目标端：目标无唯一键 + 源端无身份 + 未声明 → 多行纯 `INSERT`（不拼 `ON DUPLICATE KEY`）；取消 `hasUniqueKey` 的硬失败；`ErrNoUniqueKey` 只在「声明了但对不上」或「源端有主键、目标缺键」时出现 | `internal/mysqlsink/{upsert,apply}.go`、`internal/pgsink/pgsink.go`（对齐） | 单测：无主键源表 → 生成 SQL 不含 `ON DUPLICATE KEY`；本地真库 PG→MySQL 全量搬完、行数一致 | 1d |
-| **S2** 改/删 → 按表暂停 | 新 `PausableError`（`Reason()="no_pk_write"`）在两个 sink 的 `EvUpdate`/`EvDelete` 分支前置判定（**写之前**判定，别写到一半）；引擎侧 `pauseSink` 登记 + `skipped_rows` + 退出码 3；下一轮重搬补齐；**`E1017` 码表 + `ERRORS.md` 由这片落地**（它出现的时点就是这片） | `internal/pgsink`、`internal/mysqlsink`、`internal/engine/{pause_skip,pause_generic,resume}.go`、`internal/core/codes.go`、`docs/ERRORS.md` | 集成：无主键表 `UPDATE` → 该表 `paused_tables.reason=no_pk_write`、`skipped_rows≥1`、**其它表行数继续增长**、退出码 3；重跑后该表与源端一致 | 1.5d |
+| **S2** 改/删 → 按表暂停（**含 `PG-06` 源端前置**） | ① 新 `PausableError`（`Reason()="no_pk_write"`）在两个 sink 的 `EvUpdate`/`EvDelete` 分支前置判定（**写之前**判定，别写到一半）；引擎侧 `pauseSink` 登记 + `skipped_rows` + 退出码 3；下一轮重搬补齐；**`E1017` 码表 + `ERRORS.md` 由这片落地**。② `PG-06`：PG 源 + 无主键 + 增量 → 读 `Table.ReplicaIdentity`，非 `full`/`index` 则 warn + autofix `ALTER TABLE … REPLICA IDENTITY FULL`（属主权限前提；拿不到权限就只给 SQL + 明说「这张表不能进增量」）。**没有 ②，① 在 PG 源上承诺的「只停这张表」就是假的**（源端解码先断） | `internal/pgsink`、`internal/mysqlsink`、`internal/engine/{pause_skip,pause_generic,resume}.go`、`internal/preflight/b0.go`、`internal/core/codes.go`、`docs/ERRORS.md` | 集成：无主键表 `UPDATE` → 该表 `paused_tables.reason=no_pk_write`、`skipped_rows≥1`、**其它表行数继续增长**、退出码 3；重跑后该表与源端一致。PG-06：未设 RI 时**不出现**「流反复断开」，而是预检给 autofix；设了 RI 后 S-NP3 才成立 | 2d |
 | **S3** `unique_key` | `TableDoc.UniqueKey` + 校验 + schema；`source.Table.UniqueKeys`（两个 `connect`）；`TARGET-02` 三档 + `preflight.Input.UniqueKeys`；两个 sink 的 upsert/delete 用声明；§4.5 其余文案（1/2/3/5–8） | `internal/control/jobspec.go`、`schema/job.schema.json`、`internal/connect/{mysql,postgres}.go`、`internal/source/contract.go`、`internal/preflight/b0.go`、两个 sink | 单测：五条核对判据逐条红/绿；集成：声明真唯一索引 → 重放两次行数不变、`DELETE` 生效；声明不存在的索引 → `TARGET-02` blocked + 四段式 | 1.5d |
 | **S4** 矩阵格 | §2.4 的 PR 10 格 + nightly 39 格；`testmatrix.yaml` 标注「待接通 12 格」 | `test/`、`scripts/`、`testmatrix.yaml` | PR 门禁 ≤15 分钟；nightly 报告里能单独筛出 `no-pk` 变体 | 1d |
 
 - **S1/S2 可并行**（S2 只依赖 `PausableError` 的形状，不依赖 S1 的 SQL 生成）；**S3 依赖 S1**（写路径要先有 insert-only 才能对比 upsert）；
   **S4 依赖 S1+S2+S3**。
-- 总计 5 人日（S1 1d + S2 1.5d + S3 1.5d + S4 1d），正好压在排期 3–5 人日的上限；
-  若砍范围，**先砍 S3**（v1 只留 insert-only + 暂停 = 2.5d），但那样 `continuous` 用户遇到第一次 `UPDATE`
-  就只能整表重搬，要把这句话写进发布说明。
+- 总计 **5.5 人日**（S1 1d + S2 2d + S3 1.5d + S4 1d）：评审 P1 把 `PG-06` 从「顺带一句」变成
+  「S2 里独立的前置工作」，比初版 +0.5d，**超出排期 3–5 人日的上限 0.5d**——这一笔要么由主持人认，
+  要么砍范围（**先砍 S3**，v1 只留 insert-only + 暂停 + PG-06 = 4d；代价是 `continuous` 用户
+  遇到第一次 `UPDATE` 只能整表重搬，得写进发布说明）。
 
 ---
 
@@ -369,6 +424,9 @@ control.JobDoc.Content.Tables[t].UniqueKey
 7. **文案分档**：`SCOPE-02` 四档、`TARGET-02` 三档，同一份报告里不许出现两句互相矛盾的话
    （`PAUSE-01` 踩过：引擎 note 说「只停这一张表」、预检卡片说「不做按表暂停」）。
 8. **矩阵证明不了的必须写在 PR 描述与 `notes/`**：MySQL→MySQL 未接通，目标端增量这一半今天只有单测 + 本地真库。
+9. **PG 源上，`REPLICA IDENTITY` 没到位就不许说「只停这张表」**（R5）：`default(no-pk)` / `nothing` 时源端解码先报错，
+   整条流断且重连再炸。「只停一张表」是一句**有前置的承诺**，不是默认行为。
+10. **不许把 `PG-06` 并进 `TARGET-02`**：一个问源端能不能解出这一行，一个问目标端能不能定位这一行。
 
 ---
 
@@ -385,6 +443,7 @@ control.JobDoc.Content.Tables[t].UniqueKey
 | D7 | `transform` 与 `unique_key` 的冲突规则 | `transform` 本身只有契约没有实现 |
 | D8 | `jinliang status` 的暂停展示（含 `skipped_rows`） | 已知债（契约 §1.8 片 D2）；**文案不许再把用户指去 status 找它** |
 | D9 | MySQL 目标端 upsert **不指定冲突列**：命中任意唯一索引即可更新，可能与源端主键语义不一致 | 与「无主键表」相邻但不同源；v1 只在 `TARGET-02` 的 Detail 里点明，改 SQL 形状要连带改 5.7 的 `VALUES()` 变体，属独立一片 |
+| D10 | 分区表叶子的 `REPLICA IDENTITY` 批量代做（catalog 只列父表，`connect/postgres.go:172-174` 跳过子分区） | 要先把 `pg_inherits` 枚举接进 catalog，否则代做只能改到父表；v1 明说不代做 + 给 SQL 模板 |
 
 ---
 
@@ -392,7 +451,7 @@ control.JobDoc.Content.Tables[t].UniqueKey
 
 | 文档 | 改什么 |
 |---|---|
-| `docs/SPEC.md` | `SCOPE-02` 补一行（四档）；`PG-06` 注明实现形态是 `TARGET-02`；`MY-08`/`MY-11` **不动** |
+| `docs/SPEC.md` | `SCOPE-02` 补一行（四档）；`PG-06` 那一行**拆两句**（源端 `REPLICA IDENTITY` 留 `PG-06`、目标表主键归 `TARGET-02`）；`MY-08`/`MY-11` **不动** |
 | `docs/ERRORS.md` | 加 `E1017` 一行（与 `codes.go` 同批） |
 | `docs/DESIGN.md` §0 原则 6 | 「无主键表照跑（insert-only）」后面补「改/删 → 只停这张表 + 欠一次整表重搬；`unique_key` 可升级成 upsert」 |
 | `docs/SNAPSHOT.md` §1/§4 | 无主键表两行补「整表重来不拖累其它表」与「`unique_key` 不改变切块」 |
