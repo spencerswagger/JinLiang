@@ -37,6 +37,7 @@ const (
 	CodeUnsupportedDirection Code = "E1014" // 当前版本不支持这个同步方向（源×目标组合）
 	CodeSchemaMismatch       Code = "E1015" // 表结构不一致（prepare 类型不一致 / 运行时改类型改名删列）
 	CodeSourceResourceLimit  Code = "E1016" // 源端资源或上限已用满（SQLSTATE 53400）
+	CodeNoIdentity           Code = "E1017" // 没有行身份（主键/唯一索引）：改删/去重做不到（族码，见下）
 	CodeTargetReset          Code = "E2001" // 目标连接被重置
 	CodeSourceTimeout        Code = "E2002" // 源库连接超时
 	CodeLockTimeout          Code = "E2003" // 目标库锁等待超时
@@ -254,6 +255,28 @@ var specs = []Spec{
 		},
 		Risk: "一条数据都不会写入、位点也不动（还没开始搬）；最常见误判是去 --resync 重搬全量——没用，名额还是满的。" +
 			"另一个误判是把别人的书签当孤儿删掉：gc --force 会跨实例清理，删了正在用的书签会让那个任务丢变更流水",
+	},
+	{
+		Code: CodeNoIdentity, Class: UserAction,
+		Message: "这张表没有主键，去重、改动、删除都做不到",
+		// 为什么 Message 敢一次说三件事：E1017 是族码（见上面常量处的注释）。
+		// 只写「改/删」会让 `interval` 那条预检卡片挂着一个说不通的码（它的问题是重复插入）。
+		Why: "数据库只能按主键或唯一索引定位一行，也只能靠它判重。没有它：改动会变成再插一行、" +
+			"删除不知道删哪一行、定时增量每轮重读的行也没有依据去重（于是每轮都重复插）。" +
+			"这张表本身仍然能同步：全量照搬、新的行照插，只有「改」「删」这两类变更表达不出来。" +
+			"PostgreSQL 源还有一道前置：这张表要能给出旧行（REPLICA IDENTITY 是 FULL 或 USING INDEX），" +
+			"否则源端读变更时就报错、整条同步会反复断开",
+		// 三条都必须是**现在就能走通**的做法（用例 TestNoIdentityNextOnlyNamesRealActions 钉住）。
+		// 定稿 §2.3 的第三条「声明 content.tables.<表>.unique_key」要等 S3 落地才写进来：
+		// 现在 jobspec 是 strict 解析，照着我们的话写会直接撞「未知字段」，比不说更糟。
+		Next: []string{
+			"给源表和目标表都加上主键或唯一索引（推荐：两边一致，改、删、去重一次解决）",
+			"不想改表结构：把 mode.frequency 改成 once / full_interval——每轮整表重搬，不需要逐行定位",
+			"不想再跟这张表：从 content.tables 里去掉后重新 import（按新范围重算 job_key，会新建状态行）",
+		},
+		Risk: "运行中被暂停的那张表：其它表照常、位点照常前进，跳过的那段要等整表重搬才补齐，" +
+			"期间它和源端不一致；重搬会**清空这张表**再从头读（本任务建的表才允许清，你自己的表会停下来问你）。" +
+			"定时增量在预检阶段就被拦下：一条数据都不会写入（也不会替你猜哪些是重复）",
 	},
 	{
 		Code: CodeControlDBBroken, Class: Fatal,
