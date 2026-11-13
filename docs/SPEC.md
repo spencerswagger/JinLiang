@@ -110,9 +110,69 @@
 | MY-05 | `server_id` 唯一且未与源冲突 | blocked（撞号会把真正的从库踢下线，给建议值） |
 | MY-06 | `binlog_expire_logs_seconds` ≥ 预期最长断线 | 提示风险（可 autofix） |
 | MY-07 | `binlog_transaction_compression` | 默认自身解压；解不了才 blocked，并提示「关闭源端压缩」 |
-| MY-08 | 表的存储引擎 | MyISAM → **warn**（无事务，崩溃时可能不一致），照跑并标注 |
+| MY-08 | 表的存储引擎**有没有事务**（取服务器自报的 `information_schema.ENGINES.TRANSACTIONS`：`MyISAM` / `MRG_MYISAM` / `MEMORY` / `CSV` / `ARCHIVE` / `BLACKHOLE` 实测都是 `NO`） | **降级（warn）+ 收尾标注**：照跑、不拒绝，但明说「全量不是一致性切面」；引擎名查不到也按降级（**读不到能力 ≠ 有事务**）。只有「非 MySQL 源」与「没读到表清单」才不判。口径见下 |
 | MY-09 | 认证插件可用（8.4/9.x 移除 native） | autofixable（建 caching_sha2 独立账号） |
 | MY-10 | 主从角色（`SHOW REPLICA STATUS` / `SHOW BINARY LOG STATUS`） | 指向主库，或说明只读副本的限制 |
+
+#### MY-08（表的存储引擎）：降级口径
+
+一句话：**无事务引擎的表照跑，但它给不出一致性切面这件事，预检和收尾各说一次**——不是拒绝，也不是沉默。
+
+**判据（唯一入口）**：`preflight.JudgeEngines(sourceKind, cat, selected)`（`internal/preflight/engine.go`，`#126`）。
+预检卡片与引擎收尾都只读它的结论；任何一处另写一份判据都算回归。三态：
+
+| `EngineVerdict` | 含义 | 卡片 | 哪些表落这一格 |
+|---|---|---|---|
+| `transactional` | 选中的表全部有事务 | 不发 MY-08 | `TRANSACTIONS = 'YES'` 的引擎（`InnoDB`） |
+| `non_transactional` | 至少一张没有事务，**或**它的引擎名在 `information_schema.ENGINES` 里查不到 | MY-08 `warn`（**降级**）+ 收尾「说明」 | 8.0.28 实测 `NO`：`MyISAM` `MRG_MYISAM` `MEMORY` `CSV` `ARCHIVE` `BLACKHOLE`；`FEDERATED` 的 `TRANSACTIONS` 是 `NULL`，同样落这一格 |
+| `not_judged` | **没判**，不冒充 ok | 不发 MY-08 | 非 MySQL 源（PG 的 `Engine` 是 relkind，不是存储引擎）；`SourceCat` 没读到（这一半归 `SCOPE-01`） |
+
+四条要写进实现的判据细节：
+
+1. **判「能力」，不判引擎名**。取值来自服务器自报的 `information_schema.ENGINES`（`SHOW ENGINES` 的表格版）：
+   `TRANSACTIONS = 'YES'` 才有事务，`NO` / `NULL` / 空一律没有。**不维护引擎名黑名单**——按名字判会把
+   `MEMORY` / `CSV` / `ARCHIVE` 当成「有事务」（这正是 `#113` 那条判据漏掉的假绿），将来加进来的引擎
+   （MyRocks、插件引擎）也不该等我们改代码才被发现。
+2. **查不到 = 降级，不是 ok**。「不知道这个引擎有没有事务」与「它没有事务」在同一侧：两者都不能声称一致。
+   代价是探针彻底失败时每张表都多一句提示——这是**故意**付的：宁可多一句，也不许一次假绿。
+   反过来，把 `not_judged` 当 ok 是本项最容易犯的错。
+3. **档位与 `mode` 无关**。`once` 也不是一致快照（读取没有 read view，且它同样存快照起点位点），`interval`
+   更没有一致性切面。所以 MY-08 **不按 `mode` 分档**——别照抄 `SCOPE-02` / `PAUSE-01` 的四档分流，
+   那两条的模式差异是真的（写路径不同），MY-08 的模式差异是假的。
+4. **只判源端**。目标端 MySQL 由 `mysqlsink` 一律建 `ENGINE=InnoDB`（`internal/mysqlsink/schema.go` 硬编码），
+   目标端引擎不进 MY-08；`MySQL→MySQL` 这个方向本身还在待接通（`D6`）。
+
+**为什么不是 blocked**：无事务引擎的表读得到、也搬得动，缺的只是「同一时间点」。`DESIGN.md` 原则 6 只有两类地方会停：
+物理上做不到、安全底线不对。这里两条都不沾。
+
+**为什么不是「暂不判」**（`MEMORY` / `CSV` / `ARCHIVE` / `BLACKHOLE` / `FEDERATED` 的归属）：它们是「**看了，并且知道没有事务**」，
+不是「没看」。放进 `not_judged` 等于让它们悄悄走正常路径，而 `not_judged` 在用户那儿等价于「没问题」——空白就是下一个假绿。
+所以**归入同一判据、同一档位（降级）**，各自多一句自己特有的代价，而不是各开一张卡、也不是拒绝。
+
+**为什么不去加全局读锁拿真正的一致性切面**：`FLUSH TABLES WITH READ LOCK` 确实能给出一致性切面，但它要**整个全量期间**停写
+（不是我们取位点时那毫秒级）。大表上是不可接受的停机；所以选「照跑 + 明说」，而不是偷偷加锁、也不是拒绝。
+现在的做法是 `START TRANSACTION WITH CONSISTENT SNAPSHOT`（`mysqlsource/snapshot.go:178`）——**它只对事务引擎建立 read view**，
+MyISAM 系的行不受保护：读取期间源端的写入会逐条被看见，位点又是读取之前取的。这就是「不是一致性切面」的全部来历。
+
+**四段文案（预检卡片 Detail 与收尾「说明」共用一个来源：`preflight.EngineDegradeNote`）**：
+
+- 发生了什么：`降级：<表>(<引擎>) 用的是无事务引擎——本轮照跑、不拒绝，但不是一致性切面`
+- 为什么：全量读取和位点不在同一个时间点（读取没有 read view）
+- 风险：崩溃或并发写入时目标端可能与源端不一致；`verify` 全绿只说明「校验那一刻两边一样」，不说明崩溃后仍然一致
+- 能做什么：`ALTER TABLE <schema>.<表> ENGINE=InnoDB;`（要重建表、要磁盘余量、要主键），改完下一轮 MY-08 自动消失；或者就这样接受
+
+**引擎特有的代价（命中才追加一句；`InnoDB` 一个字不加）**：
+
+| 引擎 | 追加的那一句 |
+|---|---|
+| `MEMORY` | 整表在内存，实例重启/崩溃即空；源端空了目标端还留着旧行，要重搬才收敛（增量里没有 delete 事件承载它） |
+| `CSV` / `ARCHIVE` | 不支持任何索引（8.0.28 实测：CSV `max 0 keys allowed`、ARCHIVE `ADD PRIMARY KEY` 报 1030），所以这类表**恒无主键**——身份与改删归 `SCOPE-02` / `TARGET-02`，MY-08 只说「有没有事务」这一半，**别把两张卡并成一张**；`interval` 下以 `SCOPE-02` 的 blocked 为准 |
+| `ARCHIVE` | 只能 `INSERT`/`SELECT`，也不支持可空列 ⇒ 源端不会发生改删 |
+| `BLACKHOLE` | 写入即丢、读永远 0 行：「全量完成 0 行」对它成立，但没有意义 |
+| `FEDERATED` | 表在远端；位点是本机变更流的位置，两者不保证同一时间点 |
+
+**措辞约束**：卡片标题不许写死 `MyISAM`（`MEMORY` 也降级之后，「用 MyISAM 引擎」就是假话），要写成
+「部分表用无事务引擎」；正文必须点名 `<表>(<引擎>)` 的真实引擎名，并给出那条 `ALTER`。
 
 ## 4. 错误模型
 
