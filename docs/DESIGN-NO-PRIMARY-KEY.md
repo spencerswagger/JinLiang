@@ -1,7 +1,7 @@
 # 设计：无主键表同步（insert-only / 显式唯一键）· v1 定稿
 
-> **状态：设计定稿，尚未实现。** 本文件描述的是**目标行为**，不是现状；
-> 每条口径都标了「今天能不能跑」。实现切片见 §5，落地状态由后续 PR 回填到本注。
+> **状态：S1–S3 + E1017 已合入 main（`#116`/`#117`/`#119`/`#120`/`#122`）；S4 矩阵格与 D2/D10 等挂账未落地。**
+> 本文件既是设计也是落地记录，下面「今天能不能跑」按此读。
 >
 > 基线：`main` `0143986`（`#112` 报错文案、`#113` MY-08 preflight + 单测、`#114` MY-08 矩阵 smoke 已合入）。
 > 本文件**不改** `MY-08`/`MY-11` 的编号与语义，也**不推翻** `#112` 已改的 `ErrNoUniqueKey` 文案——只在它上面扩展一句。
@@ -14,7 +14,7 @@
 
 ## §1 口径选择：insert-only 与「显式业务唯一键」
 
-### 1.1 现状（逐条可核对，别凭印象）
+### 1.1 现状（**设计当时 `0143986` 的快照**，逐条可核对；S1–S3 之后的差异以本文件首句状态与 §4.5 为准）
 
 | 能力 | 现状 | 依据 |
 |---|---|---|
@@ -180,7 +180,7 @@ A 是地板，B 是天花板。
 
 **`E1017` 的落地记录**：`#119` 先落三条真实做法（那时 `JobDoc` 还没有 `unique_key` 字段，strict 解析会把照抄的用户
 挡在「未知字段」上）；S3 合入后已补回——码表 `Next`、`docs/ERRORS.md` 那一行、`uniqueKeyConfigLanded = true`
-三处同批完成（`#120` 的 `c06a891`）。码表硬约束 `Next` 只能 1–3 步，所以四条做法压成三步：`unique_key` 独占一条，
+三处同批完成（`#120`，`a99337c`）。码表硬约束 `Next` 只能 1–3 步，所以四条做法压成三步：`unique_key` 独占一条，
 「换 `once`/`full_interval`」与「移出 `content.tables`」并进第 3 步。
 
 > **PG 源的前置（R5，评审 P1）**：上面 `Risk` 那三句「只停这张表、其它表照常、位点照常前进」**只在
@@ -379,23 +379,25 @@ control.JobDoc.Content.Tables[t].UniqueKey
 只喂给**两个 sink**（写路径）与**预检**。引擎不需要它：改/删写不进去这件事由 sink 返回
 `PausableError` 表达，引擎只看原因码（`pause_skip.go:60-90` 现有形状，不新增接口）。
 
-### 4.5 报错文案同步项（挂账清单，实现切片 S3 同批收口）
+### 4.5 报错文案同步项（**已收口**：`#119` / `#120` / `#122`）
 
-1. **`internal/mysqlsink/apply.go:218-222` 的 `ErrNoUniqueKey` 文案**（Owl 在 `#112` 的挂账）：
-   现在只有「① 加主键/唯一索引 ② 从 `content.tables` 去掉」，且开头写着「**两种做法任选**」。
-   要**加第三条**「或声明 `unique_key: [列…]`（指向目标端已有的唯一索引）」，同时把「两种」改成「**三种**」——
-   数词不改，用户会以为第三条是附注；风险句保留。
-2. `internal/mysqlsink/upsert.go:93-96` `deleteSQL` 的裸错误 → 换成 `E1017` 四段式（或 `PausableError` + `no_pk_write`）。
-3. `internal/pgsink/pgsink.go:1729-1733` `deleteTx` 的裸错误 → 同上（**这是今天最刺眼的一处**：用户看到一句话，任务就停了）。
-4. `internal/core/codes.go` 加 `CodeNoIdentity Code = "E1017"` + `specs` 条目；`docs/ERRORS.md` 加行。
-5. `docs/SPEC.md:91` 的 `PG-06` **保号、拆两句**：源端那一半（`REPLICA IDENTITY`，本设计 §3.5 实现）留 `PG-06`；
-   目标表主键那一半归 `TARGET-02`。**不能**把整条折进 `TARGET-02`（评审 P1）——「源端解不出这一行」与
-   「目标端定位不了这一行」是两道不同的闸，合成一条排障时分不开。
-6. `docs/STREAMING.md:77`、`docs/CONFLICT.md:6`、`docs/SNAPSHOT.md:12-13`、`docs/VERIFY.md:40`、`docs/OPEN-QUESTIONS.md#1`：
-   各加一句「口径见 `DESIGN-NO-PRIMARY-KEY.md`」，不再各自表述。
-7. `docs/CONNECTOR-SDK.md`：Catalog 字段表加 `UniqueKeys`（§3.4）。
-8. `internal/verify/verify.go:439` 那句「增量只能 insert-only」在声明 `unique_key` 后不再准确 →
-   文案改成「这张表没有主键：本版只比行数（声明 `unique_key` 后仍不做行级比对，见挂账 D2）」。**别**承诺没实现的能力。
+1. **`ErrNoUniqueKey` 文案**（Owl 在 `#112` 的挂账）已改成「**三种**做法任选」——加主键/唯一索引 ·
+   声明 `unique_key: [列…]` · 从 `content.tables` 去掉；`#122` 另收口了「源端已有主键时声明无效」这个坑
+   （不再劝用户声明），风险句保留。现状：`internal/mysqlsink/apply.go:307`。
+2. `deleteSQL` 的裸错误已换成可暂停类型（`no_pk_write` + `E1017`），绝不退化成全表条件
+   （`internal/mysqlsink/upsert.go:242-246`，§6 红线 2）。
+3. `pgsink` 的 `deleteTx` 裸错误同样收口：`NoPKWriteError`（`internal/pgsink/pgsink.go:1534-1560`、`:1840`）——
+   原来那句「表 x 没有主键，无法安全删除目标端对应行」在 main 上已 **0 处**。
+4. `internal/core/codes.go` 的 `CodeNoIdentity = "E1017"` + `specs` 条目、`docs/ERRORS.md` 那一行已落地（`#119`），
+   `Next` 三条怎么合并的见 §2.3 落地记录。
+5. `docs/SPEC.md:91` 的 `PG-06` 已拆两句：源端 `REPLICA IDENTITY` 一半留 `PG-06`（warn + autofix），
+   目标表主键一半归 `TARGET-02`——**两道闸不合并**（评审 P1）。
+6. `STREAMING` / `CONFLICT` / `SNAPSHOT` / `VERIFY` / `OPEN-QUESTIONS` / `CONNECTOR-SDK` 六处都已有
+   「口径见 `DESIGN-NO-PRIMARY-KEY.md`」的交叉引用（各 1 处，随 `#120` 落地），不再各自表述。
+7. `docs/CONNECTOR-SDK.md` 的 Catalog 字段表已加 `UniqueKeys`（`[][]string`，**只用于核对用户声明**，
+   不用来发现行身份）。
+8. `internal/verify/verify.go:439` 已改成「这张表没有主键：本版只比行数（声明 `unique_key` 后仍不做行级比对，
+   见挂账 D2）」——不承诺没实现的能力。
 
 ---
 
