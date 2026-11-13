@@ -178,11 +178,10 @@ A 是地板，B 是天花板。
 `internal/pgsink/paused.go:32-50`）。它与 `E1015` 的区别：E1015 是「结构对不上」，E1017 是「结构没错，但没有身份」。
 `Detail` 里写人话（哪张表、哪条变更、需要什么），不写进 Message。
 
-**`E1017` 的来源跑法**：进码表时（`#119`）第三条做法 `unique_key` **暂缓**——S3 未落地，而 `jobspec` 是 strict 解析，
-把「声明 `unique_key`」写进「你现在能做什么」会让用户直接撞「未知字段」，比不说更糟。所以码表当前的 Next 是
-三条**真能走通**的路（加主键/唯一索引 · 换 `once`/`full_interval` · 移出 `content.tables` 后重新 import）。
-S3 合入时必须一次性改三处：码表 Next 补第三条 · `docs/ERRORS.md` 那一行同步 ·
-`internal/core/codes_noidentity_test.go` 的 `uniqueKeyConfigLanded` 改 `true`（漏了它，用例会红，正好当提醒）。
+**`E1017` 的落地记录**：`#119` 先落三条真实做法（那时 `JobDoc` 还没有 `unique_key` 字段，strict 解析会把照抄的用户
+挡在「未知字段」上）；S3 合入后已补回——码表 `Next`、`docs/ERRORS.md` 那一行、`uniqueKeyConfigLanded = true`
+三处同批完成（`#120` 的 `c06a891`）。码表硬约束 `Next` 只能 1–3 步，所以四条做法压成三步：`unique_key` 独占一条，
+「换 `once`/`full_interval`」与「移出 `content.tables`」并进第 3 步。
 
 > **PG 源的前置（R5，评审 P1）**：上面 `Risk` 那三句「只停这张表、其它表照常、位点照常前进」**只在
 > `REPLICA IDENTITY` 到位时成立**。PG 源的无主键表若是 `default(no-pk)`，源端在解出第一条 `UPDATE`/`DELETE`
