@@ -891,8 +891,8 @@ func (r *runner) targetRef(ref source.TableRef) source.TableRef {
 }
 
 // declaredUniqueKeys 是用户声明的行身份（content.tables.<表>.unique_key），
-// key 用**裸表名**：源端与目标端只差 schema，裸表名两边一致，所以同一份 map
-// 既能喂 preflight（源端口径）也能喂 sink.Options.UniqueKeys（目标端口径，§4.4）。
+// key 用**裸表名**（§4.4）：源端与目标端只差 schema，裸表名两边一致。
+// 预检与写路径各有一份口径选择，见下面 sinkDeclaredUniqueKeys 的注释。
 // declaredUniqueKeys 是**预检**用的声明（raw）：声明写错了要能提示，哪怕当前模式用不上它。
 // 解析口径只写一份：`control.JobDoc.DeclaredUniqueKeys`（key 用裸表名）。
 func (r *runner) declaredUniqueKeys() map[string][]string {

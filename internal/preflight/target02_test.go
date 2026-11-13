@@ -456,4 +456,7 @@ func TestTarget02MatchingKeyWithNullableColumnWarnsAboutNulls(t *testing.T) {
 	if !strings.Contains(c.Detail, "NULL 互不相等") {
 		t.Fatalf("要说清真实风险（NULL 行互不冲突 → 重复），得到：%s", c.Detail)
 	}
+	if len(c.Affected) != 1 || c.Affected[0] != "orders" {
+		t.Fatalf("Affected 只能放裸表名（其它档都是这个口径），得到 %v", c.Affected)
+	}
 }

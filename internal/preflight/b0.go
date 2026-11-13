@@ -546,6 +546,7 @@ func targetUniqueKeyChecks(in Input) []source.Check {
 	wholeTable := in.Mode == "once" || in.Mode == "full_interval"
 
 	var blocked, warnNoPK, warnIgnored, warnNoMatch, warnOtherKey, warnNullable []string
+	nullableWhy := map[string]string{}
 	blockedWhy := map[string]string{}
 	for _, name := range in.Tables {
 		st, known := src[name]
@@ -585,7 +586,9 @@ func targetUniqueKeyChecks(in Input) []source.Check {
 				if strings.Contains(why, "允许为空") {
 					// 那组列可空：ON CONFLICT 照收（不报 42P10），但 NULL 互不相等 →
 					// 带 NULL 的行不会互相冲突，重放就会插重复。真实风险 ≠ 「键不存在」。
-					warnNullable = append(warnNullable, fmt.Sprintf("%s：%s", name, why))
+					// Affected 只放裸表名（与其它档一致），why 进 Detail。
+					warnNullable = append(warnNullable, name)
+					nullableWhy[name] = why
 					continue
 				}
 				warnOtherKey = append(warnOtherKey, name)
@@ -649,9 +652,13 @@ func targetUniqueKeyChecks(in Input) []source.Check {
 	}
 	if len(warnNullable) > 0 {
 		sort.Strings(warnNullable)
-		parts = append(parts, fmt.Sprintf("%s 目标端的唯一索引/主键含可空列：ON CONFLICT 照收，但 NULL 互不相等——"+
+		whys := make([]string, 0, len(warnNullable))
+		for _, n := range warnNullable {
+			whys = append(whys, nullableWhy[n])
+		}
+		parts = append(parts, fmt.Sprintf("%s 目标端的唯一索引/主键含可空列（%s）：ON CONFLICT 照收，但 NULL 互不相等——"+
 			"带 NULL 的行不会互相冲突，重放/重复投递会插出多行。你能做的：把那几列改成 NOT NULL，或换一组非空的唯一索引",
-			preview(warnNullable)))
+			preview(warnNullable), strings.Join(whys, "；")))
 		affected = append(affected, warnNullable...)
 	}
 	if len(warnOtherKey) > 0 {
