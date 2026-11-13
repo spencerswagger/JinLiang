@@ -258,7 +258,10 @@ func (p *Prober) checks(res *ProbeResult, vars map[string]string, grants string,
 	}
 	if strings.EqualFold(res.Server.Flavor, "mariadb") {
 		out = append(out, source.Check{
-			ID: "MY-08", Title: "这是 MariaDB，本期不支持",
+			// MY-08 在 docs/SPEC.md:107 是「表的存储引擎」（MyISAM → warn 照跑），
+			// 这条 MariaDB 检查之前错占了 MY-08；MY-09/MY-10 也已留给 SPEC 的
+			// 认证插件 / 主从角色，所以用下一个空号 MY-11。
+			ID: "MY-11", Title: "这是 MariaDB，本期不支持",
 			Status: source.StatusBlocked,
 			Detail: "MariaDB 的 binlog 事件编号与 GTID 格式和 MySQL 不同",
 			Who:    "you", Code: "E1001",
