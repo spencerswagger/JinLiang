@@ -146,8 +146,15 @@ func TestInsertOnlyDecision(t *testing.T) {
 	if !insertOnly(&source.Table{HasStablePK: false}) {
 		t.Fatal("源端无稳定主键的表必须是 insert-only")
 	}
-	if insertOnly(&source.Table{HasStablePK: true, PrimaryKey: []string{"id"}}) {
-		t.Fatal("源端有主键的表不能走 insert-only")
+	withPK := &source.Table{HasStablePK: true, PrimaryKey: []string{"id"},
+		Columns: []source.Column{{Name: "id"}, {Name: "v"}}}
+	if insertOnly(withPK) {
+		t.Fatal("源端有主键（且主键列在搬运列里）的表不能走 insert-only")
+	}
+	// 主键列被 columns.exclude 排掉：目标端没有那几列可定位 → 与 pgsink 同口径按无身份处理。
+	if !insertOnly(&source.Table{HasStablePK: true, PrimaryKey: []string{"id"},
+		Columns: []source.Column{{Name: "v"}}}) {
+		t.Fatal("主键列不在搬运列里时，upsert 拼不出定位列，必须按 insert-only")
 	}
 	if insertOnly(nil) {
 		t.Fatal("拿不到 Relation 时不能猜 insert-only（没有身份信息就按老规矩要求唯一键）")

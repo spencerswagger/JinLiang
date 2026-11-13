@@ -266,13 +266,14 @@ var specs = []Spec{
 			"这张表本身仍然能同步：全量照搬、新的行照插，只有「改」「删」这两类变更表达不出来。" +
 			"PostgreSQL 源还有一道前置：这张表要能给出旧行（REPLICA IDENTITY 是 FULL 或 USING INDEX），" +
 			"否则源端读变更时就报错、整条同步会反复断开",
-		// 三条都必须是**现在就能走通**的做法（用例 TestNoIdentityNextOnlyNamesRealActions 钉住）。
-		// 定稿 §2.3 的第三条「声明 content.tables.<表>.unique_key」要等 S3 落地才写进来：
-		// 现在 jobspec 是 strict 解析，照着我们的话写会直接撞「未知字段」，比不说更糟。
+		// 每一条都必须是**现在就能走通**的做法（用例 TestNoIdentityNextOnlyNamesRealActions 钉住）。
+		// 第三条「声明 unique_key」随 S3（PR #120）落地：jobspec 已解析并校验该字段，
+		// 目标端由 TARGET-02 与两个 sink 的写前核对把关（判据见设计 §4.3）。
 		Next: []string{
 			"给源表和目标表都加上主键或唯一索引（推荐：两边一致，改、删、去重一次解决）",
-			"不想改表结构：把 mode.frequency 改成 once / full_interval——每轮整表重搬，不需要逐行定位",
-			"不想再跟这张表：从 content.tables 里去掉后重新 import（按新范围重算 job_key，会新建状态行）",
+			"不想改源表结构：在 content.tables.<表> 里写 unique_key: [列…]——指向目标端**已有**的唯一索引（列都非空），声明后 upsert 与删除都能定位；源端已有主键时这条会被忽略",
+			"两条都不行：把 mode.frequency 改成 once / full_interval（每轮整表重搬，不需要逐行定位）；" +
+				"不想再跟这张表就从 content.tables 里去掉后重新 import（按新范围重算 job_key，会新建状态行）",
 		},
 		Risk: "运行中被暂停的那张表：其它表照常、位点照常前进，跳过的那段要等整表重搬才补齐，" +
 			"期间它和源端不一致；重搬会**清空这张表**再从头读（本任务建的表才允许清，你自己的表会停下来问你）。" +

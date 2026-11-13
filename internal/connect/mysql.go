@@ -185,6 +185,47 @@ func (m *MySQL) Catalog(ctx context.Context, scope source.Scope) (source.Catalog
 		return source.Catalog{}, err
 	}
 
+	// 唯一索引（TARGET-02 的核对依据，docs/DESIGN-NO-PRIMARY-KEY.md §3.4）：
+	// 只收「非主键、非前缀（SUB_PART IS NULL）、非表达式（COLUMN_NAME 非空）」的
+	// 全列唯一索引。含 NULL 的列**照收**——NULL 是否构成唯一性由 preflight 按列
+	// 可空性判（判据 5），目录层不替它下结论。
+	const qUniq = `
+		SELECT TABLE_NAME, INDEX_NAME, COLUMN_NAME
+		FROM information_schema.STATISTICS
+		WHERE TABLE_SCHEMA = ? AND NON_UNIQUE = 0
+		  AND INDEX_NAME <> 'PRIMARY'
+		  AND SUB_PART IS NULL
+		  AND COLUMN_NAME IS NOT NULL
+		ORDER BY TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX`
+	urows, err := m.db.QueryContext(ctx, qUniq, db)
+	if err != nil {
+		return source.Catalog{}, fmt.Errorf("读取唯一索引失败: %w", err)
+	}
+	type idxKey struct{ table, index string }
+	uniq := map[idxKey][]string{}
+	var uniqOrder []idxKey
+	for urows.Next() {
+		var table, index, col string
+		if err := urows.Scan(&table, &index, &col); err != nil {
+			urows.Close()
+			return source.Catalog{}, err
+		}
+		k := idxKey{table, index}
+		if _, ok := uniq[k]; !ok {
+			uniqOrder = append(uniqOrder, k)
+		}
+		uniq[k] = append(uniq[k], col)
+	}
+	urows.Close()
+	if err := urows.Err(); err != nil {
+		return source.Catalog{}, err
+	}
+	for _, k := range uniqOrder {
+		if t, ok := tables[k.table]; ok {
+			t.UniqueKeys = append(t.UniqueKeys, uniq[k])
+		}
+	}
+
 	var cat source.Catalog
 	for _, name := range order {
 		t := tables[name]

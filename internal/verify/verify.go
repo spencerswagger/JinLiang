@@ -436,7 +436,7 @@ func checkType(lr *LevelReport, table string, sc, tc source.Column, from, to cat
 func checkPrimaryKey(lr *LevelReport, srcT, tgtT source.Table) {
 	if len(srcT.PrimaryKey) == 0 {
 		lr.add(SeverityWarn, "no_primary_key", srcT.Table, "",
-			"源表没有主键：增量只能 insert-only，数据级校验只能比行数", "", "", "")
+			"这张表没有主键：本版只比行数（声明 unique_key 后仍不做行级比对，见挂账 D2）", "", "", "")
 		return
 	}
 	if len(tgtT.PrimaryKey) == 0 {

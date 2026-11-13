@@ -466,3 +466,174 @@ func TestIntegrationNoPKInsertOnlyRejectsUpdate(t *testing.T) {
 		t.Fatalf("失败时位点不能前进: %q", p)
 	}
 }
+
+// 声明 unique_key 的无主键表：ON CONFLICT 用声明列，重放幂等，删除能定位
+// （docs/DESIGN-NO-PRIMARY-KEY.md §5 S3 验收）。
+func TestIntegrationDeclaredUniqueKeyUpsertAndDelete(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	const table = "jl_b5_decl"
+	cat := source.Catalog{Tables: []source.Table{{
+		TableRef: source.TableRef{Schema: "public", Table: table},
+		Columns: []source.Column{
+			{Name: "tenant_id", Type: "bigint"},
+			{Name: "event_no", Type: "text"},
+			{Name: "payload", Type: "text", Nullable: true},
+		},
+		// 源端没有稳定主键（HasStablePK=false）：身份来自声明。
+	}}}
+	s := openSinkFor(t, cat, func(o *Options) {
+		o.UniqueKeys = map[string][]string{table: {"tenant_id", "event_no"}}
+	})
+	drop := func() { _, _ = s.conn.Exec(ctx, "DROP TABLE IF EXISTS public."+table) }
+	drop()
+	// 目标表由用户建好并带唯一索引（声明要求「已有唯一索引」，我们不建）。
+	if _, err := s.conn.Exec(ctx, "CREATE TABLE public."+table+
+		" (tenant_id bigint NOT NULL, event_no text NOT NULL, payload text, UNIQUE (tenant_id, event_no))"); err != nil {
+		t.Fatalf("建带唯一索引的无主键表: %v", err)
+	}
+	defer drop()
+	if _, err := s.EnsureSchema(ctx, cat); err != nil {
+		t.Fatalf("append 策略应沿用已有表: %v", err)
+	}
+
+	rel := &source.Table{TableRef: source.TableRef{Schema: "public", Table: table},
+		Columns: cat.Tables[0].Columns}
+	mk := func(payload string) []source.Event {
+		return []source.Event{
+			{Kind: source.EvBegin, TxID: "tx"},
+			{Kind: source.EvInsert, TxID: "tx", Table: source.TableRef{Schema: "public", Table: table},
+				Relation: rel,
+				New: source.Row{Table: source.TableRef{Schema: "public", Table: table}, Values: []source.Value{
+					{Kind: source.KindString, S: "1"},
+					{Kind: source.KindString, S: "e1"},
+					{Kind: source.KindString, S: payload}}}},
+			{Kind: source.EvCommit, TxID: "tx"},
+		}
+	}
+	if err := s.Apply(ctx, mk("x"), testPosition{"postgres:v1:0/B0"}); err != nil {
+		t.Fatalf("声明身份后的首写失败: %v", err)
+	}
+	if err := s.Apply(ctx, mk("y"), testPosition{"postgres:v1:0/C0"}); err != nil {
+		t.Fatalf("重放失败: %v", err)
+	}
+	n, err := s.Count(ctx, source.TableRef{Schema: "public", Table: table})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("声明行身份后重放应幂等（1 行），实际 %d", n)
+	}
+	var payload string
+	if err := s.conn.QueryRow(ctx, "SELECT payload FROM public."+table).Scan(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload != "y" {
+		t.Fatalf("重放应更新 payload，实际 %q", payload)
+	}
+
+	del := []source.Event{
+		{Kind: source.EvBegin, TxID: "tx"},
+		{Kind: source.EvDelete, TxID: "tx", Table: source.TableRef{Schema: "public", Table: table},
+			Relation: rel,
+			Old: source.Row{Table: source.TableRef{Schema: "public", Table: table}, Values: []source.Value{
+				{Kind: source.KindString, S: "1"},
+				{Kind: source.KindString, S: "e1"},
+				{Kind: source.KindString, S: "y"}}}},
+		{Kind: source.EvCommit, TxID: "tx"},
+	}
+	if err := s.Apply(ctx, del, testPosition{"postgres:v1:0/D0"}); err != nil {
+		t.Fatalf("按声明列删除失败: %v", err)
+	}
+	if n, err = s.Count(ctx, source.TableRef{Schema: "public", Table: table}); err != nil || n != 0 {
+		t.Fatalf("删除后应 0 行，实际 %d err=%v", n, err)
+	}
+}
+
+// 声明列含 NULL：PG 的唯一索引允许 NULL 且 NULL 互不相等，这组列不构成唯一性 → 写前必须停。
+func TestIntegrationDeclaredUniqueKeyNullableFails(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	const table = "jl_b5_decl_null"
+	cat := source.Catalog{Tables: []source.Table{{
+		TableRef: source.TableRef{Schema: "public", Table: table},
+		Columns: []source.Column{
+			{Name: "tenant_id", Type: "bigint"},
+			{Name: "event_no", Type: "text", Nullable: true},
+		},
+	}}}
+	s := openSinkFor(t, cat, func(o *Options) {
+		o.UniqueKeys = map[string][]string{table: {"tenant_id", "event_no"}}
+	})
+	drop := func() { _, _ = s.conn.Exec(ctx, "DROP TABLE IF EXISTS public."+table) }
+	drop()
+	if _, err := s.conn.Exec(ctx, "CREATE TABLE public."+table+
+		" (tenant_id bigint NOT NULL, event_no text, UNIQUE (tenant_id, event_no))"); err != nil {
+		t.Fatalf("建表: %v", err)
+	}
+	defer drop()
+	if _, err := s.EnsureSchema(ctx, cat); err != nil {
+		t.Fatalf("append 策略应沿用已有表: %v", err)
+	}
+	evs := []source.Event{
+		{Kind: source.EvBegin, TxID: "tx"},
+		{Kind: source.EvInsert, TxID: "tx", Table: source.TableRef{Schema: "public", Table: table},
+			Relation: &cat.Tables[0],
+			New: source.Row{Table: source.TableRef{Schema: "public", Table: table}, Values: []source.Value{
+				{Kind: source.KindString, S: "1"}, {Kind: source.KindString, S: "e1"}}}},
+		{Kind: source.EvCommit, TxID: "tx"},
+	}
+	err := s.Apply(ctx, evs, testPosition{"postgres:v1:0/E0"})
+	if err == nil {
+		t.Fatal("声明列可空时必须失败")
+	}
+	if !strings.Contains(err.Error(), "允许为空") {
+		t.Fatalf("错误要点明含 NULL 的列不构成唯一性: %v", err)
+	}
+}
+
+// 快照分页（BulkApply）也走 upsert，所以声明核对必须和 Apply 同口径：
+// 声明与目标端索引对不上时，用户应该拿到四段式（可行动），而不是驱动的原始 42P10。
+func TestIntegrationBulkApplyChecksDeclaredKey(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	const table = "jl_b5_decl_bulk"
+	cat := source.Catalog{Tables: []source.Table{{
+		TableRef: source.TableRef{Schema: "public", Table: table},
+		Columns: []source.Column{
+			{Name: "tenant_id", Type: "bigint"},
+			{Name: "event_no", Type: "text"},
+			{Name: "payload", Type: "text", Nullable: true},
+		},
+	}}}
+	// 声明只写 tenant_id，但目标表唯一索引是 (tenant_id,event_no)：核对不过。
+	s := openSinkFor(t, cat, func(o *Options) {
+		o.UniqueKeys = map[string][]string{table: {"tenant_id"}}
+	})
+	drop := func() { _, _ = s.conn.Exec(ctx, "DROP TABLE IF EXISTS public."+table) }
+	drop()
+	if _, err := s.conn.Exec(ctx, "CREATE TABLE public."+table+
+		" (tenant_id bigint NOT NULL, event_no text NOT NULL, payload text, UNIQUE (tenant_id, event_no))"); err != nil {
+		t.Fatalf("建表: %v", err)
+	}
+	defer drop()
+	if _, err := s.EnsureSchema(ctx, cat); err != nil {
+		t.Fatalf("append 策略应沿用已有表: %v", err)
+	}
+	ti := s.tables["public."+table]
+	rows := [][]any{{int64(1), "e1", "x"}}
+	err := s.BulkApply(ctx, ti, 0, rows, "", "", "")
+	if err == nil {
+		t.Fatal("声明与目标端唯一索引不一致时，快照分页必须停下")
+	}
+	if !strings.Contains(err.Error(), "声明了 unique_key") || !strings.Contains(err.Error(), "三种做法") {
+		t.Fatalf("要出四段式（发生了什么/为什么/你能做什么/风险），得到：%v", err)
+	}
+	// 顺带：一行都不该写进去。
+	if n, cErr := s.Count(ctx, source.TableRef{Schema: "public", Table: table}); cErr != nil || n != 0 {
+		t.Fatalf("核对不过时不许写行，实际 %d err=%v", n, cErr)
+	}
+}

@@ -37,7 +37,7 @@ PG 是服务端 `sum(hashtextextended)`（`pg-hashtextextended-v1`），两个�
 
 ## 3. 扫描与并发
 
-默认**全表按主键顺序扫描**（无主键表只做聚合，并明确 warn「无法逐行定位」）；
+默认**全表按主键顺序扫描**（无主键表只做聚合，并明确 warn「无法逐行定位」；声明 `unique_key` 也**不**升级成行级比对——那是挂账 D2，见 `DESIGN-NO-PRIMARY-KEY.md`）；
 块大小 1000 行，块级 checksum 用于定位。`--tables` 只校验指定表。
 抽样只作为 L1/L2 之后的补充确认（`--sample` 控制行数，默认 100），不参与判据。
 

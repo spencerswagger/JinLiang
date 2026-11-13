@@ -88,7 +88,11 @@
                 }
               },
               "where": { "type": "string", "description": "受限表达式：列比较 + 常量，不支持子查询" },
-              "transform": { "type": "array", "items": { "type": "object", "minProperties": 1 } }
+              "transform": { "type": "array", "items": { "type": "object", "minProperties": 1 } },
+              "unique_key": {
+                "type": "array", "items": { "type": "string" }, "uniqueItems": true, "minItems": 1,
+                "description": "无主键表声明的行身份（必须是目标端已有的唯一索引，列都非空）"
+              }
             }
           }
         },

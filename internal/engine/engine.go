@@ -47,11 +47,8 @@ const (
 )
 
 // codeNoIdentity 是无主键表收到改/删时的错误码（E1017，docs/DESIGN-NO-PRIMARY-KEY.md §2.3）。
-//
-// 码表条目（`core.CodeNoIdentity` + `docs/ERRORS.md` 那一行）由 Ark 同批落 codes.go——
-// 本片只接线：条目到位后把这里换成 `core.CodeNoIdentity` 即可，语义一个字都不变。
-// 条目到位前 `core.Lookup` 不命中，last_error 仍带 `[E1017]`，不会静默降级。
-const codeNoIdentity = core.Code("E1017")
+// 码表条目在 `core.CodeNoIdentity`（#119 已落）；这里只是给分类那一段一个短名字。
+const codeNoIdentity = core.CodeNoIdentity
 
 // Options is one engine invocation.
 type Options struct {
@@ -844,6 +841,8 @@ func (r *runner) preflight(ctx context.Context) error {
 		// 水位列必须交给预检：interval 模式靠它判断「哪些是新数据」，
 		// 漏传会让预检永远报「缺水位列」（这条曾经真的漏过）。
 		Incremental: r.doc.Mode.IncrementalColumn,
+		// 声明的 unique_key 交给预检核对（TARGET-02，key 用源端裸表名，§4.4）。
+		UniqueKeys: r.declaredUniqueKeys(),
 	}
 	if v, err := srcConn.Version(ctx); err != nil {
 		in.SourceErr = err.Error()

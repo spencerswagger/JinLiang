@@ -12,6 +12,7 @@ package pgsink
 // 当成 INSERT 写进去（多一行，`upsertBatchTx` 对无主键表拼的就是裸 INSERT）。
 
 import (
+	"context"
 	"errors"
 	"testing"
 
@@ -54,7 +55,7 @@ func TestNoIdentityWritesArePausableBeforeAnyWrite(t *testing.T) {
 	s := nopkSink(t)
 
 	for _, kind := range []source.EventKind{source.EvUpdate, source.EvDelete} {
-		err := s.checkNoIdentityWrites([]source.Event{
+		err := s.checkNoIdentityWrites(context.Background(), []source.Event{
 			nopkEvent(source.EvInsert, "with_pk"), // 同批的其它表：不该被牵连
 			nopkEvent(kind, "no_pk"),
 		})
@@ -81,7 +82,7 @@ func TestNoIdentityWritesArePausableBeforeAnyWrite(t *testing.T) {
 func TestNoIdentityInsertsStillRun(t *testing.T) {
 	s := nopkSink(t)
 	// insert-only 是默认口径：无主键表纯插入照跑，不许因为「没有身份」被拦。
-	if err := s.checkNoIdentityWrites([]source.Event{
+	if err := s.checkNoIdentityWrites(context.Background(), []source.Event{
 		nopkEvent(source.EvInsert, "no_pk"),
 		nopkEvent(source.EvInsert, "no_pk"),
 		nopkEvent(source.EvTruncate, "no_pk"),
@@ -89,7 +90,7 @@ func TestNoIdentityInsertsStillRun(t *testing.T) {
 		t.Fatalf("无主键表的 INSERT/TRUNCATE 不需要行身份，不该被拦：%v", err)
 	}
 	// 有主键的表：改/删都照旧（定位得）。
-	if err := s.checkNoIdentityWrites([]source.Event{
+	if err := s.checkNoIdentityWrites(context.Background(), []source.Event{
 		nopkEvent(source.EvUpdate, "with_pk"),
 		nopkEvent(source.EvDelete, "with_pk"),
 	}); err != nil {

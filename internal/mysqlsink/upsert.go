@@ -2,9 +2,11 @@ package mysqlsink
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"strings"
 
+	"github.com/spencerswagger/jinliang/internal/pgsink"
 	"github.com/spencerswagger/jinliang/internal/source"
 )
 
@@ -35,6 +37,117 @@ func (s *Sink) hasUniqueKey(ctx context.Context, table source.TableRef) (bool, e
 	ok := n > 0
 	s.uniqueCache[key] = ok
 	return ok, nil
+}
+
+// declaredCheck 是「声明的 unique_key 与目标端实际索引」的核对结果（按表缓存）。
+type declaredCheck struct {
+	ok  bool
+	why string
+}
+
+// declaredKeyFor 返回这张表生效的声明行身份；源端有**可用**主键时声明被忽略
+// （§4.2 第 4 条：主键就是身份，换一组列当身份会让同一条数据两次同步用两个身份）。
+// 「可用」= 主键列没被 columns.include/exclude 排掉（判据与 pgsink 的 hasPK 同一份）。
+func (s *Sink) declaredKeyFor(table source.TableRef, rel *source.Table) []string {
+	if hasUsablePK(rel) {
+		return nil
+	}
+	return s.opt.UniqueKeys[table.Table]
+}
+
+// verifyDeclaredKey 实现 §4.3 的目标端核对判据（五条全过才算「唯一键可用」）：
+// 存在一条唯一索引（**含主键**——主键本来就是唯一索引，`ON DUPLICATE KEY` 也命中它）、
+// 非部分、非表达式、无前缀长度、列集合与声明完全一致、且列都 NOT NULL。
+// 目录层（connect.Catalog）已过滤掉部分/表达式/前缀索引，这里再按同一判据复核一遍：
+// 从声明到写入之间目标端可能被改过（索引被删/换），运行时要响，而不是静默写重复（R3）。
+func (s *Sink) verifyDeclaredKey(ctx context.Context, table source.TableRef, key []string) (bool, string, error) {
+	cacheKey := s.schemaOf(table) + "." + table.Table + "\x00" + strings.Join(key, ",")
+	if v, ok := s.declaredCache[cacheKey]; ok {
+		return v.ok, v.why, nil
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT INDEX_NAME, COLUMN_NAME FROM information_schema.STATISTICS
+		WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND NON_UNIQUE = 0
+		  AND SUB_PART IS NULL AND COLUMN_NAME IS NOT NULL
+		ORDER BY INDEX_NAME, SEQ_IN_INDEX`,
+		s.schemaOf(table), table.Table)
+	if err != nil {
+		return false, "", fmt.Errorf("读 %s 的唯一索引失败: %w", qualified(table), err)
+	}
+	defer rows.Close()
+	var names []string
+	byIndex := map[string][]string{}
+	for rows.Next() {
+		var idx, col string
+		if err := rows.Scan(&idx, &col); err != nil {
+			return false, "", err
+		}
+		if _, seen := byIndex[idx]; !seen {
+			names = append(names, idx)
+		}
+		byIndex[idx] = append(byIndex[idx], col)
+	}
+	if err := rows.Err(); err != nil {
+		return false, "", err
+	}
+
+	want := map[string]bool{}
+	for _, c := range key {
+		want[c] = true
+	}
+	var existing []string
+	var match []string
+	for _, name := range names {
+		cols := byIndex[name]
+		existing = append(existing, "("+strings.Join(cols, ", ")+")")
+		if len(cols) != len(key) {
+			continue
+		}
+		same := true
+		for _, c := range cols {
+			if !want[c] {
+				same = false
+				break
+			}
+		}
+		if same {
+			match = cols
+			break
+		}
+	}
+	if match == nil {
+		res := declaredCheck{ok: false, why: "目标端这张表没有与声明逐列一致的可用唯一索引/主键（要求：非部分、非表达式、无前缀长度）"}
+		if len(existing) > 0 {
+			res.why = fmt.Sprintf("目标端唯一索引是 %s，与声明 (%s) 的列集合不一致",
+				strings.Join(existing, "、"), strings.Join(key, ", "))
+		}
+		s.declaredCache[cacheKey] = res
+		return false, res.why, nil
+	}
+	// 列都 NOT NULL：NULL 互不相等，含 NULL 的列组合不构成唯一性（判据 5）。
+	args := []any{s.schemaOf(table), table.Table}
+	holders := make([]string, len(key))
+	for i, c := range key {
+		holders[i] = "?"
+		args = append(args, c)
+	}
+	var nullable string
+	err = s.db.QueryRowContext(ctx, `
+		SELECT COLUMN_NAME FROM information_schema.COLUMNS
+		WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND IS_NULLABLE = 'YES'
+		  AND COLUMN_NAME IN (`+strings.Join(holders, ",")+`) LIMIT 1`,
+		args...).Scan(&nullable)
+	if err != nil && err != sql.ErrNoRows {
+		return false, "", fmt.Errorf("读 %s 的列可空性失败: %w", qualified(table), err)
+	}
+	if err == nil {
+		res := declaredCheck{ok: false, why: fmt.Sprintf("唯一索引 (%s) 的列 %s 允许为空：NULL 互不相等，这组列不构成唯一性",
+			strings.Join(match, ", "), nullable)}
+		s.declaredCache[cacheKey] = res
+		return false, res.why, nil
+	}
+	s.declaredCache[cacheKey] = declaredCheck{ok: true}
+	return true, "", nil
 }
 
 // insertSQL 造一条多行纯 INSERT（无主键表的 insert-only 写路径）。
@@ -125,10 +238,12 @@ func (s *Sink) upsertSQL(table source.TableRef, cols []string, rows int, updateC
 	return b.String()
 }
 
-// deleteSQL 按主键删一行。没有主键就没法定位，明确报错。
+// deleteSQL 按定位列（主键或声明的 unique_key）删一行。没有定位列就没法删：
+// 按表暂停这张表（no_pk_write / E1017），绝不退化成全表条件（§6 红线 2）。
 func deleteSQL(table source.TableRef, pk []string) (string, error) {
 	if len(pk) == 0 {
-		return "", fmt.Errorf("%s 没有主键，无法按行删除（DELETE 若退化成全表条件会清空目标表）", qualified(table))
+		return "", &pgsink.NoPKWriteError{TableName: table.Table,
+			Detail: "收到一次删除，但这张表没有主键、也没声明 unique_key：目标端定位不到该删哪一行"}
 	}
 	var b strings.Builder
 	b.WriteString("DELETE FROM ")

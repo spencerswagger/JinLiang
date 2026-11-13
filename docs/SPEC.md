@@ -88,11 +88,17 @@
 | PG-03 | `max_wal_senders` 余量 ≥1 | autofixable |
 | PG-04 | 账号有 `REPLICATION`（或 superuser） | blocked 或 autofixable（我们建账号并授权） |
 | PG-05 | `pg_hba.conf` 允许 replication 连接（用真连验证） | blocked（给具体行 + 需 reload） |
-| PG-06 | 目标表有主键 / `REPLICA IDENTITY` | **warn**：无主键只能 insert-only、不可块级续跑；照跑，附改善建议（加主键） |
+| PG-06 | **源表**的 `REPLICA IDENTITY`（只管源端这一半） | **warn + autofix**：无主键表拿不到旧行标识，第一次改/删会让整条流断（不是只停这张表）；代做 `ALTER TABLE … REPLICA IDENTITY FULL`（需表属主），做不了就明说「这张表不能进增量」。**目标表有没有主键是另一道闸**（`TARGET-02`），别混着读 |
 | PG-07 | `max_slot_wal_keep_size` 是否存在 | PG≤12：记一条「无磁盘保护阀」补偿说明 |
 | PG-08 | 是否 primary（`pg_is_in_recovery()`） | blocked（指向正确节点） |
 | PG-09 | `track_commit_timestamp` | 关：记「时间戳新者胜」精度受限 |
 | PG-10 | `pg_wal` 占用 + slot 落后量 | 超 guard 阈值即告警 |
+
+### 目标端
+| ID | 检查 | 不通过时 |
+|---|---|---|
+| TARGET-01 | 目标端是否已有同名表 | `on_exists=error`（默认）时 blocked：改 `append`，或换 schema |
+| TARGET-02 | 目标端能不能定位这一行：主键，或你在 `content.tables.<表>.unique_key` 里声明的唯一键（要求目标端已有**主键或唯一索引**，且非部分、非表达式、无前缀长度、列集合完全一致、列都 NOT NULL） | 声明与事实不符 → **blocked**（挂 `E1017`，并点名哪条判据不过）；源端无主键又没声明 → warn（只追加，改/删会让这张表暂停）；`once`/`full_interval` 下不需要行身份，不提示；源端已有主键时声明被忽略 + warn。口径见 `DESIGN-NO-PRIMARY-KEY.md §3.4/§4.3` |
 
 ### MySQL
 | ID | 检查 | 不通过时 |

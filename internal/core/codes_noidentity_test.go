@@ -7,13 +7,14 @@ import (
 )
 
 // uniqueKeyConfigLanded 是 S3（`content.tables.<表>.unique_key`）是否已落地的人工开关。
+// PR #120 已把它置 true（三处同改的最后一步）。
 //
 // 为什么要有它：E1017 的四段式里「还能怎么办」这一节必须**只写现在真能走通的做法**。
 // 定稿（docs/DESIGN-NO-PRIMARY-KEY.md §2.3）里的第三条是「声明 unique_key」，但 jobspec 是
 // strict 解析——配置项还没落地时照着我们的话写，用户会直接撞「未知字段」，比不说更糟。
 // 所以 S3 合入时必须一次改三处：① 码表 Next 补第三条；② docs/ERRORS.md 那一行同步；
 // ③ 把这个常量改成 true（漏了第 ③ 步，本用例会红，正好当提醒）。
-const uniqueKeyConfigLanded = false
+const uniqueKeyConfigLanded = true
 
 // TestNoIdentityFourParts：E1017 是**族码**（2026-11-13 裁决）——两个场景共用：
 //   - 运行中：无主键表收到改/删 → 按表暂停（原因码 no_pk_write，#117 接线）；
@@ -62,18 +63,18 @@ func TestNoIdentityFourParts(t *testing.T) {
 
 // TestNoIdentityNextOnlyNamesRealActions：「你现在能做什么」里的每一条都必须是**真能走通**的。
 //
-// 三条判据：① 加主键/唯一索引；② 换 once / full_interval（每轮整表重搬）；③ 从 content.tables 去掉后重新 import。
-// 第四条「声明 unique_key」在 S3 落地前不许出现（见 uniqueKeyConfigLanded）。
+// 三条判据（码表硬约束 1–3 步）：① 加主键/唯一索引；② 声明 unique_key（S3 已落地）；
+// ③ 换 once / full_interval，或从 content.tables 去掉后重新 import。开关见 uniqueKeyConfigLanded。
 func TestNoIdentityNextOnlyNamesRealActions(t *testing.T) {
 	spec, ok := Lookup(CodeNoIdentity)
 	if !ok {
 		t.Fatal("E1017 必须在码表里")
 	}
 	if len(spec.Next) != 3 {
-		t.Fatalf("E1017 的 Next 应为 3 步（三条真实做法），实际 %d 步", len(spec.Next))
+		t.Fatalf("E1017 的 Next 应为 3 步（码表硬约束 1–3 步，四条做法合并进第 3 步），实际 %d 步", len(spec.Next))
 	}
 	steps := strings.Join(spec.Next, "\n")
-	for _, want := range []string{"主键或唯一索引", "once", "full_interval", "content.tables", "重新 import"} {
+	for _, want := range []string{"主键或唯一索引", "unique_key", "once", "full_interval", "content.tables", "重新 import"} {
 		if !strings.Contains(steps, want) {
 			t.Errorf("Next 应包含可执行做法 %q：\n%s", want, steps)
 		}
@@ -114,7 +115,7 @@ func TestErrorsDocE1017MatchesCatalogue(t *testing.T) {
 	if !strings.Contains(row, spec.Message) {
 		t.Errorf("ERRORS.md 的 E1017 行与码表 Message 不一致：\n码表：%s\n文档：%s", spec.Message, row)
 	}
-	for _, want := range []string{"主键或唯一索引", "once", "full_interval", "content.tables", "REPLICA IDENTITY"} {
+	for _, want := range []string{"主键或唯一索引", "unique_key", "once", "full_interval", "content.tables", "REPLICA IDENTITY"} {
 		if !strings.Contains(row, want) {
 			t.Errorf("ERRORS.md 的 E1017 行缺 %q（四段式里能做的事必须与码表同源）：%s", want, row)
 		}

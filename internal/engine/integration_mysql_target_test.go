@@ -60,6 +60,14 @@ func myEndpoint(c myConn) dsn.Endpoint {
 // newMySQLTargetJob 建一个「PG 源 → MySQL 目标」的任务（目标库就是连接里的库）。
 func newMySQLTargetJob(t *testing.T, srcDSN, dstDSN, jobName, table, freq string) (*control.Store, string) {
 	t.Helper()
+	return newMySQLTargetJobWith(t, srcDSN, dstDSN, jobName, table, freq, nil)
+}
+
+// newMySQLTargetJobWith 是 newMySQLTargetJob 的带改写版：用例要在建任务之前改 JobDoc
+// （例如给无主键表声明 unique_key）。
+func newMySQLTargetJobWith(t *testing.T, srcDSN, dstDSN, jobName, table, freq string,
+	mutate func(*control.JobDoc)) (*control.Store, string) {
+	t.Helper()
 	dir := t.TempDir()
 	store, err := control.Open(control.Options{DataDir: dir, Autogen: true})
 	if err != nil {
@@ -84,17 +92,20 @@ func newMySQLTargetJob(t *testing.T, srcDSN, dstDSN, jobName, table, freq string
 	if err != nil {
 		t.Fatalf("建 MySQL 目标连接失败: %v", err)
 	}
+	doc := control.JobDoc{
+		Version: 1, Job: jobName,
+		Source: control.SourceDoc{Kind: "postgres", Scope: &control.ScopeDoc{Schema: "public"}},
+		Target: control.TargetDoc{Kind: "mysql", OnExists: "append"},
+		Mode: control.ModeDoc{Frequency: freq, Interval: "1h",
+			// interval 模式要求水位列：给它一个，才能走到「目标端不支持」那道拒绝。
+			IncrementalColumn: incCol(freq)},
+		Content: &control.ContentDoc{Tables: map[string]control.TableDoc{table: {}}},
+	}
+	if mutate != nil {
+		mutate(&doc)
+	}
 	job, err := store.CreateJob(ctx, control.JobInput{
-		Name: jobName, SourceID: sc.ID, TargetID: tc.ID,
-		Spec: control.JobDoc{
-			Version: 1, Job: jobName,
-			Source: control.SourceDoc{Kind: "postgres", Scope: &control.ScopeDoc{Schema: "public"}},
-			Target: control.TargetDoc{Kind: "mysql", OnExists: "append"},
-			Mode: control.ModeDoc{Frequency: freq, Interval: "1h",
-				// interval 模式要求水位列：给它一个，才能走到「目标端不支持」那道拒绝。
-				IncrementalColumn: incCol(freq)},
-			Content: &control.ContentDoc{Tables: map[string]control.TableDoc{table: {}}},
-		},
+		Name: jobName, SourceID: sc.ID, TargetID: tc.ID, Spec: doc,
 	})
 	if err != nil {
 		t.Fatalf("建任务失败: %v", err)

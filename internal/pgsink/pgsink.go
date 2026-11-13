@@ -64,6 +64,12 @@ type Options struct {
 	// 跳过是最需要留痕的一类结果：失败会有人看，跳过不会。
 	OnDDLSkipped func(stmt string)
 
+	// UniqueKeys 是用户声明的行身份（content.tables.<表>.unique_key），key 用目标端
+	// **裸表名**（docs/DESIGN-NO-PRIMARY-KEY.md §4.4）。只对源端无稳定主键的表生效；
+	// 声明必须与目标端已有唯一索引逐列一致（§4.3），否则写入前就报错——PG 的
+	// `ON CONFLICT (…)` 没有匹配索引会直接报错，不会静默写错，但仍要给出四段式。
+	UniqueKeys map[string][]string
+
 	// ApplyBatchRows 是一条多行 upsert 里最多放几行（默认 500）。
 	//
 	// 逐行 Exec 时 500 行/事务 = 500 次往返，增量吞吐卡在 ~10.5k 行/s（稳态线）；
@@ -91,7 +97,10 @@ type tableInfo struct {
 	pk         []string
 	pkIdx      []int
 	hasPK      bool
-	colIndex   map[string]int
+	// declared 是用户声明的行身份（unique_key）。非空时 upsert/delete 用它定位，
+	// 与 hasPK 互斥：源端已有主键时声明被忽略（§4.2 第 4 条）。
+	declared []string
+	colIndex map[string]int
 }
 
 // Sink is the PostgreSQL write side. It owns one dedicated connection: writes
@@ -121,6 +130,11 @@ type Sink struct {
 	// ownerToken 让「同一个进程里的两个 Sink」也彼此可分（否则它们同 pid、
 	// 同 instance_id，第二个会把第一个的租约抢走）。
 	ownerToken string
+
+	// declaredChecked 缓存「声明的 unique_key 已核对通过」的表（key: schema.table）。
+	declaredChecked map[string]bool
+	// verNum 是目标端 server_version_num（核对待用；PG 10 没有 indnkeyatts）。
+	verNum int
 
 	// CountSource / FingerprintSource are injected by the engine so Verify can
 	// compare both sides without this package importing the source.
@@ -159,7 +173,20 @@ func Open(ctx context.Context, opt Options) (*Sink, error) {
 		return nil, err
 	}
 	tables, order := buildTables(opt.Catalog, opt.SourceKind)
-	s := &Sink{opt: opt, tables: tables, order: order, ownerToken: newOwnerToken()}
+	// 声明行身份按裸表名挂到表定义上；源端已有主键的表忽略声明（§4.2 第 4 条）。
+	for name, cols := range opt.UniqueKeys {
+		if len(cols) == 0 {
+			continue
+		}
+		for _, key := range order {
+			ti := tables[key]
+			if ti.ref.Table == name && !ti.hasPK {
+				ti.declared = append([]string(nil), cols...)
+			}
+		}
+	}
+	s := &Sink{opt: opt, tables: tables, order: order, ownerToken: newOwnerToken(),
+		declaredChecked: map[string]bool{}}
 	conn, err := pgwire.Connect(ctx, opt.Target)
 	if err != nil {
 		return nil, err
@@ -927,6 +954,11 @@ func (s *Sink) BulkApply(ctx context.Context, ti *tableInfo, chunkNo int, rows [
 	if ti == nil {
 		return fmt.Errorf("内部错误：目标端没有这张表的定义")
 	}
+	// 快照/增量分页也走 upsert（`conflictClause` 认声明身份），所以和 Apply 一样
+	// 在写之前核对一次：否则声明与目标端索引对不上时，用户拿到的是驱动的原始 42P10。
+	if err := s.ensureDeclared(ctx, ti); err != nil {
+		return err
+	}
 	tx, err := s.conn.Begin(ctx)
 	if err != nil {
 		return err
@@ -991,6 +1023,10 @@ func (s *Sink) ApplyRowsRange(ctx context.Context, ref source.TableRef, rows [][
 	ti := s.tables[ref.Schema+"."+ref.Table]
 	if ti == nil {
 		return fmt.Errorf("内部错误：目标端没有这张表的定义")
+	}
+	// 与 Apply 同口径：声明身份写之前核对（interval 每轮重读同一批行，靠它去重）。
+	if err := s.ensureDeclared(ctx, ti); err != nil {
+		return err
 	}
 	tx, err := s.conn.Begin(ctx)
 	if err != nil {
@@ -1093,7 +1129,7 @@ func (s *Sink) Apply(ctx context.Context, evs []source.Event, pos source.Positio
 	// 但**「这张表没有行身份」是例外**：那不是「表停着」，是「这一条改/删我们做不到」
 	// （docs/DESIGN-NO-PRIMARY-KEY.md §2.3）。必须在**写任何一行之前**整批判定：
 	// 写到一半才发现定位不了，会留下半批数据 + 位点不动，下一轮重放还要再撞一次。
-	if err := s.checkNoIdentityWrites(evs); err != nil {
+	if err := s.checkNoIdentityWrites(ctx, evs); err != nil {
 		return err
 	}
 
@@ -1119,21 +1155,6 @@ func (s *Sink) Apply(ctx context.Context, evs []source.Event, pos source.Positio
 			for j < len(evs) && (evs[j].Kind == source.EvInsert || evs[j].Kind == source.EvUpdate) &&
 				evs[j].Table == ev.Table {
 				j++
-			}
-			// 无主键表只 INSERT（设计 §1.2 路线 A）。改行没有定位依据：既不降级成
-			// INSERT 插一版新的（§1.5 已否，目标端会越滚越多），也不按全列条件去改。
-			// 按表暂停/整表重搬是下一个切片（S2）；在那之前这里**明确失败**，
-			// 不留下半批数据。
-			if ti := s.tables[ev.Table.Schema+"."+ev.Table.Table]; ti != nil && !ti.hasPK {
-				for _, e := range evs[i:j] {
-					if e.Kind == source.EvUpdate {
-						return fmt.Errorf("%s 没有主键：本版对无主键表只做 insert-only（新增照写），"+
-							"收到改行（UPDATE）时目标端无法定位是哪一行。"+
-							"风险：这是整批失败，本轮其它表也会停在同一个位点。"+
-							"做法：给源表加主键，或从 content.tables 去掉这张表后重新 import",
-							pgwire.Qualified(ev.Table.Schema, ev.Table.Table))
-					}
-				}
 			}
 			if err := s.upsertBatchTx(ctx, tx, evs[i:j]); err != nil {
 				return err
@@ -1350,6 +1371,8 @@ func (s *Sink) alignRelationTx(ctx context.Context, tx pgx.Tx, ev source.Event) 
 		}
 	}
 	if len(added) > 0 {
+		// 结构变了：声明核对的结论要重新问一遍（不能让「上次核过」挡住下一次核对）。
+		delete(s.declaredChecked, key)
 		log.Printf("%s 跟随源端新增了 %d 列（%s）", ev.Table.Table, len(added), strings.Join(added, ", "))
 	}
 	return nil
@@ -1778,17 +1801,36 @@ func describeSQLError(err error) string {
 
 // checkNoIdentityWrites 在写任何一行之前，把「改/删但定位不了这一行」的表挑出来。
 //
-// 判据 = 目标表没有主键（`ti.hasPK` false）。`EvInsert` 不受影响：纯 INSERT 不需要
-// 定位（insert-only 照跑）；`EvTruncate` 整表清空也不需要行身份。
-// unique_key（DESIGN-NO-PRIMARY-KEY §4.4，S3）落地后这里要放宽成「有声明且核对通过」，
-// 由那一片改这一处判定——别在别的文件里另写一份。
-func (s *Sink) checkNoIdentityWrites(evs []source.Event) error {
+// 判据 = 目标表既没有主键、也没有生效的声明身份（`ti.hasPK` false 且 `ti.declared` 为空）。
+// `EvInsert` 不受影响：纯 INSERT 不需要定位（insert-only 照跑）；`EvTruncate` 整表清空
+// 也不需要行身份。声明了 unique_key 的表（S3，DESIGN-NO-PRIMARY-KEY §4.2）有身份，
+// 照 upsert/delete 走——声明与目标端索引对不对得上由 ensureDeclared 在写之前核对。
+func (s *Sink) checkNoIdentityWrites(ctx context.Context, evs []source.Event) error {
+	verified := map[string]bool{}
 	for _, ev := range evs {
-		if ev.Kind != source.EvUpdate && ev.Kind != source.EvDelete {
+		if ev.Kind != source.EvInsert && ev.Kind != source.EvUpdate && ev.Kind != source.EvDelete {
 			continue
 		}
 		ti := s.tables[ev.Table.Schema+"."+ev.Table.Table]
-		if ti == nil || ti.hasPK {
+		if ti == nil {
+			continue
+		}
+		// 声明了 unique_key：写之前核对声明与目标端索引（§4.3 五条判据），
+		// 核对不过就停在这一批之前——不能让 upsert 撞一句驱动原始错误。
+		if len(ti.declared) > 0 {
+			key := ev.Table.Schema + "." + ev.Table.Table
+			if !verified[key] {
+				if err := s.ensureDeclared(ctx, ti); err != nil {
+					return err
+				}
+				verified[key] = true
+			}
+			// 有身份就不该再喊 no_pk_write：这条跳过下面的判定。
+			if ev.Kind != source.EvInsert {
+				continue
+			}
+		}
+		if ti.hasPK || ev.Kind == source.EvInsert {
 			continue
 		}
 		what := "收到一次改动"
@@ -1808,15 +1850,28 @@ func (s *Sink) deleteTx(ctx context.Context, tx pgx.Tx, ev source.Event) error {
 	if ti == nil {
 		return fmt.Errorf("收到未知表 %s 的删除", ev.Table.Table)
 	}
-	if !ti.hasPK {
+	// 声明了 unique_key 的无主键表：用声明列定位。否则走主键。
+	keyCols := ti.pk
+	keyIdx := ti.pkIdx
+	if len(ti.declared) > 0 {
+		keyCols = ti.declared
+		keyIdx = make([]int, 0, len(ti.declared))
+		for _, c := range ti.declared {
+			idx, ok := ti.colIndex[c]
+			if !ok {
+				return fmt.Errorf("删除 %s 时找不到用于定位的列 %s（声明的 unique_key 列必须在搬运列里）", ti.ref.Table, c)
+			}
+			keyIdx = append(keyIdx, idx)
+		}
+	} else if !ti.hasPK {
 		// 正常路径上 `checkNoIdentityWrites` 已经在写任何一行之前拦住了；
 		// 这里只作第二道防线（新写路径忘了过那道判定时，仍然是「按表暂停」而不是整条任务失败）。
 		return &NoPKWriteError{TableName: ev.Table.Table, Detail: "收到一次删除，但目标端没有可用来定位这一行的主键或唯一索引"}
 	}
 	var where []string
-	params := make([]any, 0, len(ti.pkIdx))
-	for i, idx := range ti.pkIdx {
-		where = append(where, fmt.Sprintf("%s = $%d::text::%s", pgwire.Quote(ti.pk[i]), i+1, ti.types[idx]))
+	params := make([]any, 0, len(keyIdx))
+	for i, idx := range keyIdx {
+		where = append(where, fmt.Sprintf("%s = $%d::text::%s", pgwire.Quote(keyCols[i]), i+1, ti.types[idx]))
 		var v any
 		if idx < len(ev.Old.Values) {
 			v = s.param(ev.Old.Values[idx])
@@ -2166,26 +2221,143 @@ func castedHoldersFor(ti *tableInfo, rows int) string {
 	return out.String()
 }
 
-// conflictClause renders the upsert tail. Tables whose every column is part of
-// the primary key can only be idempotent hits, hence DO NOTHING.
-func conflictClause(ti *tableInfo) string {
-	if !ti.hasPK {
-		return ""
+// ensureDeclared 在第一次用声明身份写这张表之前核对目标端索引
+// （docs/DESIGN-NO-PRIMARY-KEY.md §4.3 五条判据：唯一、非部分、非表达式、列集合完全一致、列都非空）。
+// PG 的 `ON CONFLICT (…)` 在没有匹配唯一索引时会直接报错（不会静默写错），
+// 但报错要能行动：这里提前拦、给四段式，而不是让驱动吐一句 constraint 名。
+func (s *Sink) ensureDeclared(ctx context.Context, ti *tableInfo) error {
+	if len(ti.declared) == 0 {
+		return nil // 没声明就没有要核对的东西（主键表 / insert-only 表）
 	}
-	if len(ti.pk) >= len(ti.cols) {
-		return fmt.Sprintf(" ON CONFLICT (%s) DO NOTHING", quoteList(ti.pk))
+	cacheKey := ti.ref.Schema + "." + ti.ref.Table
+	if s.declaredChecked[cacheKey] {
+		return nil
 	}
-	return fmt.Sprintf(" ON CONFLICT (%s) DO UPDATE SET %s", quoteList(ti.pk), updateSetList(ti))
+	key := ti.declared
+	if s.verNum == 0 {
+		if err := s.conn.QueryRow(ctx, "SELECT current_setting('server_version_num')::int").Scan(&s.verNum); err != nil {
+			return fmt.Errorf("读取目标端版本失败: %w", err)
+		}
+	}
+	keyExpr := "x.indkey" // PG 10：没有 INCLUDE，indkey 全是键列
+	if s.verNum >= 110000 {
+		keyExpr = "x.indkey[0:x.indnkeyatts-1]"
+	}
+	q := fmt.Sprintf(`
+		SELECT ic.relname, a.attname
+		FROM pg_index x
+		JOIN pg_class c ON c.oid = x.indrelid
+		JOIN pg_class ic ON ic.oid = x.indexrelid
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = ANY(%s)
+		WHERE n.nspname = $1 AND c.relname = $2
+		  AND x.indisunique
+		  AND x.indpred IS NULL AND x.indexprs IS NULL
+		ORDER BY ic.relname, array_position(%s, a.attnum)`, keyExpr, keyExpr)
+	rows, err := s.conn.Query(ctx, q, ti.ref.Schema, ti.ref.Table)
+	if err != nil {
+		return fmt.Errorf("读目标表 %s 的唯一索引失败: %w", ti.ref.Table, err)
+	}
+	var names []string
+	byIndex := map[string][]string{}
+	for rows.Next() {
+		var idx, col string
+		if err := rows.Scan(&idx, &col); err != nil {
+			rows.Close()
+			return err
+		}
+		if _, seen := byIndex[idx]; !seen {
+			names = append(names, idx)
+		}
+		byIndex[idx] = append(byIndex[idx], col)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	want := map[string]bool{}
+	for _, c := range key {
+		want[c] = true
+	}
+	var existing []string
+	var match []string
+	for _, name := range names {
+		cols := byIndex[name]
+		existing = append(existing, "("+strings.Join(cols, ", ")+")")
+		if len(cols) != len(key) {
+			continue
+		}
+		same := true
+		for _, c := range cols {
+			if !want[c] {
+				same = false
+				break
+			}
+		}
+		if same {
+			match = cols
+			break
+		}
+	}
+	why := ""
+	if match == nil {
+		if len(existing) == 0 {
+			why = "目标端这张表没有任何可用唯一索引或主键（要求：非部分、非表达式）"
+		} else {
+			why = fmt.Sprintf("目标端唯一索引是 %s，与声明 (%s) 的列集合不一致",
+				strings.Join(existing, "、"), strings.Join(key, ", "))
+		}
+	} else {
+		// 列都 NOT NULL：NULL 互不相等，含 NULL 的列组合不构成唯一性（判据 5）。
+		var nullable string
+		err := s.conn.QueryRow(ctx, `
+			SELECT column_name FROM information_schema.columns
+			WHERE table_schema = $1 AND table_name = $2 AND is_nullable = 'YES'
+			  AND column_name = ANY($3) LIMIT 1`,
+			ti.ref.Schema, ti.ref.Table, key).Scan(&nullable)
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("读 %s 的列可空性失败: %w", ti.ref.Table, err)
+		}
+		if err == nil {
+			why = fmt.Sprintf("唯一索引 (%s) 的列 %s 允许为空：NULL 互不相等，这组列不构成唯一性",
+				strings.Join(match, ", "), nullable)
+		}
+	}
+	if why != "" {
+		return fmt.Errorf("%s 声明了 unique_key (%s)，但目标端核对不过：%s。"+
+			"三种做法任选：① 在目标端建一条与声明逐列一致的唯一索引（推荐）；"+
+			"② 改声明去匹配目标端已有的唯一索引；③ 去掉声明，这张表退回 insert-only（只追加）。"+
+			"风险：声明与事实不符时改/删会定位错行或直接失败，所以这里必须停",
+			pgwire.Qualified(ti.ref.Schema, ti.ref.Table), strings.Join(key, ", "), why)
+	}
+	s.declaredChecked[cacheKey] = true
+	return nil
 }
 
-func updateSetList(ti *tableInfo) string {
+// conflictClause renders the upsert tail. 身份只认源端主键或用户声明的 unique_key
+// （docs/DESIGN-NO-PRIMARY-KEY.md R1）：两者都没有就是 insert-only，返回空串。
+// 表已有主键时声明被忽略（§4.2 第 4 条），所以 declared 只在无主键表上生效。
+func conflictClause(ti *tableInfo) string {
+	key := ti.pk
+	if len(ti.declared) > 0 {
+		key = ti.declared
+	} else if !ti.hasPK {
+		return ""
+	}
+	if len(key) >= len(ti.cols) {
+		return fmt.Sprintf(" ON CONFLICT (%s) DO NOTHING", quoteList(key))
+	}
+	return fmt.Sprintf(" ON CONFLICT (%s) DO UPDATE SET %s", quoteList(key), updateSetList(ti, key))
+}
+
+func updateSetList(ti *tableInfo, key []string) string {
 	var sets []string
-	pkSet := map[string]bool{}
-	for _, p := range ti.pk {
-		pkSet[p] = true
+	keySet := map[string]bool{}
+	for _, p := range key {
+		keySet[p] = true
 	}
 	for _, c := range ti.cols {
-		if pkSet[c] {
+		if keySet[c] {
 			continue
 		}
 		sets = append(sets, fmt.Sprintf("%s = EXCLUDED.%s", pgwire.Quote(c), pgwire.Quote(c)))

@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/spencerswagger/jinliang/internal/pgsink"
 	"github.com/spencerswagger/jinliang/internal/sink"
 	"github.com/spencerswagger/jinliang/internal/source"
 )
@@ -46,6 +47,14 @@ func (s *Sink) Apply(ctx context.Context, evs []source.Event, pos source.Positio
 		}
 		return fmt.Errorf("引擎没有过滤掉暂停表 %s 的事件（内部错误：按表暂停的判定权在引擎，"+
 			"不该把这张表的行交到这里）", ev.Table.Table)
+	}
+
+	// 声明的 unique_key 必须在写任何一行之前核对（§4.3 五条判据）：
+	// 放在 Apply 入口、整批一起判，而不是分散在每个写分支里——**DELETE 也要过**。
+	// 反例（Owl PR #120 P0）：只核对 upsert 路径时，声明 [tenant] 而目标端唯一索引是
+	// (tenant,event_no)，一条 DELETE 会按 tenant 删掉这个租户下的**所有**行，还返回成功。
+	if err := s.checkDeclared(ctx, evs); err != nil {
+		return err
 	}
 
 	if !batchHasImplicitCommit(evs) {
@@ -207,35 +216,41 @@ func endsWithCommit(evs []source.Event) bool {
 // applyUpserts 把连续的同表插入/更新合并成一条多行 upsert。
 func (s *Sink) applyUpserts(ctx context.Context, tx *sql.Tx, evs []source.Event) error {
 	table := evs[0].Table
-	cols, updateCols, err := s.columnsFor(ctx, table, evs[0].Relation, evs[0].New)
+	rel := evs[0].Relation
+	cols, updateCols, err := s.columnsFor(ctx, table, rel, evs[0].New)
 	if err != nil {
 		return err
 	}
+	declared := s.declaredKeyFor(table, rel)
 	var stmt string
-	if insertOnly(evs[0].Relation) {
+	switch {
+	case len(declared) > 0:
+		// 声明已核过（checkDeclared 在 Apply 入口整批前置）；这里只按它改写法：
+		// 更新集排除声明列，避免 `键列=EXCLUDED.键列` 这种无意义甚至改键的赋值。
+		updateCols = exclude(cols, declared)
+		stmt = s.upsertSQL(table, cols, len(evs), updateCols)
+	case insertOnly(rel):
 		// 无主键表：只 INSERT（设计 §1.2 路线 A）。目标端有没有唯一索引都不升级成
 		// upsert——身份只认源端（R1），拿别人的索引猜行身份会静默改错数据。
 		for _, ev := range evs {
 			if ev.Kind != source.EvInsert {
 				// 改行在无主键表上没有定位依据：既不降级成 INSERT（§1.5 已否），
-				// 也不按全列条件去改。按表暂停/整表重搬是下一个切片（S2），
-				// 在那之前这里**明确失败**，不留下半批数据。
-				return fmt.Errorf("%s 没有主键：本版对无主键表只做 insert-only（新增照写），"+
-					"收到改行（UPDATE）时目标端无法定位是哪一行。"+
-					"风险：这是整批失败，本轮其它表也会停在同一个位点。"+
-					"做法：给源表加主键，或从 content.tables 去掉这张表后重新 import",
-					qualified(table))
+				// 也不按全列条件去改。按表暂停这张表（no_pk_write / E1017），
+				// 其它表照写、位点照常前进（docs/CONTRACT-PAUSE-AND-POSITION.md §1.5）。
+				return &pgsink.NoPKWriteError{TableName: table.Table,
+					Detail: "收到一次改动（UPDATE），但这张表没有主键、也没声明 unique_key：目标端定位不到是哪一行"}
 			}
 		}
 		stmt = insertSQL(table, cols, len(evs))
-	} else {
+	default:
 		ok, err := s.hasUniqueKey(ctx, table)
 		if err != nil {
 			return err
 		}
 		if !ok {
-			return fmt.Errorf("%w：%s。两种做法任选：① 给目标表加主键/唯一索引（推荐，与源端一致）；"+
-				"② 不想再跟这张表：把它从 content.tables 里去掉后重新 import。"+
+			return fmt.Errorf("%w：%s。三种做法任选：① 给目标表加主键/唯一索引（推荐，与源端一致）；"+
+				"② 在 content.tables.<表> 里声明 unique_key: [列…]（指向目标端已有的唯一索引，列都非空）；"+
+				"③ 不想再跟这张表：把它从 content.tables 里去掉后重新 import。"+
 				"风险：加唯一索引需要目标端已有数据无重复，建索引期间会短暂阻塞写入",
 				ErrNoUniqueKey, qualified(table))
 		}
@@ -256,15 +271,86 @@ func (s *Sink) applyUpserts(ctx context.Context, tx *sql.Tx, evs []source.Event)
 	return nil
 }
 
-// insertOnly 判定一张表是否只能 insert-only：源端没有稳定主键（R1：身份只认源端）。
+// checkDeclared 在写任何一行之前核对「声明的 unique_key vs 目标端实际索引」。
+//
+// 判据见 docs/DESIGN-NO-PRIMARY-KEY.md §4.3（五条全过才算唯一键可用）。为什么要在
+// **入口整批判**而不是只在 upsert 分支：DELETE 也靠声明列定位——声明比真实索引宽时
+// （声明 [tenant]、索引 (tenant,event_no)），一条 DELETE 会误删整组行且返回成功。
+// 每张表只核一次（declaredCache），同批其它事件不重复查库。
+func (s *Sink) checkDeclared(ctx context.Context, evs []source.Event) error {
+	seen := map[string]bool{}
+	for _, ev := range evs {
+		// 与 declaredCache 同一个 key 口径（schema.table），将来多 schema 也不会混。
+		cacheKey := s.schemaOf(ev.Table) + "." + ev.Table.Table
+		if ev.Table.Table == "" || seen[cacheKey] {
+			continue
+		}
+		key := s.declaredKeyFor(ev.Table, ev.Relation)
+		if len(key) == 0 {
+			continue
+		}
+		seen[cacheKey] = true
+		ok, why, err := s.verifyDeclaredKey(ctx, ev.Table, key)
+		if err != nil {
+			return err
+		}
+		if ok {
+			continue
+		}
+		return fmt.Errorf("%w：%s 声明了 unique_key (%s)，但目标端核对不过：%s。"+
+			"三种做法任选：① 在目标端建一条与声明逐列一致的唯一索引（推荐）；"+
+			"② 改声明去匹配目标端已有的唯一索引；③ 去掉声明，这张表退回 insert-only（只追加）。"+
+			"风险：声明与事实不符时 upsert 会按别的键更新、删除会多删，所以这里必须停",
+			ErrNoUniqueKey, qualified(ev.Table), strings.Join(key, ", "), why)
+	}
+	return nil
+}
+
+// insertOnly 判定一张表是否只能 insert-only：源端没有**可用**的稳定主键（R1：身份只认源端）。
 // Relation 缺失（拿不到源端目录）时**不猜**——没有身份信息就按老规矩要求目标端唯一键，
 // 避免把 upsert 悄悄降级成纯 INSERT。
 func insertOnly(rel *source.Table) bool {
-	return rel != nil && !rel.HasStablePK
+	return rel != nil && !hasUsablePK(rel)
+}
+
+// hasUsablePK 报告源端主键是不是**真的能用**：有稳定主键，且主键列都在这次交付的列里。
+//
+// 为什么多这一条：`columns.include/exclude` 可能把主键列排掉，那时目标端根本没有
+// 那几列可定位——upsert 的 SQL 会拼出「引用了不存在的列」。pgsink 早就是这个口径
+// （`buildTables` 里 pkIdx 不全就按无主键处理），这里对齐，免得「预检说按主键、写路径
+// 却按声明」两套身份（Owl PR #120 P2）。
+func hasUsablePK(rel *source.Table) bool {
+	if rel == nil || !rel.HasStablePK || len(rel.PrimaryKey) == 0 {
+		return false
+	}
+	have := map[string]bool{}
+	for _, c := range rel.Columns {
+		have[strings.ToLower(c.Name)] = true
+	}
+	for _, k := range rel.PrimaryKey {
+		if !have[strings.ToLower(k)] {
+			return false
+		}
+	}
+	return true
+}
+
+// clearDeclaredCache 在目标端结构变了（DDL 跟随/重建索引）后失效声明核对结果。
+func (s *Sink) clearDeclaredCache(table string) {
+	prefix := "." + table + "\x00"
+	for k := range s.declaredCache {
+		if strings.Contains(k, prefix) {
+			delete(s.declaredCache, k)
+		}
+	}
 }
 
 func (s *Sink) applyDelete(ctx context.Context, tx *sql.Tx, ev source.Event) error {
 	pk := primaryKeyOf(ev)
+	// 声明了 unique_key 的无主键表：用声明列定位删除（源端有主键时声明被忽略，§4.2 第 4 条）。
+	if declared := s.declaredKeyFor(ev.Table, ev.Relation); len(declared) > 0 {
+		pk = declared
+	}
 	stmt, err := deleteSQL(ev.Table, pk)
 	if err != nil {
 		return err
@@ -273,7 +359,7 @@ func (s *Sink) applyDelete(ctx context.Context, tx *sql.Tx, ev source.Event) err
 	for _, name := range pk {
 		idx, ok := columnIndex(ev, name)
 		if !ok {
-			return fmt.Errorf("删除 %s 时找不到主键列 %s 的值", qualified(ev.Table), name)
+			return fmt.Errorf("删除 %s 时找不到用于定位的列 %s 的值", qualified(ev.Table), name)
 		}
 		args = append(args, driverValue(ev.Old.Values[idx]))
 	}
@@ -323,8 +409,10 @@ func (s *Sink) applyDDL(ctx context.Context, stmt string) error {
 			return fmt.Errorf("跟随 DDL 失败（%s）：%w", d.Reason, err)
 		}
 		// 结构变了：唯一键缓存必须失效，否则加完唯一索引仍按「没有唯一键」报错。
+		// 声明的 unique_key 核对结果同理——索引可能刚被改过。
 		if d.Table.Table != "" {
 			delete(s.uniqueCache, s.schemaOf(d.Table)+"."+d.Table.Table)
+			s.clearDeclaredCache(d.Table.Table)
 		}
 		return nil
 	case DDLSkip:
@@ -342,6 +430,7 @@ func (s *Sink) applyDDL(ctx context.Context, stmt string) error {
 		}
 		if d.Table.Table != "" {
 			delete(s.uniqueCache, s.schemaOf(d.Table)+"."+d.Table.Table)
+			s.clearDeclaredCache(d.Table.Table)
 		}
 		return nil
 	default:
