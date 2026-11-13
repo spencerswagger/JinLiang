@@ -280,14 +280,16 @@ func (s *Sink) applyUpserts(ctx context.Context, tx *sql.Tx, evs []source.Event)
 func (s *Sink) checkDeclared(ctx context.Context, evs []source.Event) error {
 	seen := map[string]bool{}
 	for _, ev := range evs {
-		if ev.Table.Table == "" || seen[ev.Table.Table] {
+		// 与 declaredCache 同一个 key 口径（schema.table），将来多 schema 也不会混。
+		cacheKey := s.schemaOf(ev.Table) + "." + ev.Table.Table
+		if ev.Table.Table == "" || seen[cacheKey] {
 			continue
 		}
 		key := s.declaredKeyFor(ev.Table, ev.Relation)
 		if len(key) == 0 {
 			continue
 		}
-		seen[ev.Table.Table] = true
+		seen[cacheKey] = true
 		ok, why, err := s.verifyDeclaredKey(ctx, ev.Table, key)
 		if err != nil {
 			return err

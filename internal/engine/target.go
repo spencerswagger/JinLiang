@@ -894,6 +894,12 @@ func (r *runner) targetRef(ref source.TableRef) source.TableRef {
 // key 用**裸表名**：源端与目标端只差 schema，裸表名两边一致，所以同一份 map
 // 既能喂 preflight（源端口径）也能喂 sink.Options.UniqueKeys（目标端口径，§4.4）。
 func (r *runner) declaredUniqueKeys() map[string][]string {
+	// 整轮重搬的模式（once / full_interval）每轮清空重写，行身份用不上：
+	// 声明在这里**不生效**（与预检 TARGET-02 同口径），别让写路径拿它去 upsert。
+	switch r.doc.Mode.Frequency {
+	case "once", "full_interval":
+		return nil
+	}
 	// 解析口径只写一份：`control.JobDoc.DeclaredUniqueKeys`（key 用裸表名）。
 	return r.doc.DeclaredUniqueKeys()
 }

@@ -553,6 +553,12 @@ func targetUniqueKeyChecks(in Input) []source.Check {
 			continue // SCOPE-01 会报「源端没有这张表」，这里不重复
 		}
 		declared := in.UniqueKeys[name]
+		if wholeTable && len(declared) > 0 {
+			// 整轮重搬模式每轮清空重写，行身份用不上：声明在这里不生效（写路径也不会拿它定位）。
+			// 这不该拦住用户（Owl PR #120 第 2 轮 P2-1），提示一句就够。
+			warnIgnored = append(warnIgnored, name)
+			declared = nil
+		}
 		t := tgt[name]
 
 		switch {
@@ -569,7 +575,12 @@ func targetUniqueKeyChecks(in Input) []source.Check {
 			}
 			switch {
 			case len(t.PrimaryKey) > 0:
-				// 目标端有主键，但和源端不是同一组列：无所谓「按源端主键更新」。
+				// 目标端主键与源端不同组：但如果另有一条唯一索引正好是源端主键那几列，
+				// upsert 定位得到（PG 的 ON CONFLICT / MySQL 的 ON DUPLICATE KEY 都认唯一索引），
+				// 那就不是问题（Owl PR #120 第 2 轮 P2-2 的真库反例）。
+				if ok, _ := uniqueKeyMatches(t, st.PrimaryKey); ok {
+					continue
+				}
 				warnOtherKey = append(warnOtherKey, name)
 			case len(t.UniqueKeys) == 0:
 				// 一条唯一索引都没有：upsert 直接不成立（ErrNoUniqueKey）。
@@ -624,8 +635,8 @@ func targetUniqueKeyChecks(in Input) []source.Check {
 	}
 	if len(warnIgnored) > 0 {
 		sort.Strings(warnIgnored)
-		parts = append(parts, fmt.Sprintf("%s 源端已有主键：unique_key 声明被忽略（按主键走，行为不变）——"+
-			"只有你把主键列用 columns.exclude 排掉、行身份真的缺了，它才会生效", preview(warnIgnored)))
+		parts = append(parts, fmt.Sprintf("%s 源端已有主键（或整轮重搬模式用不上行身份）：unique_key 声明被忽略——"+
+			"按主键 / 整表重搬走，行为不变（列过滤能力落地后，主键列被排掉时声明才会生效）", preview(warnIgnored)))
 		affected = append(affected, warnIgnored...)
 	}
 	if len(warnOtherKey) > 0 {

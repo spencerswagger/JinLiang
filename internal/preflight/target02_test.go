@@ -34,7 +34,12 @@ func tgtTable(name string, pk []string, uniq [][]string, nullable ...string) sou
 }
 
 func srcTable(name string, hasPK bool) source.Table {
-	return source.Table{TableRef: source.TableRef{Schema: "public", Table: name}, HasStablePK: hasPK}
+	t := source.Table{TableRef: source.TableRef{Schema: "public", Table: name}, HasStablePK: hasPK}
+	if hasPK {
+		t.PrimaryKey = []string{"id"}
+		t.Columns = []source.Column{{Name: "id", Type: "bigint"}, {Name: "payload", Type: "text"}}
+	}
+	return t
 }
 
 func TestTarget02DeclaredKeyMatchesUniqueIndex(t *testing.T) {
@@ -366,5 +371,52 @@ func TestTarget02TargetHasDifferentPrimaryKeyWarns(t *testing.T) {
 	}
 	if !rep.CanStart {
 		t.Fatal("这只是 warn，不该阻断")
+	}
+}
+
+// once / full_interval 下声明不生效（写路径也不会拿它定位），目标表还不存在时更不能 blocked：
+// 那种情况只能靠删声明才能开跑，是把「模式用不上」当成「声明错了」（Owl 第 2 轮 P2-1）。
+func TestTarget02DeclaredIgnoredInWholeTableModeEvenIfTableMissing(t *testing.T) {
+	for _, mode := range []string{"once", "full_interval"} {
+		t.Run(mode, func(t *testing.T) {
+			rep := Run(Input{
+				SourceKind: "postgres", TargetKind: "postgres",
+				SourceVer: "16.2", TargetVer: "16.2",
+				SourceCaps: source.CapSet{source.CapCDC: {Supported: true}},
+				SourceCat:  catalog(srcTable("events", false)),
+				TargetCat:  catalog(), // 目标表还不存在
+				Tables:     []string{"events"},
+				Mode:       mode,
+				OnExists:   "error",
+				BatchRows:  500,
+				UniqueKeys: map[string][]string{"events": {"tenant_id", "event_no"}},
+			})
+			c, ok := statusOf(rep, "TARGET-02")
+			if ok && c.Status == source.StatusBlocked {
+				t.Fatalf("%s 下声明不生效，不该 blocked：%+v", mode, c)
+			}
+			if !rep.CanStart {
+				t.Fatal("整轮重搬模式必须能开跑")
+			}
+		})
+	}
+}
+
+// 目标端主键与源端不同组、但另有一条「源端主键那几列」的唯一索引：upsert 定位得到，别误报。
+func TestTarget02DifferentPKButMatchingUniqueKeyIsOK(t *testing.T) {
+	rep := Run(Input{
+		SourceKind: "postgres", TargetKind: "postgres",
+		SourceVer: "16.2", TargetVer: "16.2",
+		SourceCaps: source.CapSet{source.CapCDC: {Supported: true}},
+		SourceCat:  catalog(srcTable("orders", true)),
+		TargetCat:  catalog(tgtTable("orders", []string{"id"}, [][]string{{"tenant_id", "event_no"}})),
+		Tables:     []string{"orders"},
+		Mode:       "continuous+initial",
+		OnExists:   "append",
+		BatchRows:  500,
+	})
+	c, ok := statusOf(rep, "TARGET-02")
+	if !ok || c.Status != source.StatusOK {
+		t.Fatalf("目标端另有与源端主键同列的唯一索引时应 ok，得到 %+v", c)
 	}
 }

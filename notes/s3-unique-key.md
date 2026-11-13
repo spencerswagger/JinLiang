@@ -29,3 +29,13 @@
 
 `gofmt -l .` 空 / `go vet ./...` / `go test ./...` / `go vet -tags integration ./...` /
 `python3 scripts/validate_schema.py examples/*.yaml` 全绿；PR CI 20/20 pass。
+
+## Owl 第 2 轮（PR #120 复核后）
+
+- P2-1：`once`/`full_interval` 下声明**不生效**——engine 不再把声明交给 sink，预检把声明归到
+  「被忽略」提示（含目标表还不存在的情况，不再 blocked）。
+- P2-2：目标端主键与源端不同组、但另有一条与源端主键同列的唯一索引 → 预检判 ok（真库实测能 upsert）。
+- P2-3：`columns.include/exclude/map` 目前只有校验、还没实现过滤，所以「声明被忽略」的文案
+  写成「列过滤能力落地后…才会生效」，不承诺今天做不到的事；`hasUsablePK` 的列判据今天恒真，与
+  pgsink 保持同形。
+- `checkDeclared` 的去重 key 改成 `schema.table`（与 `declaredCache` 同口径）。
