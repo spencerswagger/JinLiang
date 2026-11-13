@@ -406,3 +406,63 @@ func TestIntegrationBatchFailureLocatesBadRow(t *testing.T) {
 		t.Fatalf("失败时位点不能前进: %q", p)
 	}
 }
+
+// 无主键表（源端没有身份，R1）：INSERT 照写；UPDATE 必须明确失败——不许静默插一版新的
+// （设计 §1.5 已否）。按表暂停/整表重搬是 S2；在那之前这里整批失败、位点不动。
+func TestIntegrationNoPKInsertOnlyRejectsUpdate(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	const table = "jl_nopk_insert_only"
+	cat := source.Catalog{Tables: []source.Table{{
+		TableRef: source.TableRef{Schema: "public", Table: table},
+		Columns: []source.Column{
+			{Name: "id", Type: "bigint"},
+			{Name: "payload", Type: "text"},
+		},
+		// 无 PrimaryKey、HasStablePK=false：源端没有行身份
+	}}}
+	s := openSinkFor(t, cat, nil)
+	drop := func() { _, _ = s.conn.Exec(ctx, "DROP TABLE IF EXISTS public."+table) }
+	drop()
+	defer drop()
+	if _, err := s.EnsureSchema(ctx, cat); err != nil {
+		t.Fatalf("建表: %v", err)
+	}
+
+	ref := source.TableRef{Schema: "public", Table: table}
+	rel := &source.Table{TableRef: ref, Columns: cat.Tables[0].Columns}
+	mk := func(kind source.EventKind, payload string) source.Event {
+		// 值按文本交付（pgsource 走 pgoutput 文本格式，与 insertEvents 同形态）。
+		return source.Event{Kind: kind, TxID: "tx", Table: ref,
+			New: source.Row{Table: ref, Values: []source.Value{
+				{Kind: source.KindString, S: "1"}, {Kind: source.KindString, S: payload},
+			}},
+			Old: source.Row{Table: ref, Values: []source.Value{
+				{Kind: source.KindString, S: "1"}, {Kind: source.KindString, S: "old"},
+			}},
+			Relation: rel}
+	}
+	ins := []source.Event{{Kind: source.EvBegin, TxID: "tx"}, mk(source.EvInsert, "a"), {Kind: source.EvCommit, TxID: "tx"}}
+	if err := s.Apply(ctx, ins, testPosition{"postgres:v1:0/10"}); err != nil {
+		t.Fatalf("无主键表 insert-only 不应失败: %v", err)
+	}
+	if n, err := s.Count(ctx, ref); err != nil || n != 1 {
+		t.Fatalf("应写 1 行，实际 %d（err=%v）", n, err)
+	}
+
+	upd := []source.Event{{Kind: source.EvBegin, TxID: "tx"}, mk(source.EvUpdate, "b"), {Kind: source.EvCommit, TxID: "tx"}}
+	err := s.Apply(ctx, upd, testPosition{"postgres:v1:0/20"})
+	if err == nil {
+		t.Fatal("无主键表收到 UPDATE 必须失败，不能静默插一版新的")
+	}
+	if !strings.Contains(err.Error(), "没有主键") {
+		t.Fatalf("错误应说清是无主键、无法定位改行: %v", err)
+	}
+	if n, _ := s.Count(ctx, ref); n != 1 {
+		t.Fatalf("失败时不能多插行，实际 %d", n)
+	}
+	if p, _ := s.Position(ctx); strings.Contains(p, "0/20") {
+		t.Fatalf("失败时位点不能前进: %q", p)
+	}
+}

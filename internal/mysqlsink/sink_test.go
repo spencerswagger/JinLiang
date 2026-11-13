@@ -127,6 +127,33 @@ func TestUpsertSQLOnlyPrimaryKeyStillValid(t *testing.T) {
 	}
 }
 
+func TestInsertSQLForm(t *testing.T) {
+	// 无主键表的 insert-only 路径：多行纯 INSERT，**不能**出现 ON DUPLICATE KEY
+	//（那需要唯一键；设计 §1.2 路线 A）。
+	table := source.TableRef{Schema: "shop", Table: "no_pk"}
+	got := insertSQL(table, []string{"a", "b"}, 2)
+	want := "INSERT INTO `shop`.`no_pk` (`a`,`b`) VALUES (?,?),(?,?)"
+	if got != want {
+		t.Fatalf("insert-only 形态不对:\n got %s\nwant %s", got, want)
+	}
+	if strings.Contains(got, "ON DUPLICATE") || strings.Contains(got, "IGNORE") {
+		t.Fatalf("insert-only 不能带 ON DUPLICATE/IGNORE: %s", got)
+	}
+}
+
+func TestInsertOnlyDecision(t *testing.T) {
+	// 身份只认源端（R1）：无稳定主键 → insert-only；有主键或拿不到 Relation → 不猜。
+	if !insertOnly(&source.Table{HasStablePK: false}) {
+		t.Fatal("源端无稳定主键的表必须是 insert-only")
+	}
+	if insertOnly(&source.Table{HasStablePK: true, PrimaryKey: []string{"id"}}) {
+		t.Fatal("源端有主键的表不能走 insert-only")
+	}
+	if insertOnly(nil) {
+		t.Fatal("拿不到 Relation 时不能猜 insert-only（没有身份信息就按老规矩要求唯一键）")
+	}
+}
+
 func TestDeleteSQLRequiresPrimaryKey(t *testing.T) {
 	if _, err := deleteSQL(source.TableRef{Table: "t"}, nil); err == nil {
 		t.Fatal("没有主键时必须拒绝删除（否则可能变成全表删除）")

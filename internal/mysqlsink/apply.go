@@ -211,18 +211,36 @@ func (s *Sink) applyUpserts(ctx context.Context, tx *sql.Tx, evs []source.Event)
 	if err != nil {
 		return err
 	}
-	ok, err := s.hasUniqueKey(ctx, table)
-	if err != nil {
-		return err
+	var stmt string
+	if insertOnly(evs[0].Relation) {
+		// 无主键表：只 INSERT（设计 §1.2 路线 A）。目标端有没有唯一索引都不升级成
+		// upsert——身份只认源端（R1），拿别人的索引猜行身份会静默改错数据。
+		for _, ev := range evs {
+			if ev.Kind != source.EvInsert {
+				// 改行在无主键表上没有定位依据：既不降级成 INSERT（§1.5 已否），
+				// 也不按全列条件去改。按表暂停/整表重搬是下一个切片（S2），
+				// 在那之前这里**明确失败**，不留下半批数据。
+				return fmt.Errorf("%s 没有主键：本版对无主键表只做 insert-only（新增照写），"+
+					"收到改行（UPDATE）时目标端无法定位是哪一行。"+
+					"风险：这是整批失败，本轮其它表也会停在同一个位点。"+
+					"做法：给源表加主键，或从 content.tables 去掉这张表后重新 import",
+					qualified(table))
+			}
+		}
+		stmt = insertSQL(table, cols, len(evs))
+	} else {
+		ok, err := s.hasUniqueKey(ctx, table)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("%w：%s。两种做法任选：① 给目标表加主键/唯一索引（推荐，与源端一致）；"+
+				"② 不想再跟这张表：把它从 content.tables 里去掉后重新 import。"+
+				"风险：加唯一索引需要目标端已有数据无重复，建索引期间会短暂阻塞写入",
+				ErrNoUniqueKey, qualified(table))
+		}
+		stmt = s.upsertSQL(table, cols, len(evs), updateCols)
 	}
-	if !ok {
-		return fmt.Errorf("%w：%s。两种做法任选：① 给目标表加主键/唯一索引（推荐，与源端一致）；"+
-			"② 不想再跟这张表：把它从 content.tables 里去掉后重新 import。"+
-			"风险：加唯一索引需要目标端已有数据无重复，建索引期间会短暂阻塞写入",
-			ErrNoUniqueKey, qualified(table))
-	}
-
-	stmt := s.upsertSQL(table, cols, len(evs), updateCols)
 	args := make([]any, 0, len(evs)*len(cols))
 	for _, ev := range evs {
 		if len(ev.New.Values) != len(cols) {
@@ -236,6 +254,13 @@ func (s *Sink) applyUpserts(ctx context.Context, tx *sql.Tx, evs []source.Event)
 		return fmt.Errorf("写入 %s 失败（%d 行）: %w", qualified(table), len(evs), err)
 	}
 	return nil
+}
+
+// insertOnly 判定一张表是否只能 insert-only：源端没有稳定主键（R1：身份只认源端）。
+// Relation 缺失（拿不到源端目录）时**不猜**——没有身份信息就按老规矩要求目标端唯一键，
+// 避免把 upsert 悄悄降级成纯 INSERT。
+func insertOnly(rel *source.Table) bool {
+	return rel != nil && !rel.HasStablePK
 }
 
 func (s *Sink) applyDelete(ctx context.Context, tx *sql.Tx, ev source.Event) error {

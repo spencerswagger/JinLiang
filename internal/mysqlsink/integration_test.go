@@ -147,6 +147,8 @@ func TestIntegrationUpsertWithUniqueKey(t *testing.T) {
 }
 
 // 无唯一键：明确报错，且一行都不写（事务回滚）。
+// 这是「源端有主键、目标端缺键」那一半——源端身份明确，目标端却定位不了（设计 §4.3）。
+// 源端本来就无主键的表不走这条，见 TestIntegrationInsertOnlyNoPKSource。
 func TestIntegrationUpsertWithoutUniqueKeyFails(t *testing.T) {
 	s := openSink(t, func(o *Options) { o.OnExists = OnExistsAppend })
 	dropTable(t, s, "jl_b3_nopk")
@@ -167,7 +169,7 @@ func TestIntegrationUpsertWithoutUniqueKeyFails(t *testing.T) {
 		"mysql:v1:file=binlog.000001;pos=300;coord=mysql_file_pos")
 	err := s.Apply(context.Background(), batch, posOf(t, "mysql:v1:file=binlog.000001;pos=300;coord=mysql_file_pos"))
 	if err == nil {
-		t.Fatal("没有唯一键必须报错，不能退化成纯 INSERT")
+		t.Fatal("源端有主键、目标端没有唯一键时必须报错，不能退化成纯 INSERT")
 	}
 	if !errors.Is(err, ErrNoUniqueKey) {
 		t.Fatalf("错误应可判为 ErrNoUniqueKey: %v", err)
@@ -177,6 +179,75 @@ func TestIntegrationUpsertWithoutUniqueKeyFails(t *testing.T) {
 	}
 	if p, _ := s.MetaPosition(context.Background()); strings.Contains(p, "pos=300") {
 		t.Fatalf("报错时位点不能前进: %q", p)
+	}
+}
+
+// 源端无稳定主键 + 目标端无唯一索引：insert-only 照跑（设计 §1.2 路线 A）。
+// 全量也走 Apply，所以这条同时是「无主键表全量能搬完」在写路径上的那一半。
+func TestIntegrationInsertOnlyNoPKSource(t *testing.T) {
+	s := openSink(t, func(o *Options) { o.OnExists = OnExistsAppend })
+	dropTable(t, s, "jl_b4_nopk")
+	defer dropTable(t, s, "jl_b4_nopk")
+	if _, err := s.db.ExecContext(context.Background(), "CREATE TABLE `jl_b4_nopk` (a int, b varchar(16))"); err != nil {
+		t.Fatalf("建无主键表: %v", err)
+	}
+
+	cat := source.Catalog{Tables: []source.Table{{
+		TableRef: source.TableRef{Table: "jl_b4_nopk"},
+		Columns:  []source.Column{{Name: "a", Type: "int", Nullable: true}, {Name: "b", Type: "varchar(16)", Nullable: true}},
+	}}}
+	if _, err := s.EnsureSchema(context.Background(), cat); err != nil {
+		t.Fatalf("append 策略应沿用已有表: %v", err)
+	}
+
+	rel := relationNoPK("jl_b4_nopk")
+	batch := insertBatchWithRel("jl_b4_nopk", rel, [][]any{{int64(1), "x"}, {int64(2), "y"}}, "")
+	if err := s.Apply(context.Background(), batch, posOf(t, "mysql:v1:file=binlog.000001;pos=400;coord=mysql_file_pos")); err != nil {
+		t.Fatalf("无主键表 insert-only 不应失败: %v", err)
+	}
+	if n := countRows(t, s, "jl_b4_nopk"); n != 2 {
+		t.Fatalf("insert-only 应写进 2 行，实际 %d 行", n)
+	}
+	if p, _ := s.MetaPosition(context.Background()); !strings.Contains(p, "pos=400") {
+		t.Fatalf("insert-only 成功后位点应前进: %q", p)
+	}
+}
+
+// 源端无稳定主键时收到 UPDATE：必须明确失败——不许降级成 INSERT（设计 §1.5 已否），
+// 也不许按目标端唯一索引猜身份（R1）。按表暂停是下一个切片，那之前这里整批失败。
+func TestIntegrationInsertOnlyRejectsUpdateOnNoPKSource(t *testing.T) {
+	s := openSink(t, func(o *Options) { o.OnExists = OnExistsAppend })
+	dropTable(t, s, "jl_b4_nopk")
+	defer dropTable(t, s, "jl_b4_nopk")
+	if _, err := s.db.ExecContext(context.Background(), "CREATE TABLE `jl_b4_nopk` (a int, b varchar(16))"); err != nil {
+		t.Fatalf("建无主键表: %v", err)
+	}
+
+	cat := source.Catalog{Tables: []source.Table{{
+		TableRef: source.TableRef{Table: "jl_b4_nopk"},
+		Columns:  []source.Column{{Name: "a", Type: "int", Nullable: true}, {Name: "b", Type: "varchar(16)", Nullable: true}},
+	}}}
+	if _, err := s.EnsureSchema(context.Background(), cat); err != nil {
+		t.Fatalf("append 策略应沿用已有表: %v", err)
+	}
+
+	rel := relationNoPK("jl_b4_nopk")
+	upd := updateBatchWithRel("jl_b4_nopk", rel, [][]any{{int64(1), "y"}}, [][]any{{int64(1), "x"}}, "")
+	err := s.Apply(context.Background(), upd, posOf(t, "mysql:v1:file=binlog.000001;pos=500;coord=mysql_file_pos"))
+	if err == nil {
+		t.Fatal("无主键表收到 UPDATE 必须失败，不能降级成 INSERT")
+	}
+	if errors.Is(err, ErrNoUniqueKey) {
+		t.Fatalf("这条不是 upsert 缺唯一键，不该报 ErrNoUniqueKey: %v", err)
+	}
+	if !strings.Contains(err.Error(), "没有主键") {
+		t.Fatalf("错误应说清是无主键、无法定位改行: %v", err)
+	}
+	if n := countRows(t, s, "jl_b4_nopk"); n != 0 {
+		t.Fatalf("失败时不能写进任何行，实际 %d 行", n)
+	}
+	if p, _ := s.MetaPosition(context.Background()); strings.Contains(p, "pos=500") {
+		t.Fatalf("失败时位点不能前进: %q", p)
 	}
 }
 
@@ -356,7 +427,10 @@ func TestIntegrationWidthPreflightOnRealTable(t *testing.T) {
 // —— 事件构造 ——
 
 func insertBatch(table string, rows [][]any, pos string) []source.Event {
-	rel := relationFor(table)
+	return insertBatchWithRel(table, relationFor(table), rows, pos)
+}
+
+func insertBatchWithRel(table string, rel *source.Table, rows [][]any, pos string) []source.Event {
 	var evs []source.Event
 	evs = append(evs, source.Event{Kind: source.EvBegin, TxID: "tx"})
 	for _, r := range rows {
@@ -371,7 +445,10 @@ func insertBatch(table string, rows [][]any, pos string) []source.Event {
 }
 
 func updateBatch(table string, news, olds [][]any, pos string) []source.Event {
-	rel := relationFor(table)
+	return updateBatchWithRel(table, relationFor(table), news, olds, pos)
+}
+
+func updateBatchWithRel(table string, rel *source.Table, news, olds [][]any, pos string) []source.Event {
 	var evs []source.Event
 	evs = append(evs, source.Event{Kind: source.EvBegin, TxID: "tx"})
 	for i := range news {
@@ -402,6 +479,19 @@ func valuesOf(row []any) []source.Value {
 }
 
 func relationFor(table string) *source.Table { return relationPtr(table) }
+
+// relationNoPK 是「源端无稳定主键」的 Relation：列按 jl_b4_nopk 的 (a,b)，身份为空
+// （设计 §1.1 的探测口径：HasStablePK=false 且 PrimaryKey 为空）。
+func relationNoPK(table string) *source.Table {
+	return &source.Table{
+		TableRef: source.TableRef{Table: table},
+		Columns: []source.Column{
+			{Name: "a", Type: "int", Nullable: true},
+			{Name: "b", Type: "varchar(16)", Nullable: true},
+		},
+		HasStablePK: false,
+	}
+}
 
 func relationPtr(table string) *source.Table {
 	t := ordersCatalog().Tables[0]
