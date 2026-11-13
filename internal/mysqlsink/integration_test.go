@@ -175,6 +175,16 @@ func TestIntegrationUpsertWithoutUniqueKeyFails(t *testing.T) {
 	if !errors.Is(err, ErrNoUniqueKey) {
 		t.Fatalf("错误应可判为 ErrNoUniqueKey: %v", err)
 	}
+	// 这条路径是「源端有主键、目标端缺键」：此时声明 unique_key 不生效（§4.2 第 4 条），
+	// 所以不能把它列为做法——用户照做也不会好转（Ark §7 D11，与 TARGET-02 的 warn 口径对不上）。
+	if strings.Contains(err.Error(), "unique_key") {
+		t.Fatalf("源端有主键时声明会被忽略，不该让用户去声明 unique_key：%v", err)
+	}
+	// 「换空 schema」单独一条是空动作：这条用例的目标库本来就是空的（schemaOf 回落 DSN 库）。
+	// 能真救回来的前提是「那里还没有这张表」，或者配 on_exists: recreate 先 DROP 重建。
+	if !strings.Contains(err.Error(), "target.schema") || !strings.Contains(err.Error(), "on_exists") {
+		t.Fatalf("「换到空 schema + （已有表时）on_exists: recreate」才是可走的路，应写清前提：%v", err)
+	}
 	if n := countRows(t, s, "jl_b3_nopk"); n != 0 {
 		t.Fatalf("报错时不能写进任何行，实际 %d 行", n)
 	}

@@ -248,10 +248,16 @@ func (s *Sink) applyUpserts(ctx context.Context, tx *sql.Tx, evs []source.Event)
 			return err
 		}
 		if !ok {
-			return fmt.Errorf("%w：%s。三种做法任选：① 给目标表加主键/唯一索引（推荐，与源端一致）；"+
-				"② 在 content.tables.<表> 里声明 unique_key: [列…]（指向目标端已有的唯一索引，列都非空）；"+
+			// 走到这里说明**源端有可用主键**、目标端没有可用的键：此时声明 unique_key 不生效
+			// （§4.2 第 4 条：表已有主键时声明被忽略），所以不能把声明列为做法——
+			// 那是一条用户照做也不会好转的死路（Ark 在 #120 的 §7 D11 点出，与 TARGET-02
+			// 「补目标端键 / 换空 target.schema」的 warn 口径也对不上）。
+			return fmt.Errorf("%w：%s。三条做法任选：① 在目标端给这张表补上与源端一致的主键或唯一索引（推荐）；"+
+				"② 换到一个**空**的 target.schema 让本任务自己建表（按源端结构带主键；前提是那里还没有这张表——"+
+				"同一个库里已经有就配 on_exists: recreate，会先 DROP 再按源端主键重建）；"+
 				"③ 不想再跟这张表：把它从 content.tables 里去掉后重新 import。"+
-				"风险：加唯一索引需要目标端已有数据无重复，建索引期间会短暂阻塞写入",
+				"风险：加唯一索引需要目标端已有数据无重复，建索引期间会短暂阻塞写入；"+
+				"on_exists: recreate 会删掉目标端的这张表（里面是别的程序的数据就先备份）",
 				ErrNoUniqueKey, qualified(table))
 		}
 		stmt = s.upsertSQL(table, cols, len(evs), updateCols)
