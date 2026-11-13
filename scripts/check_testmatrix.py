@@ -154,7 +154,7 @@ def check_nopk(root, pg, my):
     # 与定稿**绑定**：这几个数就是 §2.4 表里写的，改了设计必须同时改这里与登记表，
     # 否则「登记表绿、文档另说」这种漂移永远发现不了。
     design = (root / "docs" / "DESIGN-NO-PRIMARY-KEY.md").read_text(encoding="utf-8")
-    for token in ("**10**", "**184 格**", "**待接通 12 格**", "≈ 39"):
+    for token in ("**10**", "**184 格**", "**待接通 12 格**", "**8/周**", "38.1"):
         if token not in design:
             raise AssertionError(
                 f"定稿 §2.4 里找不到 {token}：设计改了数字就同步改 test/nopk-matrix.yaml "
@@ -223,11 +223,8 @@ def main():
     nopk = check_nopk(root, pg, my)
     print("testmatrix: postgres 9/9 (81), mysql 4/4 (16), cross 72 — 分层正确")
     real = nopk["nightly_fixed"] + nopk["nightly_weekly"] / 7
-    design_nightly = 27 + 6 + 4 + 12 / 7  # 定稿 §2.4 的算法（T4 按 4 链 × 3 场景 = 12/周）
     print(f"nopk: pr {nopk['pr']}/10 · nightly {nopk['nightly_fixed']} 固定 + T4 "
-          f"{nopk['nightly_weekly']}/周 = {real:.1f}/晚"
-          f"（定稿自己的算术 {design_nightly:.1f} → 进位成 ≈39；差 {design_nightly - real:.1f}/晚"
-          f" = T4 少 4 格/周，因 PG→MySQL 只全量且定稿 T4 行按 3 场景算）"
+          f"{nopk['nightly_weekly']}/周 = {real:.1f}/晚（与定稿 §2.4 同口径）"
           f" · release {nopk['release']}/184 · 待接通 {nopk['pending']}/12（pending，不计入覆盖）")
 
 

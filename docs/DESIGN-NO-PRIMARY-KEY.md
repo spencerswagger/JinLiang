@@ -1,6 +1,7 @@
 # 设计：无主键表同步（insert-only / 显式唯一键）· v1 定稿
 
-> **状态：S1–S3 + E1017 已合入 main（`#116`/`#117`/`#119`/`#120`/`#122`）；S4 矩阵格与 D2/D10 等挂账未落地。**
+> **状态：S1–S4 + E1017 已全部合入 main（`#116`/`#117`/`#119`/`#120`/`#122`/`#124`）。**
+> §7 仍列着的挂账（`D1`–`D10`、`D12`）**确实还没做**，别当成已实现。
 > 本文件既是设计也是落地记录，下面「今天能不能跑」按此读。
 >
 > 基线：`main` `0143986`（`#112` 报错文案、`#113` MY-08 preflight + 单测、`#114` MY-08 矩阵 smoke 已合入）。
@@ -202,6 +203,9 @@ A 是地板，B 是天花板。
 **S-NP2** 增量纯 INSERT（不暂停、位点前进）·
 **S-NP3** 增量加一次 `UPDATE`/`DELETE`（→ 该表暂停 + `skipped_rows` + 退出码 3 → 下一轮重搬后收敛）。
 
+**例外（不是「没跑」，是「没有写路径可验」）**：`PG→MySQL` 只全量（`internal/core/direction.go` 的 `Modes`），
+所以这条方向上的每条链**只有 S-NP1 一格**，S-NP2 / S-NP3 在产品口径下不存在。下表逐行按这个算。
+
 **夹具要求**：S-NP3 在 **PG 源**上必须先给这张表设 `REPLICA IDENTITY FULL`（§3.5）——不设的话用例在源端解码
 就断了，测的是 PostgreSQL 而不是我们。这一步是前置动作，**不计入新增格数**（同一格内多一条 setup SQL）。
 
@@ -211,15 +215,18 @@ A 是地板，B 是天花板。
 | nightly T1（自洽） | PG 10→10 … 18→18（9 条） | 3 | **27** | 能 |
 | nightly T1（MySQL 同版本 4 条） | MySQL 5.7→5.7 … 9.x→9.x | 3 | 12 | **不能**（方向未接通） |
 | nightly T2（相邻升级代表） | PG 10→11、PG 17→18 | 3 | **6** | 能 |
-| nightly T3（极端跨度代表） | PG 10→18（3）、PG 18→10 降级只验「提示并允许」（1） | 3 / 1 | **4** | 能 |
-| nightly T4（异构抽样） | 每周 4 条代表链（两方向 × 2 组合） | 3 | 12/周（摊每晚 ≈ 2） | 能 |
-| **nightly 小计** | | | **≈ 39 格/晚** | |
+| nightly T3（极端跨度代表） | PG 10→18（3）、PG 18→10 降级只验「允许继续」（1；**无降级提示卡**，见 §7 `D12`） | 3 / 1 | **4** | 能 |
+| nightly T4（异构抽样） | 每周 4 条代表链：MySQL→PG 2 条 × 3、PG→MySQL 2 条 × 1（该方向只全量） | 3 / 3 / 1 / 1 | **8/周**（摊每晚 ≈ 1.1） | 能 |
+| **nightly 小计** | 27 + 6 + 4 + 8/7 | | **38.1 格/晚**（≈ 38） | |
 | release T4（全量） | MySQL→PG 36 条 × 3 = 108；**PG→MySQL 36 条 × 1 = 36**（该方向只全量） | | **144** | 能 |
 | release `unique_key` 路线 | PG 18→18（once 幂等、continuous upsert+delete 两场景 = 2）、PG 18→MySQL（once = 1） | | **3** | 能（MySQL 目标端只有全量） |
 | **release 小计** | 上面 T1/T2/T3 的 27+6+4，加 T4 的 144，加 `unique_key` 的 3 | | **184 格** | |
 
 - **PR 增量 10 格**，目标仍是 ≤15 分钟（现有 T1 子集上再加，不加新链路类型）。
-- **nightly 增量 ≈ 39 格/晚**（相对现基线 320 单元/晚，+12%）。
+- **nightly 增量 38.1 格/晚**（相对现基线 320 单元/晚，+11.9%）。
+  > 定稿早先写「≈39」是按「T4 = 4 链 × 3 场景 = 12/周」算的（27+6+4+12/7 = 38.7 → 进位 39）；
+  > 但 T4 里 2 条 PG→MySQL 链只全量，只有 S-NP1 可达 → 真实 **8/周**、小计 **38.1**。
+  > 多出来的 4 格/周在产品口径下不存在，**不是没跑**（同一张表的 release 行一直是「PG→MySQL 36 条 × 1」，口径本来就这么写）。
 - **release 增量 184 格**（相对 1352 单元，+13.6%）。
 - **待接通 12 格**：`MySQL→MySQL` 的 4 条 T1 链路 × 3 场景。今天**一格都跑不了**——
   也就是说 **MySQL 目标端的 insert-only 只能靠单测 + 本地真库 smoke 证明**，矩阵要等方向接通才补得上。
@@ -415,7 +422,7 @@ control.JobDoc.Content.Tables[t].UniqueKey
 | **S1** insert-only 写路径 | MySQL 目标端：目标无唯一键 + 源端无身份 + 未声明 → 多行纯 `INSERT`（不拼 `ON DUPLICATE KEY`）；取消 `hasUniqueKey` 的硬失败；`ErrNoUniqueKey` 只在「声明了但对不上」或「源端有主键、目标缺键」时出现 | `internal/mysqlsink/{upsert,apply}.go`、`internal/pgsink/pgsink.go`（对齐） | 单测：无主键源表 → 生成 SQL 不含 `ON DUPLICATE KEY`；本地真库 PG→MySQL 全量搬完、行数一致 | 1d |
 | **S2** 改/删 → 按表暂停（**含 `PG-06` 源端前置**） | ① 新 `PausableError`（`Reason()="no_pk_write"`）在两个 sink 的 `EvUpdate`/`EvDelete` 分支前置判定（**写之前**判定，别写到一半）；引擎侧 `pauseSink` 登记 + `skipped_rows` + 退出码 3；下一轮重搬补齐；**`E1017` 码表 + `ERRORS.md` 由这片落地**。② `PG-06`：PG 源 + 无主键 + 增量 → 读 `Table.ReplicaIdentity`，非 `full`/`index` 则 warn + autofix `ALTER TABLE … REPLICA IDENTITY FULL`（属主权限前提；拿不到权限就只给 SQL + 明说「这张表不能进增量」）。**没有 ②，① 在 PG 源上承诺的「只停这张表」就是假的**（源端解码先断） | `internal/pgsink`、`internal/mysqlsink`、`internal/engine/{pause_skip,pause_generic,resume}.go`、`internal/preflight/b0.go`、`internal/core/codes.go`、`docs/ERRORS.md` | 集成：无主键表 `UPDATE` → 该表 `paused_tables.reason=no_pk_write`、`skipped_rows≥1`、**其它表行数继续增长**、退出码 3；重跑后该表与源端一致。PG-06：未设 RI 时**不出现**「流反复断开」，而是预检给 autofix；设了 RI 后 S-NP3 才成立 | 2d |
 | **S3** `unique_key` | `TableDoc.UniqueKey` + 校验 + schema；`source.Table.UniqueKeys`（两个 `connect`）；`TARGET-02` 三档 + `preflight.Input.UniqueKeys`；两个 sink 的 upsert/delete 用声明；§4.5 其余文案（1/2/3/5–8） | `internal/control/jobspec.go`、`schema/job.schema.json`、`internal/connect/{mysql,postgres}.go`、`internal/source/contract.go`、`internal/preflight/b0.go`、两个 sink | 单测：五条核对判据逐条红/绿；集成：声明真唯一索引 → 重放两次行数不变、`DELETE` 生效；声明不存在的索引 → `TARGET-02` blocked + 四段式 | 1.5d |
-| **S4** 矩阵格 | §2.4 的 PR 10 格 + nightly 39 格；`testmatrix.yaml` 标注「待接通 12 格」 | `test/`、`scripts/`、`testmatrix.yaml` | PR 门禁 ≤15 分钟；nightly 报告里能单独筛出 `no-pk` 变体 | 1d |
+| **S4** 矩阵格 **（已落地 `#124`）** | §2.4 的 PR 10 格 + nightly 37 格 + T4 8 格/周（≈38.1/晚）；`testmatrix.yaml` 标注「待接通 12 格」 | `test/`、`scripts/`、`testmatrix.yaml` | PR 门禁 ≤15 分钟；nightly 报告里能单独筛出 `no-pk` 变体 | 1d |
 
 - **S1/S2 可并行**（S2 只依赖 `PausableError` 的形状，不依赖 S1 的 SQL 生成）；**S3 依赖 S1**（写路径要先有 insert-only 才能对比 upsert）；
   **S4 依赖 S1+S2+S3**。
@@ -458,6 +465,12 @@ control.JobDoc.Content.Tables[t].UniqueKey
 | D8 | `jinliang status` 的暂停展示（含 `skipped_rows`） | 已知债（契约 §1.8 片 D2）；**文案不许再把用户指去 status 找它** |
 | D9 | MySQL 目标端 upsert **不指定冲突列**：命中任意唯一索引即可更新，可能与源端主键语义不一致 | 与「无主键表」相邻但不同源；v1 只在 `TARGET-02` 的 Detail 里点明，改 SQL 形状要连带改 5.7 的 `VALUES()` 变体，属独立一片 |
 | D10 | 分区表叶子的 `REPLICA IDENTITY` 批量代做（catalog 只列父表，`connect/postgres.go:172-174` 跳过子分区） | 要先把 `pg_inherits` 枚举接进 catalog，否则代做只能改到父表；v1 明说不代做 + 给 SQL 模板 |
+| D12 | **「目标端版本比你低」的降级提示卡**：预检里说清「目标端版本低，这些特性会被落地/这些列会降级」，对应 `docs/DESIGN.md §4A` 那张表「③ 最后提示（仍可继续）」列的**目标版本更低**行 | 今天**没有任何版本比较或降级判据**：`TargetVer` 只用于 `NET-02` 卡片的 Detail 回显（`internal/preflight/b0.go:53`），全仓没有版本比较函数；能出现的只有 `TYPE-01`/`TYPE-02` 那种**按列类型**的卡片。要新增就得按**特性/能力**逐项探测（`DESIGN.md §4` 的红线是「能力探测，不是版本号分支」），属一条独立探测项。所以 §2.4 的 `PG 18→10` 降级格**只验「允许继续」**（`CanStart=true` + 两侧版本在 `NET-01`/`NET-02` 可见 + 引擎照跑），**不冒充「已提示」**；`docs/DESIGN.md` §2.3 / §3 的降级行也按此改 |
+
+> **`D11` 为什么不在上面**：那个编号被开着的 `#121`（无主键 v1 落地回填）占着——它记的是
+> 「`mysqlsink` 的 `ErrNoUniqueKey` 文案第 ② 条指向 `unique_key`，而该错误多发生在『源端**有**主键、目标端缺键』」，
+> 这件事**已随 `#122` 收口**（`internal/mysqlsink/apply.go` 拆成两条消息、都不含「声明 `unique_key`」，见 §4.5 第 1 条）。
+> 所以编号不复用（即使 `#121` 最终关掉也空着）：两条不同的欠账共用一个号，比留一个空号更难查；新欠账从 `D12` 起。
 
 ---
 
