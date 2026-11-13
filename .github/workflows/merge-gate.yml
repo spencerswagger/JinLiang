@@ -58,7 +58,7 @@ jobs:
           [ -n "$files" ] || gate_on_failure "改动清单为空（本不该发生）"
           echo "改动文件："; printf '%s\n' "$files"
           # internal/preflight 也是门禁输入面（#90 的 pause-wording 探针就依赖它）。
-          if printf '%s\n' "$files" | grep -qE '^(internal/(engine|pgsink|mysqlsource|mysqlsink|core|source|mysqlcanon|preflight)/|cmd/|scripts/(gate_checks|mutation_gate|merge_gate|acceptance_matrix|review_gate_logic|known_red|probe_pause_wording|exit_codes|b1_mysql_to_mysql)\.|\.github/workflows/merge-gate\.yml)'; then
+          if printf '%s\n' "$files" | grep -qE '^(internal/(engine|pgsink|mysqlsource|mysqlsink|core|source|mysqlcanon|preflight)/|cmd/|test/|scripts/(gate_checks|mutation_gate|merge_gate|acceptance_matrix|nopk_matrix|check_testmatrix|review_gate_logic|known_red|probe_pause_wording|exit_codes|b1_mysql_to_mysql)\.|\.github/workflows/merge-gate\.yml)'; then
             echo "gate=true" >> "$GITHUB_OUTPUT"
           else
             echo "gate=false" >> "$GITHUB_OUTPUT"
@@ -290,6 +290,124 @@ jobs:
         with:
           name: acceptance-mysql-${{ matrix.mysql }}
           path: acceptance-${{ matrix.mysql }}.json
+
+  nopk-pr:
+    needs: changes
+    # 门控下沉到**步骤级**（不是 job 级 if）：这个 job 是矩阵，job 级 if 跳过时矩阵不展开，
+    # 检查名会报成 `… × ${{ matrix.mysql }}` 而 required 里是 5.7/8.4 两条具体名 →
+    # 永远 Expected（#109 踩过）。步骤级跳过时 job 以 success 结束，required 视为通过。
+    name: 无主键变体 × MySQL ${{ matrix.mysql }}（PR 10 格）
+    # docs/DESIGN-NO-PRIMARY-KEY.md §2.4 的 PR 层：PG 18→18（3）、MySQL 5.7/8.4→PG（各 3）、
+    # PG 18→MySQL 8.4（1，该方向只全量）。格的定义在 test/nopk-matrix.yaml，
+    # 逐格执行器是 scripts/nopk_matrix.py（调 internal/engine 的 TestNoPKMatrixCell）。
+    # 与 acceptance 分开成 job：容器各起一套、互不抢表，总时长仍在 PR 门禁预算内（并行跑）。
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mysql: ["5.7", "8.4"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.x"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 备好 python 依赖
+        if: needs.changes.outputs.gate == 'true'
+        run: pip install --quiet pyyaml
+      - name: 起 PG 18 源 / 目标（wal_level=logical）
+        if: needs.changes.outputs.gate == 'true'
+        run: |
+          set -e
+          docker run -d --name pg-src -p 55442:5432 \
+            -e POSTGRES_USER=jinliang -e POSTGRES_PASSWORD=jinliang -e POSTGRES_DB=jinliang_src \
+            postgres:18 -c wal_level=logical -c max_replication_slots=40 -c max_wal_senders=40
+          docker run -d --name pg-dst -p 55443:5432 \
+            -e POSTGRES_USER=jinliang -e POSTGRES_PASSWORD=jinliang -e POSTGRES_DB=jinliang_test \
+            postgres:18 -c wal_level=logical -c max_replication_slots=40 -c max_wal_senders=40
+          for c in pg-src pg-dst; do
+            ok=0
+            for _ in $(seq 1 90); do
+              # 连续两次真查询都成功才算起好（initdb 的临时实例会应答一次就重启）。
+              if docker exec "$c" psql -U jinliang -d postgres -tAc 'select 1' >/dev/null 2>&1; then
+                sleep 2
+                if docker exec "$c" psql -U jinliang -d postgres -tAc 'select 1' >/dev/null 2>&1; then ok=1; break; fi
+              fi
+              sleep 2
+            done
+            [ "$ok" = 1 ] || { echo "--- $c 没起来 ---"; docker logs "$c"; exit 1; }
+          done
+      - name: 起 MySQL 源 / 目标（${{ matrix.mysql }}，binlog ROW/FULL）
+        if: needs.changes.outputs.gate == 'true'
+        run: |
+          set -e
+          for attempt in 1 2 3; do
+            docker rm -f my-src >/dev/null 2>&1 || true
+            docker run -d --name my-src -p 55306:3306 \
+              -e MYSQL_ROOT_PASSWORD=root -e MYSQL_DATABASE=jinliang_src \
+              -e MYSQL_USER=jinliang -e MYSQL_PASSWORD=jinliang \
+              mysql:${{ matrix.mysql }} \
+              --server-id=1 --log-bin=mysql-bin --binlog-format=ROW --binlog-row-image=FULL && break
+            echo "第 $attempt 次起 my-src 失败，5s 后重试"; sleep 5
+          done
+          for attempt in 1 2 3; do
+            docker rm -f my-dst >/dev/null 2>&1 || true
+            docker run -d --name my-dst -p 55307:3306 \
+              -e MYSQL_ROOT_PASSWORD=root -e MYSQL_DATABASE=jinliang_target \
+              -e MYSQL_USER=jinliang -e MYSQL_PASSWORD=jinliang \
+              mysql:${{ matrix.mysql }} \
+              --server-id=2 --log-bin=mysql-bin --binlog-format=ROW --binlog-row-image=FULL && break
+            echo "第 $attempt 次起 my-dst 失败，5s 后重试"; sleep 5
+          done
+          for c in my-src my-dst; do
+            docker inspect "$c" >/dev/null
+            ok=0
+            for _ in $(seq 1 120); do
+              # 不能用 mysqladmin ping：它在「拒绝访问」时也返回 0。
+              if docker exec "$c" mysql -h127.0.0.1 -P3306 -uroot -proot -N -e 'select 1' >/dev/null 2>&1; then ok=1; break; fi
+              sleep 2
+            done
+            [ "$ok" = 1 ] || { docker logs "$c"; exit 1; }
+          done
+      - name: 补权限 + 第二套库
+        if: needs.changes.outputs.gate == 'true'
+        run: |
+          set -e
+          docker exec my-src mysql -h127.0.0.1 -P3306 -uroot -proot -e "
+            GRANT ALL PRIVILEGES ON *.* TO 'jinliang'@'%' WITH GRANT OPTION;
+            CREATE DATABASE IF NOT EXISTS jinliang_test; FLUSH PRIVILEGES; SELECT VERSION();"
+          docker exec my-dst mysql -h127.0.0.1 -P3306 -uroot -proot -e "
+            GRANT ALL PRIVILEGES ON *.* TO 'jinliang'@'%' WITH GRANT OPTION;
+            CREATE DATABASE IF NOT EXISTS jinliang_target; FLUSH PRIVILEGES; SELECT VERSION();"
+      - name: 无主键变体（PR 层：10 格，逐格真跑）
+        if: needs.changes.outputs.gate == 'true'
+        env:
+          JINLIANG_TEST_PG_SRC_DSN: postgres://jinliang:jinliang@127.0.0.1:55442/jinliang_src?sslmode=disable
+          JINLIANG_TEST_PG_DSN: postgres://jinliang:jinliang@127.0.0.1:55443/jinliang_test?sslmode=disable
+          JINLIANG_TEST_MYSQL_SRC_DSN: mysql://jinliang:jinliang@127.0.0.1:55306/jinliang_src
+          JINLIANG_TEST_MYSQL_DSN: mysql://jinliang:jinliang@127.0.0.1:55307/jinliang_target
+        run: |
+          set -e
+          if [ "${{ matrix.mysql }}" = "5.7" ]; then
+            # 5.7 这一腿只跑「MySQL 5.7 → PG」的 3 格。
+            python3 scripts/nopk_matrix.py --layer pr --src-version 5.7 --json "nopk-pr-${{ matrix.mysql }}.json"
+          else
+            # 8.4 这一腿跑「MySQL 8.4 → PG」3 格 + 「PG 18 → PG 18」3 格 + 「PG 18 → MySQL 8.4」1 格。
+            python3 scripts/nopk_matrix.py --layer pr --src-version 8.4 --json "nopk-pr-${{ matrix.mysql }}-a.json"
+            python3 scripts/nopk_matrix.py --layer pr --src-version 18 --json "nopk-pr-${{ matrix.mysql }}-b.json"
+          fi
+      - name: 结果进 job summary
+        if: always()
+        run: |
+          { echo "### 无主键变体（MySQL ${{ matrix.mysql }}，PR 层）"; echo;
+            for f in nopk-pr-*.json; do [ -f "$f" ] && { echo '```json'; cat "$f"; echo '```'; }; done; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nopk-pr-mysql-${{ matrix.mysql }}
+          path: nopk-pr-*.json
 
   mysql-mysql:
     needs: changes

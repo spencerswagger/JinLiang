@@ -55,3 +55,16 @@ matrix:
       pairs: "全部 4×4"
       count: 16
       scenarios: [snapshot, incremental_crud, large_transaction, ddl_whitelist, crash_recovery, orphan_cleanup, type_boundary]
+
+# 无主键变体（docs/DESIGN-NO-PRIMARY-KEY.md §2.4）：格的定义/层数在 test/nopk-matrix.yaml，
+# 这里只登记「本连接器这一侧」的账。
+#
+# **矩阵绿 ≠ MySQL 目标端已全覆盖**：MySQL→MySQL 方向未接通
+# （internal/core/direction.go 的 pendingDirections，欠账 D6），这条方向的 4 条 T1 链路 ×
+# 3 场景 = 12 格**全部待接通**。它们登记为 pending，`scripts/nopk_matrix.py` 永远不会把
+# 它们算进 pass。目标端 insert-only 今天只有单测 + 本地真库 smoke（PG→MySQL 全量格）证明。
+no_pk:
+  registry: test/nopk-matrix.yaml
+  scenarios: [snapshot, insert, pause]
+  pending_cells: 12
+  pending_reason: "MySQL→MySQL 方向未接通（D6）：4 条 T1 链路 × 3 场景，一格都不可执行"
