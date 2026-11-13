@@ -381,9 +381,16 @@ control.JobDoc.Content.Tables[t].UniqueKey
 
 ### 4.5 报错文案同步项（**已收口**：`#119` / `#120` / `#122`）
 
-1. **`ErrNoUniqueKey` 文案**（Owl 在 `#112` 的挂账）已改成「**三种**做法任选」——加主键/唯一索引 ·
-   声明 `unique_key: [列…]` · 从 `content.tables` 去掉；`#122` 另收口了「源端已有主键时声明无效」这个坑
-   （不再劝用户声明），风险句保留。现状：`internal/mysqlsink/apply.go:307`。
+1. **`ErrNoUniqueKey` 文案**（Owl 在 `#112` 的挂账）已收口成**两条消息、各三条做法**，且两条都**不含**
+   「声明 `unique_key`」——那条只在**源端无主键**时才成立；源端已有主键时声明会被忽略（§4.2 第 4 条，
+   `#122` 收口了这个坑），所以不能把它写成做法，否则支持同学会去教用户声明一个会被忽略的键：
+   - `internal/mysqlsink/apply.go:255`（**源端有主键、目标端缺键**）：① 目标端补上与源端一致的主键/唯一索引（推荐）
+     ② 换到一个**空**的 `target.schema` 让本任务自己建表（那里已有同名表就配 `on_exists: recreate`，
+     会先 DROP 再按源端主键重建）③ 从 `content.tables` 去掉后重新 import；风险句保留（建索引阻塞写入、
+     `recreate` 会删目标端那张表）。
+   - `internal/mysqlsink/apply.go:307`、`internal/pgsink/pgsink.go:2328`（**声明了但与索引对不上**）：
+     ① 建一条与声明逐列一致的唯一索引（推荐）② 改声明去匹配目标端已有的唯一索引 ③ 去掉声明、这张表退回
+     insert-only（只追加）；风险句保留（声明与事实不符时改/删会定位错行或多删）。
 2. `deleteSQL` 的裸错误已换成可暂停类型（`no_pk_write` + `E1017`），绝不退化成全表条件
    （`internal/mysqlsink/upsert.go:242-246`，§6 红线 2）。
 3. `pgsink` 的 `deleteTx` 裸错误同样收口：`NoPKWriteError`（`internal/pgsink/pgsink.go:1534-1560`、`:1840`）——
