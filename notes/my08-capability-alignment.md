@@ -100,3 +100,28 @@ gofmt -l .  → 空 ; go vet ./... → 通过
    没有合并卡片（SPEC 明确「别把两张卡并成一张」）。
 3. `FEDERATED` 本机未安装（`SUPPORT=NO`），所以第 5 格（未知引擎）实际也覆盖了它：真库上它可能
    连 `ENGINES` 键都没有 → 走「服务器没告诉我们」→ 降级。
+
+## 6. P1 收口（Owl II：收尾标注接线没有自动化保护）
+
+新增 `internal/engine/integration_mysql_my08_test.go::TestMySQLSourceMY08DegradeAnnotatedInStreamAndResult`
+（build tag `integration`，CI 的 b4-mysql-source job 用 `-run 'TestMySQLSource'` 选中；b1-engine 用
+`-skip 'TestMySQLSource'` 排除——那个 job 没有 MySQL 源库）。
+
+它测的是**接线**，不是打印函数：真建 MySQL `MyISAM` + `MEMORY` 两张表 → 真跑 `engine.Run`（mode=once）→
+断言 ①`Result.Note` 带降级并点名 `<表>(<引擎>)`；②事件流里「降级」出现 **2 次**（预检 MY-08 + 收尾）；
+③其中一次必须排在「全量完成：…」**之后**（只可能来自 `drain()`）。
+
+变异验证（本机真库，每次跑完 `git checkout -- internal/engine/engine.go` 还原）：
+
+```
+变异 A：删掉 runner.preflight 里 r.degradeNote = preflight.EngineDegradeNote(j)
+  --- FAIL: TestMySQLSourceMY08DegradeAnnotatedInStreamAndResult (0.40s)
+      Result.Note（CLI 的「说明」）必须带降级标注——否则收尾又是假绿："只搬了存量数据（mode.frequency=once）"
+
+变异 B：删掉 drain() 里 if r.degradeNote != "" { r.emit(...) }
+  --- FAIL: TestMySQLSourceMY08DegradeAnnotatedInStreamAndResult (0.31s)
+      降级标注应出现两次（预检 MY-08 + 收尾），实际 1 次（帧序：… note:MY-08 部分表用无事务引擎：降级…
+      → note:全量完成：3 行，2 块，2 张表 → phase:收尾提交 → done:全量完成）
+
+还原后：ok  github.com/spencerswagger/jinliang/internal/engine  0.320s
+```
