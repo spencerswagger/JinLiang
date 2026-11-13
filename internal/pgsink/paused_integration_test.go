@@ -136,14 +136,20 @@ func openPausedSink(t *testing.T, table, jobKey string) *Sink {
 	})
 }
 
-// dropPausedFixtures 清掉本用例可能留下的表（幂等；必须在 sink 打开之前）。
+// dropPausedFixtures 清掉本用例可能留下的业务表（幂等；必须在 sink 打开之前）。
+//
+// ⚠️ **必须带 schema 前缀**：这些表建在 `paused_it` 里，而这里拿到的是一条裸连接
+// （search_path 里没有它）。少了前缀，DROP 就退化成空操作——库里上次留下的行永远清不掉，
+// `TestApplyRejectsLeftoverPausedRows` 的「目标端 0 行」会被旧行钉死。
+// 这正是它在 origin/main 上红的原因：CI 每次都是新库看不出来（所以一直绿），
+// 本地/复用库第一次被历史数据污染后就永远红（#116 评审时 Owl 撞到的就是它）。
 func dropPausedFixtures(t *testing.T, table string) {
 	t.Helper()
 	conn := openRaw(t)
 	// **只清业务表**：`_jl_*` 是共享状态表，别的包（engine）的集成用例正在并发用它们，
 	// 这里 DROP 会把人家跑到一半的状态抹掉。暂停记录按 job_key 隔离，不需要清表。
 	for _, stmt := range []string{
-		"DROP TABLE IF EXISTS " + table,
+		"DROP TABLE IF EXISTS " + pausedSchema + "." + table,
 	} {
 		if _, err := conn.Exec(context.Background(), stmt); err != nil {
 			t.Fatalf("清场失败（%s）: %v", stmt, err)
@@ -183,6 +189,16 @@ func TestApplyRejectsLeftoverPausedRows(t *testing.T) {
 	first := openPausedSink(t, table, "pausedapply")
 	if _, err := first.EnsureSchema(ctx, pausedCatalog(table)); err != nil {
 		t.Fatalf("建目标表失败: %v", err)
+	}
+	// fixture 必须干净：把「清理失效」钉在源头。否则 `DROP` 漏了 schema 前缀时
+	// 只会在最后那句「目标端 0 行」变成一个看不懂的失败（历史旧行冒充本次写入）。
+	var leftover int
+	if err := first.conn.QueryRow(ctx, "SELECT count(*) FROM "+pausedSchema+"."+table).Scan(&leftover); err != nil {
+		t.Fatalf("读建表后的行数失败: %v", err)
+	}
+	if leftover != 0 {
+		t.Fatalf("fixture 没清干净：%s.%s 里有 %d 行旧数据（dropPausedFixtures 失效？）",
+			pausedSchema, table, leftover)
 	}
 	if err := first.EnsureMeta(ctx, "h", "", "", ""); err != nil {
 		t.Fatalf("建状态行失败: %v", err)
