@@ -390,3 +390,178 @@ func TestMyISAMSourceTablesWarnNotBlock(t *testing.T) {
 		t.Fatal("PG 源不该发 MY-08（Engine 是 relkind 名，不是存储引擎）")
 	}
 }
+
+// SCOPE-02 四档（docs/DESIGN-NO-PRIMARY-KEY.md §3.1）：同一个「没有主键」，
+// 不同 mode 下结论完全不同，Detail 不许共用一句话（PAUSE-01 踩过两处口径互相打脸）。
+func TestSCOPE02FourStatesByMode(t *testing.T) {
+	mk := func(mode string) source.Report {
+		return Run(Input{
+			SourceKind: "postgres", TargetKind: "postgres",
+			SourceCaps: source.CapSet{source.CapCDC: {Supported: true}},
+			SourceCat: catalog(source.Table{
+				TableRef: source.TableRef{Table: "logs"}, HasStablePK: false,
+				ReplicaIdentity: "full", // 隔离 PG-06：这格只验 SCOPE-02
+			}),
+			Tables: []string{"logs"}, Mode: mode, BatchRows: 500,
+		})
+	}
+
+	// ① once / full_interval：整轮重搬，不需要行身份 → ok，且不阻断。
+	for _, mode := range []string{"once", "full_interval"} {
+		rep := mk(mode)
+		c, ok := statusOf(rep, "SCOPE-02")
+		if !ok {
+			t.Fatalf("%s：必须有 SCOPE-02", mode)
+		}
+		if c.Status != source.StatusOK {
+			t.Fatalf("%s：无主键不影响这个模式，应 ok，得到 %s（%s）", mode, c.Status, c.Detail)
+		}
+		if !strings.Contains(c.Detail, "不需要行身份") || !strings.Contains(c.Detail, "部分数据") {
+			t.Fatalf("%s：Detail 要写清代价（整轮重搬 / 搬完前部分数据），得到 %q", mode, c.Detail)
+		}
+		if !rep.CanStart {
+			t.Fatalf("%s：不该阻断开跑", mode)
+		}
+	}
+
+	// ② continuous / continuous+initial / 空：insert-only 能跑，改/删只停这张表 → warn。
+	for _, mode := range []string{"continuous", "continuous+initial", ""} {
+		rep := mk(mode)
+		c, _ := statusOf(rep, "SCOPE-02")
+		if c.Status != source.StatusWarn {
+			t.Fatalf("%q：应 warn（照跑、代价说清），得到 %s", mode, c.Status)
+		}
+		if !strings.Contains(c.Detail, "只停它自己") || !strings.Contains(c.Detail, "整表重搬") {
+			t.Fatalf("%q：Detail 要写「改/删只停这张表 + 整表重搬补齐」，得到 %q", mode, c.Detail)
+		}
+		if !rep.CanStart {
+			t.Fatalf("%q：warn 不许阻断", mode)
+		}
+	}
+
+	// ③ interval：每轮按水位重读，没有身份 = 必然重复 → blocked（三条替代必须都在）。
+	rep := mk("interval")
+	c, _ := statusOf(rep, "SCOPE-02")
+	if c.Status != source.StatusBlocked {
+		t.Fatalf("interval + 无主键应 blocked（每轮必然重复，不是风险），得到 %s", c.Status)
+	}
+	if rep.CanStart {
+		t.Fatal("interval 无主键必须挡在开跑前")
+	}
+	for _, want := range []string{"加主键", "unique_key", "continuous+initial"} {
+		if !strings.Contains(c.Detail, want) {
+			t.Fatalf("blocked 必须给替代方案（缺 %q）：%s", want, c.Detail)
+		}
+	}
+	// 码：E1017（「无身份导致做不到」族码，Ark 裁决）——挂空码会回落 E1001（wal_level 那套），
+	// 把用户引到完全无关的方向。
+	if c.Code != "E1017" {
+		t.Fatalf("interval 无主键 blocked 应挂 E1017，得到 %q（%s）", c.Code, c.Title)
+	}
+}
+
+// PG-06（**源端**前置，docs/DESIGN-NO-PRIMARY-KEY.md §3.5）：
+// REPLICA IDENTITY 不是 full/index 时，源端在第一次改/删就断开整条流——
+// 「只停这张表」是一句有前置的承诺，卡片必须把它说清，并给可执行的 ALTER。
+func TestPG06SourceReplicaIdentityPreflight(t *testing.T) {
+	mk := func(kind, mode string, tbl source.Table) source.Report {
+		return Run(Input{
+			SourceKind: kind, TargetKind: "postgres",
+			SourceCaps: source.CapSet{source.CapCDC: {Supported: true}},
+			SourceCat:  catalog(tbl),
+			Tables:     []string{tbl.Table}, Mode: mode, BatchRows: 500,
+		})
+	}
+	noPK := source.Table{TableRef: source.TableRef{Table: "events"}, HasStablePK: false}
+
+	// ① default(no-pk)：不通过 → warn + 可复制的 ALTER（带 schema 限定与引号），不阻断。
+	rep := mk("postgres", "continuous+initial", source.Table{
+		TableRef: noPK.TableRef, HasStablePK: false, ReplicaIdentity: "default(no-pk)",
+	})
+	c, ok := statusOf(rep, "PG-06")
+	if !ok {
+		t.Fatalf("PG 源 + 无主键 + 增量：必须有 PG-06：%+v", rep.Checks)
+	}
+	if c.Status != source.StatusWarn {
+		t.Fatalf("PG-06 应是 warn（照跑，但改/删会断流），得到 %s", c.Status)
+	}
+	if !strings.Contains(c.SQL, `ALTER TABLE "public"."events" REPLICA IDENTITY FULL;`) {
+		t.Fatalf("PG-06 要给出可直接执行的 ALTER，得到 %q", c.SQL)
+	}
+	for _, want := range []string{"整条流停", "WAL"} {
+		if !strings.Contains(c.Detail, want) {
+			t.Fatalf("Detail 要写清「断的是整条流」与 WAL 代价（缺 %q）：%s", want, c.Detail)
+		}
+	}
+	if !rep.CanStart {
+		t.Fatal("PG-06 是 warn，不许挡开跑（用户可以选择只跑全量）")
+	}
+
+	// ② full / index：通过，不发卡片。
+	for _, ri := range []string{"full", "index"} {
+		rep := mk("postgres", "continuous+initial", source.Table{
+			TableRef: noPK.TableRef, HasStablePK: false, ReplicaIdentity: ri,
+		})
+		if _, ok := statusOf(rep, "PG-06"); ok {
+			t.Fatalf("REPLICA IDENTITY=%s 已能解出旧行，不该发 PG-06", ri)
+		}
+	}
+
+	// ③ 有主键的表：PG-06 不适用。
+	rep = mk("postgres", "continuous+initial", source.Table{
+		TableRef: source.TableRef{Table: "orders"}, HasStablePK: true, ReplicaIdentity: "default(pk)",
+	})
+	if _, ok := statusOf(rep, "PG-06"); ok {
+		t.Fatal("有主键的表不需要 REPLICA IDENTITY FULL，不该发 PG-06")
+	}
+
+	// ④ 非变更流模式（once）：不适用。
+	rep = mk("postgres", "once", source.Table{
+		TableRef: noPK.TableRef, HasStablePK: false, ReplicaIdentity: "default(no-pk)",
+	})
+	if _, ok := statusOf(rep, "PG-06"); ok {
+		t.Fatal("once 模式没有变更流，不该发 PG-06")
+	}
+
+	// ⑤ MySQL 源：不要抄一份 PG-06（行镜像由 MY-02/MY-03 管）。
+	rep = mk("mysql", "continuous+initial", source.Table{
+		TableRef: noPK.TableRef, HasStablePK: false, Engine: "InnoDB",
+	})
+	if _, ok := statusOf(rep, "PG-06"); ok {
+		t.Fatal("MySQL 源不该有 PG-06（那是 PG 源专有的前置）")
+	}
+
+	// ⑥ 分区表：父表 ALTER 不覆盖叶子（挂账 D10）→ 明说不代做、不给可执行 ALTER。
+	rep = mk("postgres", "continuous+initial", source.Table{
+		TableRef: noPK.TableRef, HasStablePK: false, ReplicaIdentity: "default(no-pk)", Partitioned: true,
+	})
+	c, ok = statusOf(rep, "PG-06")
+	if !ok {
+		t.Fatal("分区表也需要告警（叶子要逐张设置）")
+	}
+	if c.SQL != "" {
+		t.Fatalf("分区表本版不代做：不许给一条「看起来能一次改完」的 ALTER，得到 %q", c.SQL)
+	}
+	for _, want := range []string{"分区表", "叶子", "不代做"} {
+		if !strings.Contains(c.Detail, want) {
+			t.Fatalf("分区表的 Detail 缺 %q：%s", want, c.Detail)
+		}
+	}
+}
+
+// SCOPE-02（continuous）在 PG 源上必须同时说出「REPLICA IDENTITY 不到位 → 整条流停」
+// （§3.1：卡片必须同时出现，否则用户以为只是「停一张表」）。
+func TestSCOPE02PGSourceMentionsReplicaIdentity(t *testing.T) {
+	rep := Run(Input{
+		SourceKind: "postgres", TargetKind: "postgres",
+		SourceCaps: source.CapSet{source.CapCDC: {Supported: true}},
+		SourceCat: catalog(source.Table{
+			TableRef: source.TableRef{Table: "events"}, HasStablePK: false, ReplicaIdentity: "nothing",
+		}),
+		Tables: []string{"events"}, Mode: "continuous", BatchRows: 500,
+	})
+	c, _ := statusOf(rep, "SCOPE-02")
+	if !strings.Contains(c.Detail, "REPLICA IDENTITY") || !strings.Contains(c.Detail, "PG-06") {
+		t.Fatalf("PG 源 + 无主键 + continuous：SCOPE-02 必须同时点出 RI 这个前置，得到 %q", c.Detail)
+	}
+}

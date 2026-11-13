@@ -1089,6 +1089,13 @@ func (s *Sink) Apply(ctx context.Context, evs []source.Event, pos source.Positio
 	// 判定权在引擎——引擎按表丢掉暂停表的事件、保留 Begin/Commit、让位点照常前进，
 	// 欠账由「解除暂停时整表重搬」还。这里再来一次整批拒绝就会把别的表的行也挡住，
 	// 正是「一张表坏了、几十张无关表一起停」那个被否决的行为。
+	//
+	// 但**「这张表没有行身份」是例外**：那不是「表停着」，是「这一条改/删我们做不到」
+	// （docs/DESIGN-NO-PRIMARY-KEY.md §2.3）。必须在**写任何一行之前**整批判定：
+	// 写到一半才发现定位不了，会留下半批数据 + 位点不动，下一轮重放还要再撞一次。
+	if err := s.checkNoIdentityWrites(evs); err != nil {
+		return err
+	}
 
 	tx, err := s.conn.Begin(ctx)
 	if err != nil {
@@ -1419,6 +1426,10 @@ func relationMatches(ti *tableInfo, rel *source.Table, src catalog.Engine) (same
 const (
 	PauseReasonTypeChanged = "type_changed" // 源端改了列类型
 	PauseReasonSchemaDrift = "schema_drift" // 改名 / 删列
+	// PauseReasonNoPKWrite：这张表没有行身份（无主键、也没声明 unique_key），
+	// 收到改/删时目标端定位不了那一行。与 E1015 的区别：E1015 是「结构对不上」，
+	// 这是「结构没错，但没有身份」（docs/DESIGN-NO-PRIMARY-KEY.md §2.3）。
+	PauseReasonNoPKWrite = "no_pk_write"
 )
 
 // TablePausedError 表示「这张表已被标记暂停」。**写路径不再产生它**（判定权在引擎，
@@ -1481,6 +1492,34 @@ func (e *SchemaDriftError) Reason() string { return PauseReasonSchemaDrift }
 
 // Table 实现 PausableError。
 func (e *SchemaDriftError) Table() string { return e.TableName }
+
+// NoPKWriteError 表示「这张表没有行身份，改/删写不进去」
+// （docs/DESIGN-NO-PRIMARY-KEY.md §2.3，E1017 / 原因码 no_pk_write）。
+//
+// 它是 PausableError：引擎按表暂停这张表、其它表照写、位点照常前进，
+// 跳过的那段由「解除暂停时整表重搬」补齐。写路径**不许**把 UPDATE 降级成
+// INSERT（会多一行），也不许按全表条件 DELETE（§6 红线 2）。
+//
+// 形状给两个目标端共用（mysqlsink 已 import 本包）：判定条件由各自写路径给，
+// 原因是「能不能定位这一行」是目标端的事实，但「停一张表、记欠账」的口径必须同一份。
+type NoPKWriteError struct {
+	TableName string
+	// Detail 说明哪条变更、为什么写不进去（人话，动作与风险交给 E1017 码表）。
+	Detail string
+}
+
+func (e *NoPKWriteError) Error() string {
+	if e.Detail != "" {
+		return fmt.Sprintf("表 %s 没有主键、也没有可用的唯一键：%s", e.TableName, e.Detail)
+	}
+	return fmt.Sprintf("表 %s 没有主键、也没有可用的唯一键：改动和删除定位不到那一行", e.TableName)
+}
+
+// Reason 实现 PausableError：paused_tables 里记 no_pk_write。
+func (e *NoPKWriteError) Reason() string { return PauseReasonNoPKWrite }
+
+// Table 实现 PausableError。
+func (e *NoPKWriteError) Table() string { return e.TableName }
 
 // PausableError 是「这张表不能继续跟，但其它表可以继续」的错误。
 // 第③步用它把「一张表的 DDL」降级成「只暂停这张表」，而不是打死整个任务。
@@ -1722,14 +1761,42 @@ func describeSQLError(err error) string {
 	return err.Error()
 }
 
+// checkNoIdentityWrites 在写任何一行之前，把「改/删但定位不了这一行」的表挑出来。
+//
+// 判据 = 目标表没有主键（`ti.hasPK` false）。`EvInsert` 不受影响：纯 INSERT 不需要
+// 定位（insert-only 照跑）；`EvTruncate` 整表清空也不需要行身份。
+// unique_key（DESIGN-NO-PRIMARY-KEY §4.4，S3）落地后这里要放宽成「有声明且核对通过」，
+// 由那一片改这一处判定——别在别的文件里另写一份。
+func (s *Sink) checkNoIdentityWrites(evs []source.Event) error {
+	for _, ev := range evs {
+		if ev.Kind != source.EvUpdate && ev.Kind != source.EvDelete {
+			continue
+		}
+		ti := s.tables[ev.Table.Schema+"."+ev.Table.Table]
+		if ti == nil || ti.hasPK {
+			continue
+		}
+		what := "收到一次改动"
+		if ev.Kind == source.EvDelete {
+			what = "收到一次删除"
+		}
+		return &NoPKWriteError{
+			TableName: ev.Table.Table,
+			Detail:    "这张表" + what + "：目标端只能按主键或唯一索引定位一行，没有它改动会变成再插一行、删除不知道删哪一行",
+		}
+	}
+	return nil
+}
+
 func (s *Sink) deleteTx(ctx context.Context, tx pgx.Tx, ev source.Event) error {
 	ti := s.tables[ev.Table.Schema+"."+ev.Table.Table]
 	if ti == nil {
 		return fmt.Errorf("收到未知表 %s 的删除", ev.Table.Table)
 	}
 	if !ti.hasPK {
-		// 无主键表没有定位依据：只提示，不猜（预检里已标 warn）
-		return fmt.Errorf("表 %s 没有主键，无法安全删除目标端对应行", ev.Table.Table)
+		// 正常路径上 `checkNoIdentityWrites` 已经在写任何一行之前拦住了；
+		// 这里只作第二道防线（新写路径忘了过那道判定时，仍然是「按表暂停」而不是整条任务失败）。
+		return &NoPKWriteError{TableName: ev.Table.Table, Detail: "收到一次删除，但目标端没有可用来定位这一行的主键或唯一索引"}
 	}
 	var where []string
 	params := make([]any, 0, len(ti.pkIdx))
