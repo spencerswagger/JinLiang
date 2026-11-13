@@ -472,38 +472,23 @@ func quoteIdent(s string) string {
 }
 
 // engineChecks 是 SPEC MY-08（表的存储引擎）：MySQL 源端选中表里有 MyISAM
-// （含 MRG_MyISAM）时 warn——无事务，崩溃时可能不一致，照跑并标注。
+// （含 MRG_MyISAM）时 **warn 降级**——无事务，全量不是一致性切面，照跑并标注。
 //
-// 引擎名来自 Catalog（connect/mysql.go 从 information_schema.TABLES 填
-// source.Table.Engine），这里不做任何新查询。PG 源的 Engine 是 relkind 名
-// （table / partitioned table…），不能拿来判存储引擎，所以只认 mysql。
-// SourceCat 没读到时不发这条：不阻断，与 SCOPE-01 同口径。
+// 判据只有 JudgeEngines 一处（engine.go）：这里不自己判「哪些表算无事务」，
+// 否则文档/收尾/预检迟早三处三套说法。SourceCat 没读到时不发这条（不阻断），
+// 但判据给的是 not_judged 而不是 ok。
 func engineChecks(in Input) []source.Check {
-	if in.SourceKind != "mysql" || in.SourceCat == nil {
+	j := JudgeEngines(in.SourceKind, in.SourceCat, in.Tables)
+	if j.Verdict != EngineNonTransactional {
 		return nil
 	}
-	want := map[string]bool{}
-	for _, t := range in.Tables {
-		want[t] = true
-	}
-	var myisam []string
-	for _, t := range in.SourceCat.Tables {
-		if len(want) > 0 && !want[t.Table] {
-			continue
-		}
-		if strings.Contains(strings.ToUpper(t.Engine), "MYISAM") {
-			myisam = append(myisam, t.Table)
-		}
-	}
-	if len(myisam) == 0 {
-		return nil
-	}
-	sort.Strings(myisam)
 	return []source.Check{{
-		ID: "MY-08", Title: "部分表用 MyISAM 引擎（无事务）", Status: source.StatusWarn,
-		Detail: fmt.Sprintf("%s 用 MyISAM：没有事务，崩溃时目标端可能与源端不一致；同步照跑，这几张表会被标注",
-			strings.Join(myisam, "、")),
-		Affected: myisam, Who: "you",
+		ID: "MY-08", Title: "部分表用 MyISAM 引擎（无事务）",
+		Status: source.StatusWarn,
+		Detail: EngineDegradeNote(j),
+		SQL:    j.SQL,
+		// 「你能做什么」就是上面那条 ALTER：改成 InnoDB 后这一项下一轮自动消失。
+		Affected: j.Names, Who: "you",
 	}}
 }
 
