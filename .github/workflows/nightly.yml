@@ -113,6 +113,20 @@ jobs:
             grep -E '^[[:space:]]*--- SKIP' /tmp/go-test.log
             exit 1
           fi
+      - name: 备好 python 依赖（无主键矩阵执行器）
+        run: pip install --quiet pyyaml
+      - name: 无主键变体 × PG ${{ matrix.pg }}（T1 自洽，3 格）
+        # 格的定义在 test/nopk-matrix.yaml；这一腿跑「PG 同一版本 → 同一版本」的
+        # snapshot / insert / pause。格数由 scripts/check_testmatrix.py 对账。
+        run: python3 scripts/nopk_matrix.py --layer nightly --link pg-pg --src-version "${{ matrix.pg }}" --dst-version "${{ matrix.pg }}" --expect-cells 3 --json "nopk-t1-${PG}.json"
+        env:
+          PG: ${{ matrix.pg }}
+      - name: 无主键变体 × PG ${{ matrix.pg }} → MySQL 8.0（T4 抽样，本周 due 才跑）
+        # T4 异构抽样：每周 2 条链，9 周轮完一轮。不是 due 的腿会打 status=not-due
+        # （不是跳过：格在登记表里、只是本周不排它，报告里能看到）。
+        run: python3 scripts/nopk_matrix.py --layer nightly --link pg-mysql --src-version "${{ matrix.pg }}" --dst-version 8.0 --if-due --expect-cells 1 --json "nopk-t4-pm-${PG}.json"
+        env:
+          PG: ${{ matrix.pg }}
 
   mysql-matrix:
     # MySQL 源矩阵：5.7 / 8.0 / 8.4 / 9.4 各起一套真库。
@@ -220,6 +234,70 @@ jobs:
             grep -E '^[[:space:]]*--- SKIP' /tmp/go-test.log
             exit 1
           fi
+      - name: 备好 python 依赖（无主键矩阵执行器）
+        run: pip install --quiet pyyaml
+      - name: 无主键变体 × MySQL ${{ matrix.mysql }} → PG 16（T4 抽样，本周 due 才跑）
+        # MySQL 侧的版本档是 5.7 / 8.0 / 8.4 / 9.4，登记表里 9.x 的标签是 "9"：
+        # 执行器的版本过滤认前缀（9.4 命中 9），不会因为标签写法不同而漏格。
+        # --expect-cells 的口径是「链数 × 场景数」，不是链数：MySQL→PG 每条链 3 场景，
+        # 所以这里恒 3（--if-due 只把格标成 not-due，不减少选中数）；PG→MySQL 只全量，那一条是 1。
+        run: python3 scripts/nopk_matrix.py --layer nightly --link mysql-pg --src-version "${{ matrix.mysql }}" --dst-version 16 --if-due --expect-cells 3 --json "nopk-t4-mp-${MY}.json"
+        env:
+          MY: ${{ matrix.mysql }}
+
+  nopk-pairs:
+    # 无主键变体的 T2（相邻升级 2 条）/ T3（极端跨度 3 条 + 降级 1 条）：
+    # 每条链一套真库（源/目标版本不同，起两个容器），3 格（降级只 1 格）。
+    # 单独成 job 是因为它们要**两个不同版本**的 PG，pg-matrix 那个 job 是单版本。
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - src: "10"
+            dst: "11"
+            tier: "T2 相邻升级"
+            expect: 3
+          - src: "17"
+            dst: "18"
+            tier: "T2 相邻升级"
+            expect: 3
+          - src: "10"
+            dst: "18"
+            tier: "T3 极端跨度"
+            expect: 3
+          - src: "18"
+            dst: "10"
+            tier: "T3 降级（只验允许继续；提示未实现）"
+            expect: 1
+    name: 无主键 × PG ${{ matrix.src }}→${{ matrix.dst }}（${{ matrix.tier }}）
+    env:
+      JINLIANG_TEST_PG_SRC_DSN: postgres://jinliang:jinliang@127.0.0.1:55442/jinliang_src?sslmode=disable
+      JINLIANG_TEST_PG_DSN: postgres://jinliang:jinliang@127.0.0.1:55443/jinliang_test?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.x"
+          cache: true
+      - name: 备好 python 依赖（无主键矩阵执行器）
+        run: pip install --quiet pyyaml
+      - name: 起真库（PG ${{ matrix.src }} 源 / PG ${{ matrix.dst }} 目标）
+        # 与 PR 门禁、release、nopk-dry-run 同一段编排（scripts/ci/nopk_dbs.sh）。
+        run: bash scripts/ci/nopk_dbs.sh pg "${{ matrix.src }}" "${{ matrix.dst }}"
+      - name: 无主键变体 × PG ${{ matrix.src }}→${{ matrix.dst }}
+        run: python3 scripts/nopk_matrix.py --layer nightly --link pg-pg --src-version "${{ matrix.src }}" --dst-version "${{ matrix.dst }}" --expect-cells ${{ matrix.expect }} --json nopk-${{ matrix.src }}-${{ matrix.dst }}.json
+      - name: 结果进 job summary
+        if: always()
+        run: |
+          { echo "### 无主键变体：PG ${{ matrix.src }} → PG ${{ matrix.dst }}（${{ matrix.tier }}）"; echo;
+            shopt -s nullglob
+            for f in nopk-*.json; do echo '```json'; cat "$f"; echo '```'; done; } >> "$GITHUB_STEP_SUMMARY" || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nopk-pg-${{ matrix.src }}-${{ matrix.dst }}
+          path: nopk-*.json
 
   integration:
     # 一套 PG + 一套 MySQL，跑所有集成包（engine 的重搬用例也在这里）。

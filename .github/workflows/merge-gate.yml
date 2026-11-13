@@ -58,7 +58,7 @@ jobs:
           [ -n "$files" ] || gate_on_failure "改动清单为空（本不该发生）"
           echo "改动文件："; printf '%s\n' "$files"
           # internal/preflight 也是门禁输入面（#90 的 pause-wording 探针就依赖它）。
-          if printf '%s\n' "$files" | grep -qE '^(internal/(engine|pgsink|mysqlsource|mysqlsink|core|source|mysqlcanon|preflight)/|cmd/|scripts/(gate_checks|mutation_gate|merge_gate|acceptance_matrix|review_gate_logic|known_red|probe_pause_wording|exit_codes|b1_mysql_to_mysql)\.|\.github/workflows/merge-gate\.yml)'; then
+          if printf '%s\n' "$files" | grep -qE '^(internal/(engine|pgsink|mysqlsource|mysqlsink|core|source|mysqlcanon|preflight)/|cmd/|test/|scripts/ci/|scripts/(gate_checks|mutation_gate|merge_gate|acceptance_matrix|nopk_matrix|check_testmatrix|review_gate_logic|known_red|probe_pause_wording|exit_codes|b1_mysql_to_mysql)\.|\.github/workflows/(merge-gate|nightly|release|nopk-dry-run)\.yml)'; then
             echo "gate=true" >> "$GITHUB_OUTPUT"
           else
             echo "gate=false" >> "$GITHUB_OUTPUT"
@@ -290,6 +290,72 @@ jobs:
         with:
           name: acceptance-mysql-${{ matrix.mysql }}
           path: acceptance-${{ matrix.mysql }}.json
+
+  nopk-pr:
+    needs: changes
+    # 门控下沉到**步骤级**（不是 job 级 if）：这个 job 是矩阵，job 级 if 跳过时矩阵不展开，
+    # 检查名会报成 `… × ${{ matrix.mysql }}` 而 required 里是 5.7/8.4 两条具体名 →
+    # 永远 Expected（#109 踩过）。步骤级跳过时 job 以 success 结束，required 视为通过。
+    name: 无主键变体 × MySQL ${{ matrix.mysql }}（PR 10 格）
+    # docs/DESIGN-NO-PRIMARY-KEY.md §2.4 的 PR 层：PG 18→18（3）、MySQL 5.7/8.4→PG（各 3）、
+    # PG 18→MySQL 8.4（1，该方向只全量）。格的定义在 test/nopk-matrix.yaml，
+    # 逐格执行器是 scripts/nopk_matrix.py（调 internal/engine 的 TestNoPKMatrixCell）。
+    # 与 acceptance 分开成 job：容器各起一套、互不抢表，总时长仍在 PR 门禁预算内（并行跑）。
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mysql: ["5.7", "8.4"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.x"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 备好 python 依赖
+        if: needs.changes.outputs.gate == 'true'
+        run: pip install --quiet pyyaml
+      - name: 起真库（PG 18 双库 + MySQL ${{ matrix.mysql }} 双库）
+        # 与 nightly/release 同一段编排（scripts/ci/nopk_dbs.sh）：PR 门禁就成了它的日常回归，
+        # 不用等打 tag 才发现容器参数写错。就绪判据是真查询（PG 连续两次、MySQL select 1），
+        # 并断言 wal_level=logical / binlog_row_image=FULL。
+        if: needs.changes.outputs.gate == 'true'
+        run: |
+          set -e
+          bash scripts/ci/nopk_dbs.sh pg 18 18
+          bash scripts/ci/nopk_dbs.sh mysql "${{ matrix.mysql }}"
+      - name: 无主键变体（PR 层：10 格，逐格真跑）
+        if: needs.changes.outputs.gate == 'true'
+        env:
+          JINLIANG_TEST_PG_SRC_DSN: postgres://jinliang:jinliang@127.0.0.1:55442/jinliang_src?sslmode=disable
+          JINLIANG_TEST_PG_DSN: postgres://jinliang:jinliang@127.0.0.1:55443/jinliang_test?sslmode=disable
+          JINLIANG_TEST_MYSQL_SRC_DSN: mysql://jinliang:jinliang@127.0.0.1:55306/jinliang_src
+          JINLIANG_TEST_MYSQL_DSN: mysql://jinliang:jinliang@127.0.0.1:55307/jinliang_target
+        run: |
+          set -e
+          if [ "${{ matrix.mysql }}" = "5.7" ]; then
+            # 5.7 这一腿只跑「MySQL 5.7 → PG」的 3 格。
+            python3 scripts/nopk_matrix.py --layer pr --src-version 5.7 --expect-cells 3 --json "nopk-pr-${{ matrix.mysql }}.json"
+          else
+            # 8.4 这一腿跑「MySQL 8.4 → PG」3 格 + 「PG 18 → PG 18」3 格 + 「PG 18 → MySQL 8.4」1 格。
+            python3 scripts/nopk_matrix.py --layer pr --src-version 8.4 --expect-cells 3 --json "nopk-pr-${{ matrix.mysql }}-a.json"
+            python3 scripts/nopk_matrix.py --layer pr --src-version 18 --expect-cells 4 --json "nopk-pr-${{ matrix.mysql }}-b.json"
+          fi
+      - name: 结果进 job summary
+        # 只做报告整形，绝不冒充失败原因：gate=false（只改文档）时前面全 skipped、没有 json，
+        # 这里必须照样 0 退出，否则 docs-only PR 会以「失败」而不是「跳过」的形式被卡（#109）。
+        if: always()
+        run: |
+          { echo "### 无主键变体（MySQL ${{ matrix.mysql }}，PR 层）"; echo;
+            shopt -s nullglob
+            for f in nopk-pr-*.json; do echo '```json'; cat "$f"; echo '```'; done; } >> "$GITHUB_STEP_SUMMARY" || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nopk-pr-mysql-${{ matrix.mysql }}
+          path: nopk-pr-*.json
 
   mysql-mysql:
     needs: changes

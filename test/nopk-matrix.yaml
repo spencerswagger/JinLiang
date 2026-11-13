@@ -1,0 +1,278 @@
+# 无主键变体矩阵 —— docs/DESIGN-NO-PRIMARY-KEY.md §2.4 的格数登记（S4）。
+#
+# 口径：**1 格 = 1 条链路 × 1 个场景的一次可执行用例**（与 docs/DESIGN.md §2.3 同口径）。
+# 每一格都由 `scripts/nopk_matrix.py` 逐格调起 `internal/engine` 的
+# `TestNoPKMatrixCell`（真库、真写路径、真暂停），不是清单上的一个名字。
+# 那个用例带 `integration && nopkmatrix` 两个构建标签：只有执行器会带 nopkmatrix，
+# 别的集成 job 跑整包时不会把它跑起来（也就不会被「缺参数」误伤，更不会靠跳过装作通过）。
+#
+# 为什么用「块 + 层」而不是把 245 条格逐个抄一遍：
+#   - 版本对是块内展开的（`pairs` × `scenarios`），改一个版本只改一处；
+#   - 数字由 `scripts/check_testmatrix.py` 从本文件**算出来**再与定稿对账，
+#     写死一个总数而格数漂移的写法在这里是红。
+#
+# 与定稿的差异（真实算术，不改数字迁就管线）：
+#   - PR 10 格、release 184 格、待接通 12 格：**逐格对得上**；
+#   - nightly：定稿写「≈39 格/晚」，**定稿自己的算术是 27+6+4+12/7 = 38.7**（进位成 ≈39）；
+#     真实是 **37 固定 + T4 8 格/周 = 37 + 8/7 ≈ 38.1**，差 **0.6 格/晚 = T4 少 4 格/周**。
+#     差因：定稿 T4 那行按「4 条链 × 3 场景 = 12/周」算，但其中 2 条 PG→MySQL 链
+#     **只全量**（`internal/core/direction.go` 的 Modes），3 场景里只有 `snapshot` 可达
+#     → 2×3 + 2×1 = 8/周。而同一张表的 release 行自己写的是「PG→MySQL 36 条 × 1」——
+#     所以这是**定稿 §2.4 T4 行与 release 行的内部不一致**，多算的 4 格在产品口径下不存在
+#     （该方向没有增量写路径可验），不是「没跑」。已报 Ark 核 §2.4 那一行。
+#
+# 「待接通」12 格：MySQL→MySQL 的 4 条 T1 链路 × 3 场景。方向未接通
+# （`internal/core/direction.go` 的 `pendingDirections`，欠账 D6），一格都跑不了；
+# 它们在这里是 `status: pending`，`nopk_matrix.py` 只会把它们报成 pending，
+# **永远不会算进 pass**。MySQL 目标端的 insert-only 今天只有单测 + 本地真库 smoke
+# （PG→MySQL 全量格）证明，不许把「矩阵绿」读成「目标端已全覆盖」。
+version: 1
+
+scenarios:
+  snapshot: 全量搬完（insert-only 落全量，行数与源端一致、不暂停）
+  insert: 增量纯 INSERT（不暂停、位点前进）
+  pause: 增量一次 UPDATE（该表暂停 + skipped_rows + 退出码 3 → 修好身份后整表重搬收敛）
+  downgrade: >-
+    降级方向**只验「允许继续」**：预检不阻断（CanStart=true）+ 两侧版本在 NET-01/02 的
+    Detail 里可见 + 引擎照跑搬到行数一致。**「提示」在产品里尚未实现**（今天没有任何版本比较
+    或降级判据，`TargetVer` 只用于回显），这一半是欠账，不许读成「提示也验了」。
+  unique_key_once: >-
+    声明 unique_key + once：连跑两轮不翻倍，且第二轮结果等于源端当前状态（改/删都跟上）。
+    注意口径：once / full_interval 是「每轮整轮重建」，声明**不进写路径**
+    （internal/engine/target.go 的 sinkDeclaredUniqueKeys，§4.2）——幂等靠清表重搬，
+    不是靠 upsert；所以这一格验的是「重放收敛」，不冒充 upsert。
+  unique_key_continuous: 声明 unique_key + continuous：改一行/删一行，两端一致
+
+blocks:
+  # ── PR 门禁（10 格）─────────────────────────────────────────
+  pr-pg18-self:
+    source: postgres
+    target: postgres
+    pairs: [["18", "18"]]
+    scenarios: [snapshot, insert, pause]
+  pr-mysql84-to-pg:
+    source: mysql
+    target: postgres
+    pairs: [["8.4", "18"]]
+    scenarios: [snapshot, insert, pause]
+  pr-mysql57-to-pg:
+    source: mysql
+    target: postgres
+    pairs: [["5.7", "18"]]
+    scenarios: [snapshot, insert, pause]
+  pr-pg18-to-mysql84:
+    # 该方向只全量（direction.go：PostgreSQL → MySQL「只全量」），所以只有 snapshot 一格。
+    source: postgres
+    target: mysql
+    pairs: [["18", "8.4"]]
+    scenarios: [snapshot]
+
+  # ── nightly T1 自洽（PG 9 条 × 3 = 27 格）────────────────────
+  pg-t1-self:
+    source: postgres
+    target: postgres
+    pairs:
+      - ["10", "10"]
+      - ["11", "11"]
+      - ["12", "12"]
+      - ["13", "13"]
+      - ["14", "14"]
+      - ["15", "15"]
+      - ["16", "16"]
+      - ["17", "17"]
+      - ["18", "18"]
+    scenarios: [snapshot, insert, pause]
+
+  # ── nightly T2 相邻升级（2 条 × 3 = 6 格）────────────────────
+  pg-t2-adjacent:
+    source: postgres
+    target: postgres
+    pairs:
+      - ["10", "11"]
+      - ["17", "18"]
+    scenarios: [snapshot, insert, pause]
+
+  # ── nightly T3 极端跨度（10→18 三条 + 18→10 降级一条 = 4 格）──
+  # 降级那一格只验「允许继续」（见 scenarios.downgrade）：产品没有降级专属提示卡片。
+  pg-t3-extreme:
+    source: postgres
+    target: postgres
+    pairs:
+      - ["10", "18"]
+    scenarios: [snapshot, insert, pause]
+  pg-t3-downgrade:
+    source: postgres
+    target: postgres
+    pairs:
+      - ["18", "10"]
+    scenarios: [downgrade]
+
+  # ── nightly T4 异构轮转抽样（每周 2+2 条链 = 8 格/周）──────────
+  # 按 ISO 周轮转：MySQL 4 档里每周取 2 档、PG 9 档里每周取 2 档（见 nopk_matrix.py 的 due 选择）。
+  t4-weekly-mysql-to-pg:
+    source: mysql
+    target: postgres
+    schedule: weekly
+    pick: 2
+    pairs:
+      - ["5.7", "16"]
+      - ["8.0", "16"]
+      - ["8.4", "16"]
+      - ["9", "16"]
+    scenarios: [snapshot, insert, pause]
+  t4-weekly-pg-to-mysql:
+    # 该方向只全量：每条链 1 格。
+    source: postgres
+    target: mysql
+    schedule: weekly
+    pick: 2
+    pairs:
+      - ["10", "8.0"]
+      - ["11", "8.0"]
+      - ["12", "8.0"]
+      - ["13", "8.0"]
+      - ["14", "8.0"]
+      - ["15", "8.0"]
+      - ["16", "8.0"]
+      - ["17", "8.0"]
+      - ["18", "8.0"]
+    scenarios: [snapshot]
+
+  # ── release T4 全量（144 格）──────────────────────────────────
+  t4-full-mysql-to-pg:
+    source: mysql
+    target: postgres
+    pairs:
+      - ["5.7", "10"]
+      - ["5.7", "11"]
+      - ["5.7", "12"]
+      - ["5.7", "13"]
+      - ["5.7", "14"]
+      - ["5.7", "15"]
+      - ["5.7", "16"]
+      - ["5.7", "17"]
+      - ["5.7", "18"]
+      - ["8.0", "10"]
+      - ["8.0", "11"]
+      - ["8.0", "12"]
+      - ["8.0", "13"]
+      - ["8.0", "14"]
+      - ["8.0", "15"]
+      - ["8.0", "16"]
+      - ["8.0", "17"]
+      - ["8.0", "18"]
+      - ["8.4", "10"]
+      - ["8.4", "11"]
+      - ["8.4", "12"]
+      - ["8.4", "13"]
+      - ["8.4", "14"]
+      - ["8.4", "15"]
+      - ["8.4", "16"]
+      - ["8.4", "17"]
+      - ["8.4", "18"]
+      - ["9", "10"]
+      - ["9", "11"]
+      - ["9", "12"]
+      - ["9", "13"]
+      - ["9", "14"]
+      - ["9", "15"]
+      - ["9", "16"]
+      - ["9", "17"]
+      - ["9", "18"]
+    scenarios: [snapshot, insert, pause]
+  t4-full-pg-to-mysql:
+    source: postgres
+    target: mysql
+    pairs:
+      - ["10", "5.7"]
+      - ["10", "8.0"]
+      - ["10", "8.4"]
+      - ["10", "9"]
+      - ["11", "5.7"]
+      - ["11", "8.0"]
+      - ["11", "8.4"]
+      - ["11", "9"]
+      - ["12", "5.7"]
+      - ["12", "8.0"]
+      - ["12", "8.4"]
+      - ["12", "9"]
+      - ["13", "5.7"]
+      - ["13", "8.0"]
+      - ["13", "8.4"]
+      - ["13", "9"]
+      - ["14", "5.7"]
+      - ["14", "8.0"]
+      - ["14", "8.4"]
+      - ["14", "9"]
+      - ["15", "5.7"]
+      - ["15", "8.0"]
+      - ["15", "8.4"]
+      - ["15", "9"]
+      - ["16", "5.7"]
+      - ["16", "8.0"]
+      - ["16", "8.4"]
+      - ["16", "9"]
+      - ["17", "5.7"]
+      - ["17", "8.0"]
+      - ["17", "8.4"]
+      - ["17", "9"]
+      - ["18", "5.7"]
+      - ["18", "8.0"]
+      - ["18", "8.4"]
+      - ["18", "9"]
+    scenarios: [snapshot]
+
+  # ── release unique_key 路线（3 格）───────────────────────────
+  uk-pg-self:
+    source: postgres
+    target: postgres
+    pairs: [["18", "18"]]
+    scenarios: [unique_key_once, unique_key_continuous]
+  uk-pg-to-mysql:
+    source: postgres
+    target: mysql
+    pairs: [["18", "8.4"]]
+    scenarios: [unique_key_once]
+
+  # ── 待接通（12 格，永远不算 pass）───────────────────────────
+  pending-mysql-mysql:
+    source: mysql
+    target: mysql
+    status: pending
+    reason: >-
+      MySQL→MySQL 方向未接通（internal/core/direction.go 的 pendingDirections，欠账 D6）：
+      引擎主路径跑不了这条方向，一格都不可执行。接通后原样改 status: active 即可。
+    pairs:
+      - ["5.7", "5.7"]
+      - ["8.0", "8.0"]
+      - ["8.4", "8.4"]
+      - ["9", "9"]
+    scenarios: [snapshot, insert, pause]
+
+layers:
+  # PR 门禁：≤15 分钟（10 格）。
+  pr:
+    blocks: [pr-pg18-self, pr-mysql84-to-pg, pr-mysql57-to-pg, pr-pg18-to-mysql84]
+  # nightly：固定 37 格/晚 + T4 每周 8 格（≈1.1/晚）。
+  nightly:
+    blocks:
+      - pg-t1-self
+      - pg-t2-adjacent
+      - pg-t3-extreme
+      - pg-t3-downgrade
+      - t4-weekly-mysql-to-pg
+      - t4-weekly-pg-to-mysql
+  # release：T1/T2/T3（37）+ T4 全量（144）+ unique_key（3）= 184。
+  release:
+    blocks:
+      - pg-t1-self
+      - pg-t2-adjacent
+      - pg-t3-extreme
+      - pg-t3-downgrade
+      - t4-full-mysql-to-pg
+      - t4-full-pg-to-mysql
+      - uk-pg-self
+      - uk-pg-to-mysql
+  # 待接通：单独一层，只用于对账与报告，任何层都不会把它当已覆盖。
+  pending:
+    blocks: [pending-mysql-mysql]

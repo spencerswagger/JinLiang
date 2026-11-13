@@ -77,3 +77,11 @@ cross_matrix:
   required: 0
   nightly: 72
   scenarios: [snapshot, incremental_crud, type_boundary]
+
+# 无主键变体（docs/DESIGN-NO-PRIMARY-KEY.md §2.4）：格的定义/层数在 test/nopk-matrix.yaml。
+# PG 这一侧没有待接通的格（PG→PG / MySQL→PG / PG→MySQL 三条方向都已接通；
+# PG→MySQL 只全量，所以该方向只登记 snapshot / unique_key_once）。
+no_pk:
+  registry: test/nopk-matrix.yaml
+  scenarios: [snapshot, insert, pause, downgrade, unique_key_once, unique_key_continuous]
+  pending_cells: 0
