@@ -1,8 +1,14 @@
-//go:build integration
+//go:build integration && nopkmatrix
 
 package engine_test
 
 // 矩阵格：无主键变体（docs/DESIGN-NO-PRIMARY-KEY.md §2.4 / §5 S4）。
+//
+// 为什么多一个 `nopkmatrix` 构建标签：这个文件里的用例**只能由格执行器带着参数调起**，
+// 它没有「自己判断要不要跳过」的余地（缺参数就是红）。若它跟着普通 `-tags=integration`
+// 一起编译，别的集成 job（b1-engine、nightly 的 integration）跑整包时会把它跑起来 →
+// 缺参数直接红；改成 t.Skip 又会让「跳过」伪装成通过。所以：**只有执行器带这个标签**，
+// 别的 job 连编译都不带它，用例不会凭空出现，也不会凭空消失。
 //
 // **1 格 = 1 条链路 × 1 个场景的一次可执行用例**。格由 `scripts/nopk_matrix.py`
 // 按 `test/nopk-matrix.yaml` 逐格调起，用环境变量把「链路 / 场景 / 版本」传进来：

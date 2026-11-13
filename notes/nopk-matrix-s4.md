@@ -23,7 +23,7 @@
 |---|---|
 | `test/nopk-matrix.yaml` | 格的**唯一登记表**：场景定义 + 块（链路 × 版本对 × 场景）+ 四层（pr/nightly/release/pending）。数字从这里算出来 |
 | `scripts/nopk_matrix.py` | 逐格执行器：展开 → 选格（层/链路/版本/场景/本周 due）→ 调 `TestNoPKMatrixCell` → 每格一行 `RESULT nopk …`。缺 DSN 退出 78（红），pending 永不进 pass |
-| `internal/engine/integration_nopk_matrix_test.go` | 格的**可执行承载**（真库、真写路径、真暂停）。11 个链路×场景分支，未接通的链路直接在测试里拒跑 |
+| `internal/engine/integration_nopk_matrix_test.go` | 格的**可执行承载**（真库、真写路径、真暂停），构建标签 `integration && nopkmatrix`：只有执行器带 `nopkmatrix`，普通集成 job（b1-engine / nightly integration）不会把它跑起来。11 个链路×场景分支，未接通的链路直接在测试里拒跑 |
 | `scripts/check_testmatrix.py` | 新增 `check_nopk()`：算术（10/37+8/184/12）、方向与场景相容、待接通必须 pending、跨文件（连接器 `no_pk` 段）一致 |
 | `connectors/{mysql,postgres}/testmatrix.yaml` | 各自的 `no_pk` 段：MySQL `pending_cells: 12`，PG `0` |
 | `.github/workflows/merge-gate.yml` | 新 job `无主键变体 × MySQL 5.7/8.4（PR 10 格）`，门控在**步骤级**（矩阵 job 不用 job 级 `if`，#109 的教训） |
@@ -68,6 +68,14 @@
 **MySQL 目标端 + 增量改/删 → 暂停**：PG→MySQL 只全量（`direction.go`），这一格没有可执行的链路。
 归到 D6 同一笔挂账（MySQL→MySQL 未接通）。「MySQL 目标端 insert-only」今天只有
 PG→MySQL 全量格 + 单测证明——别把「矩阵绿」读成「MySQL 目标端已全覆盖」。
+
+## 5.5 CI 首跑踩到的一条（已修）
+
+第一版把用例挂在 `integration` 一个标签下 → `b1-engine` 跑整包集成时把它也跑起来，
+缺 `JINLIANG_NOPK_LINK` 直接红（`--- FAIL: TestNoPKMatrixCell (0.00s)`）。
+改成 `integration && nopkmatrix` 双标签（执行器 `-tags=integration,nopkmatrix`），
+并给执行器加一条守卫：**rc=0 但日志里没有 `--- PASS: TestNoPKMatrixCell`** 也算失败
+（防「改了用例名/漏了标签 → 一个用例都没跑却报绿」）。
 
 ## 6. 自检
 

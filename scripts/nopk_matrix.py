@@ -153,7 +153,8 @@ def run_cell(cell: dict, timeout: int, verbose: bool) -> tuple[str, str]:
     env["JINLIANG_NOPK_SCENARIO"] = cell["scenario"]
     env["JINLIANG_NOPK_SRC_VERSION"] = cell["src"]
     env["JINLIANG_NOPK_DST_VERSION"] = cell["dst"]
-    cmd = ["go", "test", "-tags=integration", "-count=1", "-timeout", f"{timeout}s",
+    # 两个标签：integration（真库）+ nopkmatrix（这一格只能被这里调起，见测试文件头注释）。
+    cmd = ["go", "test", "-tags=integration,nopkmatrix", "-count=1", "-timeout", f"{timeout}s",
            "-run", "^TestNoPKMatrixCell$", "-v", "./internal/engine/"]
     with tempfile.NamedTemporaryFile(prefix="nopk-", suffix=".log", delete=False) as f:
         log_path = f.name
@@ -167,6 +168,12 @@ def run_cell(cell: dict, timeout: int, verbose: bool) -> tuple[str, str]:
         rc = 124
         tail = [f"超时（{timeout}s + 30s 外层）"]
     if rc == 0:
+        # rc=0 也可能是「一个用例都没匹配上」（改了用例名/漏了标签）——那不能算格跑过。
+        body = Path(log_path).read_text(encoding="utf-8", errors="replace")
+        if "--- PASS: TestNoPKMatrixCell" not in body:
+            if verbose:
+                print(body[-2000:], file=sys.stderr)
+            return "fail", "用例没有真正执行：日志里没有 --- PASS: TestNoPKMatrixCell（漏了 -tags=nopkmatrix 或改了用例名）"
         return "pass", ""
     detail = " | ".join(x.strip() for x in tail[-6:] if x.strip())
     if verbose:

@@ -3,6 +3,8 @@
 # 口径：**1 格 = 1 条链路 × 1 个场景的一次可执行用例**（与 docs/DESIGN.md §2.3 同口径）。
 # 每一格都由 `scripts/nopk_matrix.py` 逐格调起 `internal/engine` 的
 # `TestNoPKMatrixCell`（真库、真写路径、真暂停），不是清单上的一个名字。
+# 那个用例带 `integration && nopkmatrix` 两个构建标签：只有执行器会带 nopkmatrix，
+# 别的集成 job 跑整包时不会把它跑起来（也就不会被「缺参数」误伤，更不会靠跳过装作通过）。
 #
 # 为什么用「块 + 层」而不是把 245 条格逐个抄一遍：
 #   - 版本对是块内展开的（`pairs` × `scenarios`），改一个版本只改一处；
