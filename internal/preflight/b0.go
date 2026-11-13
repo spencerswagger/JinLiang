@@ -106,6 +106,9 @@ func Run(in Input) source.Report {
 	// 按 docs/SPEC.md:107 的拍板口径 warn 照跑并标注，不阻断。
 	checks = append(checks, engineChecks(in)...)
 
+	// ── PG 源端行标识（PG-06，无主键表进增量的前置）──────────
+	checks = append(checks, pgReplicaIdentityCheck(in)...)
+
 	// ── 模式相关 ─────────────────────────────────────────────
 	if in.Mode == "interval" {
 		if strings.TrimSpace(in.Incremental) == "" {
@@ -267,20 +270,20 @@ func scopeChecks(in Input) []source.Check {
 			Detail: "至少选一张表，否则这次同步什么都不会发生", Who: "you"}}
 	}
 	have := map[string]bool{}
+	hasPK := map[string]bool{}
+	replIdentity := map[string]string{}
 	for _, t := range in.SourceCat.Tables {
 		have[t.Table] = true
+		hasPK[t.Table] = t.HasStablePK
+		replIdentity[t.Table] = t.ReplicaIdentity
 	}
 	var missing, noPK []string
-	pk := map[string]bool{}
-	for _, t := range in.SourceCat.Tables {
-		pk[t.Table] = t.HasStablePK
-	}
 	for _, name := range in.Tables {
 		if !have[name] {
 			missing = append(missing, name)
 			continue
 		}
-		if !pk[name] && in.Mode != "once" && in.Mode != "full_interval" {
+		if !hasPK[name] {
 			noPK = append(noPK, name)
 		}
 	}
@@ -296,18 +299,142 @@ func scopeChecks(in Input) []source.Check {
 		out = append(out, source.Check{ID: "SCOPE-01", Title: "选中的表都在源端",
 			Status: source.StatusOK, Detail: fmt.Sprintf("%d 张表", len(in.Tables))})
 	}
-	if len(noPK) > 0 {
-		sort.Strings(noPK)
-		out = append(out, source.Check{
-			ID: "SCOPE-02", Title: "部分表没有主键", Status: source.StatusWarn,
-			Detail:   fmt.Sprintf("%s 没有主键：变更只能追加不能改，重复跑会插重复行", strings.Join(noPK, "、")),
-			Affected: noPK, Who: "you",
-		})
-	} else {
-		out = append(out, source.Check{ID: "SCOPE-02", Title: "选中的表都有主键",
-			Status: source.StatusOK, Detail: "可以安全地做 upsert"})
-	}
+	out = append(out, noPKCheck(in, noPK, replIdentity))
 	return out
+}
+
+// noPKCheck 是 SCOPE-02 的四档（docs/DESIGN-NO-PRIMARY-KEY.md §3.1）。
+//
+// 口径不许共用一句话：同一份报告里两处自相矛盾（PAUSE-01 踩过），所以按
+// `mode.frequency` 分档写 Detail；`once`/`full_interval` 是 ok（整轮重搬不需要行身份），
+// `interval` 是 **blocked**（每轮按水位重读同一批行，没有身份=第二轮起必然重复，
+// 这是这个模式在我们手里做不到，不是「有风险但可以跑」），其余（continuous / 空）是 warn。
+func noPKCheck(in Input, noPK []string, replIdentity map[string]string) source.Check {
+	if len(noPK) == 0 {
+		return source.Check{ID: "SCOPE-02", Title: "选中的表都有主键",
+			Status: source.StatusOK, Detail: "可以安全地做 upsert"}
+	}
+	sort.Strings(noPK)
+	names := strings.Join(noPK, "、")
+	switch in.Mode {
+	case "once", "full_interval":
+		return source.Check{
+			ID: "SCOPE-02", Title: "无主键表不影响这个模式",
+			Status: source.StatusOK,
+			Detail: names + " 没有主键：每轮整轮重搬，结果等于源端当前状态，不需要行身份。" +
+				"代价：搬完之前目标端是部分数据；第二轮起会先清掉本任务写过的行再搬" +
+				"（目标表是你自己建的、里面是你的数据时不会自动清空，会停下来让你选）",
+			Affected: noPK,
+		}
+	case "interval":
+		return source.Check{
+			ID: "SCOPE-02", Title: "定时增量 + 无主键：每轮必然重复",
+			Status: source.StatusBlocked,
+			Detail: names + " 没有主键：定时增量每轮按水位把同一段行重读一遍，" +
+				"没有行身份就是每轮再插一遍（第二轮起必然重复、且每轮增长）。" +
+				"你能做的：① 给表加主键或唯一索引；② 在 content.tables.<表> 声明 unique_key（指向目标端已有的唯一索引）；" +
+				"③ 模式改成 continuous+initial 或 once/full_interval",
+			Affected: noPK, Who: "you",
+			// E1017 是「无身份导致做不到」的族码（Ark 裁决）：运行时改/删与这里的
+			// interval 必然重复是同一族。码表条目由 Ark 落 codes.go，到位后换 core.CodeNoIdentity。
+			Code: string(core.Code("E1017")),
+		}
+	}
+	// continuous / continuous+initial / 未指定：insert-only 能跑，改/删触发按表暂停。
+	detail := names + " 没有主键：先按只追加同步（插入照常、不会阻断）；" +
+		"源端一旦改动或删除这张表的行，它会**只停它自己**、其它表照常、位点照常前进，" +
+		"跳过的那段等结构对齐后整表重搬补齐"
+	if in.SourceKind == "postgres" {
+		// §3.1：PG 源另有一句——REPLICA IDENTITY 不到位时源端解码先断，整条流停，
+		// 不是「只停这张表」。这条不能省，省了卡片就是假承诺（§6 红线 9）。
+		var bad []string
+		for _, name := range noPK {
+			if !riOK(replIdentity[name]) {
+				bad = append(bad, name)
+			}
+		}
+		if len(bad) > 0 {
+			detail += "。另：源端 " + strings.Join(bad, "、") + " 的 REPLICA IDENTITY 不是 FULL（也不是 USING INDEX）——" +
+				"源端在第一次改动/删除时解不出旧行会直接断开连接（整条流停，不是只停这张表），见预检 PG-06"
+		}
+	}
+	return source.Check{
+		ID: "SCOPE-02", Title: "部分表没有主键：只追加，改/删会让它暂停",
+		Status: source.StatusWarn, Detail: detail, Affected: noPK, Who: "you",
+	}
+}
+
+// riOK：REPLICA IDENTITY 是否足以让源端解出旧行。
+// full（整行旧镜像）或 index（USING INDEX）都行；nothing / default(no-pk) / 读不到 都不行。
+func riOK(v string) bool {
+	return v == "full" || v == "index"
+}
+
+// pgReplicaIdentityCheck 是 PG-06（**源端**前置，docs/DESIGN-NO-PRIMARY-KEY.md §3.5）。
+//
+// 为什么必须有：PG 源上「无主键表收到改/删 → 只停这张表」这句承诺有前置条件——
+// 源端 REPLICA IDENTITY 不是 full/index 时，walsender 在解码阶段就报
+// 「does not have a replica identity」并断开；我们连事件都收不到，E1017 发不出来，
+// 用户看到的是「同步连接反复断开」，而且重连会在同一段变更上再炸。
+//
+// 触发：源端 postgres ∧ 模式含变更流 ∧ 选中表里有 HasStablePK=false ∧ RI 不满足。
+// 数据来自现有 `source.Table.ReplicaIdentity`（connect/postgres.go 已填），不新增查询。
+func pgReplicaIdentityCheck(in Input) []source.Check {
+	if in.SourceKind != "postgres" || in.SourceCat == nil || !strings.Contains(in.Mode, "continuous") {
+		return nil
+	}
+	want := map[string]bool{}
+	for _, t := range in.Tables {
+		want[t] = true
+	}
+	var fixable, partitioned []string
+	var alters []string
+	for _, t := range in.SourceCat.Tables {
+		if !want[t.Table] || t.HasStablePK || riOK(t.ReplicaIdentity) {
+			continue
+		}
+		if t.Partitioned {
+			// relreplident 是每张关系各自的属性：父表 ALTER 不覆盖叶子，而 catalog 里
+			// 子分区不单列（connect/postgres.go 直接跳过）→ 本版不代做，只给模板（挂账 D10）。
+			partitioned = append(partitioned, t.Table)
+			continue
+		}
+		fixable = append(fixable, t.Table)
+		alters = append(alters, fmt.Sprintf("ALTER TABLE %s.%s REPLICA IDENTITY FULL;",
+			quoteIdent(t.Schema), quoteIdent(t.Table)))
+	}
+	if len(fixable) == 0 && len(partitioned) == 0 {
+		return nil
+	}
+	sort.Strings(fixable)
+	sort.Strings(partitioned)
+	var parts []string
+	if len(fixable) > 0 {
+		parts = append(parts, fmt.Sprintf("%s 没有主键、REPLICA IDENTITY 也不是 FULL：源端在第一次改动/删除时"+
+			"解不出旧行，会直接断开连接（整条流停，不是只停这张表）", strings.Join(fixable, "、")))
+	}
+	if len(partitioned) > 0 {
+		parts = append(parts, fmt.Sprintf("%s 是分区表：叶子要逐张设置 REPLICA IDENTITY，本版不代做，"+
+			"请对每个分区执行 ALTER TABLE <分区> REPLICA IDENTITY FULL", strings.Join(partitioned, "、")))
+	}
+	head := strings.Join(parts, "。")
+	c := source.Check{
+		ID: "PG-06", Title: "无主键表拿不到旧行标识（改/删会让整条流断开）",
+		Status: source.StatusWarn,
+		Detail: head + "。三条路：① 执行下面的 ALTER（需要这张表的属主权限，" +
+			"拿不到就让 DBA 代跑）；② 这张表不进增量（模式改成 once / full_interval）；" +
+			"③ 把它移出 content.tables。" +
+			"风险：① 会让源端变更流水带上整行旧镜像，WAL 体积变大（大字段表尤其明显）",
+		SQL:      strings.Join(alters, "\n"),
+		Affected: append(append([]string{}, fixable...), partitioned...),
+		Who:      "dba",
+	}
+	return []source.Check{c}
+}
+
+// quoteIdent 给 SQL 里的标识符加双引号（identifier 里的双引号翻倍）。
+func quoteIdent(s string) string {
+	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
 }
 
 // engineChecks 是 SPEC MY-08（表的存储引擎）：MySQL 源端选中表里有 MyISAM

@@ -46,6 +46,13 @@ const (
 	ExitStopped     = 130
 )
 
+// codeNoIdentity 是无主键表收到改/删时的错误码（E1017，docs/DESIGN-NO-PRIMARY-KEY.md §2.3）。
+//
+// 码表条目（`core.CodeNoIdentity` + `docs/ERRORS.md` 那一行）由 Ark 同批落 codes.go——
+// 本片只接线：条目到位后把这里换成 `core.CodeNoIdentity` 即可，语义一个字都不变。
+// 条目到位前 `core.Lookup` 不命中，last_error 仍带 `[E1017]`，不会静默降级。
+const codeNoIdentity = core.Code("E1017")
+
 // Options is one engine invocation.
 type Options struct {
 	Store *control.Store
@@ -2048,6 +2055,11 @@ func classifyError(err error) (code core.Code, classified bool) {
 		// 挂 E1015（不另开码）：用户要做的动作和类型不一致那条完全一样——对齐结构后重跑；
 		// 另开一个码只会让用户多查一次「这个码和那个码有什么不同」。
 		return core.CodeSchemaMismatch, true
+	case errors.As(err, new(*pgsink.NoPKWriteError)):
+		// 无主键表收到改/删：结构没错，是没有行身份（docs/DESIGN-NO-PRIMARY-KEY.md §2.3）。
+		// 必须排在泛化的 PausableError 之前，否则会被 E1015（结构不一致）吸走，
+		// 用户拿到的动作就变成「对齐结构」——而这张表结构本来是对的。
+		return codeNoIdentity, true
 	case errors.As(err, new(pgsink.PausableError)):
 		// 「这张表的结构对不上」：prepare 补列时类型不一致，或跑起来后源端改类型/改名/删列。
 		// 目标写成**接口指针**（不是 *TypeChangedError）：将来第三个实现也能匹配上。
