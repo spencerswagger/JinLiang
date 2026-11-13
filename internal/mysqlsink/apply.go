@@ -253,9 +253,11 @@ func (s *Sink) applyUpserts(ctx context.Context, tx *sql.Tx, evs []source.Event)
 			// 那是一条用户照做也不会好转的死路（Ark 在 #120 的 §7 D11 点出，与 TARGET-02
 			// 「补目标端键 / 换空 target.schema」的 warn 口径也对不上）。
 			return fmt.Errorf("%w：%s。三条做法任选：① 在目标端给这张表补上与源端一致的主键或唯一索引（推荐）；"+
-				"② 换成空的 target.schema 让本任务自己建表（会按源端结构带上主键）；"+
+				"② 换到一个**空**的 target.schema 让本任务自己建表（按源端结构带主键；前提是那里还没有这张表——"+
+				"同一个库里已经有就配 on_exists: recreate，会先 DROP 再按源端主键重建）；"+
 				"③ 不想再跟这张表：把它从 content.tables 里去掉后重新 import。"+
-				"风险：加唯一索引需要目标端已有数据无重复，建索引期间会短暂阻塞写入",
+				"风险：加唯一索引需要目标端已有数据无重复，建索引期间会短暂阻塞写入；"+
+				"on_exists: recreate 会删掉目标端的这张表（里面是别的程序的数据就先备份）",
 				ErrNoUniqueKey, qualified(table))
 		}
 		stmt = s.upsertSQL(table, cols, len(evs), updateCols)
