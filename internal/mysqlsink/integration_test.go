@@ -175,6 +175,14 @@ func TestIntegrationUpsertWithoutUniqueKeyFails(t *testing.T) {
 	if !errors.Is(err, ErrNoUniqueKey) {
 		t.Fatalf("错误应可判为 ErrNoUniqueKey: %v", err)
 	}
+	// 这条路径是「源端有主键、目标端缺键」：此时声明 unique_key 不生效（§4.2 第 4 条），
+	// 所以不能把它列为做法——用户照做也不会好转（Ark §7 D11，与 TARGET-02 的 warn 口径对不上）。
+	if strings.Contains(err.Error(), "unique_key") {
+		t.Fatalf("源端有主键时声明会被忽略，不该让用户去声明 unique_key：%v", err)
+	}
+	if !strings.Contains(err.Error(), "target.schema") {
+		t.Fatalf("「换空 target.schema 让我们建表」是可走的路，应写出来：%v", err)
+	}
 	if n := countRows(t, s, "jl_b3_nopk"); n != 0 {
 		t.Fatalf("报错时不能写进任何行，实际 %d 行", n)
 	}
