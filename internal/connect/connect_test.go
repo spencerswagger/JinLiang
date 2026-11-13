@@ -2,7 +2,9 @@ package connect
 
 import (
 	"context"
+	"database/sql"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -123,4 +125,127 @@ func containsAny(s string, subs ...string) bool {
 		}
 	}
 	return false
+}
+
+// UniqueKeys 只收「完整列、非主键唯一索引」：部分索引、表达式索引、前缀索引都不算
+// （docs/DESIGN-NO-PRIMARY-KEY.md §3.4 判据 ①②④；列可空性归预检判）。
+func TestPostgresCatalogCollectsUniqueIndexes(t *testing.T) {
+	ep, ok := testEndpoint(t, "JINLIANG_TEST_PG_DSN")
+	if !ok {
+		t.Skip("JINLIANG_TEST_PG_DSN 未设置")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	db, err := sql.Open("pgx", ep.PostgresURL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	const table = "jl_uk_probe"
+	drop := "DROP TABLE IF EXISTS public." + table
+	if _, err := db.ExecContext(ctx, drop); err != nil {
+		t.Fatal(err)
+	}
+	defer db.ExecContext(ctx, drop) //nolint:errcheck
+	stmts := []string{
+		"CREATE TABLE public." + table + " (a int NOT NULL, b text NOT NULL, c text, note text)",
+		"CREATE UNIQUE INDEX jl_uk_ab ON public." + table + " (a, b)",
+		"CREATE UNIQUE INDEX jl_uk_c ON public." + table + " (c)",                                 // 可空列：照收，由预检判
+		"CREATE UNIQUE INDEX jl_uk_partial ON public." + table + " (note) WHERE note IS NOT NULL", // 部分索引：不收
+		"CREATE UNIQUE INDEX jl_uk_expr ON public." + table + " (lower(note))",                    // 表达式索引：不收
+	}
+	for _, q := range stmts {
+		if _, err := db.ExecContext(ctx, q); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	conn, err := Open(ep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	cat, err := conn.Catalog(ctx, source.Scope{Schema: "public"})
+	if err != nil {
+		t.Fatalf("catalog: %v", err)
+	}
+	var got [][]string
+	for _, tbl := range cat.Tables {
+		if tbl.Table == table {
+			got = tbl.UniqueKeys
+		}
+	}
+	want := map[string]bool{"a,b": true, "c": true}
+	if len(got) != len(want) {
+		t.Fatalf("应收到 2 组唯一键（a,b 与 c），实际 %v", got)
+	}
+	for _, key := range got {
+		joined := strings.Join(key, ",")
+		if !want[joined] {
+			t.Fatalf("多收了不该收的唯一索引 %v（部分/表达式索引必须滤掉）", key)
+		}
+		delete(want, joined)
+	}
+	if len(want) != 0 {
+		t.Fatalf("漏了唯一索引 %v", want)
+	}
+}
+
+func TestMySQLCatalogCollectsUniqueIndexes(t *testing.T) {
+	ep, ok := testEndpoint(t, "JINLIANG_TEST_MYSQL_DSN")
+	if !ok {
+		t.Skip("JINLIANG_TEST_MYSQL_DSN 未设置")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	db, err := sql.Open("mysql", ep.MySQLConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	const table = "jl_uk_probe"
+	drop := "DROP TABLE IF EXISTS `" + table + "`"
+	if _, err := db.ExecContext(ctx, drop); err != nil {
+		t.Fatal(err)
+	}
+	defer db.ExecContext(ctx, drop) //nolint:errcheck
+	stmts := []string{
+		"CREATE TABLE `" + table + "` (a int NOT NULL, b varchar(16) NOT NULL, c varchar(64), d text," +
+			" UNIQUE KEY uk_ab (a,b), UNIQUE KEY uk_c (c), UNIQUE KEY uk_prefix (c(8)), UNIQUE KEY uk_text (d(10)))",
+	}
+	for _, q := range stmts {
+		if _, err := db.ExecContext(ctx, q); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	conn, err := Open(ep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	cat, err := conn.Catalog(ctx, source.Scope{Schema: ep.Database})
+	if err != nil {
+		t.Fatalf("catalog: %v", err)
+	}
+	var got [][]string
+	for _, tbl := range cat.Tables {
+		if tbl.Table == table {
+			got = tbl.UniqueKeys
+		}
+	}
+	want := map[string]bool{"a,b": true, "c": true}
+	if len(got) != len(want) {
+		t.Fatalf("应收到 2 组唯一键（a,b 与 c），实际 %v", got)
+	}
+	for _, key := range got {
+		joined := strings.Join(key, ",")
+		if !want[joined] {
+			t.Fatalf("多收了不该收的唯一索引 %v（前缀索引必须滤掉）", key)
+		}
+		delete(want, joined)
+	}
+	if len(want) != 0 {
+		t.Fatalf("漏了唯一索引 %v", want)
+	}
 }

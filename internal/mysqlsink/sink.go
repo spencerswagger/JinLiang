@@ -47,6 +47,12 @@ type Options struct {
 
 	// Width 决定 utf8mb4 行宽预检用哪套上限；零值用 DefaultWidthOptions()。
 	Width WidthOptions
+
+	// UniqueKeys 是用户声明的行身份（content.tables.<表>.unique_key），key 用目标端
+	// **裸表名**（与 _jl_chunk.table_name / paused_tables 同源，docs/DESIGN-NO-PRIMARY-KEY.md §4.4）。
+	// 声明必须与目标端已有唯一索引逐列一致（§4.3 五条判据），否则写入前就报 ErrNoUniqueKey——
+	// MySQL 的 ON DUPLICATE KEY 在没索引时可不会报错，那是静默写重复（R3）。
+	UniqueKeys map[string][]string
 }
 
 // ErrTargetTableExists 是 `on_exists=error` 撞到已有表。
@@ -64,6 +70,8 @@ type Sink struct {
 	width       WidthOptions
 	aliasUpsert bool // 8.0.19+ 支持 INSERT ... AS new ON DUPLICATE KEY UPDATE new.c=…
 	uniqueCache map[string]bool
+	// declaredCache 缓存「声明的 unique_key 与目标端索引核对结果」（key: schema.table\x00col1,col2）。
+	declaredCache map[string]declaredCheck
 
 	// serverVersion 只用于错误文案（「目标端是 MySQL 5.7.44」），不参与判定。
 	serverVersion string
@@ -102,7 +110,8 @@ func Open(ctx context.Context, opt Options) (*Sink, error) {
 		db.Close()
 		return nil, fmt.Errorf("连不上目标库 %s:%d: %w", opt.DSN.Host, opt.DSN.Port, err)
 	}
-	s := &Sink{db: db, ep: opt.DSN, opt: opt, uniqueCache: map[string]bool{}, ownerToken: newOwnerToken()}
+	s := &Sink{db: db, ep: opt.DSN, opt: opt, uniqueCache: map[string]bool{},
+		declaredCache: map[string]declaredCheck{}, ownerToken: newOwnerToken()}
 	// 版本只用于错误文案与能力探测的日志，不参与任何分支判定（能力一律探测）。
 	_ = db.QueryRowContext(ctx, "SELECT VERSION()").Scan(&s.serverVersion)
 	if err := s.ensureStateTables(ctx); err != nil {

@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/spencerswagger/jinliang/internal/pgsink"
 	"github.com/spencerswagger/jinliang/internal/sink"
 	"github.com/spencerswagger/jinliang/internal/source"
 )
@@ -207,35 +208,53 @@ func endsWithCommit(evs []source.Event) bool {
 // applyUpserts 把连续的同表插入/更新合并成一条多行 upsert。
 func (s *Sink) applyUpserts(ctx context.Context, tx *sql.Tx, evs []source.Event) error {
 	table := evs[0].Table
-	cols, updateCols, err := s.columnsFor(ctx, table, evs[0].Relation, evs[0].New)
+	rel := evs[0].Relation
+	cols, updateCols, err := s.columnsFor(ctx, table, rel, evs[0].New)
 	if err != nil {
 		return err
 	}
+	declared := s.declaredKeyFor(table, rel)
 	var stmt string
-	if insertOnly(evs[0].Relation) {
+	switch {
+	case len(declared) > 0:
+		// 用户声明了行身份（unique_key）：upsert 多了一组「按它定位」的列。
+		// 声明必须与目标端索引逐列一致（§4.3）——MySQL 的 ON DUPLICATE KEY 命中任意
+		// 唯一索引，声明与索引不一致时不会报错，只会静默按别的键更新（R3）。
+		ok, why, err := s.verifyDeclaredKey(ctx, table, declared)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("%w：%s 声明了 unique_key (%s)，但目标端核对不过：%s。"+
+				"三种做法任选：① 在目标端建一条与声明逐列一致的唯一索引（推荐）；"+
+				"② 改声明去匹配目标端已有的唯一索引；③ 去掉声明，这张表退回 insert-only（只追加）。"+
+				"风险：声明与事实不符时 upsert 会静默写重复，所以这里必须停",
+				ErrNoUniqueKey, qualified(table), strings.Join(declared, ", "), why)
+		}
+		updateCols = exclude(cols, declared)
+		stmt = s.upsertSQL(table, cols, len(evs), updateCols)
+	case insertOnly(rel):
 		// 无主键表：只 INSERT（设计 §1.2 路线 A）。目标端有没有唯一索引都不升级成
 		// upsert——身份只认源端（R1），拿别人的索引猜行身份会静默改错数据。
 		for _, ev := range evs {
 			if ev.Kind != source.EvInsert {
 				// 改行在无主键表上没有定位依据：既不降级成 INSERT（§1.5 已否），
-				// 也不按全列条件去改。按表暂停/整表重搬是下一个切片（S2），
-				// 在那之前这里**明确失败**，不留下半批数据。
-				return fmt.Errorf("%s 没有主键：本版对无主键表只做 insert-only（新增照写），"+
-					"收到改行（UPDATE）时目标端无法定位是哪一行。"+
-					"风险：这是整批失败，本轮其它表也会停在同一个位点。"+
-					"做法：给源表加主键，或从 content.tables 去掉这张表后重新 import",
-					qualified(table))
+				// 也不按全列条件去改。按表暂停这张表（no_pk_write / E1017），
+				// 其它表照写、位点照常前进（docs/CONTRACT-PAUSE-AND-POSITION.md §1.5）。
+				return &pgsink.NoPKWriteError{TableName: table.Table,
+					Detail: "收到一次改动（UPDATE），但这张表没有主键、也没声明 unique_key：目标端定位不到是哪一行"}
 			}
 		}
 		stmt = insertSQL(table, cols, len(evs))
-	} else {
+	default:
 		ok, err := s.hasUniqueKey(ctx, table)
 		if err != nil {
 			return err
 		}
 		if !ok {
-			return fmt.Errorf("%w：%s。两种做法任选：① 给目标表加主键/唯一索引（推荐，与源端一致）；"+
-				"② 不想再跟这张表：把它从 content.tables 里去掉后重新 import。"+
+			return fmt.Errorf("%w：%s。三种做法任选：① 给目标表加主键/唯一索引（推荐，与源端一致）；"+
+				"② 在 content.tables.<表> 里声明 unique_key: [列…]（指向目标端已有的唯一索引，列都非空）；"+
+				"③ 不想再跟这张表：把它从 content.tables 里去掉后重新 import。"+
 				"风险：加唯一索引需要目标端已有数据无重复，建索引期间会短暂阻塞写入",
 				ErrNoUniqueKey, qualified(table))
 		}
@@ -263,8 +282,21 @@ func insertOnly(rel *source.Table) bool {
 	return rel != nil && !rel.HasStablePK
 }
 
+// clearDeclaredCache 在目标端结构变了（DDL 跟随/重建索引）后失效声明核对结果。
+func (s *Sink) clearDeclaredCache(table string) {
+	for k := range s.declaredCache {
+		if strings.HasSuffix(k, "."+table+"\x00") || strings.Contains(k, "."+table+"\x00") {
+			delete(s.declaredCache, k)
+		}
+	}
+}
+
 func (s *Sink) applyDelete(ctx context.Context, tx *sql.Tx, ev source.Event) error {
 	pk := primaryKeyOf(ev)
+	// 声明了 unique_key 的无主键表：用声明列定位删除（源端有主键时声明被忽略，§4.2 第 4 条）。
+	if declared := s.declaredKeyFor(ev.Table, ev.Relation); len(declared) > 0 {
+		pk = declared
+	}
 	stmt, err := deleteSQL(ev.Table, pk)
 	if err != nil {
 		return err
@@ -273,7 +305,7 @@ func (s *Sink) applyDelete(ctx context.Context, tx *sql.Tx, ev source.Event) err
 	for _, name := range pk {
 		idx, ok := columnIndex(ev, name)
 		if !ok {
-			return fmt.Errorf("删除 %s 时找不到主键列 %s 的值", qualified(ev.Table), name)
+			return fmt.Errorf("删除 %s 时找不到用于定位的列 %s 的值", qualified(ev.Table), name)
 		}
 		args = append(args, driverValue(ev.Old.Values[idx]))
 	}
@@ -323,8 +355,10 @@ func (s *Sink) applyDDL(ctx context.Context, stmt string) error {
 			return fmt.Errorf("跟随 DDL 失败（%s）：%w", d.Reason, err)
 		}
 		// 结构变了：唯一键缓存必须失效，否则加完唯一索引仍按「没有唯一键」报错。
+		// 声明的 unique_key 核对结果同理——索引可能刚被改过。
 		if d.Table.Table != "" {
 			delete(s.uniqueCache, s.schemaOf(d.Table)+"."+d.Table.Table)
+			s.clearDeclaredCache(d.Table.Table)
 		}
 		return nil
 	case DDLSkip:
@@ -342,6 +376,7 @@ func (s *Sink) applyDDL(ctx context.Context, stmt string) error {
 		}
 		if d.Table.Table != "" {
 			delete(s.uniqueCache, s.schemaOf(d.Table)+"."+d.Table.Table)
+			s.clearDeclaredCache(d.Table.Table)
 		}
 		return nil
 	default:

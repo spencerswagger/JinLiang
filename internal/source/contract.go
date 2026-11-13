@@ -93,13 +93,18 @@ type Column struct {
 // Table is one catalog table.
 type Table struct {
 	TableRef
-	Columns         []Column `json:"columns"`
-	PrimaryKey      []string `json:"primary_key"`
-	HasStablePK     bool     `json:"has_stable_pk"` // 无主键：增量 upsert 与双向都不成立
-	RowsEstimate    int64    `json:"rows_estimate"`
-	Partitioned     bool     `json:"partitioned"`
-	Engine          string   `json:"engine,omitempty"` // MySQL: InnoDB / MyISAM
-	ReplicaIdentity string   `json:"replica_identity,omitempty"`
+	Columns     []Column `json:"columns"`
+	PrimaryKey  []string `json:"primary_key"`
+	HasStablePK bool     `json:"has_stable_pk"` // 无主键：增量 upsert 与双向都不成立
+	// UniqueKeys 是**目录侧**发现的唯一索引列集合（不含主键、不含部分/表达式索引、
+	// 不含前缀索引、只含全列索引）。它只用于「核对用户声明的 unique_key 是否真实存在」
+	//（TARGET-02），**不用来自动发现行身份**——身份只认源端主键或用户声明
+	//（docs/DESIGN-NO-PRIMARY-KEY.md R1/§3.4）。
+	UniqueKeys      [][]string `json:"unique_keys,omitempty"`
+	RowsEstimate    int64      `json:"rows_estimate"`
+	Partitioned     bool       `json:"partitioned"`
+	Engine          string     `json:"engine,omitempty"` // MySQL: InnoDB / MyISAM
+	ReplicaIdentity string     `json:"replica_identity,omitempty"`
 }
 
 // Catalog is what the user picks tables from.

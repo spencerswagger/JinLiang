@@ -82,6 +82,10 @@ type TableDoc struct {
 	Columns   *ColumnsDoc      `yaml:"columns,omitempty" json:"columns,omitempty"`
 	Where     string           `yaml:"where,omitempty" json:"where,omitempty"`
 	Transform []map[string]any `yaml:"transform,omitempty" json:"transform,omitempty"`
+	// UniqueKey 声明无主键表的行身份（docs/DESIGN-NO-PRIMARY-KEY.md §4.1）。
+	// 只对源端没有稳定主键的表生效；源端有主键时声明被忽略（§4.2 第 4 条）。
+	// 必须是目标端**已有**的唯一索引，且列都非空——核对不过就是 blocked（TARGET-02）。
+	UniqueKey []string `yaml:"unique_key,omitempty" json:"unique_key,omitempty"`
 }
 
 // ColumnsDoc selects or retypes columns.
@@ -282,6 +286,35 @@ func (d *JobDoc) Validate() error {
 			if t.Columns != nil && len(t.Columns.Include) > 0 && len(t.Columns.Exclude) > 0 {
 				add("content.tables.%s.columns 不能同时给 include 和 exclude", name)
 			}
+			// unique_key（docs/DESIGN-NO-PRIMARY-KEY.md §4.3）：这里全是**不连库**就能判的规则。
+			// 目标端到底有没有匹配的唯一索引是 TARGET-02 的事，不在这里猜。
+			if t.UniqueKey != nil {
+				if len(t.UniqueKey) == 0 {
+					add("content.tables.%s.unique_key 不能是空数组（要么不写，要么给至少一列）", name)
+				}
+				seen := map[string]bool{}
+				for _, col := range t.UniqueKey {
+					if strings.TrimSpace(col) == "" {
+						add("content.tables.%s.unique_key 里有空列名", name)
+						continue
+					}
+					if seen[col] {
+						add("content.tables.%s.unique_key 里的列 %s 重复了", name, col)
+					}
+					seen[col] = true
+					if t.Columns != nil {
+						if len(t.Columns.Include) > 0 && !containsString(t.Columns.Include, col) {
+							add("content.tables.%s.unique_key 引用的列 %s 不在搬运列里（columns.include 没包含它）", name, col)
+						}
+						if containsString(t.Columns.Exclude, col) {
+							add("content.tables.%s.unique_key 引用的列 %s 不在搬运列里（columns.exclude 排掉了它）", name, col)
+						}
+						if _, ok := t.Columns.Map[col]; ok {
+							add("content.tables.%s.unique_key 的列 %s 不能同时在 columns.map 里换类型（映射可能引入舍入/截断，定位会失配）", name, col)
+						}
+					}
+				}
+			}
 		}
 	}
 
@@ -417,6 +450,25 @@ func (d *JobDoc) ScopeFingerprint() string {
 	return b.String()
 }
 
+// DeclaredUniqueKeys 返回用户声明的行身份（content.tables.<表>.unique_key），
+// key 用源端裸表名（与 SCOPE-01/02、preflight.Input.Tables 同口径）。
+func (d *JobDoc) DeclaredUniqueKeys() map[string][]string {
+	if d.Content == nil || len(d.Content.Tables) == 0 {
+		return nil
+	}
+	out := map[string][]string{}
+	for name, t := range d.Content.Tables {
+		if len(t.UniqueKey) == 0 {
+			continue
+		}
+		out[name] = append([]string(nil), t.UniqueKey...)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 func joinSorted(in []string) string {
 	cp := make([]string, len(in))
 	for i, s := range in {
@@ -424,6 +476,15 @@ func joinSorted(in []string) string {
 	}
 	sortStrings(cp)
 	return strings.Join(cp, ",")
+}
+
+func containsString(list []string, want string) bool {
+	for _, s := range list {
+		if s == want {
+			return true
+		}
+	}
+	return false
 }
 
 func sortStrings(s []string) {

@@ -105,6 +105,7 @@ func newTargetSink(ctx context.Context, r *runner) (targetSink, error) {
 			InstanceID: r.instID,
 			SourceKind: catalogEngine(r.srcEP.Kind),
 			OnExists:   mysqlsink.OnExists(r.doc.Target.OnExists),
+			UniqueKeys: r.declaredUniqueKeys(),
 		})
 		if err != nil {
 			return nil, fmt.Errorf("连不上 MySQL 目标端（%s）: %w", r.tgtEP.Redacted(), err)
@@ -887,6 +888,26 @@ func (r *runner) targetRef(ref source.TableRef) source.TableRef {
 		schema = r.targetSchema()
 	}
 	return source.TableRef{Schema: schema, Table: ref.Table}
+}
+
+// declaredUniqueKeys 是用户声明的行身份（content.tables.<表>.unique_key），
+// key 用**裸表名**：源端与目标端只差 schema，裸表名两边一致，所以同一份 map
+// 既能喂 preflight（源端口径）也能喂 sink.Options.UniqueKeys（目标端口径，§4.4）。
+func (r *runner) declaredUniqueKeys() map[string][]string {
+	if r.doc.Content == nil || len(r.doc.Content.Tables) == 0 {
+		return nil
+	}
+	out := map[string][]string{}
+	for name, t := range r.doc.Content.Tables {
+		if len(t.UniqueKey) == 0 {
+			continue
+		}
+		out[name] = append([]string(nil), t.UniqueKey...)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // relationOf 给出这张表这一版的列定义（引擎据此告诉目标端「值按什么列序」）。

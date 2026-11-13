@@ -193,6 +193,7 @@ func (s *Store) PreflightJob(ctx context.Context, jobID string) (source.Report, 
 		BatchRows:   batchRowsOf(doc),
 		Tables:      selectedTables(doc),
 		Lookback:    doc.Mode.Lookback,
+		UniqueKeys:  doc.DeclaredUniqueKeys(),
 	}
 	if doc.Source.Snapshot != nil && doc.Source.Snapshot.Conns != nil {
 		in.SnapshotConn = *doc.Source.Snapshot.Conns

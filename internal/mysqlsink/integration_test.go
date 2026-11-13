@@ -16,6 +16,7 @@ import (
 	"github.com/spencerswagger/jinliang/internal/catalog"
 	"github.com/spencerswagger/jinliang/internal/dsn"
 	"github.com/spencerswagger/jinliang/internal/mysqlsource"
+	"github.com/spencerswagger/jinliang/internal/pgsink"
 	"github.com/spencerswagger/jinliang/internal/source"
 )
 
@@ -242,6 +243,11 @@ func TestIntegrationInsertOnlyRejectsUpdateOnNoPKSource(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "没有主键") {
 		t.Fatalf("错误应说清是无主键、无法定位改行: %v", err)
+	}
+	// 按表暂停（no_pk_write / E1017）：这张表停、其它表照写，不是整条任务死。
+	var pe pgsink.PausableError
+	if !errors.As(err, &pe) || pe.Reason() != pgsink.PauseReasonNoPKWrite {
+		t.Fatalf("应是 PausableError(no_pk_write)，得到 %T：%v", err, err)
 	}
 	if n := countRows(t, s, "jl_b4_nopk"); n != 0 {
 		t.Fatalf("失败时不能写进任何行，实际 %d 行", n)
@@ -905,5 +911,123 @@ func TestIntegrationFingerprintComparableWithinMySQL(t *testing.T) {
 	}
 	if src.FingerprintScope() != sink.FingerprintScope() {
 		t.Fatalf("Scope 不一致就不能比: %q vs %q", src.FingerprintScope(), sink.FingerprintScope())
+	}
+}
+
+// 声明了 unique_key 的无主键表：upsert 幂等 + 删除能定位（docs/DESIGN-NO-PRIMARY-KEY.md §5 S3 验收）。
+func TestIntegrationDeclaredUniqueKeyUpsertAndDelete(t *testing.T) {
+	s := openSink(t, func(o *Options) {
+		o.OnExists = OnExistsAppend
+		o.UniqueKeys = map[string][]string{"jl_b5_decl": {"tenant_id", "event_no"}}
+	})
+	dropTable(t, s, "jl_b5_decl")
+	defer dropTable(t, s, "jl_b5_decl")
+	if _, err := s.db.ExecContext(context.Background(),
+		"CREATE TABLE `jl_b5_decl` (tenant_id int NOT NULL, event_no varchar(16) NOT NULL, payload varchar(32), UNIQUE KEY uk_event (tenant_id,event_no))"); err != nil {
+		t.Fatalf("建带唯一索引的无主键表: %v", err)
+	}
+	cat := source.Catalog{Tables: []source.Table{{
+		TableRef: source.TableRef{Table: "jl_b5_decl"},
+		Columns: []source.Column{
+			{Name: "tenant_id", Type: "int"},
+			{Name: "event_no", Type: "varchar(16)"},
+			{Name: "payload", Type: "varchar(32)", Nullable: true},
+		},
+	}}}
+	if _, err := s.EnsureSchema(context.Background(), cat); err != nil {
+		t.Fatalf("append 策略应沿用已有表: %v", err)
+	}
+	rel := &source.Table{
+		TableRef: source.TableRef{Table: "jl_b5_decl"},
+		Columns: []source.Column{
+			{Name: "tenant_id", Type: "int"},
+			{Name: "event_no", Type: "varchar(16)"},
+			{Name: "payload", Type: "varchar(32)", Nullable: true},
+		},
+		HasStablePK: false,
+	}
+	pos := posOf(t, "mysql:v1:file=binlog.000001;pos=600;coord=mysql_file_pos")
+	batch := insertBatchWithRel("jl_b5_decl", rel, [][]any{{int64(1), "e1", "x"}}, "")
+	if err := s.Apply(context.Background(), batch, pos); err != nil {
+		t.Fatalf("声明身份后的首写失败: %v", err)
+	}
+	// 重放同一批：必须靠声明唯一索引吸收，不能变两行。
+	batch2 := insertBatchWithRel("jl_b5_decl", rel, [][]any{{int64(1), "e1", "y"}}, "")
+	if err := s.Apply(context.Background(), batch2, posOf(t, "mysql:v1:file=binlog.000001;pos=700;coord=mysql_file_pos")); err != nil {
+		t.Fatalf("重放失败: %v", err)
+	}
+	if n := countRows(t, s, "jl_b5_decl"); n != 1 {
+		t.Fatalf("声明行身份后重放应幂等（1 行），实际 %d", n)
+	}
+	var payload string
+	if err := s.db.QueryRowContext(context.Background(),
+		"SELECT payload FROM `jl_b5_decl`").Scan(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload != "y" {
+		t.Fatalf("重放应更新 payload，实际 %q", payload)
+	}
+	// 删除：按声明列定位。
+	del := []source.Event{
+		{Kind: source.EvBegin, TxID: "tx"},
+		{Kind: source.EvDelete, TxID: "tx", Table: source.TableRef{Table: "jl_b5_decl"},
+			Relation: rel,
+			Old: source.Row{Table: source.TableRef{Table: "jl_b5_decl"},
+				Values: []source.Value{{Kind: source.KindInt, I: int64(1)}, {Kind: source.KindString, S: "e1"}, {Kind: source.KindString, S: "y"}}}},
+		{Kind: source.EvCommit, TxID: "tx"},
+	}
+	if err := s.Apply(context.Background(), del, posOf(t, "mysql:v1:file=binlog.000001;pos=800;coord=mysql_file_pos")); err != nil {
+		t.Fatalf("按声明列删除失败: %v", err)
+	}
+	if n := countRows(t, s, "jl_b5_decl"); n != 0 {
+		t.Fatalf("删除后应 0 行，实际 %d", n)
+	}
+}
+
+// 声明与目标端索引对不上：写之前就必须停（R3：ON DUPLICATE KEY 不会自己报错）。
+func TestIntegrationDeclaredUniqueKeyMismatchFails(t *testing.T) {
+	s := openSink(t, func(o *Options) {
+		o.OnExists = OnExistsAppend
+		o.UniqueKeys = map[string][]string{"jl_b5_decl": {"tenant_id"}}
+	})
+	dropTable(t, s, "jl_b5_decl")
+	defer dropTable(t, s, "jl_b5_decl")
+	if _, err := s.db.ExecContext(context.Background(),
+		"CREATE TABLE `jl_b5_decl` (tenant_id int NOT NULL, event_no varchar(16) NOT NULL, payload varchar(32), UNIQUE KEY uk_event (tenant_id,event_no))"); err != nil {
+		t.Fatalf("建带唯一索引的无主键表: %v", err)
+	}
+	cat := source.Catalog{Tables: []source.Table{{
+		TableRef: source.TableRef{Table: "jl_b5_decl"},
+		Columns: []source.Column{
+			{Name: "tenant_id", Type: "int"},
+			{Name: "event_no", Type: "varchar(16)"},
+			{Name: "payload", Type: "varchar(32)", Nullable: true},
+		},
+	}}}
+	if _, err := s.EnsureSchema(context.Background(), cat); err != nil {
+		t.Fatalf("append 策略应沿用已有表: %v", err)
+	}
+	rel := &source.Table{
+		TableRef: source.TableRef{Table: "jl_b5_decl"},
+		Columns: []source.Column{
+			{Name: "tenant_id", Type: "int"},
+			{Name: "event_no", Type: "varchar(16)"},
+			{Name: "payload", Type: "varchar(32)", Nullable: true},
+		},
+		HasStablePK: false,
+	}
+	err := s.Apply(context.Background(), insertBatchWithRel("jl_b5_decl", rel, [][]any{{int64(1), "e1", "x"}}, ""),
+		posOf(t, "mysql:v1:file=binlog.000001;pos=900;coord=mysql_file_pos"))
+	if err == nil {
+		t.Fatal("声明与目标端索引不一致时必须失败")
+	}
+	if !errors.Is(err, ErrNoUniqueKey) {
+		t.Fatalf("错误应可判为 ErrNoUniqueKey: %v", err)
+	}
+	if !strings.Contains(err.Error(), "unique_key") {
+		t.Fatalf("错误应点名 unique_key 与核对结论: %v", err)
+	}
+	if n := countRows(t, s, "jl_b5_decl"); n != 0 {
+		t.Fatalf("失败时不能写行，实际 %d", n)
 	}
 }

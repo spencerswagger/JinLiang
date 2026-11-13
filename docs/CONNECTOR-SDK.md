@@ -24,6 +24,24 @@ connectors/<name>/
 2. **位点可序列化**：`Position.String()` 的结果会写进目标库；同一个字符串必须能反解回同一位置。
 3. **`Cleanup` 幂等**：重复调用不报错，且**只清理自己命名空间**（`jl_<job_key>`）内的对象。
 
+### 2.1 `Catalog` 的字段契约（第三方连接器最容易漏的地方）
+
+`Catalog` 返回 `source.Catalog{Tables: []source.Table}`，每张表至少要把这几项填对——
+写路径的幂等与预检都靠它们，缺一个就会在别人机器上变成静默错误：
+
+| 字段 | 含义 | 漏填的后果 |
+|---|---|---|
+| `TableRef{Schema,Table}` | 目标端拼 SQL 用真名 | 表名大小写/库名不对 → 写到错地方或写不进去 |
+| `Columns`（顺序） | 行值的**唯一**权威顺序（`Row.Values` 按它排） | 列错位 → 静默写错列 |
+| `PrimaryKey` | 源端主键列名（顺序有意义） | upsert/delete 定位不到行 |
+| `HasStablePK` | 源端有没有**稳定**主键（视图/无主键表为 false） | 被误当 upsert 表 → 重放插重复行 |
+| `UniqueKeys` | 目标端侧要核对的唯一索引列组（`[][]string`，每项一组列） | 声明 `unique_key` 的表核对不到索引 → 预检 `TARGET-02` 永远 blocked |
+
+`UniqueKeys` **只用于核对用户声明**（`content.tables.<表>.unique_key`），**不用来发现行身份**：
+身份只认源端主键或用户声明（R1）。收进来的索引必须已经过滤掉部分索引、表达式索引与前缀索引，
+可空列可以照收（可空性由预检判，含 NULL 的组合不构成唯一性）。口径见
+`DESIGN-NO-PRIMARY-KEY.md §3.4/§4.3`。
+
 ## 3. 写侧要实现的 5 个方法
 
 `Kind / EnsureSchema / Apply / Verify / Cleanup`，其中 **`Apply(ctx, events, position)` 必须把位点和数据放在同一个事务里提交** —— 这是幂等的根基，接口上用参数强制，不许省。

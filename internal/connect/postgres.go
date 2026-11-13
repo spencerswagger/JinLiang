@@ -269,6 +269,58 @@ func (p *Postgres) Catalog(ctx context.Context, scope source.Scope) (source.Cata
 		return source.Catalog{}, err
 	}
 
+	// 唯一索引（TARGET-02 的核对依据，docs/DESIGN-NO-PRIMARY-KEY.md §3.4）：
+	// 非主键、非部分（indpred IS NULL）、非表达式（indexprs IS NULL）、全列。
+	// PG 11+ 有 INCLUDE 列（indnkeyatts 之外的只是覆盖列，不参与唯一性），
+	// PG 10 没有这个字段——按 server_version_num 分两句，不硬编码一把梭。
+	var verNum int
+	if err := p.db.QueryRowContext(ctx, "SELECT current_setting('server_version_num')::int").
+		Scan(&verNum); err != nil {
+		return source.Catalog{}, fmt.Errorf("读取服务端版本失败: %w", err)
+	}
+	keyExpr := "x.indkey" // PG 10：没有 INCLUDE，indkey 全是键列
+	if verNum >= 110000 {
+		keyExpr = "x.indkey[0:x.indnkeyatts-1]"
+	}
+	qUniq := fmt.Sprintf(`
+		SELECT c.relname, ic.relname, a.attname
+		FROM pg_index x
+		JOIN pg_class c ON c.oid = x.indrelid
+		JOIN pg_class ic ON ic.oid = x.indexrelid
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = ANY(%s)
+		WHERE n.nspname = $1 AND x.indisunique AND NOT x.indisprimary
+		  AND x.indpred IS NULL AND x.indexprs IS NULL
+		ORDER BY c.relname, ic.relname, array_position(%s, a.attnum)`, keyExpr, keyExpr)
+	qrows, err := p.db.QueryContext(ctx, qUniq, schema)
+	if err != nil {
+		return source.Catalog{}, fmt.Errorf("读取唯一索引失败: %w", err)
+	}
+	type idxKey struct{ table, index string }
+	uniq := map[idxKey][]string{}
+	var uniqOrder []idxKey
+	for qrows.Next() {
+		var table, index, col string
+		if err := qrows.Scan(&table, &index, &col); err != nil {
+			qrows.Close()
+			return source.Catalog{}, err
+		}
+		k := idxKey{table, index}
+		if _, ok := uniq[k]; !ok {
+			uniqOrder = append(uniqOrder, k)
+		}
+		uniq[k] = append(uniq[k], col)
+	}
+	qrows.Close()
+	if err := qrows.Err(); err != nil {
+		return source.Catalog{}, err
+	}
+	for _, k := range uniqOrder {
+		if t, ok := tables[k.table]; ok {
+			t.UniqueKeys = append(t.UniqueKeys, uniq[k])
+		}
+	}
+
 	var cat source.Catalog
 	for _, name := range order {
 		t := tables[name]
