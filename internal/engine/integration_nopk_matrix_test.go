@@ -52,9 +52,6 @@ func TestNoPKMatrixCell(t *testing.T) {
 		t.Fatal("缺 JINLIANG_NOPK_LINK / JINLIANG_NOPK_SCENARIO：矩阵格由 scripts/nopk_matrix.py 调起（见 test/nopk-matrix.yaml）")
 	}
 
-	if link == "mysql-matrix" { // 防手滑
-		t.Fatalf("不认识的链路 %q", link)
-	}
 	srcDSN, dstDSN := nopkDSNs(t, link)
 	nopkAssertVersion(t, "源端", srcDSN, os.Getenv("JINLIANG_NOPK_SRC_VERSION"))
 	nopkAssertVersion(t, "目标端", dstDSN, os.Getenv("JINLIANG_NOPK_DST_VERSION"))
@@ -769,6 +766,13 @@ func nopkMySQLToPGPause(t *testing.T, srcDSN, dstDSN string) {
 	}
 	if paused := nopkPausedPG(t, dst, store, jobID); len(paused) != 0 {
 		t.Fatalf("重搬搬成 → 必须解除暂停，仍有：%v", paused)
+	}
+	var v int64
+	if err := dst.QueryRow(context.Background(), "SELECT v FROM "+ta+" WHERE id=42").Scan(&v); err != nil {
+		t.Fatal(err)
+	}
+	if v != 1042 {
+		t.Fatalf("重搬后应看到源端新值 v=1042（暂停窗口里的改动只能靠整表重搬补上），实际 %d", v)
 	}
 }
 

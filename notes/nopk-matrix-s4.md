@@ -7,7 +7,7 @@
 | 层 | 定稿 | 实际 | 说明 |
 |---|---|---|---|
 | PR 门禁 | 10 | **10** | PG18→18(3) + MySQL8.4→PG(3) + MySQL5.7→PG(3) + PG18→MySQL(1，只全量) |
-| nightly 固定 | 39（≈） | **37/晚 + 8/周（≈38.1/晚）** | 差 1 格来自 T4 的算法，见下 |
+| nightly 固定 | ≈39 | **37/晚 + T4 8/周 = 38.1/晚** | 定稿自己的算术是 38.7（进位 ≈39），差 0.6/晚，见下 |
 | nightly T4 全量 | 12/周 | **8/周** | MySQL→PG 2 条 ×3 + PG→MySQL 2 条 ×1 |
 | release | 184 | **184** | 27+6+4+144+3 |
 | 待接通 | 12 | **12**（pending，永远不算 pass） | MySQL→MySQL 4 条 T1 ×3 |
@@ -39,7 +39,8 @@
    `duplicate key value violates unique constraint`（没有 ON CONFLICT）。改成验真实口径：
    **连跑两轮不翻倍、且第二轮结果等于源端当前状态**（中间在源端改一行、删一行）。
    改/删的 upsert 由 `unique_key_continuous` 那一格覆盖（continuous 下声明生效，实测绿）。
-2. **降级格只证「允许继续」**。产品今天**没有**降级专属提示卡片，本格断言的是
+2. **降级格只证「允许继续」**（文案已按事实改，不再说「提示并允许」）。产品今天**没有**降级专属
+   提示卡片（全仓 `TargetVer` 只用于 `preflight/b0.go:53` 的回显，没有任何版本比较），本格断言的是
    `preflight.CanStart == true` + 两个版本在 NET-01/NET-02 的 Detail 里可见 + 引擎照跑搬到行数一致；
    测试里显式 `t.Logf` 写清「不冒充已提示」。要真做到「提示并允许」得产品加一张卡片——这是欠账，
    不在 S4 范围（不改产品代码）。
@@ -69,7 +70,19 @@
 归到 D6 同一笔挂账（MySQL→MySQL 未接通）。「MySQL 目标端 insert-only」今天只有
 PG→MySQL 全量格 + 单测证明——别把「矩阵绿」读成「MySQL 目标端已全覆盖」。
 
-## 5.5 CI 首跑踩到的一条（已修）
+## 5.5 Owl II 评审后的修正（P0×1 / P1×2 / P2×3 全部落地）
+
+| 编号 | 问题 | 修法 |
+|---|---|---|
+| P0-1 | `nopk-pr` 的 summary 步在 gate=false（只改文档）时 `[ -f ] && …` 返回 1 → **job 红**，一旦加进 required 就把 docs-only PR 全卡死（#109 的另一种形式） | summary 步改 `shopt -s nullglob` + `|| true`（四个 workflow 同一写法），只做整形、不冒充失败原因 |
+| P1-1 | 选格为空也 exit 0 → 新假绿入口（`--src-version 99` → `cells=0` 绿） | 空选 → `EX_CONFIG` rc=2；新增 `--expect-cells N`（PR 腿 3/3/4、nightly T1 3、T4 1、pairs 3/3/3/1 全写进 CI） |
+| P1-2 | 降级格文案写「提示并允许」，产品根本没有降级提示 | 登记表/notes/PR/CI 标签统一成「只验允许继续；提示未实现」，并报 Ark 核 §2.4 T3 那半句 |
+| P2-1 | `--include-pending` 是空开关（pending 分支在判断之前就 continue） | 真跑 pending 格（用例会红，rc=1）；显式 `--layer pending` 只报挂账（pending=12、rc=0） |
+| P2-2 | 「差 1 格」口径不准 | 改成「定稿算术 38.7（进位 ≈39）→ 实际 38.1，差 0.6/晚 = T4 少 4 格/周」，并点明是定稿 T4 行与 release 行的内部不一致 |
+| P2-3 | release 的 49 个 job 一次没跑过（`on: push: tags` 且无 dispatch） | release 加 `workflow_dispatch`；新增 `.github/workflows/nopk-dry-run.yml`（手动、只起一套真库，参数与 CI 一致）先干跑 cross / pg 各一次 |
+| P3 | `FULL_ONLY_LINKS` 零引用、`expand` 的 `if_due` 未用、临时文件不删、`mysql-matrix` 死分支、`no_pk.scenarios` 不校验、gate 正则漏 `scripts/ci/` 与 nightly/release、mysql-pg 收敛后不验新值、`want` 与定稿零绑定 | 全部收掉：删死代码、`TemporaryDirectory` 自动清理、`no_pk.scenarios` 按「声明==实际用到」校验、gate 正则补 `scripts/ci/` 与四个 workflow、mysql-pg 补 `v=1042` 断言、校验器把定稿 §2.4 的 `**10**`/`**184 格**`/`**待接通 12 格**`/`≈ 39` 当锚点（文档改了不同步就红） |
+
+## 5.6 CI 首跑踩到的一条（已修）
 
 第一版把用例挂在 `integration` 一个标签下 → `b1-engine` 跑整包集成时把它也跑起来，
 缺 `JINLIANG_NOPK_LINK` 直接红（`--- FAIL: TestNoPKMatrixCell (0.00s)`）。

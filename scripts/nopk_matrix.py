@@ -52,9 +52,6 @@ LINKS = {
     ("mysql", "mysql"): ("mysql-mysql", ["JINLIANG_TEST_MYSQL_SRC_DSN", "JINLIANG_TEST_MYSQL_DST_DSN"]),
 }
 
-# 只在这些方向上「增量/改删」可达（direction.go 的 Modes）：PG→MySQL 只全量。
-FULL_ONLY_LINKS = {"pg-mysql"}
-
 
 def link_of(block: dict) -> tuple[str, list[str]]:
     key = (block["source"], block["target"])
@@ -77,8 +74,8 @@ def due_pairs(block: dict, week: int) -> list[list[str]]:
     return [pairs[(start + i) % len(pairs)] for i in range(pick)]
 
 
-def expand(reg: dict, week: int, if_due: bool) -> list[dict]:
-    """把块展开成格。weekly 块在 if_due 下只留本周该跑的那几条链。"""
+def expand(reg: dict, week: int) -> list[dict]:
+    """把块展开成格（weekly 块展开整张轮转表，due 标记本周跑哪条链）。"""
     blocks = reg["blocks"]
     cells: list[dict] = []
     for layer, spec in reg["layers"].items():
@@ -131,8 +128,10 @@ def select(cells: list[dict], args) -> list[dict]:
             continue
         if args.dst_version and not any(version_matches(c["dst"], v) for v in args.dst_version):
             continue
-        if c["status"] == "pending" and not (args.include_pending or args.list):
-            continue  # pending 只在 --list / 汇总里出现，绝不混进执行
+        # 显式点名 pending 层 = 要看这笔挂账（报 status=pending，不跑）；要真跑得加 --include-pending。
+        if c["status"] == "pending" and not (
+                args.include_pending or args.list or "pending" in (args.layer or [])):
+            continue  # pending 绝不混进别的层的执行
         if c["weekly"] and args.if_due and not c["due"]:
             # 本周不排它：明确报 not-due（可观测），不是「悄悄跳过」。
             c = dict(c, status="not-due")
@@ -156,25 +155,26 @@ def run_cell(cell: dict, timeout: int, verbose: bool) -> tuple[str, str]:
     # 两个标签：integration（真库）+ nopkmatrix（这一格只能被这里调起，见测试文件头注释）。
     cmd = ["go", "test", "-tags=integration,nopkmatrix", "-count=1", "-timeout", f"{timeout}s",
            "-run", "^TestNoPKMatrixCell$", "-v", "./internal/engine/"]
-    with tempfile.NamedTemporaryFile(prefix="nopk-", suffix=".log", delete=False) as f:
-        log_path = f.name
-    try:
-        with open(log_path, "w", encoding="utf-8") as log:
-            proc = subprocess.run(cmd, cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT,
-                                  timeout=timeout + 30)
-        rc = proc.returncode
-        tail = Path(log_path).read_text(encoding="utf-8", errors="replace").strip().splitlines()[-30:]
-    except subprocess.TimeoutExpired:
-        rc = 124
-        tail = [f"超时（{timeout}s + 30s 外层）"]
+    with tempfile.TemporaryDirectory(prefix="nopk-") as tmpdir:
+        log_path = str(Path(tmpdir) / "cell.log")
+        try:
+            with open(log_path, "w", encoding="utf-8") as log:
+                proc = subprocess.run(cmd, cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT,
+                                      timeout=timeout + 30)
+            rc = proc.returncode
+        except subprocess.TimeoutExpired:
+            rc = 124
+        body = Path(log_path).read_text(encoding="utf-8", errors="replace") if os.path.exists(log_path) else ""
+    tail = body.strip().splitlines()[-30:] if body.strip() else ["（没有输出）"]
     if rc == 0:
         # rc=0 也可能是「一个用例都没匹配上」（改了用例名/漏了标签）——那不能算格跑过。
-        body = Path(log_path).read_text(encoding="utf-8", errors="replace")
         if "--- PASS: TestNoPKMatrixCell" not in body:
             if verbose:
                 print(body[-2000:], file=sys.stderr)
             return "fail", "用例没有真正执行：日志里没有 --- PASS: TestNoPKMatrixCell（漏了 -tags=nopkmatrix 或改了用例名）"
         return "pass", ""
+    if rc == 124:
+        return "fail", f"超时（{timeout}s + 30s 外层）"
     detail = " | ".join(x.strip() for x in tail[-6:] if x.strip())
     if verbose:
         print("\n".join(tail), file=sys.stderr)
@@ -197,6 +197,8 @@ def main() -> int:
     ap.add_argument("--include-pending", action="store_true", dest="include_pending",
                     help="连 pending 格也跑（它们会以「方向未接通」失败：这是证明，不是回归）")
     ap.add_argument("--list", action="store_true", help="只列格，不执行")
+    ap.add_argument("--expect-cells", type=int, default=0, dest="expect_cells",
+                    help="断言本次选中 N 格（CI 每条腿都写死：筛选漂移=红，不是「什么都没跑但绿」）")
     ap.add_argument("--limit", type=int, default=0, help="最多跑几格（排查用；0=不限）")
     ap.add_argument("--timeout", type=int, default=300, help="单格超时秒数（默认 300）")
     ap.add_argument("--json", default="", help="把逐格结果写成 JSON")
@@ -205,7 +207,7 @@ def main() -> int:
 
     reg = yaml.safe_load(REGISTRY.read_text(encoding="utf-8"))
     week = args.week if args.week is not None else iso_week()
-    all_cells = expand(reg, week, args.if_due)
+    all_cells = expand(reg, week)
     selected = select(all_cells, args)
 
     # ── 汇总（对账用）────────────────────────────────────────
@@ -244,6 +246,16 @@ def main() -> int:
         return 0
 
     # ── 执行 ────────────────────────────────────────────────
+    # 空选必须红：CI 每条腿都靠 link + 版本标签筛格，登记表/参数一漂移就会「一格没跑却绿」。
+    if not selected:
+        print(f"EX_CONFIG: 这次筛选一格都没选中（layer={args.layer} block={args.block} "
+              f"link={args.link} scenario={args.scenario} src={args.src_version} dst={args.dst_version} "
+              f"if_due={args.if_due}）：筛选漂移或参数写错，不是「没活干」", file=sys.stderr)
+        return 2
+    if args.expect_cells and len(selected) != args.expect_cells:
+        print(f"EX_CONFIG: 期望 {args.expect_cells} 格，实际选中 {len(selected)} 格："
+              f"登记表或 CI 参数漂移了（选中的是 {[c['id'] for c in selected][:5]}…）", file=sys.stderr)
+        return 2
     if args.limit:
         selected = selected[: args.limit]
     results = []
@@ -257,7 +269,7 @@ def main() -> int:
                   f"scenario={c['scenario']} status=not-due")
             results.append({"cell": c["id"], "status": "not-due"})
             continue
-        if c["status"] == "pending":
+        if c["status"] == "pending" and not args.include_pending:
             pending += 1
             print(f"RESULT nopk cell={c['id']} link={c['link']} versions={c['src']}->{c['dst']} "
                   f"scenario={c['scenario']} status=pending reason={c['reason']}")

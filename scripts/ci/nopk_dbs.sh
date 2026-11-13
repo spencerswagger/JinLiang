@@ -6,6 +6,11 @@
 #
 #   nopk_dbs.sh cross <mysql版> <pg版>   起 PG 源/目标（同版本）+ MySQL 源/目标（同版本）
 #   nopk_dbs.sh pg    <源版>   <目标版>  只起 PG 源/目标（版本可以不同）
+#   nopk_dbs.sh mysql <mysql版>          只起 MySQL 源/目标
+#
+# 三个子命令用的是同一段容器编排：cross = pg + mysql 的组合。PR 门禁跑 pg + mysql，
+# release/nightly 跑 cross 与 pg —— 所以这段编排每个 PR 都会被真跑一遍，不是「只在打 tag 时
+# 才有机会发现写错」。
 #
 # 端口固定（一个 job 一个 runner，不会撞）：PG 55442/55443、MySQL 55306/55307。
 # 就绪判据都是「真查询」，不用 pg_isready / mysqladmin ping：
@@ -82,6 +87,10 @@ case "${1:-}" in
     pg_up pg-src "${2:?源版本}" "$PG_SRC_PORT" jinliang_src
     pg_up pg-dst "${3:?目标版本}" "$PG_DST_PORT" jinliang_test
     ;;
+  mysql)
+    mysql_up my-src "${2:?MySQL 版本}" "$MY_SRC_PORT" jinliang_src 1
+    mysql_up my-dst "${2:?MySQL 版本}" "$MY_DST_PORT" jinliang_target 2
+    ;;
   cross)
     pg_up pg-src "${3:?PG 版本}" "$PG_SRC_PORT" jinliang_src
     pg_up pg-dst "${3:?PG 版本}" "$PG_DST_PORT" jinliang_test
@@ -89,7 +98,7 @@ case "${1:-}" in
     mysql_up my-dst "${2:?MySQL 版本}" "$MY_DST_PORT" jinliang_target 2
     ;;
   *)
-    echo "用法: $0 {pg <源版> <目标版> | cross <mysql版> <pg版>}" >&2
+    echo "用法: $0 {pg <源版> <目标版> | mysql <mysql版> | cross <mysql版> <pg版>}" >&2
     exit 64
     ;;
 esac

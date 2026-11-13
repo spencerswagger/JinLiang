@@ -13,11 +13,13 @@
 #
 # 与定稿的差异（真实算术，不改数字迁就管线）：
 #   - PR 10 格、release 184 格、待接通 12 格：**逐格对得上**；
-#   - nightly：定稿写「≈39 格/晚」，真实是 **37 格/晚 + T4 8 格/周（≈1.1/晚）≈ 38.1**。
-#     差的 1 格来自定稿 T4 的算法：定稿按「4 条链 × 3 场景 = 12/周」，
-#     但其中 PG→MySQL 两条链**只全量**（`internal/core/direction.go` 的 Modes），
-#     3 场景里只有 `snapshot` 可达 → 真实是 2×3 + 2×1 = 8/周。多算的 4 格不是「没跑」，
-#     是**产品口径下不存在**（该方向没有增量写路径可验）。
+#   - nightly：定稿写「≈39 格/晚」，**定稿自己的算术是 27+6+4+12/7 = 38.7**（进位成 ≈39）；
+#     真实是 **37 固定 + T4 8 格/周 = 37 + 8/7 ≈ 38.1**，差 **0.6 格/晚 = T4 少 4 格/周**。
+#     差因：定稿 T4 那行按「4 条链 × 3 场景 = 12/周」算，但其中 2 条 PG→MySQL 链
+#     **只全量**（`internal/core/direction.go` 的 Modes），3 场景里只有 `snapshot` 可达
+#     → 2×3 + 2×1 = 8/周。而同一张表的 release 行自己写的是「PG→MySQL 36 条 × 1」——
+#     所以这是**定稿 §2.4 T4 行与 release 行的内部不一致**，多算的 4 格在产品口径下不存在
+#     （该方向没有增量写路径可验），不是「没跑」。已报 Ark 核 §2.4 那一行。
 #
 # 「待接通」12 格：MySQL→MySQL 的 4 条 T1 链路 × 3 场景。方向未接通
 # （`internal/core/direction.go` 的 `pendingDirections`，欠账 D6），一格都跑不了；
@@ -30,7 +32,10 @@ scenarios:
   snapshot: 全量搬完（insert-only 落全量，行数与源端一致、不暂停）
   insert: 增量纯 INSERT（不暂停、位点前进）
   pause: 增量一次 UPDATE（该表暂停 + skipped_rows + 退出码 3 → 修好身份后整表重搬收敛）
-  downgrade: 降级方向只验「提示并允许继续」
+  downgrade: >-
+    降级方向**只验「允许继续」**：预检不阻断（CanStart=true）+ 两侧版本在 NET-01/02 的
+    Detail 里可见 + 引擎照跑搬到行数一致。**「提示」在产品里尚未实现**（今天没有任何版本比较
+    或降级判据，`TargetVer` 只用于回显），这一半是欠账，不许读成「提示也验了」。
   unique_key_once: >-
     声明 unique_key + once：连跑两轮不翻倍，且第二轮结果等于源端当前状态（改/删都跟上）。
     注意口径：once / full_interval 是「每轮整轮重建」，声明**不进写路径**
@@ -88,6 +93,7 @@ blocks:
     scenarios: [snapshot, insert, pause]
 
   # ── nightly T3 极端跨度（10→18 三条 + 18→10 降级一条 = 4 格）──
+  # 降级那一格只验「允许继续」（见 scenarios.downgrade）：产品没有降级专属提示卡片。
   pg-t3-extreme:
     source: postgres
     target: postgres

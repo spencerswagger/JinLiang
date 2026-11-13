@@ -1,0 +1,91 @@
+name: nopk-dry-run
+
+# 无主键变体矩阵的**单套真库**干跑入口（只手动触发）。
+#
+# 为什么单独一个 workflow：release 的 49 个 job 只在打 tag 时跑，`nopk_dbs.sh` 那段容器编排
+# 与版本标签匹配（MySQL 9.4 → 标签 9、PG 10 当目标端）平时没有机会验。整条 release 一次
+# 要起 49 套库，排查时太重；这里只起**一套**，跑指定链路，参数与 CI 完全一致。
+#
+#   gh workflow run nopk-dry-run.yml -f mode=cross -f mysql=8.4 -f pg_src=17 -f pg_dst=17
+#   gh workflow run nopk-dry-run.yml -f mode=pg    -f pg_src=10 -f pg_dst=11
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "cross = MySQL↔PG 两个方向；pg = 只 PG→PG"
+        required: true
+        default: "cross"
+        type: choice
+        options: ["cross", "pg"]
+      mysql:
+        description: "MySQL 版本（cross 用；9.4 会匹配登记表里的 9.x）"
+        required: false
+        default: "8.4"
+      pg_src:
+        description: "PG 源版本"
+        required: true
+        default: "17"
+      pg_dst:
+        description: "PG 目标版本（pg 模式下可与源不同，用来验降级/升级）"
+        required: true
+        default: "17"
+
+jobs:
+  dry-run:
+    runs-on: ubuntu-latest
+    name: 干跑 ${{ inputs.mode }} · MySQL ${{ inputs.mysql }} · PG ${{ inputs.pg_src }}→${{ inputs.pg_dst }}
+    env:
+      JINLIANG_TEST_PG_SRC_DSN: postgres://jinliang:jinliang@127.0.0.1:55442/jinliang_src?sslmode=disable
+      JINLIANG_TEST_PG_DSN: postgres://jinliang:jinliang@127.0.0.1:55443/jinliang_test?sslmode=disable
+      JINLIANG_TEST_MYSQL_SRC_DSN: mysql://jinliang:jinliang@127.0.0.1:55306/jinliang_src
+      JINLIANG_TEST_MYSQL_DSN: mysql://jinliang:jinliang@127.0.0.1:55307/jinliang_target
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.x"
+      - name: 备好 python 依赖
+        run: pip install --quiet pyyaml
+      - name: 起真库
+        run: |
+          set -e
+          if [ "${{ inputs.mode }}" = "cross" ]; then
+            bash scripts/ci/nopk_dbs.sh cross "${{ inputs.mysql }}" "${{ inputs.pg_src }}"
+          else
+            bash scripts/ci/nopk_dbs.sh pg "${{ inputs.pg_src }}" "${{ inputs.pg_dst }}"
+          fi
+      - name: 先看选中了什么（格清单，不跑）
+        run: |
+          set -e
+          if [ "${{ inputs.mode }}" = "cross" ]; then
+            python3 scripts/nopk_matrix.py --list --layer release --link mysql-pg \
+              --src-version "${{ inputs.mysql }}" --dst-version "${{ inputs.pg_src }}" | grep -v "^PLAN"
+            python3 scripts/nopk_matrix.py --list --layer release --link pg-mysql \
+              --src-version "${{ inputs.pg_src }}" --dst-version "${{ inputs.mysql }}" | grep -v "^PLAN"
+          else
+            python3 scripts/nopk_matrix.py --list --layer release --link pg-pg \
+              --src-version "${{ inputs.pg_src }}" --dst-version "${{ inputs.pg_dst }}" | grep -v "^PLAN"
+          fi
+      - name: 逐格真跑
+        run: |
+          set -e
+          if [ "${{ inputs.mode }}" = "cross" ]; then
+            python3 scripts/nopk_matrix.py --layer release --link mysql-pg \
+              --src-version "${{ inputs.mysql }}" --dst-version "${{ inputs.pg_src }}" --json nopk-mp.json
+            python3 scripts/nopk_matrix.py --layer release --link pg-mysql \
+              --src-version "${{ inputs.pg_src }}" --dst-version "${{ inputs.mysql }}" --json nopk-pm.json
+          else
+            python3 scripts/nopk_matrix.py --layer release --link pg-pg \
+              --src-version "${{ inputs.pg_src }}" --dst-version "${{ inputs.pg_dst }}" --json nopk-pp.json
+          fi
+      - name: 结果进 job summary
+        if: always()
+        run: |
+          { echo "### 干跑：${{ inputs.mode }} · MySQL ${{ inputs.mysql }} · PG ${{ inputs.pg_src }}→${{ inputs.pg_dst }}"; echo;
+            shopt -s nullglob
+            for f in nopk-*.json; do echo '```json'; cat "$f"; echo '```'; done; } >> "$GITHUB_STEP_SUMMARY" || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nopk-dry-run
+          path: nopk-*.json

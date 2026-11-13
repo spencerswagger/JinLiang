@@ -6,6 +6,9 @@ name: release
 on:
   push:
     tags: ["v*"]
+  # 手动跑一次用（整条 release 会起 49 个真库 job，只在露出问题时这么用；
+  # 单格排查走 .github/workflows/nopk-dry-run.yml，只起一套库）。
+  workflow_dispatch:
 
 jobs:
   cross-compile:
@@ -109,14 +112,15 @@ jobs:
         run: |
           set -e
           python3 scripts/nopk_matrix.py --layer release --link mysql-pg \
-            --src-version "${{ matrix.mysql }}" --dst-version "${{ matrix.pg }}" --json nopk-mp.json
+            --src-version "${{ matrix.mysql }}" --dst-version "${{ matrix.pg }}" --expect-cells 3 --json nopk-mp.json
           python3 scripts/nopk_matrix.py --layer release --link pg-mysql \
             --src-version "${{ matrix.pg }}" --dst-version "${{ matrix.mysql }}" --json nopk-pm.json
       - name: 结果进 job summary
         if: always()
         run: |
           { echo "### 无主键 release：MySQL ${{ matrix.mysql }} ↔ PG ${{ matrix.pg }}"; echo;
-            for f in nopk-*.json; do [ -f "$f" ] && { echo '```json'; cat "$f"; echo '```'; }; done; } >> "$GITHUB_STEP_SUMMARY"
+            shopt -s nullglob
+            for f in nopk-*.json; do echo '```json'; cat "$f"; echo '```'; done; } >> "$GITHUB_STEP_SUMMARY" || true
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -164,7 +168,8 @@ jobs:
         if: always()
         run: |
           { echo "### 无主键 release：PG ${{ matrix.src }} → PG ${{ matrix.dst }}"; echo;
-            for f in nopk-*.json; do [ -f "$f" ] && { echo '```json'; cat "$f"; echo '```'; }; done; } >> "$GITHUB_STEP_SUMMARY"
+            shopt -s nullglob
+            for f in nopk-*.json; do echo '```json'; cat "$f"; echo '```'; done; } >> "$GITHUB_STEP_SUMMARY" || true
       - uses: actions/upload-artifact@v4
         if: always()
         with:

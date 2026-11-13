@@ -65,6 +65,9 @@ matrix:
 # 它们算进 pass。目标端 insert-only 今天只有单测 + 本地真库 smoke（PG→MySQL 全量格）证明。
 no_pk:
   registry: test/nopk-matrix.yaml
-  scenarios: [snapshot, insert, pause]
+  # 这个连接器参与的块里用到的全部场景（校验器按「声明 == 实际用到」核对，多写少写都红）。
+  # unique_key_once 在 MySQL 侧是 PG 18→MySQL 8.4 那一格（该方向只全量，声明在 once 下不生效，
+  # 验的是「重放收敛」而不是 upsert）。
+  scenarios: [snapshot, insert, pause, unique_key_once]
   pending_cells: 12
   pending_reason: "MySQL→MySQL 方向未接通（D6）：4 条 T1 链路 × 3 场景，一格都不可执行"

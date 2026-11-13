@@ -151,6 +151,15 @@ def check_nopk(root, pg, my):
         return n
 
     # 与定稿 §2.4 对账：PR 10 / nightly 37 每晚 + T4 8 每周（≈38.1）/ release 184 / 待接通 12。
+    # 与定稿**绑定**：这几个数就是 §2.4 表里写的，改了设计必须同时改这里与登记表，
+    # 否则「登记表绿、文档另说」这种漂移永远发现不了。
+    design = (root / "docs" / "DESIGN-NO-PRIMARY-KEY.md").read_text(encoding="utf-8")
+    for token in ("**10**", "**184 格**", "**待接通 12 格**", "≈ 39"):
+        if token not in design:
+            raise AssertionError(
+                f"定稿 §2.4 里找不到 {token}：设计改了数字就同步改 test/nopk-matrix.yaml "
+                f"与本校验器的 want，别让两边各说一套")
+
     got = {
         "pr": count("pr"),
         "nightly_fixed": count("nightly", weekly=False),
@@ -171,10 +180,24 @@ def check_nopk(root, pg, my):
         raise AssertionError(f"mysql testmatrix 的 no_pk.pending_cells 应为 {got['pending']}，实际 {mp.get('pending_cells')}")
     if int(pp.get("pending_cells", -1)) != 0:
         raise AssertionError(f"postgres testmatrix 的 no_pk.pending_cells 应为 0，实际 {pp.get('pending_cells')}")
-    for label, doc2 in (("mysql", my), ("postgres", pg)):
-        reg = (doc2.get("no_pk") or {}).get("registry")
-        if reg != "test/nopk-matrix.yaml":
-            raise AssertionError(f"{label} testmatrix 的 no_pk.registry 应指向 test/nopk-matrix.yaml，实际 {reg}")
+    for label, doc2, kind in (("mysql", my, "mysql"), ("postgres", pg, "postgres")):
+        np = doc2.get("no_pk") or {}
+        if np.get("registry") != "test/nopk-matrix.yaml":
+            raise AssertionError(f"{label} testmatrix 的 no_pk.registry 应指向 test/nopk-matrix.yaml，实际 {np.get('registry')}")
+        declared = set(np.get("scenarios") or [])
+        if not declared:
+            raise AssertionError(f"{label} testmatrix 的 no_pk.scenarios 不能为空")
+        # 语义：声明的场景必须是登记表里真有的，并且**这个连接器参与的块里真的用到它**。
+        used = set()
+        for b in blocks.values():
+            if kind in (b["source"], b["target"]):
+                used |= set(b["scenarios"])
+        for sc in sorted(declared - scenarios):
+            raise AssertionError(f"{label} testmatrix 的 no_pk.scenarios 里有登记表没声明的场景 {sc}")
+        for sc in sorted(declared - used):
+            raise AssertionError(f"{label} testmatrix 的 no_pk.scenarios 声明了 {sc}，但没有一个它参与的块用到")
+        for sc in sorted(used - declared):
+            raise AssertionError(f"{label} testmatrix 的 no_pk.scenarios 漏了 {sc}（它的块用到了，声明里没有）")
 
     return got
 
@@ -199,8 +222,12 @@ def main():
 
     nopk = check_nopk(root, pg, my)
     print("testmatrix: postgres 9/9 (81), mysql 4/4 (16), cross 72 — 分层正确")
-    print(f"nopk: pr {nopk['pr']}/10 · nightly {nopk['nightly_fixed']} 每晚 + T4 "
-          f"{nopk['nightly_weekly']}/周（≈{(nopk['nightly_fixed'] + nopk['nightly_weekly']/7):.1f}/晚，定稿 ≈39）"
+    real = nopk["nightly_fixed"] + nopk["nightly_weekly"] / 7
+    design_nightly = 27 + 6 + 4 + 12 / 7  # 定稿 §2.4 的算法（T4 按 4 链 × 3 场景 = 12/周）
+    print(f"nopk: pr {nopk['pr']}/10 · nightly {nopk['nightly_fixed']} 固定 + T4 "
+          f"{nopk['nightly_weekly']}/周 = {real:.1f}/晚"
+          f"（定稿自己的算术 {design_nightly:.1f} → 进位成 ≈39；差 {design_nightly - real:.1f}/晚"
+          f" = T4 少 4 格/周，因 PG→MySQL 只全量且定稿 T4 行按 3 场景算）"
           f" · release {nopk['release']}/184 · 待接通 {nopk['pending']}/12（pending，不计入覆盖）")
 
 
