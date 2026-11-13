@@ -101,6 +101,11 @@ func Run(in Input) source.Report {
 	// ── 表范围 ───────────────────────────────────────────────
 	checks = append(checks, scopeChecks(in)...)
 
+	// ── MySQL 源端存储引擎（SPEC MY-08）───────────────────────
+	// MyISAM 没有事务：崩溃时目标端可能与源端不一致，但同步本身能跑——
+	// 按 docs/SPEC.md:107 的拍板口径 warn 照跑并标注，不阻断。
+	checks = append(checks, engineChecks(in)...)
+
 	// ── 模式相关 ─────────────────────────────────────────────
 	if in.Mode == "interval" {
 		if strings.TrimSpace(in.Incremental) == "" {
@@ -303,6 +308,42 @@ func scopeChecks(in Input) []source.Check {
 			Status: source.StatusOK, Detail: "可以安全地做 upsert"})
 	}
 	return out
+}
+
+// engineChecks 是 SPEC MY-08（表的存储引擎）：MySQL 源端选中表里有 MyISAM
+// （含 MRG_MyISAM）时 warn——无事务，崩溃时可能不一致，照跑并标注。
+//
+// 引擎名来自 Catalog（connect/mysql.go 从 information_schema.TABLES 填
+// source.Table.Engine），这里不做任何新查询。PG 源的 Engine 是 relkind 名
+// （table / partitioned table…），不能拿来判存储引擎，所以只认 mysql。
+// SourceCat 没读到时不发这条：不阻断，与 SCOPE-01 同口径。
+func engineChecks(in Input) []source.Check {
+	if in.SourceKind != "mysql" || in.SourceCat == nil {
+		return nil
+	}
+	want := map[string]bool{}
+	for _, t := range in.Tables {
+		want[t] = true
+	}
+	var myisam []string
+	for _, t := range in.SourceCat.Tables {
+		if len(want) > 0 && !want[t.Table] {
+			continue
+		}
+		if strings.Contains(strings.ToUpper(t.Engine), "MYISAM") {
+			myisam = append(myisam, t.Table)
+		}
+	}
+	if len(myisam) == 0 {
+		return nil
+	}
+	sort.Strings(myisam)
+	return []source.Check{{
+		ID: "MY-08", Title: "部分表用 MyISAM 引擎（无事务）", Status: source.StatusWarn,
+		Detail: fmt.Sprintf("%s 用 MyISAM：没有事务，崩溃时目标端可能与源端不一致；同步照跑，这几张表会被标注",
+			strings.Join(myisam, "、")),
+		Affected: myisam, Who: "you",
+	}}
 }
 
 func tablesWithoutColumn(cat *source.Catalog, tables []string, column string) []string {

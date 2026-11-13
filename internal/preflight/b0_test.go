@@ -333,3 +333,60 @@ func TestPause01TextMatchesPerTablePauseSemantics(t *testing.T) {
 		}
 	}
 }
+
+// SPEC MY-08：MySQL 源端的 MyISAM 表 warn 照跑并标注，不阻断；
+// InnoDB / 未选中的 MyISAM / PG 源都不触发。
+func TestMyISAMSourceTablesWarnNotBlock(t *testing.T) {
+	rep := Run(Input{
+		SourceKind: "mysql", TargetKind: "postgres",
+		SourceVer: "8.0.36", TargetVer: "16.2",
+		SourceCaps: source.CapSet{source.CapCDC: {Supported: true}},
+		SourceCat: catalog(
+			source.Table{TableRef: source.TableRef{Table: "orders"}, Engine: "InnoDB", HasStablePK: true},
+			source.Table{TableRef: source.TableRef{Table: "legacy"}, Engine: "MyISAM", HasStablePK: true},
+			source.Table{TableRef: source.TableRef{Table: "mrg"}, Engine: "MRG_MyISAM", HasStablePK: true},
+		),
+		Tables:    []string{"orders", "legacy", "mrg"},
+		Mode:      "continuous+initial",
+		BatchRows: 500,
+	})
+	c, ok := statusOf(rep, "MY-08")
+	if !ok {
+		t.Fatalf("选中表里有 MyISAM，应有 MY-08：%+v", rep.Checks)
+	}
+	if c.Status != source.StatusWarn {
+		t.Fatalf("MY-08 = %s，SPEC 口径是 warn 照跑并标注（无事务，不物理阻断）", c.Status)
+	}
+	if !rep.CanStart {
+		t.Fatal("MyISAM 照跑，不该把 CanStart 压成 false")
+	}
+	for _, want := range []string{"legacy", "mrg"} {
+		if !strings.Contains(c.Detail, want) {
+			t.Errorf("MY-08 明细应点名 %s：%s", want, c.Detail)
+		}
+	}
+	if strings.Contains(c.Detail, "orders") {
+		t.Errorf("InnoDB 表不该被点名：%s", c.Detail)
+	}
+
+	// 没选 MyISAM 表（含 PG 源）不触发。
+	rep = Run(Input{
+		SourceKind: "mysql", SourceCaps: source.CapSet{source.CapCDC: {Supported: true}},
+		SourceCat: catalog(
+			source.Table{TableRef: source.TableRef{Table: "orders"}, Engine: "InnoDB", HasStablePK: true},
+			source.Table{TableRef: source.TableRef{Table: "legacy"}, Engine: "MyISAM", HasStablePK: true},
+		),
+		Tables: []string{"orders"}, Mode: "once", BatchRows: 500,
+	})
+	if _, ok := statusOf(rep, "MY-08"); ok {
+		t.Fatal("没选 MyISAM 表不该发 MY-08")
+	}
+	rep = Run(Input{
+		SourceKind: "postgres", SourceCaps: source.CapSet{source.CapCDC: {Supported: true}},
+		SourceCat: catalog(source.Table{TableRef: source.TableRef{Table: "t"}, Engine: "table", HasStablePK: true}),
+		Tables:    []string{"t"}, Mode: "once", BatchRows: 500,
+	})
+	if _, ok := statusOf(rep, "MY-08"); ok {
+		t.Fatal("PG 源不该发 MY-08（Engine 是 relkind 名，不是存储引擎）")
+	}
+}

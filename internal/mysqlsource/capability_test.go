@@ -227,3 +227,31 @@ func TestProbeChecksAreActionable(t *testing.T) {
 		t.Fatal("PARTIAL_JSON 必须被识别出来（否则更新会缺列）")
 	}
 }
+
+func TestProbeMariaDBBlockedKeepsMy08FreeForEngineCheck(t *testing.T) {
+	// docs/SPEC.md:107 的 MY-08 是「表的存储引擎」（MyISAM → warn 照跑）；
+	// MariaDB 检查之前错占了 MY-08（blocked），口径对不上——现在挪到 MY-11。
+	f := newProbeFixture(t, "11.4.2-MariaDB-1:11.4.2+maria~ubu2404")
+	f.vars = map[string]string{"log_bin": "1", "binlog_format": "ROW", "binlog_row_image": "FULL"}
+	f.grants = []string{"GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO `u`@`%`"}
+	res := f.run(t)
+
+	var maria *source.Check
+	for i := range res.Checks {
+		switch res.Checks[i].ID {
+		case "MY-08":
+			t.Fatalf("MY-08 必须留给存储引擎检查，MariaDB 检查不该再占它: %+v", res.Checks[i])
+		case "MY-11":
+			maria = &res.Checks[i]
+		}
+	}
+	if maria == nil {
+		t.Fatal("MariaDB 源必须有 MY-11 检查")
+	}
+	if maria.Status != source.StatusBlocked {
+		t.Fatalf("MariaDB 本期不支持，检查应保持 blocked: %+v", maria)
+	}
+	if maria.Code != "E1001" {
+		t.Fatalf("错误码语义不变：仍挂 E1001，实际 %q", maria.Code)
+	}
+}
