@@ -487,7 +487,7 @@ func nopkPGPGDowngrade(t *testing.T, srcDSN, dstDSN string) {
 	nopkSeedPGNoPK(t, src, tbl, rows)
 	nopkResetPGTarget(t, dst, tbl)
 
-	// 「提示并允许」：预检不许阻断，并且两张连接卡片把两侧版本写出来（版本可见）。
+	// 「允许继续」：预检不许阻断，并且两张连接卡片把两侧版本写出来（版本可见）。
 	srcVer := nopkServerVersion(t, srcDSN)
 	dstVer := nopkServerVersion(t, dstDSN)
 	rep := preflight.Run(preflight.Input{
