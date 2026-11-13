@@ -408,6 +408,10 @@ type runner struct {
 	// skippedTables 是「本轮结构对不上、连存量也不搬」的表（prepare 期发现的）。
 	// 它们仍在 r.tables 里（跨轮存活判据要它），但不进 copy plan 的搬运名单。
 	skippedTables map[string]bool
+	// degradeNote 是「这一轮是降级跑的」那句话（目前唯一来源：SPEC MY-08 无事务引擎）。
+	// 非空时收尾的 Result.Note 会带上它，CLI 打印「说明：…」——这样「全量完成」
+	// 不会单独出现，用户不会把一次非一致性的全量当成一致切面（假绿）。
+	degradeNote string
 
 	rowsCopied int64
 	rowsStream int64
@@ -440,6 +444,7 @@ func (r *runner) execute(parent context.Context, res *Result) error {
 		res.Position = posString(r.lastPos)
 		res.ExitCode = r.exitCode
 		res.Resync = r.resyncReport
+		r.finishNotes(res)
 	}()
 
 	if err := r.checkResync(); err != nil {
@@ -886,6 +891,13 @@ func (r *runner) preflight(ctx context.Context) error {
 				}
 			}
 		}
+	}
+
+	// 无事务引擎（SPEC MY-08）是**降级**：预检 warn 照跑，但收尾必须标注——
+	// 「预检说了有风险、快照阶段却只报一句全量完成」就是假绿（用户以为拿到了
+	// 一致性切面，其实没有）。判据仍只取 preflight.JudgeEngines，引擎不另写一份。
+	if j := preflight.JudgeEngines(in.SourceKind, in.SourceCat, in.Tables); j.Verdict == preflight.EngineNonTransactional {
+		r.degradeNote = preflight.EngineDegradeNote(j)
 	}
 
 	report := preflight.Run(in)
@@ -1849,6 +1861,11 @@ func (r *runner) drain(ctx context.Context, exit int, msg string) error {
 	r.exitCode = exit
 	dctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
+	// 降级标注要在「全量完成」之后、用户读到最终状态之前说一次：只报一句
+	// 「全量完成」而不提 MyISAM 没有事务，就是假绿（SPEC MY-08 的降级口径）。
+	if r.degradeNote != "" {
+		r.emit(dctx, control.Event{Type: "note", Message: r.degradeNote})
+	}
 	if r.phase != state.Draining && !state.CanTransition(r.phase, state.Draining) {
 		// 有些阶段不能直接进 Draining（例如 once 发现「没有可搬的存量」时还停在
 		// Prepare）。按状态机允许的路径补一步空转，而不是硬写一个非法终态。
@@ -1902,6 +1919,20 @@ func emitEarlyNote(res *Result, msg string) {
 		res.Note += "；"
 	}
 	res.Note += msg
+}
+
+// finishNotes 把本轮的「降级」标注拼进 Result.Note（CLI 的「说明：…」）。
+//
+// 为什么必须在 Result 里也留一份：事件流是易失的（容器里没人读、日志被截断），
+// 而 `run` 的最后一行是 `$?` 之前唯一一定被看到的东西。只有事件、没有 Result，
+// 就等于「降级过」这件事随时可以丢——那还是假绿。
+//
+// 单测直接调它（不需要库）：见 engine_degrade_test.go。
+func (r *runner) finishNotes(res *Result) {
+	if r.degradeNote == "" {
+		return
+	}
+	emitEarlyNote(res, r.degradeNote)
 }
 
 // pauseHead 拼 last_error 的前缀。**表名可能为空**（错误被别处包装过、或 typed error
